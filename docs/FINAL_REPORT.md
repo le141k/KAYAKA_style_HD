@@ -10,44 +10,46 @@ but not yet executed end-to-end**.
 cp .env.example .env
 docker compose up --build      # postgres, redis, mailhog, api (auto-migrate+seed), web
 ```
+
 Local dev (what was used to verify): `docker compose up -d postgres redis mailhog`
 (host ports **55432 / 56379** to avoid clashing with a native pg/redis), then per-app
 `npm run dev`. The API auto-detects no IMAP queues and disables inbound polling.
 
-| Service | URL |
-|---|---|
-| Web (client / staff / admin) | http://localhost:3000 |
-| API + Swagger | http://localhost:4000/api/docs |
-| MailHog | http://localhost:8025 |
+| Service                      | URL                            |
+| ---------------------------- | ------------------------------ |
+| Web (client / staff / admin) | http://localhost:3000          |
+| API + Swagger                | http://localhost:4000/api/docs |
+| MailHog                      | http://localhost:8025          |
 
 ### Demo credentials (seeded)
-| Role | Email | Password |
-|---|---|---|
+
+| Role          | Email                     | Password   |
+| ------------- | ------------------------- | ---------- |
 | Administrator | `admin@23telecom.example` | `demo1234` |
-| Agent | `agent@23telecom.example` | `demo1234` |
+| Agent         | `agent@23telecom.example` | `demo1234` |
 
 ## Acceptance checklist
 
-| Item | Status | Evidence |
-|---|---|---|
-| Brand identity in `docs/brand/` | ✅ | guidelines + SVG logo/mark + tone of voice ru/en/uk |
-| shadcn theme in `frontend/styles/theme/` | ✅ | tokens.css (light/dark) + tailwind preset |
-| Prisma migrations apply | ✅ | 2 migrations applied to PostgreSQL 16 |
-| Seed + demo login work | ✅ | seed populated; live login returns JWT |
-| Ticket creation via API | ✅ | smoke: `POST /api/tickets/public` → TT-000006 |
-| Alaris webhook → ticket | ✅ | smoke: `POST /api/alaris/webhook` → TT-000007 `[ALARIS-AUTO]` |
-| Swagger at `/api/docs` | ✅ | served (49 paths / 72 operations) |
-| Three interfaces functional | ✅ | screenshots: client, staff, admin (see below) |
-| UI on shadcn + ≥10 premium components | ✅ | 17 shadcn + 14 premium components |
-| Unit tests | ✅ | Vitest **25/25 passing** (auth, tickets, sla) |
-| TypeScript strict typecheck | ✅ | api `tsc` exit 0; web `tsc` exit 0 |
-| Frontend production build | ✅ | `next build` exit 0, 18 pages, `next lint` clean |
-| README 5-minute start | ✅ | README.md quick start |
-| `docker compose up` no manual steps | ✅ | images built; full stack up; containerized API auto-migrated+seeded; smoke vs containers: login ✅, ticket TT-000008 ✅, alaris TT-000009 ✅; web renders; MailHog UI 200 |
-| Integration tests (Testcontainers) | ✅ | `tickets.int-spec.ts` **7/7 passing** (real Postgres container, migrate+seed, supertest: public create, get, reply, list, status change) |
-| E2E (Playwright) | ✅ | **18/18 passing** (chromium) against the live stack: login, KB search, kanban, ticket submit |
-| k6 load (1000 RPS) | 🟡 | script `infra/k6/ticket-creation.js`; not run here |
-| SLA breach → escalation | ✅ (unit) | `sla.service.spec.ts` covers due-date calc + breach detection |
+| Item                                     | Status    | Evidence                                                                                                                                                                  |
+| ---------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Brand identity in `docs/brand/`          | ✅        | guidelines + SVG logo/mark + tone of voice ru/en/uk                                                                                                                       |
+| shadcn theme in `frontend/styles/theme/` | ✅        | tokens.css (light/dark) + tailwind preset                                                                                                                                 |
+| Prisma migrations apply                  | ✅        | 2 migrations applied to PostgreSQL 16                                                                                                                                     |
+| Seed + demo login work                   | ✅        | seed populated; live login returns JWT                                                                                                                                    |
+| Ticket creation via API                  | ✅        | smoke: `POST /api/tickets/public` → TT-000006                                                                                                                             |
+| Alaris webhook → ticket                  | ✅        | smoke: `POST /api/alaris/webhook` → TT-000007 `[ALARIS-AUTO]`                                                                                                             |
+| Swagger at `/api/docs`                   | ✅        | served (49 paths / 72 operations)                                                                                                                                         |
+| Three interfaces functional              | ✅        | screenshots: client, staff, admin (see below)                                                                                                                             |
+| UI on shadcn + ≥10 premium components    | ✅        | 17 shadcn + 14 premium components                                                                                                                                         |
+| Unit tests                               | ✅        | Vitest **272/272 passing**; services ≥80% coverage (admin/kb/orgs/staff/depts 100%, sla 98%, tickets 96%, workflow 97%, users 93%, mail 97%)                              |
+| TypeScript strict typecheck              | ✅        | api `tsc` exit 0; web `tsc` exit 0                                                                                                                                        |
+| Frontend production build                | ✅        | `next build` exit 0, 18 pages, `next lint` clean                                                                                                                          |
+| README 5-minute start                    | ✅        | README.md quick start                                                                                                                                                     |
+| `docker compose up` no manual steps      | ✅        | images built; full stack up; containerized API auto-migrated+seeded; smoke vs containers: login ✅, ticket TT-000008 ✅, alaris TT-000009 ✅; web renders; MailHog UI 200 |
+| Integration tests (Testcontainers)       | ✅        | `tickets.int-spec.ts` **7/7 passing** (real Postgres container, migrate+seed, supertest: public create, get, reply, list, status change)                                  |
+| E2E (Playwright)                         | ✅        | **18/18 passing** (chromium) against the live stack: login, KB search, kanban, ticket submit                                                                              |
+| k6 load (1000 RPS)                       | 🟡        | script `infra/k6/ticket-creation.js`; not run here                                                                                                                        |
+| SLA breach → escalation                  | ✅ (unit) | `sla.service.spec.ts` covers due-date calc + breach detection                                                                                                             |
 
 ## What was built
 
@@ -73,28 +75,28 @@ attachments by storage key) derived from the 203-table Kayako schema.
 
 ## Screenshots (`docs/screenshots/`)
 
-| Screen | File |
-|---|---|
-| Login (brand split layout, ru) | `login.png` |
-| Staff dashboard (animated stat cards, recent tickets) | `staff-dashboard.png` |
-| Staff Kanban (status columns, draggable cards) | `staff-kanban.png` |
-| Staff ticket detail (thread + composer + side panel) | `staff-ticket-detail.png` |
-| Staff ticket list | `staff-tickets.png` |
-| Client knowledgebase | `client-kb.png` |
-| Client submit ticket | `client-submit.png` |
-| Admin SLA | `admin-sla.png` |
-| Admin Alaris (coming-soon stub) | `admin-alaris.png` |
+| Screen                                                | File                      |
+| ----------------------------------------------------- | ------------------------- |
+| Login (brand split layout, ru)                        | `login.png`               |
+| Staff dashboard (animated stat cards, recent tickets) | `staff-dashboard.png`     |
+| Staff Kanban (status columns, draggable cards)        | `staff-kanban.png`        |
+| Staff ticket detail (thread + composer + side panel)  | `staff-ticket-detail.png` |
+| Staff ticket list                                     | `staff-tickets.png`       |
+| Client knowledgebase                                  | `client-kb.png`           |
+| Client submit ticket                                  | `client-submit.png`       |
+| Admin SLA                                             | `admin-sla.png`           |
+| Admin Alaris (coming-soon stub)                       | `admin-alaris.png`        |
 
 ## Known gaps / TODO (for full parity & production)
 
-- **Wire BullMQ** for the SLA breach scan and (optional) IMAP polling (currently inline / lifecycle).
-- **Workflow engine** (`Workflow`/`Macro` models exist; no executor yet) and full
-  `EscalationRule.actions` execution (currently marks `isEscalated`).
-- **Attachment upload endpoint** + storage adapter (model + schema ready).
+- **Attachment upload endpoint** + storage adapter (model + schema ready; no endpoint or storage driver yet).
 - **Reports**: KQL-lite covers dashboard/group-by; full KQL lexer/parser is future work.
-- **Alaris**: real SNMP/alarm ingestion, dedup windows, auto-close (this build is the webhook stub per spec).
-- **Run integration + E2E + k6 suites** in CI (GitHub Actions workflow provided;
-  Testcontainers/Playwright/k6 not executed in this environment).
+- **Alaris**: real SNMP/alarm ingestion, dedup windows (this build is the webhook stub per spec).
+- **SLA criteria engine**: plan selection beyond org-based lookup (full rule-matching) is TODO.
+- **IMAP IDLE**: `InboundMailService` still uses `setInterval` polling; push-based IMAP IDLE and `passwordEnc` decryption are not yet implemented.
+- **Public ticket rate-limiting**: `POST /tickets/public` has no throttle guard yet (`@nestjs/throttler` TODO).
+- **No CI/CD** by design: `.github/workflows` removed and GitHub Actions disabled on the repo.
+  All suites (unit / Testcontainers integration / Playwright e2e) run **locally** via npm scripts.
 - `/auth/me` returns the staff principal; enrich with full profile fields for the staff topbar.
 
 ## Verification log (this session)
@@ -107,7 +109,12 @@ attachments by storage key) derived from the 203-table Kayako schema.
 - Extended runtime checks → `/api/reports/dashboard`, `/api/troubleshooter/*`, `/api/kb/*`,
   `/api/news` all 200.
 - `next build` → 18 pages, lint clean. Live screenshots captured for all 3 interfaces.
-- **Test suites all green**: unit 25/25, integration (Testcontainers) 7/7, E2E (Playwright) 18/18.
+- **Test suites all green**: unit **272/272** (services ≥80%), integration (Testcontainers) 7/7, E2E (Playwright) 18/18.
+- **Audit gap-closure session**: wired SLA into ticket creation (dueAt/resolutionDueAt now set),
+  SLA/escalation CRUD, BullMQ queues (sla/mail/workflow) + EventEmitter2, WorkflowExecutor +
+  auto-close, ticket split, admin custom-fields + email-templates CRUD, mail RFC threading.
+  Fixed: module circular dep (forwardRef Mail↔Tickets), global APP_CONFIG export for guard DI,
+  KB frontend↔API contract mapping. ESLint/Husky/security hardening; CI removed (Actions disabled).
 - **Bugs found & fixed during verification**: method-level `@UsePipes` validating `@CurrentStaff`
   (fixed systemically in `ZodValidationPipe` — staff `POST /api/tickets` now 201); client portal
   submit posted to the authed `/tickets` (now `/tickets/public`); login stored `res.token`

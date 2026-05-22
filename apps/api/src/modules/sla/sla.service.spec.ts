@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { SlaService } from './sla.service';
 import type { PrismaService } from '../../prisma/prisma.service';
+import type { MailService } from '../mail/mail.service';
 
 type WorkHours = Record<string, Array<[string, string]>>;
 
@@ -27,7 +28,12 @@ describe('SlaService', () => {
 
   beforeEach(() => {
     prisma = makePrismaMock();
-    service = new SlaService(prisma as unknown as PrismaService);
+    const mailMock = {
+      send: vi.fn(),
+      sendTemplate: vi.fn(),
+      renderTemplate: vi.fn(),
+    } as unknown as MailService;
+    service = new SlaService(prisma as unknown as PrismaService, mailMock);
   });
 
   // ─── computeDueDates ──────────────────────────────────────────────────────
@@ -44,8 +50,8 @@ describe('SlaService', () => {
       (prisma.slaPlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 1,
         isEnabled: true,
-        firstResponseSeconds: 3600,  // 1 hour
-        resolutionSeconds: 86400,    // 24 hours
+        firstResponseSeconds: 3600, // 1 hour
+        resolutionSeconds: 86400, // 24 hours
         schedule: null,
       });
 

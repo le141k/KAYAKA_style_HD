@@ -1,6 +1,17 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
-import type { SlaPlan, SlaSchedule, SlaHoliday, Ticket } from '@prisma/client';
+import { MailService } from '../mail/mail.service';
+import type { SlaPlan, SlaSchedule, SlaHoliday, EscalationRule, Ticket } from '@prisma/client';
+import type {
+  CreateSlaPlanDto,
+  UpdateSlaPlanDto,
+  CreateSlaScheduleDto,
+  UpdateSlaScheduleDto,
+  CreateSlaHolidayDto,
+  UpdateSlaHolidayDto,
+  CreateEscalationRuleDto,
+  UpdateEscalationRuleDto,
+} from './dto';
 
 export interface DueDates {
   dueAt: Date | null;
@@ -37,11 +48,7 @@ function dayKey(date: Date): string {
  * Check whether a given Date falls within a schedule's working hours,
  * taking holidays into account.
  */
-function isWorkingTime(
-  date: Date,
-  workHours: WorkHours,
-  holidays: SlaHoliday[],
-): boolean {
+function isWorkingTime(date: Date, workHours: WorkHours, holidays: SlaHoliday[]): boolean {
   // Holiday check (compare date only, not time)
   const dateOnly = date.toISOString().slice(0, 10);
   if (holidays.some((h) => h.date.toISOString().slice(0, 10) === dateOnly)) return false;
@@ -66,12 +73,7 @@ function isWorkingTime(
  * This is O(minutes) and sufficient for SLA windows up to ~24 h.
  * For production scale, replace with a calendar-interval algorithm.
  */
-function addWorkingSeconds(
-  start: Date,
-  seconds: number,
-  workHours: WorkHours,
-  holidays: SlaHoliday[],
-): Date {
+function addWorkingSeconds(start: Date, seconds: number, workHours: WorkHours, holidays: SlaHoliday[]): Date {
   let cursor = new Date(start);
   let remaining = seconds;
 
@@ -93,11 +95,27 @@ function addWorkingSeconds(
   return cursor;
 }
 
+/** Escalation action shape stored in EscalationRule.actions JSON */
+interface EscalationAction {
+  type: 'notify' | 'change_priority' | 'assign' | 'add_note' | 'mark_escalated';
+  /** staffId for notify/assign */
+  staffId?: number;
+  /** priorityId for change_priority */
+  priorityId?: number;
+  /** note text for add_note */
+  note?: string;
+}
+
 @Injectable()
 export class SlaService {
   private readonly logger = new Logger(SlaService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly mailService: MailService,
+  ) {}
+
+  // ─────────────────── computeDueDates ───────────────────
 
   /**
    * Compute first-response and resolution due dates for a ticket
@@ -122,9 +140,7 @@ export class SlaService {
     if (!schedule) {
       // No business-hours schedule → wall-clock offsets
       return {
-        dueAt: plan.firstResponseSeconds
-          ? new Date(now.getTime() + plan.firstResponseSeconds * 1000)
-          : null,
+        dueAt: plan.firstResponseSeconds ? new Date(now.getTime() + plan.firstResponseSeconds * 1000) : null,
         resolutionDueAt: plan.resolutionSeconds
           ? new Date(now.getTime() + plan.resolutionSeconds * 1000)
           : null,
@@ -143,6 +159,8 @@ export class SlaService {
         : null,
     };
   }
+
+  // ─────────────────── checkBreaches ───────────────────
 
   /**
    * Find all open, non-escalated tickets that have breached their SLA targets.
@@ -175,9 +193,7 @@ export class SlaService {
       }
 
       if (ticket.resolutionDueAt && ticket.resolutionDueAt < now) {
-        const minutesOverdue = Math.floor(
-          (now.getTime() - ticket.resolutionDueAt.getTime()) / 60_000,
-        );
+        const minutesOverdue = Math.floor((now.getTime() - ticket.resolutionDueAt.getTime()) / 60_000);
         breaches.push({ ticket, breachType: 'RESOLUTION', minutesOverdue });
       }
     }
@@ -189,17 +205,16 @@ export class SlaService {
     return breaches;
   }
 
+  // ─────────────────── runPeriodicCheck ───────────────────
+
   /**
-   * Periodic SLA check — called by the BullMQ processor or cron hook.
-   * Marks tickets as escalated and logs. Full escalation actions (notify staff,
-   * change priority) are a TODO: wire EscalationRule.actions here.
+   * Periodic SLA check — called by the BullMQ processor every 60 seconds.
+   * Marks tickets as escalated, then executes EscalationRule.actions.
    */
   async runPeriodicCheck(): Promise<void> {
     const breaches = await this.checkBreaches();
     for (const { ticket, breachType, minutesOverdue } of breaches) {
-      this.logger.warn(
-        `SLA ${breachType} breach on ${ticket.mask}: ${minutesOverdue}m overdue`,
-      );
+      this.logger.warn(`SLA ${breachType} breach on ${ticket.mask}: ${minutesOverdue}m overdue`);
 
       // Mark as escalated
       if (!ticket.isEscalated) {
@@ -209,18 +224,116 @@ export class SlaService {
         });
       }
 
-      // TODO: execute EscalationRule.actions (notify assignee, change priority, etc.)
+      // Execute EscalationRule.actions for this ticket's SLA plan
+      if (ticket.slaPlanId) {
+        await this.executeEscalationRules(ticket, breachType, minutesOverdue);
+      }
     }
   }
+
+  /**
+   * Execute EscalationRule.actions for a ticket that has breached its SLA.
+   */
+  private async executeEscalationRules(
+    ticket: Ticket,
+    breachType: 'FIRST_RESPONSE' | 'RESOLUTION',
+    minutesOverdue: number,
+  ): Promise<void> {
+    if (!ticket.slaPlanId) return;
+
+    const slaTargetType = breachType === 'FIRST_RESPONSE' ? 'FIRST_RESPONSE' : 'RESOLUTION';
+    const thresholdSeconds = minutesOverdue * 60;
+
+    const rules = await this.prisma.escalationRule.findMany({
+      where: {
+        slaPlanId: ticket.slaPlanId,
+        targetType: slaTargetType,
+        isEnabled: true,
+        thresholdSeconds: { lte: thresholdSeconds },
+      },
+      orderBy: { thresholdSeconds: 'asc' },
+    });
+
+    for (const rule of rules) {
+      const actions = rule.actions as unknown as EscalationAction[];
+      for (const action of actions) {
+        await this.executeAction(ticket, action, rule);
+      }
+    }
+  }
+
+  private async executeAction(ticket: Ticket, action: EscalationAction, rule: EscalationRule): Promise<void> {
+    try {
+      switch (action.type) {
+        case 'notify': {
+          // Send email notification to a specific staff member
+          const staffId = action.staffId ?? ticket.ownerStaffId;
+          if (staffId) {
+            const staff = await this.prisma.staff.findUnique({
+              where: { id: staffId },
+              select: { email: true, firstName: true },
+            });
+            if (staff) {
+              await this.mailService.sendTemplate(staff.email, 'sla_breach_internal', 'en', {
+                mask: ticket.mask,
+                subject: ticket.subject,
+                rule: rule.name,
+                staff: staff.firstName,
+              });
+            }
+          }
+          break;
+        }
+        case 'change_priority': {
+          if (action.priorityId) {
+            await this.prisma.ticket.update({
+              where: { id: ticket.id },
+              data: { priorityId: action.priorityId },
+            });
+          }
+          break;
+        }
+        case 'assign': {
+          if (action.staffId) {
+            await this.prisma.ticket.update({
+              where: { id: ticket.id },
+              data: { ownerStaffId: action.staffId },
+            });
+          }
+          break;
+        }
+        case 'add_note': {
+          if (action.note) {
+            await this.prisma.ticketNote.create({
+              data: {
+                ticketId: ticket.id,
+                contents: `[SLA Escalation: ${rule.name}] ${action.note}`,
+              },
+            });
+          }
+          break;
+        }
+        case 'mark_escalated': {
+          await this.prisma.ticket.update({
+            where: { id: ticket.id },
+            data: { isEscalated: true, escalationLevel: { increment: 1 } },
+          });
+          break;
+        }
+      }
+    } catch (err) {
+      this.logger.error(`Error executing escalation action ${action.type} on ${ticket.mask}: ${String(err)}`);
+    }
+  }
+
+  // ─────────────────── resolvePlanForTicket ───────────────────
 
   /**
    * Apply the correct SLA plan to a newly-created ticket.
    * Checks SlaPlan.criteria (currently org-based only; full rule engine is a TODO).
    * Returns the SLA plan ID to assign, or null if none matches.
    */
-  async resolvePlanForTicket(
-    organizationId: number | null | undefined,
-  ): Promise<number | null> {
+  async resolvePlanForTicket(organizationId: number | null | undefined): Promise<number | null> {
     if (organizationId) {
       // Check if the org has a dedicated SLA plan
       const org = await this.prisma.organization.findUnique({
@@ -237,5 +350,140 @@ export class SlaService {
     });
 
     return defaultPlan?.id ?? null;
+  }
+
+  // ─────────────────── SlaSchedule CRUD ───────────────────
+
+  async listSchedules(): Promise<SlaSchedule[]> {
+    return this.prisma.slaSchedule.findMany({ include: { holidays: true } });
+  }
+
+  async getSchedule(id: number): Promise<SlaSchedule & { holidays: SlaHoliday[] }> {
+    const s = await this.prisma.slaSchedule.findUnique({ where: { id }, include: { holidays: true } });
+    if (!s) throw new NotFoundException(`SlaSchedule ${id} not found`);
+    return s;
+  }
+
+  async createSchedule(dto: CreateSlaScheduleDto): Promise<SlaSchedule> {
+    return this.prisma.slaSchedule.create({ data: dto });
+  }
+
+  async updateSchedule(id: number, dto: UpdateSlaScheduleDto): Promise<SlaSchedule> {
+    await this.getSchedule(id);
+    return this.prisma.slaSchedule.update({ where: { id }, data: dto });
+  }
+
+  async deleteSchedule(id: number): Promise<void> {
+    await this.getSchedule(id);
+    await this.prisma.slaSchedule.delete({ where: { id } });
+  }
+
+  // ─────────────────── SlaHoliday CRUD ───────────────────
+
+  async listHolidays(scheduleId: number): Promise<SlaHoliday[]> {
+    return this.prisma.slaHoliday.findMany({ where: { scheduleId } });
+  }
+
+  async createHoliday(scheduleId: number, dto: CreateSlaHolidayDto): Promise<SlaHoliday> {
+    await this.getSchedule(scheduleId);
+    return this.prisma.slaHoliday.create({ data: { ...dto, scheduleId } });
+  }
+
+  async updateHoliday(id: number, dto: UpdateSlaHolidayDto): Promise<SlaHoliday> {
+    const h = await this.prisma.slaHoliday.findUnique({ where: { id } });
+    if (!h) throw new NotFoundException(`SlaHoliday ${id} not found`);
+    return this.prisma.slaHoliday.update({ where: { id }, data: dto });
+  }
+
+  async deleteHoliday(id: number): Promise<void> {
+    const h = await this.prisma.slaHoliday.findUnique({ where: { id } });
+    if (!h) throw new NotFoundException(`SlaHoliday ${id} not found`);
+    await this.prisma.slaHoliday.delete({ where: { id } });
+  }
+
+  // ─────────────────── SlaPlan CRUD ───────────────────
+
+  async listPlans(): Promise<SlaPlan[]> {
+    return this.prisma.slaPlan.findMany({ include: { escalationRules: true } });
+  }
+
+  async getPlan(id: number): Promise<SlaPlan & { escalationRules: EscalationRule[] }> {
+    const p = await this.prisma.slaPlan.findUnique({
+      where: { id },
+      include: { escalationRules: true },
+    });
+    if (!p) throw new NotFoundException(`SlaPlan ${id} not found`);
+    return p;
+  }
+
+  async createPlan(dto: CreateSlaPlanDto): Promise<SlaPlan> {
+    return this.prisma.slaPlan.create({
+      data: {
+        title: dto.title,
+        isEnabled: dto.isEnabled,
+        criteria: dto.criteria as object,
+        firstResponseSeconds: dto.firstResponseSeconds ?? null,
+        resolutionSeconds: dto.resolutionSeconds ?? null,
+        scheduleId: dto.scheduleId ?? null,
+      },
+    });
+  }
+
+  async updatePlan(id: number, dto: UpdateSlaPlanDto): Promise<SlaPlan> {
+    await this.getPlan(id);
+    return this.prisma.slaPlan.update({
+      where: { id },
+      data: {
+        ...(dto.title !== undefined && { title: dto.title }),
+        ...(dto.isEnabled !== undefined && { isEnabled: dto.isEnabled }),
+        ...(dto.criteria !== undefined && { criteria: dto.criteria as object }),
+        ...(dto.firstResponseSeconds !== undefined && { firstResponseSeconds: dto.firstResponseSeconds }),
+        ...(dto.resolutionSeconds !== undefined && { resolutionSeconds: dto.resolutionSeconds }),
+        ...(dto.scheduleId !== undefined && { scheduleId: dto.scheduleId }),
+      },
+    });
+  }
+
+  async deletePlan(id: number): Promise<void> {
+    await this.getPlan(id);
+    await this.prisma.slaPlan.delete({ where: { id } });
+  }
+
+  // ─────────────────── EscalationRule CRUD ───────────────────
+
+  async listRules(slaPlanId: number): Promise<EscalationRule[]> {
+    return this.prisma.escalationRule.findMany({ where: { slaPlanId } });
+  }
+
+  async getRule(id: number): Promise<EscalationRule> {
+    const r = await this.prisma.escalationRule.findUnique({ where: { id } });
+    if (!r) throw new NotFoundException(`EscalationRule ${id} not found`);
+    return r;
+  }
+
+  async createRule(slaPlanId: number, dto: CreateEscalationRuleDto): Promise<EscalationRule> {
+    await this.getPlan(slaPlanId);
+    return this.prisma.escalationRule.create({
+      data: { ...dto, slaPlanId, actions: dto.actions as object },
+    });
+  }
+
+  async updateRule(id: number, dto: UpdateEscalationRuleDto): Promise<EscalationRule> {
+    await this.getRule(id);
+    return this.prisma.escalationRule.update({
+      where: { id },
+      data: {
+        ...(dto.name !== undefined && { name: dto.name }),
+        ...(dto.targetType !== undefined && { targetType: dto.targetType }),
+        ...(dto.thresholdSeconds !== undefined && { thresholdSeconds: dto.thresholdSeconds }),
+        ...(dto.actions !== undefined && { actions: dto.actions as object }),
+        ...(dto.isEnabled !== undefined && { isEnabled: dto.isEnabled }),
+      },
+    });
+  }
+
+  async deleteRule(id: number): Promise<void> {
+    await this.getRule(id);
+    await this.prisma.escalationRule.delete({ where: { id } });
   }
 }

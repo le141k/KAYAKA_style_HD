@@ -4,6 +4,8 @@ import { TicketsService } from './tickets.service';
 import { formatTicketMask } from './ticket-mask.util';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { UsersService } from '../users/users.service';
+import type { SlaService } from '../sla/sla.service';
+import type { EventEmitter2 } from '@nestjs/event-emitter';
 import type { Ticket } from '@prisma/client';
 
 // ─── Mask util unit tests ───────────────────────────────────────────────────
@@ -74,6 +76,9 @@ function makePrismaMock() {
       count: vi.fn(),
       findUniqueOrThrow: vi.fn(),
     },
+    user: {
+      findUnique: vi.fn().mockResolvedValue({ organizationId: null }),
+    },
     ticketPost: {
       create: vi.fn(),
       updateMany: vi.fn(),
@@ -116,7 +121,12 @@ describe('TicketsService', () => {
   beforeEach(() => {
     prisma = makePrismaMock();
     users = makeUsersMock();
-    service = new TicketsService(prisma as unknown as PrismaService, users);
+    const slaMock = {
+      resolvePlanForTicket: vi.fn().mockResolvedValue(null),
+      computeDueDates: vi.fn().mockResolvedValue({ dueAt: null, resolutionDueAt: null }),
+    } as unknown as SlaService;
+    const eventEmitterMock = { emit: vi.fn() } as unknown as EventEmitter2;
+    service = new TicketsService(prisma as unknown as PrismaService, users, slaMock, eventEmitterMock);
   });
 
   // ─── createTicket ─────────────────────────────────────────────────────────
@@ -134,18 +144,21 @@ describe('TicketsService', () => {
       });
       (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
 
-      const result = await service.createTicket({
-        subject: 'Test',
-        contents: 'Body',
-        isHtml: false,
-        departmentId: 1,
-        requesterEmail: 'test@example.com',
-        requesterName: 'Test User',
-        creationMode: 'STAFF',
-        ipAddress: '127.0.0.1',
-        tags: [],
-        customFields: {},
-      }, 10);
+      const result = await service.createTicket(
+        {
+          subject: 'Test',
+          contents: 'Body',
+          isHtml: false,
+          departmentId: 1,
+          requesterEmail: 'test@example.com',
+          requesterName: 'Test User',
+          creationMode: 'STAFF',
+          ipAddress: '127.0.0.1',
+          tags: [],
+          customFields: {},
+        },
+        10,
+      );
 
       expect(result.mask).toBe('TT-000042');
       expect(prisma.ticket.update).toHaveBeenCalledWith(
@@ -234,9 +247,7 @@ describe('TicketsService', () => {
       const ticket = makeTicket({ id: 1 });
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
 
-      await expect(service.merge(1, { targetTicketId: 1 }, 99)).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(service.merge(1, { targetTicketId: 1 }, 99)).rejects.toThrow(BadRequestException);
     });
 
     it('throws BadRequestException when source is already merged', async () => {
@@ -247,9 +258,7 @@ describe('TicketsService', () => {
         .mockResolvedValueOnce(source)
         .mockResolvedValueOnce(target);
 
-      await expect(service.merge(1, { targetTicketId: 2 }, 99)).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(service.merge(1, { targetTicketId: 2 }, 99)).rejects.toThrow(BadRequestException);
     });
 
     it('moves posts and updates mergedIntoId on success', async () => {

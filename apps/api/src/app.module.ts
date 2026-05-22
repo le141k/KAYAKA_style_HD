@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 import { LoggerModule } from 'nestjs-pino';
+import { BullModule } from '@nestjs/bullmq';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 import { PrismaModule } from './prisma/prisma.module';
 import { loadConfig, APP_CONFIG } from './config/configuration';
 import { AuthModule } from './auth/auth.module';
@@ -15,8 +17,11 @@ import { NewsModule } from './modules/news/news.module';
 import { KnowledgebaseModule } from './modules/knowledgebase/knowledgebase.module';
 import { TroubleshooterModule } from './modules/troubleshooter/troubleshooter.module';
 import { ReportsModule } from './modules/reports/reports.module';
+import { WorkflowModule } from './modules/workflow/workflow.module';
+import { AdminModule } from './modules/admin/admin.module';
 
 const config = loadConfig();
+const redisUrl = new URL(config.REDIS_URL);
 
 /**
  * Root application module.
@@ -40,6 +45,12 @@ const config = loadConfig();
       },
     }),
 
+    // Background queues (BullMQ) + in-process domain events
+    BullModule.forRoot({
+      connection: { host: redisUrl.hostname, port: Number(redisUrl.port) || 6379 },
+    }),
+    EventEmitterModule.forRoot(),
+
     // Core database access (global — available everywhere without explicit import)
     PrismaModule,
 
@@ -57,6 +68,8 @@ const config = loadConfig();
     KnowledgebaseModule,
     TroubleshooterModule,
     ReportsModule,
+    WorkflowModule,
+    AdminModule,
   ],
   providers: [
     // Provide AppConfig as a VALUE token so it can be constructor-injected via @Inject(APP_CONFIG)

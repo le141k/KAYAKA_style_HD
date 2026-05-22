@@ -10,16 +10,16 @@ A modern, production-oriented rewrite of the legacy **Kayako Classic** helpdesk
 
 ## Stack
 
-| Layer | Tech |
-|---|---|
-| Backend | Node 22, TypeScript (strict), NestJS 10, Prisma 6, PostgreSQL 16 |
-| Queues | Redis + BullMQ (mail fetch, SLA breaches, escalations, auto-close) |
-| Mail | imapflow + mailparser (inbound), Nodemailer (outbound) |
-| Auth | JWT access + refresh, argon2id password hashing, RBAC permission guards |
-| Frontend | Next.js 15 (App Router), Tailwind, shadcn/ui, Framer Motion, TanStack Query |
-| Observability | Pino structured logs, OpenTelemetry (opt-in) |
-| API docs | Swagger / OpenAPI at `/api/docs` |
-| Tests | Vitest (unit), Testcontainers (integration), Playwright (E2E), k6 (load) |
+| Layer         | Tech                                                                        |
+| ------------- | --------------------------------------------------------------------------- |
+| Backend       | Node 22, TypeScript (strict), NestJS 10, Prisma 6, PostgreSQL 16            |
+| Queues        | Redis + BullMQ (mail fetch, SLA breaches, escalations, auto-close)          |
+| Mail          | imapflow + mailparser (inbound), Nodemailer (outbound)                      |
+| Auth          | JWT access + refresh, argon2id password hashing, RBAC permission guards     |
+| Frontend      | Next.js 15 (App Router), Tailwind, shadcn/ui, Framer Motion, TanStack Query |
+| Observability | Pino structured logs, OpenTelemetry (opt-in)                                |
+| API docs      | Swagger / OpenAPI at `/api/docs`                                            |
+| Tests         | Vitest (unit), Testcontainers (integration), Playwright (E2E), k6 (load)    |
 
 ## Quick start (5 minutes)
 
@@ -32,18 +32,18 @@ docker compose up --build
 This boots PostgreSQL, Redis, MailHog, the API, and the web app. On first boot the API
 applies Prisma migrations and seeds demo data automatically.
 
-| Service | URL |
-|---|---|
-| Web (client / staff / admin) | http://localhost:3000 |
-| API + Swagger | http://localhost:4000/api/docs |
-| MailHog (captured outbound mail) | http://localhost:8025 |
+| Service                          | URL                            |
+| -------------------------------- | ------------------------------ |
+| Web (client / staff / admin)     | http://localhost:3000          |
+| API + Swagger                    | http://localhost:4000/api/docs |
+| MailHog (captured outbound mail) | http://localhost:8025          |
 
 ### Demo credentials (seeded)
 
-| Role | Email | Password |
-|---|---|---|
+| Role          | Email                     | Password   |
+| ------------- | ------------------------- | ---------- |
 | Administrator | `admin@23telecom.example` | `demo1234` |
-| Agent | `agent@23telecom.example` | `demo1234` |
+| Agent         | `agent@23telecom.example` | `demo1234` |
 
 ## Interfaces
 
@@ -81,10 +81,15 @@ npm run test:integration --workspace=apps/api   # Testcontainers (Postgres + Red
 npm run test:e2e           # Playwright E2E
 ```
 
+> **No CI/CD.** This project intentionally has **no continuous-integration pipeline** — there is
+> no `.github/workflows`, and GitHub Actions is disabled on the repository. All tests are run
+> **locally** via the npm scripts above (Docker must be running for integration/e2e). Run them
+> before committing; the Husky `pre-commit` hook runs lint-staged.
+
 ## Alaris integration (stub)
 
 A **placeholder** module wires `POST /api/alaris/webhook` (shared-secret guarded) to
-auto-create a ticket of type *Alaris Incident* with subject prefix `[ALARIS-AUTO]`.
+auto-create a ticket of type _Alaris Incident_ with subject prefix `[ALARIS-AUTO]`.
 There is **no** SNMP polling, Telegram bridge, alarm de-duplication, or auto-close yet — the
 admin UI shows a "Coming soon" tab. See `docs/adr/0005-alaris-stub.md` and
 `apps/api/src/modules/alaris/`. A demo event generator lives in

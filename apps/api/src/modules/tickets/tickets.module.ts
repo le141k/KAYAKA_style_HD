@@ -4,9 +4,10 @@ import { TicketsController } from './tickets.controller';
 import { ReferenceService } from './reference.service';
 import { ReferenceController } from './reference.controller';
 import { UsersModule } from '../users/users.module';
+import { SlaModule } from '../sla/sla.module';
 
 @Module({
-  imports: [UsersModule],
+  imports: [UsersModule, SlaModule],
   controllers: [TicketsController, ReferenceController],
   providers: [TicketsService, ReferenceService],
   exports: [TicketsService],

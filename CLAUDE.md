@@ -26,6 +26,7 @@ cp .env.example .env && docker compose up --build   # full stack, auto migrate +
 # local dev: docker compose up -d postgres redis mailhog (host ports 55432 / 56379), then
 # npm install && npm run prisma:migrate -w apps/api && npm run seed -w apps/api && npm run dev
 ```
+
 Demo: `admin@23telecom.example` / `demo1234` (admin), `agent@23telecom.example` / `demo1234`.
 
 > ⚠️ Local Postgres/Redis often occupy 5432/6379, so the compose services are published on
@@ -37,15 +38,15 @@ Demo: `admin@23telecom.example` / `demo1234` (admin), `agent@23telecom.example` 
 These documents are the project's source of truth. **Whenever you add, change, or remove an
 endpoint, module, table, or architectural decision, update the relevant doc in the SAME change:**
 
-| Doc | What it covers | Update when… |
-|---|---|---|
-| `docs/architecture.md` | system overview, modules, request flow, queues, data flow | you add/restructure a module, queue, or cross-cutting concern |
-| `docs/api/endpoints.md` | every public/staff/admin REST endpoint (method, path, auth, body, response) | you add/change/remove any controller route |
-| `docs/api/internal.md` | internal service contracts, domain events, queue jobs, key invariants | you add/change a service method other modules rely on, or a BullMQ job |
-| `docs/adr/*` | architecture decision records | you make a non-obvious decision (add a new numbered ADR) |
-| `docs/database.md` | canonical data model — all Prisma models, enums, indexes, JSONB fields, migrations, seed | you add/change/remove any model, column, index, or enum in `schema.prisma` |
-| `docs/FINAL_REPORT.md` | delivery status & acceptance | at milestones / delivery |
-| `PROGRESS.md` | running build status | as milestones complete |
+| Doc                     | What it covers                                                                           | Update when…                                                               |
+| ----------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `docs/architecture.md`  | system overview, modules, request flow, queues, data flow                                | you add/restructure a module, queue, or cross-cutting concern              |
+| `docs/api/endpoints.md` | every public/staff/admin REST endpoint (method, path, auth, body, response)              | you add/change/remove any controller route                                 |
+| `docs/api/internal.md`  | internal service contracts, domain events, queue jobs, key invariants                    | you add/change a service method other modules rely on, or a BullMQ job     |
+| `docs/adr/*`            | architecture decision records                                                            | you make a non-obvious decision (add a new numbered ADR)                   |
+| `docs/database.md`      | canonical data model — all Prisma models, enums, indexes, JSONB fields, migrations, seed | you add/change/remove any model, column, index, or enum in `schema.prisma` |
+| `docs/FINAL_REPORT.md`  | delivery status & acceptance                                                             | at milestones / delivery                                                   |
+| `PROGRESS.md`           | running build status                                                                     | as milestones complete                                                     |
 
 Swagger (`/api/docs`) is generated from decorators and is authoritative for request/response
 shapes; `docs/api/endpoints.md` is the human-readable index that must mirror it.
@@ -62,3 +63,5 @@ same change) is the default for small edits.
 - Custom fields → JSONB (ADR-0002). Attachments by storage key (ADR-0003).
 - Env vars are `TELECOM_HD_*`; DB is `telecom_hd`.
 - Tests: Vitest (unit), Testcontainers (integration), Playwright (E2E), k6 (load).
+- **No CI/CD.** There is no `.github/workflows`; GitHub Actions is disabled on the repo. Tests
+  run **locally only** (npm scripts); the Husky `pre-commit` hook runs lint-staged. Do not add CI.

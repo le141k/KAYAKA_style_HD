@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import {
   Body,
   Controller,
@@ -36,7 +37,12 @@ export class AlarisController {
     @Headers('x-alaris-secret') secret: string | undefined,
     @Body() payload: AlarisWebhookPayload,
   ) {
-    if (!secret || secret !== this.config.TELECOM_HD_ALARIS_WEBHOOK_SECRET) {
+    const expected = this.config.TELECOM_HD_ALARIS_WEBHOOK_SECRET;
+    const secretOk =
+      !!secret &&
+      secret.length === expected.length &&
+      timingSafeEqual(Buffer.from(secret), Buffer.from(expected));
+    if (!secretOk) {
       throw new ForbiddenException('Invalid Alaris webhook secret');
     }
 

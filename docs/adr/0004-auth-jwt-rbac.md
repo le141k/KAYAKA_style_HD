@@ -25,3 +25,16 @@ typed permission model.
 - Stateless, horizontally scalable API; revocation handled via the refresh-token table.
 - Permissions are discoverable in code and enforced uniformly; the admin RBAC matrix UI maps
   groups → permission keys.
+
+## 2026-05-22 — Security hardening
+
+- **No fallback secrets**: `TELECOM_HD_JWT_ACCESS_SECRET` and `TELECOM_HD_JWT_REFRESH_SECRET`
+  are now validated as `z.string().min(32)` with no `.default(...)`. The app fails fast at boot
+  if either is absent or shorter than 32 characters.
+- **Guard reads config via DI**: `JwtAuthGuard` now injects `AppConfig` via `@Inject(APP_CONFIG)`
+  and uses `config.TELECOM_HD_JWT_ACCESS_SECRET` for token verification, removing the
+  `process.env ?? 'change-me-access-secret'` fallback that was previously in the guard.
+- **Timing-safe webhook secret comparison**: `AlarisController` now uses Node's
+  `timingSafeEqual` (from `node:crypto`) when validating the `x-alaris-secret` header,
+  guarding against timing-oracle attacks. A length pre-check ensures no exception is thrown
+  on mismatched buffer sizes.

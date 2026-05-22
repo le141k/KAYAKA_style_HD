@@ -1,30 +1,31 @@
-"use client";
+'use client';
 
-import { useState, useCallback, useEffect, useMemo } from "react";
-import { useRouter } from "next/navigation";
-import { Search, SlidersHorizontal, LayoutGrid } from "lucide-react";
-import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { TicketRow } from "@/components/premium/TicketRow";
-import { TicketListSkeleton } from "@/components/premium/SkeletonLoaders";
-import { useTickets } from "@/lib/hooks/use-tickets";
-import { useI18n } from "@/lib/i18n";
-import Link from "next/link";
+import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useRouter } from 'next/navigation';
+import { Search, SlidersHorizontal, LayoutGrid, CalendarDays, X } from 'lucide-react';
+import { format } from 'date-fns';
+import { ru } from 'date-fns/locale';
+import type { DateRange } from 'react-day-picker';
+import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Calendar } from '@/components/ui/calendar';
+import { TicketRow } from '@/components/premium/TicketRow';
+import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
+import { useTickets } from '@/lib/hooks/use-tickets';
+import { useI18n } from '@/lib/i18n';
+import Link from 'next/link';
 
 export function TicketsListContent() {
   const { t } = useI18n();
   const router = useRouter();
-  const [search, setSearch] = useState("");
-  const [status, setStatus] = useState("all");
-  const [priority, setPriority] = useState("all");
-  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [search, setSearch] = useState('');
+  const [status, setStatus] = useState('all');
+  const [priority, setPriority] = useState('all');
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(undefined);
+  const [calendarOpen, setCalendarOpen] = useState(false);
+  const [debouncedSearch, setDebouncedSearch] = useState('');
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(search), 300);
@@ -33,8 +34,8 @@ export function TicketsListContent() {
 
   const { data, isLoading } = useTickets({
     q: debouncedSearch || undefined,
-    status: status === "all" ? undefined : status,
-    priority: priority === "all" ? undefined : priority,
+    status: status === 'all' ? undefined : status,
+    priority: priority === 'all' ? undefined : priority,
   });
 
   const tickets = useMemo(() => data?.data ?? [], [data]);
@@ -44,28 +45,25 @@ export function TicketsListContent() {
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
-      if (
-        document.activeElement?.tagName === "INPUT" ||
-        document.activeElement?.tagName === "TEXTAREA"
-      )
+      if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA')
         return;
-      if (e.key === "j") {
+      if (e.key === 'j') {
         setFocusedIdx((i) => Math.min(i + 1, tickets.length - 1));
         e.preventDefault();
-      } else if (e.key === "k") {
+      } else if (e.key === 'k') {
         setFocusedIdx((i) => Math.max(i - 1, 0));
         e.preventDefault();
-      } else if (e.key === "Enter" && focusedIdx >= 0) {
+      } else if (e.key === 'Enter' && focusedIdx >= 0) {
         const t = tickets[focusedIdx];
         if (t) router.push(`/staff/tickets/${t.id}`);
       }
     },
-    [tickets, focusedIdx, router]
+    [tickets, focusedIdx, router],
   );
 
   useEffect(() => {
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
 
   return (
@@ -112,6 +110,52 @@ export function TicketsListContent() {
           </SelectContent>
         </Select>
 
+        {/* Date range filter */}
+        <Popover open={calendarOpen} onOpenChange={setCalendarOpen}>
+          <PopoverTrigger asChild>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5 text-sm font-normal"
+              aria-label="Фильтр по дате"
+            >
+              <CalendarDays className="h-3.5 w-3.5 text-muted-foreground" />
+              {dateRange?.from ? (
+                dateRange.to ? (
+                  <span>
+                    {format(dateRange.from, 'dd.MM', { locale: ru })}
+                    {' — '}
+                    {format(dateRange.to, 'dd.MM.yy', { locale: ru })}
+                  </span>
+                ) : (
+                  <span>{format(dateRange.from, 'dd.MM.yy', { locale: ru })}</span>
+                )
+              ) : (
+                <span className="text-muted-foreground">Период</span>
+              )}
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent className="w-auto p-0" align="end">
+            <Calendar mode="range" selected={dateRange} onSelect={setDateRange} numberOfMonths={2} />
+            {dateRange && (
+              <div className="flex justify-end border-t border-border p-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 gap-1 text-xs text-muted-foreground"
+                  onClick={() => {
+                    setDateRange(undefined);
+                    setCalendarOpen(false);
+                  }}
+                >
+                  <X className="h-3 w-3" />
+                  Сбросить
+                </Button>
+              </div>
+            )}
+          </PopoverContent>
+        </Popover>
+
         <div className="ml-auto flex gap-2">
           <Button variant="outline" size="sm" asChild>
             <Link href="/staff/kanban">
@@ -128,9 +172,7 @@ export function TicketsListContent() {
 
       {/* Results info */}
       <div className="px-6 py-2 text-xs text-muted-foreground border-b border-border">
-        {isLoading
-          ? "Загрузка..."
-          : `${data?.total ?? 0} заявок · j/k для навигации · Enter для открытия`}
+        {isLoading ? 'Загрузка...' : `${data?.total ?? 0} заявок · j/k для навигации · Enter для открытия`}
       </div>
 
       {/* List */}

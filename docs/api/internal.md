@@ -41,10 +41,15 @@ buildPrincipal(staff: StaffWithGroup): AuthStaff
 
 Consumed by: `TicketsController`, `AlarisService`, `InboundMailService`.
 
+Constructor: `(prisma: PrismaService, usersService: UsersService, slaService: SlaService, eventEmitter: EventEmitter2)`
+
 ```ts
 createTicket(dto: CreateTicketDto, creatorStaffId?: number): Promise<Ticket>
 // Resolves/creates requester User by email, generates mask (TT-XXXXXX),
 // creates first TicketPost, resolves default status/priority, writes CREATE audit log.
+// SLA wiring (implemented): calls slaService.resolvePlanForTicket(orgId) to set slaPlanId,
+// then slaService.computeDueDates(slaPlanId, now) to set dueAt + resolutionDueAt.
+// Fires eventEmitter.emit('ticket.created', { ticketId }) on completion.
 // Invariant: every ticket has ≥1 post and a unique mask.
 
 listTickets(query: ListTicketsQueryDto): Promise<{ data: Ticket[]; total: number }>
@@ -75,22 +80,35 @@ merge(sourceTicketId: number, dto: MergeTicketDto, staffId: number): Promise<Tic
 // sets source.mergedIntoId, increments target.totalReplies.
 // Writes MERGE audit on both source and target.
 
+split(sourceTicketId: number, dto: SplitTicketDto, staffId: number): Promise<Ticket>
+// Moves selected posts (dto.postIds) into a brand-new ticket (dto.subject / dto.departmentId?).
+// Inherits requester, owner, priority, type, customFields, and slaPlanId from source.
+// Recomputes SLA due dates for the new ticket. Decrements source.totalReplies.
+// Writes SPLIT audit on both source and new ticket.
+// Fires eventEmitter.emit('ticket.created', { ticketId: newTicket.id }).
+
 addWatcher(ticketId: number, dto: WatcherDto): Promise<void>
 removeWatcher(ticketId: number, staffId: number): Promise<void>
 addTag(ticketId: number, dto: TagDto): Promise<void>
 removeTag(ticketId: number, tagName: string): Promise<void>
 ```
 
-**Domain event hook (stub):** `protected emitDomainEvent(_event: string, _ticketId: number): void`
-Currently a no-op. TODO: replace with `EventEmitter2` or BullMQ job dispatch to wire SLA and
-workflow evaluation on ticket mutations.
+**Domain events (implemented):** `protected emitDomainEvent(event: string, ticketId: number): void`
+Uses `EventEmitter2.emit()` — no longer a stub. Events fired:
+
+- `ticket.created` — on `createTicket()` and `split()` (for the new ticket)
+- `ticket.replied` — on `reply()`
+- `ticket.status_changed` — on `changeStatus()`
+
+Consumed by `WorkflowExecutor` (`@OnEvent` listeners).
 
 ---
 
 ## SlaService (`apps/api/src/modules/sla/sla.service.ts`)
 
-No HTTP controller. Called by `runPeriodicCheck()` (currently must be wired manually or via cron;
-BullMQ processor not yet registered).
+Constructor: `(prisma: PrismaService, mailService: MailService)`
+
+No HTTP controller. Invoked from `TicketsService.createTicket()` and `TicketsService.split()` for SLA wiring; and periodically by `SlaProcessor` (BullMQ `sla` queue, `scan` repeatable job).
 
 ```ts
 computeDueDates(slaPlanId: number, now: Date): Promise<DueDates>
@@ -103,13 +121,22 @@ checkBreaches(): Promise<BreachEntry[]>
 // Finds open, unmerged tickets past dueAt (no firstResponseAt) or resolutionDueAt.
 
 runPeriodicCheck(): Promise<void>
-// Calls checkBreaches(), marks breaching tickets as isEscalated=true (increments escalationLevel).
-// TODO: parse and execute EscalationRule.actions (notify staff, change priority, etc.).
+// Calls checkBreaches(), marks breaching tickets isEscalated=true (escalationLevel++).
+// Then calls executeEscalationRules() which fetches EscalationRule rows for the ticket's
+// slaPlanId where thresholdSeconds ≤ minutesOverdue and isEnabled=true, then executes each
+// action: notify (sends 'sla_breach_internal' mail template), change_priority, assign,
+// add_note, mark_escalated.
 
 resolvePlanForTicket(organizationId: number | null | undefined): Promise<number | null>
 // Returns the SLA plan ID to assign to a new ticket.
 // Checks org.slaPlanId first; falls back to the first enabled plan with no criteria.
 // Full rule-engine criteria matching is TODO.
+
+// ── CRUD methods (called via SlaController HTTP routes) ──
+listPlans / getPlan / createPlan / updatePlan / deletePlan
+listSchedules / getSchedule / createSchedule / updateSchedule / deleteSchedule
+listHolidays / createHoliday / updateHoliday / deleteHoliday
+listRules / createRule / updateRule / deleteRule
 ```
 
 ---
@@ -154,6 +181,72 @@ ingest(payload: AlarisWebhookPayload): Promise<AlarisIngestResult>
 // Creates ticket via TicketsService.createTicket() with creationMode='ALARIS',
 // subject='[ALARIS-AUTO] <message>' (truncated to 500 chars).
 // Stores AlarisEvent record linked to the ticket.
+```
+
+---
+
+## WorkflowService (`apps/api/src/modules/workflow/workflow.service.ts`)
+
+Consumed by: `WorkflowController`, `MacroCategoryController`, `MacroController`.
+
+```ts
+listWorkflows / getWorkflow / createWorkflow / updateWorkflow / deleteWorkflow
+listMacroCategories / getMacroCategory / createMacroCategory / updateMacroCategory / deleteMacroCategory
+listMacros(categoryId?: number) / getMacro / createMacro / updateMacro / deleteMacro
+```
+
+---
+
+## WorkflowExecutor (`apps/api/src/modules/workflow/workflow.executor.ts`)
+
+Listens for `EventEmitter2` domain events fired by `TicketsService` and evaluates all enabled
+workflows against the mutated ticket.
+
+```ts
+@OnEvent('ticket.created') → evaluate(ticketId, 'ticket.created')
+@OnEvent('ticket.replied') → evaluate(ticketId, 'ticket.replied')
+@OnEvent('ticket.status_changed') → evaluate(ticketId, 'ticket.status_changed')
+```
+
+`evaluate()` loads all enabled `Workflow` rows (ordered by `sortOrder`), runs `matchesCriteria()`
+against the ticket, and calls `applyActions()` for each matching workflow.
+
+**Criteria operators:** `eq | neq | contains | gt | lt` on any scalar ticket field.
+
+**Action types:** `change_department | change_owner | change_status | change_priority | change_type | add_tag | add_note`
+
+---
+
+## AdminService (`apps/api/src/modules/admin/admin.service.ts`)
+
+Consumed by: `AdminController`.
+
+```ts
+// ── Custom field groups ──
+listGroups(): Promise<CustomFieldGroup[]>       // includes fields ordered by displayOrder
+createGroup(dto): Promise<CustomFieldGroup>
+updateGroup(id, dto): Promise<CustomFieldGroup>
+deleteGroup(id): Promise<void>
+
+// ── Custom fields ──
+createField(groupId, dto): Promise<CustomField>
+updateField(id, dto): Promise<CustomField>      // fieldKey is immutable (omitted from update schema)
+deleteField(id): Promise<void>
+
+/**
+ * Cross-module validation helper — called by any entity that stores customFields JSONB.
+ * Loads field definitions for the given scope, then enforces:
+ *   - isRequired fields must be present and non-null/empty
+ *   - Values must match the field's type (TEXT→string, CHECKBOX→boolean, MULTISELECT→array, DATE→ISO string, etc.)
+ * Throws BadRequestException on first violation.
+ */
+validateCustomFields(scope: CustomFieldScope, values: Record<string, unknown>): Promise<void>
+
+// ── Email templates ──
+listTemplates(): Promise<EmailTemplate[]>        // ordered by key, locale
+createTemplate(dto): Promise<EmailTemplate>
+updateTemplate(id, dto): Promise<EmailTemplate>  // key and locale are immutable
+deleteTemplate(id): Promise<void>
 ```
 
 ---
@@ -203,28 +296,29 @@ update(id: number, dto: Partial<NewsDto>): Promise<NewsItem>
 
 ## Queue jobs (BullMQ)
 
-BullMQ is **not yet installed or configured** (`@nestjs/bullmq` is a TODO).
-The `app.module.ts` comment notes: _"add BullModule.forRoot(...) once @nestjs/bullmq is installed
-and the SLA queue processor is wired."_
+`BullModule.forRoot()` is registered in `AppModule` with the Redis connection from `REDIS_URL`.
+Each feature module that needs a queue calls `BullModule.registerQueue({ name })`.
 
-Planned queues once wired:
+| Queue      | Job                       | Producer                 | Consumer             | Purpose                                                                                                             |
+| ---------- | ------------------------- | ------------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `sla`      | `scan` (repeatable, 60 s) | `SlaModule` on init      | `SlaProcessor`       | Periodic SLA breach scan → `SlaService.runPeriodicCheck()`                                                          |
+| `workflow` | `auto-close` (repeatable) | `WorkflowModule` on init | `AutoCloseProcessor` | Close idle pending tickets after `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); sends `autoresponder` mail template |
+| `mail`     | per-message send job      | `MailService`            | `MailProcessor`      | Async outbound mail delivery via nodemailer                                                                         |
 
-| Queue | Job | Producer | Consumer | Purpose |
-|---|---|---|---|---|
-| `sla` | `scan` | scheduler / cron | `SlaProcessor` (TODO) | Periodic breach scan → escalation |
-| `mail` | _(future)_ | — | — | Potential alternative to setInterval IMAP polling |
-
-Currently `SlaService.runPeriodicCheck()` and `InboundMailService` run inline (lifecycle hooks /
-setInterval). No BullMQ worker processes exist yet.
+`InboundMailService` still uses `setInterval` (60 s) for IMAP polling; IMAP IDLE is a future TODO.
 
 ---
 
 ## Domain events
 
-`TicketsService.emitDomainEvent()` is a **stub** (no-op). When implemented it should emit events
-such as `ticket.created`, `ticket.replied`, `ticket.status_changed` for consumption by:
-- `SlaService` — recompute due dates on ticket creation/change
-- Future `WorkflowEngine` — evaluate macro/auto-action criteria
+`TicketsService.emitDomainEvent()` calls `EventEmitter2.emit()` (fully implemented — not a stub).
 
-The `Workflow`, `MacroCategory`, and `Macro` Prisma models exist in the schema but have no
-service implementation yet.
+Events fired:
+
+| Event                   | Fired by                                 | Consumed by                                |
+| ----------------------- | ---------------------------------------- | ------------------------------------------ |
+| `ticket.created`        | `createTicket()`, `split()` (new ticket) | `WorkflowExecutor.onTicketCreated()`       |
+| `ticket.replied`        | `reply()`                                | `WorkflowExecutor.onTicketReplied()`       |
+| `ticket.status_changed` | `changeStatus()`                         | `WorkflowExecutor.onTicketStatusChanged()` |
+
+`EventEmitterModule.forRoot()` is registered in `AppModule`.

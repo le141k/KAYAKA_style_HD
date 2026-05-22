@@ -1,7 +1,8 @@
-import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
+import { CanActivate, ExecutionContext, Inject, Injectable, UnauthorizedException } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
 import { IS_PUBLIC_KEY, AuthStaff } from './auth.decorators';
+import { AppConfig, APP_CONFIG } from '../config/configuration';
 import type { Request } from 'express';
 
 /**
@@ -15,6 +16,7 @@ export class JwtAuthGuard implements CanActivate {
   constructor(
     private readonly jwtService: JwtService,
     private readonly reflector: Reflector,
+    @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -34,7 +36,7 @@ export class JwtAuthGuard implements CanActivate {
 
     try {
       const payload = await this.jwtService.verifyAsync<AuthStaff & { sub: number }>(token, {
-        secret: process.env['TELECOM_HD_JWT_ACCESS_SECRET'] ?? 'change-me-access-secret',
+        secret: this.config.TELECOM_HD_JWT_ACCESS_SECRET,
       });
 
       // Normalise: staffId is stored in `sub` by AuthService
@@ -58,4 +60,3 @@ export class JwtAuthGuard implements CanActivate {
     return auth.slice(7);
   }
 }
-

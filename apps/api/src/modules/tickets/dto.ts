@@ -20,9 +20,7 @@ export const CreateTicketSchema = z.object({
   slaPlanId: z.number().int().positive().optional(),
   customFields: z.record(z.unknown()).default({}),
   tags: z.array(z.string()).default([]),
-  creationMode: z
-    .enum(['WEB', 'EMAIL', 'API', 'STAFF', 'ALARIS'])
-    .default('STAFF'),
+  creationMode: z.enum(['WEB', 'EMAIL', 'API', 'STAFF', 'ALARIS']).default('STAFF'),
   ipAddress: z.string().default('0.0.0.0'),
 });
 export type CreateTicketDto = z.infer<typeof CreateTicketSchema>;
@@ -96,6 +94,18 @@ export const ListTicketsQuerySchema = z.object({
   sortDir: z.enum(['asc', 'desc']).default('desc'),
 });
 export type ListTicketsQueryDto = z.infer<typeof ListTicketsQuerySchema>;
+
+// ─────────────────── split ───────────────────
+
+export const SplitTicketSchema = z.object({
+  /** IDs of posts to move into the new ticket */
+  postIds: z.array(z.number().int().positive()).min(1),
+  /** Subject for the new ticket */
+  subject: z.string().min(1).max(500),
+  /** Optional override of department for the new ticket */
+  departmentId: z.number().int().positive().optional(),
+});
+export type SplitTicketDto = z.infer<typeof SplitTicketSchema>;
 
 // ─────────────────── public submission ───────────────────
 

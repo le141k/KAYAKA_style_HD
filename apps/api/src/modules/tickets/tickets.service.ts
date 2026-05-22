@@ -1,11 +1,8 @@
-import {
-  BadRequestException,
-  Injectable,
-  Logger,
-  NotFoundException,
-} from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
+import { SlaService } from '../sla/sla.service';
 import { formatTicketMask } from './ticket-mask.util';
 import type {
   CreateTicketDto,
@@ -15,6 +12,7 @@ import type {
   ChangePriorityDto,
   ChangeTypeDto,
   MergeTicketDto,
+  SplitTicketDto,
   ListTicketsQueryDto,
   TagDto,
   WatcherDto,
@@ -36,14 +34,13 @@ export class TicketsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly usersService: UsersService,
+    private readonly slaService: SlaService,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   // ─────────────────────────── Create ───────────────────────────
 
-  async createTicket(
-    dto: CreateTicketDto,
-    creatorStaffId?: number,
-  ): Promise<Ticket> {
+  async createTicket(dto: CreateTicketDto, creatorStaffId?: number): Promise<Ticket> {
     // Resolve or create the requester user
     let userId = dto.userId;
     if (!userId) {
@@ -54,11 +51,30 @@ export class TicketsService {
       userId = user.id;
     }
 
+    // Resolve the SLA plan for the ticket (based on org or default)
+    const userWithOrg = userId
+      ? await this.prisma.user.findUnique({ where: { id: userId }, select: { organizationId: true } })
+      : null;
+    const orgId = userWithOrg?.organizationId ?? null;
+
+    const slaPlanId = dto.slaPlanId ?? (await this.slaService.resolvePlanForTicket(orgId));
+
     // Resolve default status / priority if not supplied
     const statusId = dto.statusId ?? (await this.defaultStatusId());
     const priorityId = dto.priorityId ?? (await this.defaultPriorityId());
 
     const creatorActor: ActorType = creatorStaffId ? 'STAFF' : 'USER';
+
+    const now = new Date();
+
+    // Compute SLA due dates if a plan was resolved
+    let dueAt: Date | null = null;
+    let resolutionDueAt: Date | null = null;
+    if (slaPlanId) {
+      const dueDates = await this.slaService.computeDueDates(slaPlanId, now);
+      dueAt = dueDates.dueAt;
+      resolutionDueAt = dueDates.resolutionDueAt;
+    }
 
     // Create ticket without mask first (need id for mask)
     const ticket = await this.prisma.ticket.create({
@@ -73,7 +89,9 @@ export class TicketsService {
         requesterEmail: dto.requesterEmail,
         requesterName: dto.requesterName,
         ownerStaffId: dto.ownerStaffId,
-        slaPlanId: dto.slaPlanId,
+        slaPlanId,
+        dueAt,
+        resolutionDueAt,
         creationMode: dto.creationMode as CreationMode,
         creator: creatorActor,
         ipAddress: dto.ipAddress,
@@ -119,6 +137,10 @@ export class TicketsService {
     });
 
     this.logger.log(`Ticket ${mask} created`);
+
+    // Emit domain event
+    this.emitDomainEvent('ticket.created', updated.id);
+
     return updated;
   }
 
@@ -205,11 +227,7 @@ export class TicketsService {
 
   // ─────────────────────────── Reply ───────────────────────────
 
-  async reply(
-    ticketId: number,
-    dto: ReplyTicketDto,
-    staffId?: number,
-  ): Promise<TicketPost | TicketNote> {
+  async reply(ticketId: number, dto: ReplyTicketDto, staffId?: number): Promise<TicketPost | TicketNote> {
     const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
     if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
 
@@ -218,10 +236,13 @@ export class TicketsService {
     }
 
     const now = new Date();
+    const isStaffReply = !!staffId;
+    const firstResponse = isStaffReply && ticket.firstResponseAt === null;
+
     const post = await this.prisma.ticketPost.create({
       data: {
         ticketId,
-        authorType: 'STAFF',
+        authorType: isStaffReply ? 'STAFF' : 'USER',
         staffId,
         subject: ticket.subject,
         contents: dto.contents,
@@ -240,11 +261,14 @@ export class TicketsService {
         lastReplyAt: now,
         lastActivityAt: now,
         // Mark first staff response time if not yet set
-        ...(ticket.firstResponseAt === null && { firstResponseAt: now }),
+        ...(firstResponse && { firstResponseAt: now }),
       },
     });
 
-    await this.writeAudit(ticketId, 'REPLY', staffId ?? undefined, 'STAFF', {});
+    await this.writeAudit(ticketId, 'REPLY', staffId ?? undefined, isStaffReply ? 'STAFF' : 'USER', {});
+
+    // Emit domain event
+    this.emitDomainEvent('ticket.replied', ticketId);
 
     return post;
   }
@@ -291,13 +315,42 @@ export class TicketsService {
     const status = await this.prisma.ticketStatus.findUnique({ where: { id: dto.statusId } });
     if (!status) throw new NotFoundException(`Status ${dto.statusId} not found`);
 
+    const now = new Date();
+    const wasResolved = ticket.isResolved;
+    const becomesResolved = status.markAsResolved;
+    const isReopen = wasResolved && !becomesResolved;
+
+    let slaUpdate: {
+      dueAt?: Date | null;
+      resolutionDueAt?: Date | null;
+      reopenedAt?: Date;
+      wasReopened?: boolean;
+    } = {};
+
+    if (becomesResolved) {
+      // Stop SLA timers on resolve
+      slaUpdate = { dueAt: null, resolutionDueAt: null };
+    }
+
+    if (isReopen && ticket.slaPlanId) {
+      // Reopen: recompute SLA due dates from now
+      const dueDates = await this.slaService.computeDueDates(ticket.slaPlanId, now);
+      slaUpdate = {
+        dueAt: dueDates.dueAt,
+        resolutionDueAt: dueDates.resolutionDueAt,
+        reopenedAt: now,
+        wasReopened: true,
+      };
+    }
+
     const updated = await this.prisma.ticket.update({
       where: { id: ticketId },
       data: {
         statusId: dto.statusId,
-        isResolved: status.markAsResolved,
-        resolvedAt: status.markAsResolved ? new Date() : null,
-        lastActivityAt: new Date(),
+        isResolved: becomesResolved,
+        resolvedAt: becomesResolved ? now : null,
+        lastActivityAt: now,
+        ...slaUpdate,
       },
     });
 
@@ -306,6 +359,9 @@ export class TicketsService {
       oldValue: ticket.statusId.toString(),
       newValue: dto.statusId.toString(),
     });
+
+    // Emit domain event
+    this.emitDomainEvent('ticket.status_changed', ticketId);
 
     return updated;
   }
@@ -350,11 +406,7 @@ export class TicketsService {
    * Merge the source ticket into the target ticket.
    * All posts from source are re-parented to the target; source is marked merged.
    */
-  async merge(
-    sourceTicketId: number,
-    dto: MergeTicketDto,
-    staffId: number,
-  ): Promise<Ticket> {
+  async merge(sourceTicketId: number, dto: MergeTicketDto, staffId: number): Promise<Ticket> {
     const source = await this.findOrThrow(sourceTicketId);
     const target = await this.findOrThrow(dto.targetTicketId);
 
@@ -400,6 +452,107 @@ export class TicketsService {
     return this.prisma.ticket.findUniqueOrThrow({ where: { id: target.id } });
   }
 
+  // ─────────────────────────── Split ───────────────────────────
+
+  /**
+   * Split selected posts out of a ticket into a new ticket.
+   * Creates a new ticket with the given subject and moves the selected posts to it.
+   * Writes SPLIT audit entries on both tickets.
+   */
+  async split(sourceTicketId: number, dto: SplitTicketDto, staffId: number): Promise<Ticket> {
+    const source = await this.findOrThrow(sourceTicketId);
+
+    if (!dto.postIds.length) {
+      throw new BadRequestException('postIds must not be empty');
+    }
+
+    // Verify all posts belong to the source ticket
+    const posts = await this.prisma.ticketPost.findMany({
+      where: { id: { in: dto.postIds }, ticketId: sourceTicketId },
+    });
+
+    if (posts.length !== dto.postIds.length) {
+      throw new BadRequestException('Some postIds do not belong to this ticket');
+    }
+
+    // Resolve defaults for new ticket
+    const statusId = await this.defaultStatusId();
+    const priorityId = source.priorityId;
+    const departmentId = dto.departmentId ?? source.departmentId;
+
+    const now = new Date();
+
+    // Compute SLA due dates for the new ticket
+    let dueAt: Date | null = null;
+    let resolutionDueAt: Date | null = null;
+    if (source.slaPlanId) {
+      const dueDates = await this.slaService.computeDueDates(source.slaPlanId, now);
+      dueAt = dueDates.dueAt;
+      resolutionDueAt = dueDates.resolutionDueAt;
+    }
+
+    // Create new ticket
+    const newTicket = await this.prisma.ticket.create({
+      data: {
+        mask: 'TT-PENDING',
+        subject: dto.subject,
+        departmentId,
+        statusId,
+        priorityId,
+        typeId: source.typeId,
+        userId: source.userId,
+        requesterName: source.requesterName,
+        requesterEmail: source.requesterEmail,
+        ownerStaffId: source.ownerStaffId,
+        slaPlanId: source.slaPlanId,
+        dueAt,
+        resolutionDueAt,
+        creationMode: source.creationMode,
+        creator: 'STAFF',
+        customFields: source.customFields as object,
+        totalReplies: posts.length,
+      },
+    });
+
+    const newMask = formatTicketMask(newTicket.id);
+
+    await this.prisma.$transaction([
+      // Update mask on new ticket
+      this.prisma.ticket.update({
+        where: { id: newTicket.id },
+        data: { mask: newMask },
+      }),
+      // Move posts to new ticket
+      this.prisma.ticketPost.updateMany({
+        where: { id: { in: dto.postIds } },
+        data: { ticketId: newTicket.id },
+      }),
+      // Decrement source reply count
+      this.prisma.ticket.update({
+        where: { id: sourceTicketId },
+        data: {
+          totalReplies: { decrement: posts.length },
+          lastActivityAt: now,
+        },
+      }),
+    ]);
+
+    // Audit on both
+    await this.writeAudit(sourceTicketId, 'SPLIT', staffId, 'STAFF', {
+      field: 'splitTo',
+      newValue: newMask,
+    });
+    await this.writeAudit(newTicket.id, 'SPLIT', staffId, 'STAFF', {
+      field: 'splitFrom',
+      newValue: source.mask,
+    });
+
+    this.logger.log(`Ticket ${source.mask} split into ${newMask} (${posts.length} posts)`);
+
+    this.emitDomainEvent('ticket.created', newTicket.id);
+    return this.prisma.ticket.findUniqueOrThrow({ where: { id: newTicket.id } });
+  }
+
   // ─────────────────────────── Watchers ───────────────────────────
 
   async addWatcher(ticketId: number, dto: WatcherDto): Promise<void> {
@@ -442,17 +595,13 @@ export class TicketsService {
     });
   }
 
-  // ─────────────────────────── Domain hook stub ───────────────────────────
+  // ─────────────────────────── Domain events ───────────────────────────
 
   /**
-   * Emit a domain event for SLA/workflow processing.
-   * Currently a no-op; replace with EventEmitter2 or BullMQ job when wiring SLA.
-   *
-   * @todo Wire to SlaService.onTicketChanged() and WorkflowEngine.evaluate()
+   * Emit a domain event via EventEmitter2 for SLA/workflow processing.
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  protected emitDomainEvent(_event: string, _ticketId: number): void {
-    // TODO: this.eventEmitter.emit(event, { ticketId });
+  protected emitDomainEvent(event: string, ticketId: number): void {
+    this.eventEmitter.emit(event, { ticketId });
   }
 
   // ─────────────────────────── Helpers ───────────────────────────

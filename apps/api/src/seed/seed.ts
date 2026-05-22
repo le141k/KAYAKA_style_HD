@@ -40,7 +40,10 @@ async function main(): Promise<void> {
 
   const adminGroup = await findOrCreateWhere(
     () => prisma.staffGroup.findFirst({ where: { title: 'Administrator' } }),
-    () => prisma.staffGroup.create({ data: { title: 'Administrator', isAdmin: true, permissions: ALL_PERMISSIONS } }),
+    () =>
+      prisma.staffGroup.create({
+        data: { title: 'Administrator', isAdmin: true, permissions: ALL_PERMISSIONS },
+      }),
   );
   await prisma.staffGroup.update({
     where: { id: adminGroup.id },
@@ -49,7 +52,8 @@ async function main(): Promise<void> {
 
   const agentGroup = await findOrCreateWhere(
     () => prisma.staffGroup.findFirst({ where: { title: 'Agent' } }),
-    () => prisma.staffGroup.create({ data: { title: 'Agent', isAdmin: false, permissions: ROLE_PRESETS.agent } }),
+    () =>
+      prisma.staffGroup.create({ data: { title: 'Agent', isAdmin: false, permissions: ROLE_PRESETS.agent } }),
   );
 
   console.log(`  StaffGroups: Administrator (id=${adminGroup.id}), Agent (id=${agentGroup.id})`);
@@ -101,16 +105,53 @@ async function main(): Promise<void> {
     () => prisma.department.create({ data: { title: 'NOC', isDefault: false, displayOrder: 1 } }),
   );
 
-  console.log(`  Departments: ${supportDept.title} (id=${supportDept.id}), ${nocDept.title} (id=${nocDept.id})`);
+  console.log(
+    `  Departments: ${supportDept.title} (id=${supportDept.id}), ${nocDept.title} (id=${nocDept.id})`,
+  );
 
   // ─────────────────── Ticket Statuses ───────────────────
 
   const statusDefs = [
-    { title: 'Open',        isDefault: true,  markAsResolved: false, color: '#ffffff', bgColor: '#22c55e', displayOrder: 0 },
-    { title: 'Pending',     isDefault: false, markAsResolved: false, color: '#ffffff', bgColor: '#f59e0b', displayOrder: 1 },
-    { title: 'In Progress', isDefault: false, markAsResolved: false, color: '#ffffff', bgColor: '#3b82f6', displayOrder: 2 },
-    { title: 'Resolved',    isDefault: false, markAsResolved: true,  color: '#ffffff', bgColor: '#6b7280', displayOrder: 3 },
-    { title: 'Closed',      isDefault: false, markAsResolved: true,  color: '#ffffff', bgColor: '#374151', displayOrder: 4 },
+    {
+      title: 'Open',
+      isDefault: true,
+      markAsResolved: false,
+      color: '#ffffff',
+      bgColor: '#22c55e',
+      displayOrder: 0,
+    },
+    {
+      title: 'Pending',
+      isDefault: false,
+      markAsResolved: false,
+      color: '#ffffff',
+      bgColor: '#f59e0b',
+      displayOrder: 1,
+    },
+    {
+      title: 'In Progress',
+      isDefault: false,
+      markAsResolved: false,
+      color: '#ffffff',
+      bgColor: '#3b82f6',
+      displayOrder: 2,
+    },
+    {
+      title: 'Resolved',
+      isDefault: false,
+      markAsResolved: true,
+      color: '#ffffff',
+      bgColor: '#6b7280',
+      displayOrder: 3,
+    },
+    {
+      title: 'Closed',
+      isDefault: false,
+      markAsResolved: true,
+      color: '#ffffff',
+      bgColor: '#374151',
+      displayOrder: 4,
+    },
   ];
 
   const seededStatuses: Array<{ id: number; title: string }> = [];
@@ -128,9 +169,9 @@ async function main(): Promise<void> {
   // ─────────────────── Ticket Priorities ───────────────────
 
   const priorityDefs = [
-    { title: 'Low',    displayOrder: 0, color: '#374151', bgColor: '#f3f4f6' },
+    { title: 'Low', displayOrder: 0, color: '#374151', bgColor: '#f3f4f6' },
     { title: 'Normal', displayOrder: 1, color: '#374151', bgColor: '#dbeafe' },
-    { title: 'High',   displayOrder: 2, color: '#ffffff', bgColor: '#f59e0b' },
+    { title: 'High', displayOrder: 2, color: '#ffffff', bgColor: '#f59e0b' },
     { title: 'Urgent', displayOrder: 3, color: '#ffffff', bgColor: '#ef4444' },
   ];
 
@@ -151,9 +192,9 @@ async function main(): Promise<void> {
   // ─────────────────── Ticket Types ───────────────────
 
   const typeDefs = [
-    { title: 'Issue',           displayOrder: 0 },
-    { title: 'Question',        displayOrder: 1 },
-    { title: 'Incident',        displayOrder: 2 },
+    { title: 'Issue', displayOrder: 0 },
+    { title: 'Question', displayOrder: 1 },
+    { title: 'Incident', displayOrder: 2 },
     { title: 'Alaris Incident', displayOrder: 3 },
   ];
 
@@ -213,36 +254,46 @@ async function main(): Promise<void> {
       key: 'ticket_user_reply',
       locale: 'en',
       subject: 'Re: [{{mask}}] {{subject}}',
-      htmlBody: '<p>Hello {{name}},</p><p>A new reply has been posted to your ticket <strong>{{mask}}</strong>: {{subject}}</p><p>{{contents}}</p><p>Best regards,<br>23 Telecom Support</p>',
-      textBody: 'Hello {{name}},\n\nA new reply to ticket {{mask}} ({{subject}}):\n\n{{contents}}\n\n23 Telecom Support',
+      htmlBody:
+        '<p>Hello {{name}},</p><p>A new reply has been posted to your ticket <strong>{{mask}}</strong>: {{subject}}</p><p>{{contents}}</p><p>Best regards,<br>23 Telecom Support</p>',
+      textBody:
+        'Hello {{name}},\n\nA new reply to ticket {{mask}} ({{subject}}):\n\n{{contents}}\n\n23 Telecom Support',
     },
     {
       key: 'ticket_user_reply',
       locale: 'ru',
       subject: 'Ответ: [{{mask}}] {{subject}}',
-      htmlBody: '<p>Здравствуйте, {{name}},</p><p>Получен новый ответ по тикету <strong>{{mask}}</strong>: {{subject}}</p><p>{{contents}}</p><p>С уважением,<br>Служба поддержки 23 Telecom</p>',
-      textBody: 'Здравствуйте, {{name}},\n\nНовый ответ по тикету {{mask}} ({{subject}}):\n\n{{contents}}\n\nСлужба поддержки 23 Telecom',
+      htmlBody:
+        '<p>Здравствуйте, {{name}},</p><p>Получен новый ответ по тикету <strong>{{mask}}</strong>: {{subject}}</p><p>{{contents}}</p><p>С уважением,<br>Служба поддержки 23 Telecom</p>',
+      textBody:
+        'Здравствуйте, {{name}},\n\nНовый ответ по тикету {{mask}} ({{subject}}):\n\n{{contents}}\n\nСлужба поддержки 23 Telecom',
     },
     {
       key: 'autoresponder',
       locale: 'en',
       subject: '[{{mask}}] Your request has been received',
-      htmlBody: '<p>Hello {{name}},</p><p>We have received your support request and assigned it ticket number <strong>{{mask}}</strong>.</p><p>Our team will respond within the next 4 business hours.</p><p>Best regards,<br>23 Telecom Support</p>',
-      textBody: 'Hello {{name}},\n\nYour request has been received ({{mask}}). We will respond within 4 business hours.\n\n23 Telecom Support',
+      htmlBody:
+        '<p>Hello {{name}},</p><p>We have received your support request and assigned it ticket number <strong>{{mask}}</strong>.</p><p>Our team will respond within the next 4 business hours.</p><p>Best regards,<br>23 Telecom Support</p>',
+      textBody:
+        'Hello {{name}},\n\nYour request has been received ({{mask}}). We will respond within 4 business hours.\n\n23 Telecom Support',
     },
     {
       key: 'autoresponder',
       locale: 'ru',
       subject: '[{{mask}}] Ваш запрос получен',
-      htmlBody: '<p>Здравствуйте, {{name}},</p><p>Ваше обращение зарегистрировано под номером <strong>{{mask}}</strong>.</p><p>Мы ответим в течение 4 рабочих часов.</p><p>С уважением,<br>Служба поддержки 23 Telecom</p>',
-      textBody: 'Здравствуйте, {{name}},\n\nВаш запрос зарегистрирован ({{mask}}). Ответим в течение 4 рабочих часов.\n\nСлужба поддержки 23 Telecom',
+      htmlBody:
+        '<p>Здравствуйте, {{name}},</p><p>Ваше обращение зарегистрировано под номером <strong>{{mask}}</strong>.</p><p>Мы ответим в течение 4 рабочих часов.</p><p>С уважением,<br>Служба поддержки 23 Telecom</p>',
+      textBody:
+        'Здравствуйте, {{name}},\n\nВаш запрос зарегистрирован ({{mask}}). Ответим в течение 4 рабочих часов.\n\nСлужба поддержки 23 Telecom',
     },
     {
       key: 'sla_breach_internal',
       locale: 'en',
       subject: '[SLA BREACH] {{breachType}} — {{mask}} — {{minutesOverdue}}m overdue',
-      htmlBody: '<p><strong>SLA Breach Alert</strong></p><p>Ticket <strong>{{mask}}</strong> has breached the {{breachType}} SLA target by {{minutesOverdue}} minutes.</p><p>Subject: {{subject}}</p><p>Please take immediate action.</p>',
-      textBody: 'SLA BREACH\nTicket: {{mask}}\nType: {{breachType}}\nOverdue: {{minutesOverdue}}m\nSubject: {{subject}}\n\nPlease take immediate action.',
+      htmlBody:
+        '<p><strong>SLA Breach Alert</strong></p><p>Ticket <strong>{{mask}}</strong> has breached the {{breachType}} SLA target by {{minutesOverdue}} minutes.</p><p>Subject: {{subject}}</p><p>Please take immediate action.</p>',
+      textBody:
+        'SLA BREACH\nTicket: {{mask}}\nType: {{breachType}}\nOverdue: {{minutesOverdue}}m\nSubject: {{subject}}\n\nPlease take immediate action.',
     },
   ];
 
@@ -261,7 +312,13 @@ async function main(): Promise<void> {
     () => prisma.organization.findFirst({ where: { name: 'Acme Corp' } }),
     () =>
       prisma.organization.create({
-        data: { name: 'Acme Corp', city: 'Moscow', country: 'RU', phone: '+7 495 000-0001', slaPlanId: slaPlan.id },
+        data: {
+          name: 'Acme Corp',
+          city: 'Moscow',
+          country: 'RU',
+          phone: '+7 495 000-0001',
+          slaPlanId: slaPlan.id,
+        },
       }),
   );
 
@@ -279,10 +336,10 @@ async function main(): Promise<void> {
 
   type UserSeed = { fullName: string; email: string; orgId: number | null };
   const usersData: UserSeed[] = [
-    { fullName: 'Ivan Petrov',    email: 'ivan.petrov@acme.example',  orgId: org1.id },
-    { fullName: 'Maria Sidorova', email: 'maria.s@acme.example',      orgId: org1.id },
-    { fullName: 'Dmitry Volkov',  email: 'dvolkov@beta.example',      orgId: org2.id },
-    { fullName: 'Guest User',     email: 'guest@external.example',    orgId: null    },
+    { fullName: 'Ivan Petrov', email: 'ivan.petrov@acme.example', orgId: org1.id },
+    { fullName: 'Maria Sidorova', email: 'maria.s@acme.example', orgId: org1.id },
+    { fullName: 'Dmitry Volkov', email: 'dvolkov@beta.example', orgId: org2.id },
+    { fullName: 'Guest User', email: 'guest@external.example', orgId: null },
   ];
 
   const seededUsers: Array<{ id: number; fullName: string }> = [];
@@ -329,43 +386,68 @@ async function main(): Promise<void> {
   const ticketSeeds: TicketSeed[] = [
     {
       subject: 'Cannot connect to VPN',
-      userId: ivan.id, email: 'ivan.petrov@acme.example', name: 'Ivan Petrov',
-      priorityId: highPriority.id, typeId: incidentType.id, departmentId: supportDept.id,
+      userId: ivan.id,
+      email: 'ivan.petrov@acme.example',
+      name: 'Ivan Petrov',
+      priorityId: highPriority.id,
+      typeId: incidentType.id,
+      departmentId: supportDept.id,
       ownerStaffId: agentStaff.id,
       body: 'Since this morning I cannot connect to the corporate VPN. Error: connection timeout. Checked firewall — no changes. Please help ASAP.',
-      creationMode: 'WEB', creator: 'USER',
+      creationMode: 'WEB',
+      creator: 'USER',
     },
     {
       subject: 'Invoice #2024-112 — billing question',
-      userId: maria.id, email: 'maria.s@acme.example', name: 'Maria Sidorova',
-      priorityId: normalPriority.id, typeId: issueType.id, departmentId: supportDept.id,
+      userId: maria.id,
+      email: 'maria.s@acme.example',
+      name: 'Maria Sidorova',
+      priorityId: normalPriority.id,
+      typeId: issueType.id,
+      departmentId: supportDept.id,
       ownerStaffId: agentStaff.id,
       body: 'Hello, I received invoice #2024-112 but the amount does not match our contract. Could you clarify the line items?',
-      creationMode: 'WEB', creator: 'USER',
+      creationMode: 'WEB',
+      creator: 'USER',
     },
     {
       subject: 'Port 8443 blocked on transit link',
-      userId: dmitry.id, email: 'dvolkov@beta.example', name: 'Dmitry Volkov',
-      priorityId: urgentPriority.id, typeId: incidentType.id, departmentId: nocDept.id,
+      userId: dmitry.id,
+      email: 'dvolkov@beta.example',
+      name: 'Dmitry Volkov',
+      priorityId: urgentPriority.id,
+      typeId: incidentType.id,
+      departmentId: nocDept.id,
       ownerStaffId: agentStaff.id,
       body: 'Our monitoring shows port 8443 is being blocked on the upstream transit link AS23456. This is impacting production traffic. Need urgent investigation.',
-      creationMode: 'WEB', creator: 'USER',
+      creationMode: 'WEB',
+      creator: 'USER',
     },
     {
       subject: 'Request for static IP on circuit BT-0042',
-      userId: ivan.id, email: 'ivan.petrov@acme.example', name: 'Ivan Petrov',
-      priorityId: normalPriority.id, typeId: issueType.id, departmentId: supportDept.id,
+      userId: ivan.id,
+      email: 'ivan.petrov@acme.example',
+      name: 'Ivan Petrov',
+      priorityId: normalPriority.id,
+      typeId: issueType.id,
+      departmentId: supportDept.id,
       ownerStaffId: null,
       body: 'We would like to add a static IP block (/29) to our existing circuit BT-0042. Please advise on the process and timelines.',
-      creationMode: 'WEB', creator: 'USER',
+      creationMode: 'WEB',
+      creator: 'USER',
     },
     {
       subject: 'Alaris: high CPU on router R-MSK-01',
-      userId: null, email: 'alaris@system.internal', name: 'Alaris Monitor',
-      priorityId: highPriority.id, typeId: alarisType.id, departmentId: nocDept.id,
+      userId: null,
+      email: 'alaris@system.internal',
+      name: 'Alaris Monitor',
+      priorityId: highPriority.id,
+      typeId: alarisType.id,
+      departmentId: nocDept.id,
       ownerStaffId: null,
       body: 'Automated alert: CPU utilization on R-MSK-01 exceeded 90% for 5 consecutive minutes. Threshold: 85%. Interface: GigabitEthernet0/0.',
-      creationMode: 'ALARIS', creator: 'SYSTEM',
+      creationMode: 'ALARIS',
+      creator: 'SYSTEM',
     },
   ];
 
@@ -441,6 +523,60 @@ async function main(): Promise<void> {
 
     console.log(`  Ticket ${mask}: ${ts.subject}`);
   }
+
+  // ── Knowledgebase (categories + articles) ──
+  const kbCats: Array<{ title: string; displayOrder: number }> = [
+    { title: 'Техническая поддержка', displayOrder: 1 },
+    { title: 'Подключение и настройка', displayOrder: 2 },
+    { title: 'Биллинг', displayOrder: 3 },
+  ];
+  const kbCatId: Record<string, number> = {};
+  for (const c of kbCats) {
+    let cat = await prisma.kbCategory.findFirst({ where: { title: c.title } });
+    if (!cat) cat = await prisma.kbCategory.create({ data: { ...c, isPublished: true } });
+    kbCatId[c.title] = cat.id;
+  }
+  const kbArticles: Array<{ title: string; cat: string; html: string }> = [
+    {
+      title: 'Настройка PPPoE-подключения',
+      cat: 'Подключение и настройка',
+      html: '<p>Пошаговая настройка PPPoE: укажите логин и пароль из договора, MTU 1492. После сохранения переподключите интерфейс.</p>',
+    },
+    {
+      title: 'Как сбросить VPN-подключение',
+      cat: 'Техническая поддержка',
+      html: '<p>Перезапустите VPN-клиент и переподключитесь к резервному шлюзу vpn2.23telecom.example.</p>',
+    },
+    {
+      title: 'Вопросы по счёту и оплате',
+      cat: 'Биллинг',
+      html: '<p>Счета формируются ежемесячно. Оплатить можно в личном кабинете или по реквизитам из договора.</p>',
+    },
+  ];
+  for (const a of kbArticles) {
+    const existing = await prisma.kbArticle.findFirst({ where: { title: a.title } });
+    if (!existing) {
+      const slug = a.title
+        .toLowerCase()
+        .replace(/[^a-z0-9а-яё]+/gi, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80);
+      await prisma.kbArticle.create({
+        data: {
+          title: a.title,
+          slug,
+          contents: a.html,
+          contentsText: a.html
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim(),
+          isPublished: true,
+          categoryId: kbCatId[a.cat],
+        },
+      });
+    }
+  }
+  console.log('  Knowledgebase: 3 categories, 3 articles');
 
   console.log('\n✅ Seed complete.');
 }

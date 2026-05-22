@@ -24,6 +24,6 @@ const config = loadConfig();
     JwtAuthGuard,
     PermissionsGuard,
   ],
-  exports: [AuthService, JwtAuthGuard, PermissionsGuard, JwtModule],
+  exports: [AuthService, JwtAuthGuard, PermissionsGuard, JwtModule, APP_CONFIG],
 })
 export class AuthModule {}

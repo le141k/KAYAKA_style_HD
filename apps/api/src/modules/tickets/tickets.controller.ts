@@ -26,6 +26,7 @@ import {
   ChangePrioritySchema,
   ChangeTypeSchema,
   MergeTicketSchema,
+  SplitTicketSchema,
   TagSchema,
   WatcherSchema,
   ListTicketsQuerySchema,
@@ -37,6 +38,7 @@ import {
   type ChangePriorityDto,
   type ChangeTypeDto,
   type MergeTicketDto,
+  type SplitTicketDto,
   type TagDto,
   type WatcherDto,
   type ListTicketsQueryDto,
@@ -178,6 +180,18 @@ export class TicketsController {
     return this.ticketsService.merge(id, dto, staff.staffId);
   }
 
+  @Post(':id/split')
+  @RequirePermissions(PERMISSIONS.TICKET_MERGE)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Split selected posts out of a ticket into a new ticket' })
+  split(
+    @Param('id', ParseIntPipe) id: number,
+    @Body(new ZodValidationPipe(SplitTicketSchema)) dto: SplitTicketDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.ticketsService.split(id, dto, staff.staffId);
+  }
+
   // ─────────────────── Watchers ───────────────────
 
   @Post(':id/watchers')
@@ -195,10 +209,7 @@ export class TicketsController {
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Remove a watcher from a ticket' })
-  removeWatcher(
-    @Param('id', ParseIntPipe) id: number,
-    @Param('staffId', ParseIntPipe) staffId: number,
-  ) {
+  removeWatcher(@Param('id', ParseIntPipe) id: number, @Param('staffId', ParseIntPipe) staffId: number) {
     return this.ticketsService.removeWatcher(id, staffId);
   }
 
@@ -208,10 +219,7 @@ export class TicketsController {
   @RequirePermissions(PERMISSIONS.TICKET_EDIT)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Add a tag to a ticket' })
-  addTag(
-    @Param('id', ParseIntPipe) id: number,
-    @Body(new ZodValidationPipe(TagSchema)) dto: TagDto,
-  ) {
+  addTag(@Param('id', ParseIntPipe) id: number, @Body(new ZodValidationPipe(TagSchema)) dto: TagDto) {
     return this.ticketsService.addTag(id, dto);
   }
 

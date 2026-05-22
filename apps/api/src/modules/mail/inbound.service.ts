@@ -1,6 +1,7 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit, Inject } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit, Inject, forwardRef } from '@nestjs/common';
 import type { ImapFlow, FetchMessageObject } from 'imapflow';
 import { TicketsService } from '../tickets/tickets.service';
+import { MailService } from './mail.service';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
 import { PrismaService } from '../../prisma/prisma.service';
 
@@ -12,11 +13,11 @@ const MASK_RE = /TT-\d{6,}/i;
  *
  * When TELECOM_HD_IMAP_ENABLED=true (checked at runtime from the EmailQueue table),
  * this service polls each enabled IMAP queue and:
- *  1. Threads replies into existing tickets by matching the ticket mask in the subject.
- *  2. Creates new tickets from unthreaded messages via TicketsService.createTicket().
- *
- * The ImapFlow connection objects are stored in this.connections for cleanup.
- * Polling is driven by a simple setInterval (not BullMQ) to keep dependencies minimal.
+ *  1. Threads replies by RFC Message-ID / In-Reply-To / References headers.
+ *  2. Falls back to TT-XXXXXX mask matching in the subject.
+ *  3. Creates new tickets from unthreaded messages and sends autoresponder.
+ *  4. Stores RFC Message-ID on created TicketPost.
+ *  5. Sends a reply email notification on staff reply.
  *
  * TODO: replace polling with IMAP IDLE for push-based notification.
  * TODO: persist per-queue UID watermark in the Setting table to avoid re-processing.
@@ -30,7 +31,8 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   constructor(
     @Inject(APP_CONFIG) private readonly config: AppConfig,
     private readonly prisma: PrismaService,
-    private readonly ticketsService: TicketsService,
+    @Inject(forwardRef(() => TicketsService)) private readonly ticketsService: TicketsService,
+    private readonly mailService: MailService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -59,9 +61,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
 
     // Poll every 60 seconds
     this.pollHandle = setInterval(() => {
-      void this.pollAll().catch((err: unknown) =>
-        this.logger.error(`IMAP poll error: ${String(err)}`),
-      );
+      void this.pollAll().catch((err: unknown) => this.logger.error(`IMAP poll error: ${String(err)}`));
     }, 60_000);
 
     this.logger.log(`IMAP inbound polling started for ${queues.length} queue(s)`);
@@ -131,12 +131,12 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Process one inbound IMAP message.
-   * Threads by ticket mask in subject; falls back to creating a new ticket.
+   * Threading priority:
+   *   1. In-Reply-To / References header → look up TicketPost.messageId
+   *   2. Subject mask TT-XXXXXX
+   *   3. Fall back to creating a new ticket
    */
-  private async processMessage(
-    msg: FetchMessageObject,
-    departmentId: number | undefined,
-  ): Promise<void> {
+  private async processMessage(msg: FetchMessageObject, departmentId: number | undefined): Promise<void> {
     const { simpleParser } = await import('mailparser');
     const source = msg.source;
     if (!source) return;
@@ -149,25 +149,66 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const textBody = parsed.text ?? '';
     const htmlBody = parsed.html || undefined;
 
-    // Attempt to thread by mask
+    // RFC threading identifiers
+    const incomingMessageId = parsed.messageId ?? undefined;
+    const inReplyTo = parsed.inReplyTo ?? undefined;
+    const references = (parsed.references as string[] | string | undefined) ?? undefined;
+
+    // Build list of message IDs from In-Reply-To and References to try
+    const referencedIds: string[] = [];
+    if (inReplyTo) referencedIds.push(inReplyTo);
+    if (references) {
+      if (Array.isArray(references)) {
+        referencedIds.push(...references);
+      } else {
+        referencedIds.push(...String(references).split(/\s+/).filter(Boolean));
+      }
+    }
+
+    // 1. Try RFC threading by In-Reply-To / References
+    if (referencedIds.length > 0) {
+      const linkedPost = await this.prisma.ticketPost.findFirst({
+        where: { messageId: { in: referencedIds } },
+        include: { ticket: true },
+      });
+
+      if (linkedPost) {
+        await this.ticketsService.reply(linkedPost.ticketId, {
+          contents: htmlBody ?? textBody,
+          isHtml: !!htmlBody,
+          isNote: false,
+          isEmailed: true,
+          isThirdParty: false,
+          creationMode: 'EMAIL',
+          ipAddress: '0.0.0.0',
+        });
+        // Store the incoming messageId on the new post
+        if (incomingMessageId) {
+          await this.storeMessageIdOnLatestPost(linkedPost.ticketId, incomingMessageId);
+        }
+        this.logger.log(`IMAP: RFC-threaded reply to ticket ${linkedPost.ticket.mask} from ${fromEmail}`);
+        return;
+      }
+    }
+
+    // 2. Thread by mask in subject
     const maskMatch = MASK_RE.exec(subject);
     if (maskMatch) {
       const mask = maskMatch[0].toUpperCase();
       try {
         const ticket = await this.ticketsService.getTicketByMask(mask);
-        await this.ticketsService.reply(
-          ticket.id,
-          {
-            contents: htmlBody ?? textBody,
-            isHtml: !!htmlBody,
-            isNote: false,
-            isEmailed: true,
-            isThirdParty: false,
-            creationMode: 'EMAIL',
-            ipAddress: '0.0.0.0',
-          },
-          // no staffId — user/system reply
-        );
+        await this.ticketsService.reply(ticket.id, {
+          contents: htmlBody ?? textBody,
+          isHtml: !!htmlBody,
+          isNote: false,
+          isEmailed: true,
+          isThirdParty: false,
+          creationMode: 'EMAIL',
+          ipAddress: '0.0.0.0',
+        });
+        if (incomingMessageId) {
+          await this.storeMessageIdOnLatestPost(ticket.id, incomingMessageId);
+        }
         this.logger.log(`IMAP: threaded reply to ${mask} from ${fromEmail}`);
         return;
       } catch {
@@ -176,9 +217,9 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // Create new ticket
+    // 3. Create new ticket
     const deptId = departmentId ?? (await this.defaultDeptId());
-    await this.ticketsService.createTicket({
+    const newTicket = await this.ticketsService.createTicket({
       subject,
       contents: htmlBody ?? textBody,
       isHtml: !!htmlBody,
@@ -190,7 +231,37 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       tags: [],
       customFields: {},
     });
-    this.logger.log(`IMAP: new ticket from ${fromEmail} — "${subject}"`);
+
+    // Store the incoming messageId on the first post
+    if (incomingMessageId) {
+      await this.storeMessageIdOnLatestPost(newTicket.id, incomingMessageId);
+    }
+
+    // Send autoresponder
+    await this.mailService.sendTemplate(fromEmail, 'autoresponder', 'en', {
+      mask: newTicket.mask,
+      subject: newTicket.subject,
+      name: fromName,
+    });
+
+    this.logger.log(`IMAP: new ticket ${newTicket.mask} from ${fromEmail} — "${subject}"`);
+  }
+
+  /**
+   * Store the RFC Message-ID on the most recent post of a ticket.
+   * Used so future In-Reply-To matches can find this post.
+   */
+  private async storeMessageIdOnLatestPost(ticketId: number, messageId: string): Promise<void> {
+    const post = await this.prisma.ticketPost.findFirst({
+      where: { ticketId },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (post) {
+      await this.prisma.ticketPost.update({
+        where: { id: post.id },
+        data: { messageId },
+      });
+    }
   }
 
   private async defaultDeptId(): Promise<number> {
