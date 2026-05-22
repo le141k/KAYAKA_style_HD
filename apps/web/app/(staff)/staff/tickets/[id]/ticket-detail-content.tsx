@@ -71,7 +71,6 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
     await replyMutation.mutateAsync({
       body: data.body,
       is_internal: replyTab === 'note',
-      attachments: attachedFiles,
     });
     reset();
     setAttachedFiles([]);

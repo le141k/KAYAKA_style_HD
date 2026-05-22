@@ -74,7 +74,7 @@ describe('StaffService', () => {
       (prisma.staffGroup.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([MOCK_GROUP]);
       const result = await service.listGroups();
       expect(result).toHaveLength(1);
-      expect(result[0].title).toBe('Support');
+      expect(result[0]!.title).toBe('Support');
     });
   });
 

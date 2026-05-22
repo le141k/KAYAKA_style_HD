@@ -1,0 +1,16 @@
+import { chromium } from '@playwright/test';
+const b = await chromium.launch({ headless: true });
+const ctx = await b.newContext();
+const p = await ctx.newPage();
+const errs = [];
+p.on('pageerror', e => errs.push(e.stack || e.message));
+const r = await fetch('http://localhost:4000/api/auth/login', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:'admin@23telecom.example',password:'demo1234'})});
+const { accessToken } = await r.json();
+await ctx.addInitScript(t => { try{localStorage.setItem('auth_token',t)}catch{} }, accessToken);
+await ctx.addCookies([{name:'auth_token',value:accessToken,url:'http://localhost:3000'}]);
+await p.goto('http://localhost:3000/staff/dashboard', { waitUntil:'domcontentloaded', timeout:45000 });
+await p.waitForTimeout(4000);
+const body = await p.textContent('body');
+console.log('CRASHED:', body.includes('Application error')||body.includes('client-side exception'));
+console.log('FIRST PAGEERROR:\n', errs[0] || 'none');
+await b.close();

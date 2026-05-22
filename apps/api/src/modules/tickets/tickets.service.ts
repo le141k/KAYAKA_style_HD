@@ -179,6 +179,14 @@ export class TicketsService {
         orderBy: { [sortBy]: sortDir },
         skip: (page - 1) * limit,
         take: limit,
+        include: {
+          status: true,
+          priority: true,
+          type: true,
+          department: true,
+          owner: { select: { id: true, firstName: true, lastName: true, email: true } },
+          user: { include: { emails: true } },
+        },
       }),
       this.prisma.ticket.count({ where }),
     ]);
@@ -192,6 +200,12 @@ export class TicketsService {
     const ticket = await this.prisma.ticket.findUnique({
       where: { id },
       include: {
+        status: true,
+        priority: true,
+        type: true,
+        department: true,
+        owner: { select: { id: true, firstName: true, lastName: true, email: true } },
+        user: { include: { emails: true } },
         posts: {
           orderBy: { createdAt: 'asc' },
           include: { attachments: true },
@@ -212,6 +226,12 @@ export class TicketsService {
     const ticket = await this.prisma.ticket.findUnique({
       where: { mask },
       include: {
+        status: true,
+        priority: true,
+        type: true,
+        department: true,
+        owner: { select: { id: true, firstName: true, lastName: true, email: true } },
+        user: { include: { emails: true } },
         posts: { orderBy: { createdAt: 'asc' }, include: { attachments: true } },
         notes: { orderBy: { createdAt: 'asc' } },
         attachments: true,

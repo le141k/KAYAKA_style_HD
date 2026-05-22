@@ -197,7 +197,7 @@ describe('KnowledgebaseService', () => {
         isPublished: true,
       });
 
-      const callArg = (prisma.kbArticle.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const callArg = (prisma.kbArticle.create as ReturnType<typeof vi.fn>).mock.calls[0]![0];
       // slug should have a suffix appended
       expect(callArg.data.slug).toMatch(/getting-started-.+/);
     });
@@ -215,7 +215,7 @@ describe('KnowledgebaseService', () => {
         isPublished: false,
       });
 
-      const callArg = (prisma.kbArticle.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const callArg = (prisma.kbArticle.create as ReturnType<typeof vi.fn>).mock.calls[0]![0];
       expect(callArg.data.contentsText).not.toContain('<');
       expect(callArg.data.contentsText).not.toContain('body{}');
     });

@@ -343,7 +343,7 @@ describe('TicketsService (extra coverage)', () => {
       );
 
       // firstResponseAt should NOT be included in update since it was already set
-      const updateCall = (prisma.ticket.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const updateCall = (prisma.ticket.update as ReturnType<typeof vi.fn>).mock.calls[0]![0];
       expect(updateCall.data).not.toHaveProperty('firstResponseAt');
     });
   });

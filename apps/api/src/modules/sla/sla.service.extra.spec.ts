@@ -249,7 +249,7 @@ describe('SlaService (extra coverage)', () => {
         name: 'New Year',
         date: new Date('2025-01-01'),
       } as any);
-      expect(result.name).toBe('New Year');
+      expect((result as any).name).toBe('New Year');
     });
 
     it('throws NotFoundException when schedule not found', async () => {
@@ -269,7 +269,7 @@ describe('SlaService (extra coverage)', () => {
       });
 
       const result = await service.updateHoliday(1, { name: 'Updated' } as any);
-      expect(result.name).toBe('Updated');
+      expect((result as any).name).toBe('Updated');
     });
 
     it('throws NotFoundException when holiday not found', async () => {
@@ -377,7 +377,7 @@ describe('SlaService (extra coverage)', () => {
     it('returns rule when found', async () => {
       (prisma.escalationRule.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_RULE);
       const result = await service.getRule(1);
-      expect(result.name).toBe('Level 1 Escalation');
+      expect((result as any).name).toBe('Level 1 Escalation');
     });
 
     it('throws NotFoundException when rule not found', async () => {
@@ -398,7 +398,7 @@ describe('SlaService (extra coverage)', () => {
         actions: [],
         isEnabled: true,
       } as any);
-      expect(result.name).toBe('Level 1 Escalation');
+      expect((result as any).name).toBe('Level 1 Escalation');
     });
 
     it('throws NotFoundException when plan not found', async () => {
@@ -418,7 +418,7 @@ describe('SlaService (extra coverage)', () => {
       });
 
       const result = await service.updateRule(1, { name: 'Updated' });
-      expect(result.name).toBe('Updated');
+      expect((result as any).name).toBe('Updated');
     });
 
     it('throws NotFoundException when rule not found', async () => {

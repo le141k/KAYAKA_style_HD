@@ -156,7 +156,7 @@ describe('AdminService', () => {
       });
 
       const result = await service.updateField(1, { label: 'Updated Label' } as any);
-      expect(result.label).toBe('Updated Label');
+      expect((result as any).label).toBe('Updated Label');
     });
 
     it('throws NotFoundException when field not found', async () => {
