@@ -1,0 +1,90 @@
+/* 23 Telecom Help Desk — theme "Telecom Signal"
+ * Generated from docs/brand/brand-guidelines.md via the theme-factory step.
+ * shadcn/ui-compatible HSL CSS variables (light + dark) + semantic status tokens.
+ * UI must consume these tokens, never hard-code hex.
+ */
+:root {
+  --background: 210 40% 98%;
+  --foreground: 222 47% 11%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 47% 11%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222 47% 11%;
+  --primary: 210 90% 42%;            /* brand-600 #0B6BCB */
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 40% 96%;
+  --secondary-foreground: 222 47% 11%;
+  --muted: 210 40% 96%;
+  --muted-foreground: 215 16% 47%;   /* #64748B */
+  --accent: 189 94% 43%;             /* cyan-500 #06B6D4 */
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 72% 51%;          /* #DC2626 */
+  --destructive-foreground: 0 0% 100%;
+  --border: 214 32% 91%;             /* #E2E8F0 */
+  --input: 214 32% 91%;
+  --ring: 210 90% 42%;
+  --radius: 0.5rem;
+
+  /* brand scale */
+  --brand-700: 209 92% 33%;
+  --brand-600: 210 90% 42%;
+  --brand-500: 209 79% 49%;
+  --indigo-500: 239 84% 67%;
+
+  /* semantic status (ticket lifecycle + SLA + priority) */
+  --status-open: 209 79% 49%;
+  --status-pending: 38 92% 50%;
+  --status-progress: 239 84% 67%;
+  --status-resolved: 142 71% 35%;
+  --status-closed: 215 16% 47%;
+  --sla-ok: 142 71% 35%;
+  --sla-warn: 38 92% 50%;
+  --sla-breach: 0 72% 51%;
+  --priority-urgent: 0 72% 51%;
+  --priority-high: 25 95% 53%;
+  --priority-normal: 209 79% 49%;
+  --priority-low: 215 16% 47%;
+
+  --chart-1: 210 90% 42%;
+  --chart-2: 189 94% 43%;
+  --chart-3: 239 84% 67%;
+  --chart-4: 38 92% 50%;
+  --chart-5: 142 71% 35%;
+
+  --shadow-sm: 0 1px 2px 0 rgb(15 23 42 / 0.06);
+  --shadow-md: 0 4px 12px -2px rgb(15 23 42 / 0.12);
+}
+
+.dark {
+  --background: 222 47% 8%;          /* #0B1220 */
+  --foreground: 213 31% 91%;
+  --card: 220 39% 13%;               /* #111A2E */
+  --card-foreground: 213 31% 91%;
+  --popover: 220 39% 13%;
+  --popover-foreground: 213 31% 91%;
+  --primary: 209 79% 49%;            /* brand-500 (brighter in dark) */
+  --primary-foreground: 0 0% 100%;
+  --secondary: 217 33% 17%;
+  --secondary-foreground: 213 31% 91%;
+  --muted: 217 33% 17%;
+  --muted-foreground: 215 20% 65%;
+  --accent: 189 94% 43%;
+  --accent-foreground: 222 47% 8%;
+  --destructive: 0 63% 45%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 217 33% 17%;             /* #1E293B */
+  --input: 217 33% 17%;
+  --ring: 209 79% 49%;
+
+  --status-open: 209 79% 55%;
+  --status-pending: 38 92% 55%;
+  --status-progress: 239 84% 72%;
+  --status-resolved: 142 60% 45%;
+  --status-closed: 215 20% 65%;
+  --sla-ok: 142 60% 45%;
+  --sla-warn: 38 92% 55%;
+  --sla-breach: 0 72% 58%;
+
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.4);
+  --shadow-md: 0 4px 16px -2px rgb(0 0 0 / 0.55);
+}

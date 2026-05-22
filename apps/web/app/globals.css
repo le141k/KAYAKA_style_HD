@@ -1,0 +1,198 @@
+/* 23 Telecom Help Desk — Global Styles
+ * Tokens sourced from frontend/styles/theme/tokens.css (Telecom Signal theme)
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Theme Tokens (shadcn HSL CSS vars + brand/status/SLA/priority) ─── */
+:root {
+  --background: 210 40% 98%;
+  --foreground: 222 47% 11%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 47% 11%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222 47% 11%;
+  --primary: 210 90% 42%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 40% 96%;
+  --secondary-foreground: 222 47% 11%;
+  --muted: 210 40% 96%;
+  --muted-foreground: 215 16% 47%;
+  --accent: 189 94% 43%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 214 32% 91%;
+  --input: 214 32% 91%;
+  --ring: 210 90% 42%;
+  --radius: 0.5rem;
+
+  /* brand scale */
+  --brand-700: 209 92% 33%;
+  --brand-600: 210 90% 42%;
+  --brand-500: 209 79% 49%;
+  --indigo-500: 239 84% 67%;
+
+  /* semantic status */
+  --status-open: 209 79% 49%;
+  --status-pending: 38 92% 50%;
+  --status-progress: 239 84% 67%;
+  --status-resolved: 142 71% 35%;
+  --status-closed: 215 16% 47%;
+  --sla-ok: 142 71% 35%;
+  --sla-warn: 38 92% 50%;
+  --sla-breach: 0 72% 51%;
+  --priority-urgent: 0 72% 51%;
+  --priority-high: 25 95% 53%;
+  --priority-normal: 209 79% 49%;
+  --priority-low: 215 16% 47%;
+
+  --chart-1: 210 90% 42%;
+  --chart-2: 189 94% 43%;
+  --chart-3: 239 84% 67%;
+  --chart-4: 38 92% 50%;
+  --chart-5: 142 71% 35%;
+
+  --shadow-sm: 0 1px 2px 0 rgb(15 23 42 / 0.06);
+  --shadow-md: 0 4px 12px -2px rgb(15 23 42 / 0.12);
+}
+
+.dark {
+  --background: 222 47% 8%;
+  --foreground: 213 31% 91%;
+  --card: 220 39% 13%;
+  --card-foreground: 213 31% 91%;
+  --popover: 220 39% 13%;
+  --popover-foreground: 213 31% 91%;
+  --primary: 209 79% 49%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 217 33% 17%;
+  --secondary-foreground: 213 31% 91%;
+  --muted: 217 33% 17%;
+  --muted-foreground: 215 20% 65%;
+  --accent: 189 94% 43%;
+  --accent-foreground: 222 47% 8%;
+  --destructive: 0 63% 45%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 217 33% 17%;
+  --input: 217 33% 17%;
+  --ring: 209 79% 49%;
+
+  --status-open: 209 79% 55%;
+  --status-pending: 38 92% 55%;
+  --status-progress: 239 84% 72%;
+  --status-resolved: 142 60% 45%;
+  --status-closed: 215 20% 65%;
+  --sla-ok: 142 60% 45%;
+  --sla-warn: 38 92% 55%;
+  --sla-breach: 0 72% 58%;
+
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.4);
+  --shadow-md: 0 4px 16px -2px rgb(0 0 0 / 0.55);
+}
+
+/* ─── Base Styles ─── */
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    @apply scroll-smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-sans font-semibold tracking-tight;
+  }
+
+  code, kbd, pre, samp {
+    @apply font-mono;
+  }
+
+  /* Focus rings */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-border rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-muted-foreground/40;
+  }
+}
+
+/* ─── Utility Classes ─── */
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .text-gradient-brand {
+    background: linear-gradient(
+      135deg,
+      hsl(var(--brand-600)),
+      hsl(var(--accent))
+    );
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .bg-gradient-brand {
+    background: linear-gradient(
+      135deg,
+      hsl(var(--brand-700)),
+      hsl(var(--brand-600)),
+      hsl(var(--accent))
+    );
+  }
+
+  .bg-gradient-subtle {
+    background: linear-gradient(
+      180deg,
+      hsl(var(--background)),
+      hsl(var(--muted))
+    );
+  }
+
+  .shadow-brand-glow {
+    box-shadow: 0 0 0 3px hsl(var(--primary) / 0.2);
+  }
+
+  .shimmer-bg {
+    background: linear-gradient(
+      90deg,
+      hsl(var(--muted)) 0%,
+      hsl(var(--muted-foreground) / 0.1) 50%,
+      hsl(var(--muted)) 100%
+    );
+    background-size: 200% 100%;
+  }
+
+  /* reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}

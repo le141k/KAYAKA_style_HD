@@ -1,0 +1,729 @@
+// 23 Telecom Help Desk — data model
+// Modern, normalized rewrite of the Kayako Classic `kayako_fusion` schema.
+// Key modernizations vs. Kayako:
+//   * real foreign keys & referential integrity (Kayako had none)
+//   * DateTime instead of unix-int columns
+//   * custom fields as JSONB (`customFields`) instead of the EAV value table
+//   * attachments referenced by storage key (disk/object store), not chunked BLOBs
+//   * denormalized `*title` mirror columns dropped (joined live instead)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── enums ─────────────────────────────
+
+enum DepartmentType {
+  PUBLIC
+  PRIVATE
+}
+
+enum UserGroupType {
+  GUEST
+  REGISTERED
+}
+
+enum ActorType {
+  STAFF
+  USER
+  SYSTEM
+}
+
+enum CreationMode {
+  WEB
+  EMAIL
+  API
+  STAFF
+  ALARIS
+}
+
+enum CustomFieldScope {
+  TICKET
+  USER
+  STAFF
+  ORGANIZATION
+}
+
+enum CustomFieldType {
+  TEXT
+  TEXTAREA
+  PASSWORD
+  CHECKBOX
+  RADIO
+  SELECT
+  MULTISELECT
+  DATE
+  FILE
+  CUSTOM
+}
+
+enum SlaTargetType {
+  FIRST_RESPONSE
+  RESOLUTION
+}
+
+enum EmailQueueType {
+  IMAP
+  POP3
+  PIPE
+}
+
+enum FlagType {
+  NONE
+  PURPLE
+  ORANGE
+  GREEN
+  YELLOW
+  RED
+  BLUE
+}
+
+// ───────────────────────────── staff / RBAC ─────────────────────────────
+
+model StaffGroup {
+  id          Int      @id @default(autoincrement())
+  title       String
+  isAdmin     Boolean  @default(false)
+  // RBAC: list of permission keys (see apps/api/src/auth/permissions.ts catalog)
+  permissions String[] @default([])
+  staff       Staff[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Staff {
+  id              Int       @id @default(autoincrement())
+  email           String    @unique
+  username        String    @unique
+  firstName       String
+  lastName        String
+  passwordHash    String
+  designation     String    @default("")
+  signature       String    @default("")
+  mobileNumber    String    @default("")
+  timezone        String    @default("UTC")
+  isEnabled       Boolean   @default(true)
+  staffGroup      StaffGroup @relation(fields: [staffGroupId], references: [id])
+  staffGroupId    Int
+  // departments this agent can act in (empty = all, governed by group)
+  departments     DepartmentStaff[]
+  ownedTickets    Ticket[]  @relation("TicketOwner")
+  posts           TicketPost[]
+  notes           TicketNote[]
+  auditLogs       TicketAuditLog[]
+  refreshTokens   RefreshToken[]
+  watching        TicketWatcher[]
+  lastLoginAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([staffGroupId])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  staffId   Int
+  tokenHash String   @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([staffId])
+}
+
+// ───────────────────────────── customers / orgs ─────────────────────────────
+
+model UserGroup {
+  id        Int           @id @default(autoincrement())
+  title     String
+  type      UserGroupType @default(REGISTERED)
+  isMaster  Boolean       @default(false)
+  users     User[]
+  createdAt DateTime      @default(now())
+}
+
+model Organization {
+  id          Int      @id @default(autoincrement())
+  name        String
+  address     String   @default("")
+  city        String   @default("")
+  state       String   @default("")
+  postalCode  String   @default("")
+  country     String   @default("")
+  phone       String   @default("")
+  website     String   @default("")
+  slaPlan     SlaPlan? @relation(fields: [slaPlanId], references: [id])
+  slaPlanId   Int?
+  users       User[]
+  customFields Json    @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model User {
+  id             Int           @id @default(autoincrement())
+  fullName       String
+  phone          String        @default("")
+  designation    String        @default("")
+  // nullable: many customers are created from inbound email without a password
+  passwordHash   String?
+  isEnabled      Boolean       @default(true)
+  isValidated    Boolean       @default(false)
+  timezone       String        @default("UTC")
+  userGroup      UserGroup?    @relation(fields: [userGroupId], references: [id])
+  userGroupId    Int?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  organizationId Int?
+  emails         UserEmail[]
+  tickets        Ticket[]
+  posts          TicketPost[]
+  geoip          Json?
+  customFields   Json          @default("{}")
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([organizationId])
+}
+
+model UserEmail {
+  id        Int     @id @default(autoincrement())
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    Int
+  email     String  @unique
+  isPrimary Boolean @default(false)
+
+  @@index([userId])
+}
+
+// ───────────────────────────── departments ─────────────────────────────
+
+model Department {
+  id           Int            @id @default(autoincrement())
+  title        String
+  type         DepartmentType @default(PUBLIC)
+  app          String         @default("tickets")
+  isDefault    Boolean        @default(false)
+  displayOrder Int            @default(0)
+  parent       Department?    @relation("DepartmentTree", fields: [parentId], references: [id])
+  parentId     Int?
+  children     Department[]   @relation("DepartmentTree")
+  tickets      Ticket[]
+  staff        DepartmentStaff[]
+  emailQueues  EmailQueue[]
+  createdAt    DateTime       @default(now())
+}
+
+model DepartmentStaff {
+  department   Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  departmentId Int
+  staff        Staff      @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  staffId      Int
+
+  @@id([departmentId, staffId])
+}
+
+// ───────────────────────────── ticket reference data ─────────────────────────────
+
+model TicketStatus {
+  id            Int      @id @default(autoincrement())
+  title         String
+  displayOrder  Int      @default(0)
+  markAsResolved Boolean @default(false)
+  color         String   @default("")
+  bgColor       String   @default("")
+  displayIcon   String   @default("")
+  triggersSurvey Boolean @default(false)
+  isDefault     Boolean  @default(false)
+  tickets       Ticket[]
+}
+
+model TicketPriority {
+  id           Int      @id @default(autoincrement())
+  title        String
+  displayOrder Int      @default(0)
+  color        String   @default("")
+  bgColor      String   @default("")
+  tickets      Ticket[]
+}
+
+model TicketType {
+  id           Int      @id @default(autoincrement())
+  title        String
+  displayOrder Int      @default(0)
+  displayIcon  String   @default("")
+  tickets      Ticket[]
+}
+
+// ───────────────────────────── tickets ─────────────────────────────
+
+model Ticket {
+  id              Int            @id @default(autoincrement())
+  mask            String         @unique          // human ID, e.g. TT-000123
+  subject         String
+
+  department      Department     @relation(fields: [departmentId], references: [id])
+  departmentId    Int
+  status          TicketStatus   @relation(fields: [statusId], references: [id])
+  statusId        Int
+  priority        TicketPriority @relation(fields: [priorityId], references: [id])
+  priorityId      Int
+  type            TicketType?    @relation(fields: [typeId], references: [id])
+  typeId          Int?
+
+  // requester (registered user optional; raw email always captured)
+  user            User?          @relation(fields: [userId], references: [id])
+  userId          Int?
+  requesterName   String         @default("")
+  requesterEmail  String         @default("")
+
+  owner           Staff?         @relation("TicketOwner", fields: [ownerStaffId], references: [id])
+  ownerStaffId    Int?
+
+  slaPlan         SlaPlan?       @relation(fields: [slaPlanId], references: [id])
+  slaPlanId       Int?
+  dueAt           DateTime?
+  resolutionDueAt DateTime?
+  firstResponseAt DateTime?
+  resolvedAt      DateTime?
+  reopenedAt      DateTime?
+
+  creationMode    CreationMode   @default(WEB)
+  creator         ActorType      @default(USER)
+  flagType        FlagType       @default(NONE)
+
+  totalReplies    Int            @default(0)
+  hasAttachments  Boolean        @default(false)
+  hasNotes        Boolean        @default(false)
+  isResolved      Boolean        @default(false)
+  isEscalated     Boolean        @default(false)
+  escalationLevel Int            @default(0)
+  wasReopened     Boolean        @default(false)
+  isPhoneCall     Boolean        @default(false)
+  ipAddress       String         @default("0.0.0.0")
+
+  // threading
+  messageId       String?        @default("")
+
+  // merge: when merged, points to surviving ticket
+  mergedInto      Ticket?        @relation("TicketMerge", fields: [mergedIntoId], references: [id])
+  mergedIntoId    Int?
+  mergedFrom      Ticket[]       @relation("TicketMerge")
+
+  customFields    Json           @default("{}")
+
+  posts           TicketPost[]
+  notes           TicketNote[]
+  attachments     Attachment[]
+  watchers        TicketWatcher[]
+  tags            TicketTag[]
+  auditLogs       TicketAuditLog[]
+  linksFrom       TicketLink[]   @relation("LinkSource")
+  linksTo         TicketLink[]   @relation("LinkTarget")
+  alarisEvent     AlarisEvent?
+
+  lastReplyAt     DateTime?
+  lastActivityAt  DateTime       @default(now())
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([statusId])
+  @@index([departmentId])
+  @@index([ownerStaffId])
+  @@index([userId])
+  @@index([lastActivityAt])
+  @@index([createdAt])
+}
+
+model TicketPost {
+  id           Int        @id @default(autoincrement())
+  ticket       Ticket     @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId     Int
+  authorType   ActorType  @default(USER)
+  staff        Staff?     @relation(fields: [staffId], references: [id])
+  staffId      Int?
+  user         User?      @relation(fields: [userId], references: [id])
+  userId       Int?
+  fullName     String     @default("")
+  email        String     @default("")
+  subject      String     @default("")
+  contents     String     // body (HTML or plaintext per isHtml)
+  isHtml       Boolean    @default(true)
+  isEmailed    Boolean    @default(false)
+  isThirdParty Boolean    @default(false)
+  creationMode CreationMode @default(WEB)
+  messageId    String?    @default("")    // RFC Message-ID for threading
+  ipAddress    String     @default("0.0.0.0")
+  attachments  Attachment[]
+  editedAt     DateTime?
+  editedByStaffId Int?
+  createdAt    DateTime   @default(now())
+
+  @@index([ticketId])
+  @@index([messageId])
+}
+
+model TicketNote {
+  id        Int      @id @default(autoincrement())
+  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId  Int
+  staff     Staff?   @relation(fields: [staffId], references: [id])
+  staffId   Int?
+  contents  String
+  createdAt DateTime @default(now())
+
+  @@index([ticketId])
+}
+
+model Attachment {
+  id         Int         @id @default(autoincrement())
+  ticket     Ticket?     @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId   Int?
+  post       TicketPost? @relation(fields: [postId], references: [id], onDelete: Cascade)
+  postId     Int?
+  fileName   String
+  mimeType   String      @default("application/octet-stream")
+  size       Int         @default(0)
+  sha1       String      @default("")
+  storageKey String                       // path/key in object store or disk
+  createdAt  DateTime    @default(now())
+
+  @@index([ticketId])
+  @@index([postId])
+}
+
+model TicketWatcher {
+  ticket   Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId Int
+  staff    Staff  @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  staffId  Int
+
+  @@id([ticketId, staffId])
+}
+
+model TicketTag {
+  id      Int      @id @default(autoincrement())
+  name    String   @unique
+  tickets Ticket[]
+}
+
+model TicketAuditLog {
+  id        Int       @id @default(autoincrement())
+  ticket    Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId  Int
+  staff     Staff?    @relation(fields: [staffId], references: [id])
+  staffId   Int?
+  actorType ActorType @default(STAFF)
+  action    String                       // e.g. STATUS_CHANGE, ASSIGN, REPLY, MERGE
+  field     String?
+  oldValue  String?
+  newValue  String?
+  createdAt DateTime  @default(now())
+
+  @@index([ticketId])
+}
+
+model TicketLink {
+  id        Int    @id @default(autoincrement())
+  source    Ticket @relation("LinkSource", fields: [sourceId], references: [id], onDelete: Cascade)
+  sourceId  Int
+  target    Ticket @relation("LinkTarget", fields: [targetId], references: [id], onDelete: Cascade)
+  targetId  Int
+  linkType  String @default("related")
+
+  @@unique([sourceId, targetId])
+}
+
+// ───────────────────────────── SLA / escalation ─────────────────────────────
+
+model SlaSchedule {
+  id        Int          @id @default(autoincrement())
+  title     String
+  // weekly operational hours: { mon: [["09:00","18:00"]], ... }
+  workHours Json         @default("{}")
+  holidays  SlaHoliday[]
+  plans     SlaPlan[]
+  createdAt DateTime     @default(now())
+}
+
+model SlaHoliday {
+  id         Int         @id @default(autoincrement())
+  schedule   SlaSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  scheduleId Int
+  title      String
+  date       DateTime
+
+  @@index([scheduleId])
+}
+
+model SlaPlan {
+  id                   Int             @id @default(autoincrement())
+  title                String
+  isEnabled            Boolean         @default(true)
+  // criteria for auto-applying the plan (JSON rule set)
+  criteria             Json            @default("[]")
+  firstResponseSeconds Int?
+  resolutionSeconds    Int?
+  schedule             SlaSchedule?    @relation(fields: [scheduleId], references: [id])
+  scheduleId           Int?
+  escalationRules      EscalationRule[]
+  tickets              Ticket[]
+  organizations        Organization[]
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+}
+
+model EscalationRule {
+  id              Int           @id @default(autoincrement())
+  slaPlan         SlaPlan       @relation(fields: [slaPlanId], references: [id], onDelete: Cascade)
+  slaPlanId       Int
+  name            String
+  targetType      SlaTargetType @default(FIRST_RESPONSE)
+  thresholdSeconds Int          @default(0)
+  // actions to run on breach (assign, notify, change priority…)
+  actions         Json          @default("[]")
+  isEnabled       Boolean       @default(true)
+
+  @@index([slaPlanId])
+}
+
+// ───────────────────────────── workflows / macros ─────────────────────────────
+
+model MacroCategory {
+  id      Int     @id @default(autoincrement())
+  title   String
+  parent  MacroCategory? @relation("MacroTree", fields: [parentId], references: [id])
+  parentId Int?
+  children MacroCategory[] @relation("MacroTree")
+  macros  Macro[]
+}
+
+model Macro {
+  id         Int            @id @default(autoincrement())
+  category   MacroCategory? @relation(fields: [categoryId], references: [id])
+  categoryId Int?
+  title      String
+  replyText  String         @default("")
+  // bulk actions applied with the macro
+  actions    Json           @default("[]")
+  createdAt  DateTime       @default(now())
+}
+
+model Workflow {
+  id        Int      @id @default(autoincrement())
+  title     String
+  criteria  Json     @default("[]")   // condition set
+  actions   Json     @default("[]")   // actions to apply
+  isEnabled Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ───────────────────────────── mail ─────────────────────────────
+
+model EmailQueue {
+  id             Int            @id @default(autoincrement())
+  type           EmailQueueType @default(IMAP)
+  emailAddress   String
+  host           String         @default("")
+  port           Int            @default(993)
+  username       String         @default("")
+  passwordEnc    String         @default("")   // encrypted at rest
+  useTls         Boolean        @default(true)
+  department     Department?    @relation(fields: [departmentId], references: [id])
+  departmentId   Int?
+  signature      String         @default("")
+  isEnabled      Boolean        @default(false)
+  createdAt      DateTime       @default(now())
+}
+
+model EmailTemplate {
+  id        Int      @id @default(autoincrement())
+  key       String                          // e.g. ticket_user_reply, autoresponder
+  locale    String   @default("en")
+  subject   String
+  htmlBody  String
+  textBody  String   @default("")
+  updatedAt DateTime @updatedAt
+
+  @@unique([key, locale])
+}
+
+// ───────────────────────────── custom fields (metadata only; values live as JSONB) ─────────────────────────────
+
+model CustomFieldGroup {
+  id           Int              @id @default(autoincrement())
+  title        String
+  scope        CustomFieldScope @default(TICKET)
+  displayOrder Int              @default(0)
+  fields       CustomField[]
+}
+
+model CustomField {
+  id           Int              @id @default(autoincrement())
+  group        CustomFieldGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  groupId      Int
+  // stable key used inside the owning entity's `customFields` JSONB
+  fieldKey     String
+  title        String
+  type         CustomFieldType  @default(TEXT)
+  isRequired   Boolean          @default(false)
+  isEncrypted  Boolean          @default(false)
+  options      Json             @default("[]")
+  displayOrder Int              @default(0)
+
+  @@unique([groupId, fieldKey])
+}
+
+// ───────────────────────────── knowledgebase ─────────────────────────────
+
+model KbCategory {
+  id           Int          @id @default(autoincrement())
+  title        String
+  parent       KbCategory?  @relation("KbTree", fields: [parentId], references: [id])
+  parentId     Int?
+  children     KbCategory[] @relation("KbTree")
+  displayOrder Int          @default(0)
+  isPublished  Boolean      @default(true)
+  articles     KbArticle[]
+}
+
+model KbArticle {
+  id            Int                @id @default(autoincrement())
+  category      KbCategory?        @relation(fields: [categoryId], references: [id])
+  categoryId    Int?
+  title         String
+  slug          String             @unique
+  contents      String                              // current HTML
+  contentsText  String             @default("")     // plaintext for search
+  isPublished   Boolean            @default(false)
+  views         Int                @default(0)
+  authorStaffId Int?
+  revisions     KbArticleRevision[]
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([categoryId])
+}
+
+model KbArticleRevision {
+  id             Int       @id @default(autoincrement())
+  article        KbArticle @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  articleId      Int
+  contents       String
+  editedByStaffId Int?
+  createdAt      DateTime  @default(now())
+
+  @@index([articleId])
+}
+
+// ───────────────────────────── news ─────────────────────────────
+
+model NewsItem {
+  id            Int       @id @default(autoincrement())
+  title         String
+  contents      String
+  isPublished   Boolean   @default(false)
+  publishedAt   DateTime?
+  authorStaffId Int?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+// ───────────────────────────── settings ─────────────────────────────
+
+model Setting {
+  id      Int    @id @default(autoincrement())
+  section String
+  key     String
+  value   Json   @default("null")
+
+  @@unique([section, key])
+}
+
+// ───────────────────────────── alaris integration (STUB) ─────────────────────────────
+
+model AlarisEvent {
+  id         Int      @id @default(autoincrement())
+  externalId String   @unique
+  severity   String   @default("info")
+  payload    Json     @default("{}")
+  ticket     Ticket?  @relation(fields: [ticketId], references: [id])
+  ticketId   Int?     @unique
+  receivedAt DateTime @default(now())
+}
+
+// ───────────────────────────── troubleshooter (branching guides) ─────────────────────────────
+
+model TroubleshooterCategory {
+  id           Int                       @id @default(autoincrement())
+  title        String
+  parent       TroubleshooterCategory?   @relation("TsTree", fields: [parentId], references: [id])
+  parentId     Int?
+  children     TroubleshooterCategory[]  @relation("TsTree")
+  displayOrder Int                       @default(0)
+  isPublished  Boolean                   @default(true)
+  steps        TroubleshooterStep[]
+}
+
+model TroubleshooterStep {
+  id           Int                     @id @default(autoincrement())
+  category     TroubleshooterCategory  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  categoryId   Int
+  title        String
+  contents     String
+  displayOrder Int                     @default(0)
+  // branching: outgoing links to next steps
+  linksFrom    TroubleshooterStepLink[] @relation("TsFrom")
+  linksTo      TroubleshooterStepLink[] @relation("TsTo")
+  createdAt    DateTime                @default(now())
+
+  @@index([categoryId])
+}
+
+model TroubleshooterStepLink {
+  id       Int                @id @default(autoincrement())
+  from     TroubleshooterStep @relation("TsFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  fromId   Int
+  to       TroubleshooterStep @relation("TsTo", fields: [toId], references: [id], onDelete: Cascade)
+  toId     Int
+  label    String             @default("")
+
+  @@unique([fromId, toId])
+}
+
+// ───────────────────────────── reports ─────────────────────────────
+
+enum ReportKind {
+  TABULAR
+  SUMMARY
+  MATRIX
+}
+
+model Report {
+  id         Int              @id @default(autoincrement())
+  title      String
+  kind       ReportKind       @default(SUMMARY)
+  // declarative definition: { source, columns, filters, groupBy, aggregates } (KQL-lite)
+  definition Json             @default("{}")
+  schedules  ReportSchedule[]
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+}
+
+model ReportSchedule {
+  id         Int      @id @default(autoincrement())
+  report     Report   @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  reportId   Int
+  cron       String
+  recipients Json     @default("[]")
+  isEnabled  Boolean  @default(true)
+
+  @@index([reportId])
+}

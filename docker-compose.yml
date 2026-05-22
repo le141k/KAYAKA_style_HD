@@ -1,0 +1,69 @@
+name: telecom-hd
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${TELECOM_HD_DB_USER:-telecom_hd}
+      POSTGRES_PASSWORD: ${TELECOM_HD_DB_PASSWORD:-telecom_hd_dev}
+      POSTGRES_DB: ${TELECOM_HD_DB_NAME:-telecom_hd}
+    ports:
+      - "55432:5432"   # host 55432 to avoid clashing with a native postgres on 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TELECOM_HD_DB_USER:-telecom_hd}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "56379:6379"   # host 56379 to avoid clashing with a native redis on 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # web UI
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${TELECOM_HD_DB_USER:-telecom_hd}:${TELECOM_HD_DB_PASSWORD:-telecom_hd_dev}@postgres:5432/${TELECOM_HD_DB_NAME:-telecom_hd}?schema=public
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+    # On first boot: apply migrations + seed, then start.
+    command: ["sh", "-c", "npx prisma migrate deploy && node dist/seed/seed.js && node dist/main.js"]
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+      TELECOM_HD_API_URL: http://api:4000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

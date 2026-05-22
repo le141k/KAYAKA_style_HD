@@ -1,0 +1,111 @@
+import { z } from 'zod';
+
+// ─────────────────── create ───────────────────
+
+export const CreateTicketSchema = z.object({
+  subject: z.string().min(1).max(500),
+  /** Initial post body */
+  contents: z.string().min(1),
+  isHtml: z.boolean().default(true),
+  departmentId: z.number().int().positive(),
+  statusId: z.number().int().positive().optional(),
+  priorityId: z.number().int().positive().optional(),
+  typeId: z.number().int().positive().optional(),
+  /** Requester identification — at least one must be provided */
+  requesterEmail: z.string().email(),
+  requesterName: z.string().default(''),
+  /** If provided, links to existing User; otherwise resolved by email */
+  userId: z.number().int().positive().optional(),
+  ownerStaffId: z.number().int().positive().optional(),
+  slaPlanId: z.number().int().positive().optional(),
+  customFields: z.record(z.unknown()).default({}),
+  tags: z.array(z.string()).default([]),
+  creationMode: z
+    .enum(['WEB', 'EMAIL', 'API', 'STAFF', 'ALARIS'])
+    .default('STAFF'),
+  ipAddress: z.string().default('0.0.0.0'),
+});
+export type CreateTicketDto = z.infer<typeof CreateTicketSchema>;
+
+// ─────────────────── reply / note ───────────────────
+
+export const ReplyTicketSchema = z.object({
+  contents: z.string().min(1),
+  isHtml: z.boolean().default(true),
+  /** True = internal note only; stored in TicketNote not TicketPost */
+  isNote: z.boolean().default(false),
+  isEmailed: z.boolean().default(false),
+  isThirdParty: z.boolean().default(false),
+  creationMode: z.enum(['WEB', 'EMAIL', 'API', 'STAFF', 'ALARIS']).default('STAFF'),
+  ipAddress: z.string().default('0.0.0.0'),
+});
+export type ReplyTicketDto = z.infer<typeof ReplyTicketSchema>;
+
+// ─────────────────── assign ───────────────────
+
+export const AssignTicketSchema = z.object({
+  ownerStaffId: z.number().int().positive().nullable(),
+});
+export type AssignTicketDto = z.infer<typeof AssignTicketSchema>;
+
+// ─────────────────── status / priority / type ───────────────────
+
+export const ChangeStatusSchema = z.object({ statusId: z.number().int().positive() });
+export type ChangeStatusDto = z.infer<typeof ChangeStatusSchema>;
+
+export const ChangePrioritySchema = z.object({ priorityId: z.number().int().positive() });
+export type ChangePriorityDto = z.infer<typeof ChangePrioritySchema>;
+
+export const ChangeTypeSchema = z.object({ typeId: z.number().int().positive().nullable() });
+export type ChangeTypeDto = z.infer<typeof ChangeTypeSchema>;
+
+// ─────────────────── merge ───────────────────
+
+export const MergeTicketSchema = z.object({
+  /** The ticket ID that will SURVIVE (the other ticket is merged into this one). */
+  targetTicketId: z.number().int().positive(),
+});
+export type MergeTicketDto = z.infer<typeof MergeTicketSchema>;
+
+// ─────────────────── tags / watchers ───────────────────
+
+export const TagSchema = z.object({ name: z.string().min(1).max(100) });
+export type TagDto = z.infer<typeof TagSchema>;
+
+export const WatcherSchema = z.object({ staffId: z.number().int().positive() });
+export type WatcherDto = z.infer<typeof WatcherSchema>;
+
+// ─────────────────── list query ───────────────────
+
+export const ListTicketsQuerySchema = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().positive().max(100).default(20),
+  statusId: z.coerce.number().int().positive().optional(),
+  priorityId: z.coerce.number().int().positive().optional(),
+  departmentId: z.coerce.number().int().positive().optional(),
+  typeId: z.coerce.number().int().positive().optional(),
+  ownerStaffId: z.coerce.number().int().positive().optional(),
+  /** When true, list only unassigned tickets */
+  unassigned: z.coerce.boolean().optional(),
+  search: z.string().optional(),
+  /** Filter by requester user id */
+  userId: z.coerce.number().int().positive().optional(),
+  isResolved: z.coerce.boolean().optional(),
+  /** Sort field */
+  sortBy: z.enum(['createdAt', 'lastActivityAt', 'lastReplyAt']).default('lastActivityAt'),
+  sortDir: z.enum(['asc', 'desc']).default('desc'),
+});
+export type ListTicketsQueryDto = z.infer<typeof ListTicketsQuerySchema>;
+
+// ─────────────────── public submission ───────────────────
+
+export const PublicCreateTicketSchema = z.object({
+  subject: z.string().min(1).max(500),
+  contents: z.string().min(1),
+  requesterEmail: z.string().email(),
+  requesterName: z.string().min(1).max(200),
+  departmentId: z.number().int().positive().optional(),
+  typeId: z.number().int().positive().optional(),
+  customFields: z.record(z.unknown()).default({}),
+});
+export type PublicCreateTicketDto = z.infer<typeof PublicCreateTicketSchema>;

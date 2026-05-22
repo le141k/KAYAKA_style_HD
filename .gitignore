@@ -1,0 +1,36 @@
+# deps
+node_modules/
+.pnp.*
+.yarn/*
+
+# build
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# env
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# test / coverage
+coverage/
+playwright-report/
+test-results/
+.nyc_output/
+
+# prisma
+apps/api/prisma/*.db
+
+# logs
+*.log
+npm-debug.log*
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

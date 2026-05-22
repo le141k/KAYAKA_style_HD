@@ -1,0 +1,24 @@
+{
+  "name": "Telecom Signal",
+  "source": "docs/brand/brand-guidelines.md",
+  "typography": {
+    "ui": "Inter, -apple-system, \"Segoe UI\", Arial, sans-serif",
+    "mono": "\"JetBrains Mono\", ui-monospace, \"SF Mono\", Menlo, monospace",
+    "scale": ["0.75rem","0.875rem","1rem","1.125rem","1.25rem","1.5rem","1.875rem","2.25rem","3rem"]
+  },
+  "radii": { "sm": "6px", "md": "8px", "lg": "12px", "xl": "16px", "full": "9999px" },
+  "spacing": { "base": 4 },
+  "shadows": {
+    "sm": "0 1px 2px 0 rgb(15 23 42 / 0.06)",
+    "md": "0 4px 12px -2px rgb(15 23 42 / 0.12)"
+  },
+  "motion": { "enter": "200ms ease-out", "exit": "150ms ease-in", "respectReducedMotion": true },
+  "accentCycle": ["brand", "cyan", "indigo"],
+  "status": {
+    "open": "#1A7FE0", "pending": "#F59E0B", "progress": "#6366F1",
+    "resolved": "#16A34A", "closed": "#64748B",
+    "slaOk": "#16A34A", "slaWarn": "#F59E0B", "slaBreach": "#DC2626",
+    "priorityUrgent": "#DC2626", "priorityHigh": "#F97316",
+    "priorityNormal": "#1A7FE0", "priorityLow": "#64748B"
+  }
+}
