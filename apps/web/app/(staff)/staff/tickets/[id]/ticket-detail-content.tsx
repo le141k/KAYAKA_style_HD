@@ -41,7 +41,8 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const replyMutation = useReply(ticketId);
 
   const [replyTab, setReplyTab] = useState<'reply' | 'note'>('reply');
-  const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
+  // Files are collected for UX; the reply endpoint does not yet accept uploads.
+  const [, setAttachedFiles] = useState<File[]>([]);
   const [assigneeId, setAssigneeId] = useState<string>(ticket?.assignee ? String(ticket.assignee.id) : '');
 
   const {
@@ -73,7 +74,6 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
       is_internal: replyTab === 'note',
     });
     reset();
-    setAttachedFiles([]);
     toast({
       title: replyTab === 'note' ? 'Заметка добавлена' : 'Ответ отправлен',
     });
