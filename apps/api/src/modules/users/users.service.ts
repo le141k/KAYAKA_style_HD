@@ -1,9 +1,6 @@
-import {
-  ConflictException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
+import { AdminService } from '../admin/admin.service';
 import type { CreateUserDto, UpdateUserDto, ListUsersQueryDto, AddEmailDto } from './dto';
 import type { User, UserEmail } from '@prisma/client';
 
@@ -31,7 +28,10 @@ const SAFE_USER_SELECT = {
 
 @Injectable()
 export class UsersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly adminService: AdminService,
+  ) {}
 
   async list(query: ListUsersQueryDto): Promise<{ data: SafeUser[]; total: number }> {
     const { page, limit, search, organizationId, email } = query;
@@ -105,6 +105,11 @@ export class UsersService {
   }
 
   async create(dto: CreateUserDto): Promise<SafeUser> {
+    // Validate custom fields against USER scope definitions
+    if (dto.customFields && typeof dto.customFields === 'object') {
+      await this.adminService.validateCustomFields('USER', dto.customFields as Record<string, unknown>);
+    }
+
     // Ensure primary email isn't already taken
     const conflict = await this.prisma.userEmail.findUnique({
       where: { email: dto.primaryEmail },
@@ -128,6 +133,12 @@ export class UsersService {
 
   async update(id: number, dto: UpdateUserDto): Promise<SafeUser> {
     await this.get(id);
+
+    // Validate custom fields against USER scope definitions (if provided)
+    if (dto.customFields && typeof dto.customFields === 'object') {
+      await this.adminService.validateCustomFields('USER', dto.customFields as Record<string, unknown>);
+    }
+
     return this.prisma.user.update({
       where: { id },
       data: dto as Parameters<typeof this.prisma.user.update>[0]['data'],

@@ -3,6 +3,8 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import { SlaService } from '../sla/sla.service';
+import { MailService } from '../mail/mail.service';
+import { AdminService } from '../admin/admin.service';
 import { formatTicketMask } from './ticket-mask.util';
 import type {
   CreateTicketDto,
@@ -36,11 +38,18 @@ export class TicketsService {
     private readonly usersService: UsersService,
     private readonly slaService: SlaService,
     private readonly eventEmitter: EventEmitter2,
+    private readonly mailService: MailService,
+    private readonly adminService: AdminService,
   ) {}
 
   // ─────────────────────────── Create ───────────────────────────
 
   async createTicket(dto: CreateTicketDto, creatorStaffId?: number): Promise<Ticket> {
+    // Validate custom fields against TICKET scope definitions
+    if (dto.customFields && typeof dto.customFields === 'object') {
+      await this.adminService.validateCustomFields('TICKET', dto.customFields as Record<string, unknown>);
+    }
+
     // Resolve or create the requester user
     let userId = dto.userId;
     if (!userId) {
@@ -141,7 +150,59 @@ export class TicketsService {
     // Emit domain event
     this.emitDomainEvent('ticket.created', updated.id);
 
+    // Send autoresponder email to requester (non-blocking)
+    if (dto.requesterEmail) {
+      this.mailService
+        .sendTemplate(dto.requesterEmail, 'autoresponder', 'en', {
+          mask,
+          subject: dto.subject,
+          contents: dto.contents,
+          requesterName: dto.requesterName || dto.requesterEmail,
+        })
+        .catch((err: unknown) => this.logger.error(`Autoresponder email failed for ${mask}: ${String(err)}`));
+    }
+
     return updated;
+  }
+
+  // ─────────────────────────── Client: my tickets ───────────────────────────
+
+  /**
+   * Return tickets for a given requester email address.
+   * Matches requesterEmail directly OR any UserEmail linked to a User row.
+   * Used by the client-facing "my tickets" page (@Public endpoint).
+   */
+  async listMyTickets(requesterEmail: string): Promise<{ data: Ticket[]; total: number }> {
+    // Build OR clause: direct requesterEmail OR through the user's emails
+    const where = {
+      mergedIntoId: null,
+      OR: [
+        { requesterEmail: { equals: requesterEmail, mode: 'insensitive' as const } },
+        {
+          user: {
+            emails: {
+              some: { email: { equals: requesterEmail, mode: 'insensitive' as const } },
+            },
+          },
+        },
+      ],
+    };
+
+    const [data, total] = await Promise.all([
+      this.prisma.ticket.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          status: true,
+          priority: true,
+          type: true,
+          department: true,
+        },
+      }),
+      this.prisma.ticket.count({ where }),
+    ]);
+
+    return { data, total };
   }
 
   // ─────────────────────────── List ───────────────────────────
@@ -286,6 +347,20 @@ export class TicketsService {
     });
 
     await this.writeAudit(ticketId, 'REPLY', staffId ?? undefined, isStaffReply ? 'STAFF' : 'USER', {});
+
+    // Send outbound email to requester when a staff member replies (non-blocking)
+    if (isStaffReply && ticket.requesterEmail) {
+      this.mailService
+        .sendTemplate(ticket.requesterEmail, 'ticket_user_reply', 'en', {
+          mask: ticket.mask,
+          subject: ticket.subject,
+          contents: dto.contents,
+          requesterName: ticket.requesterName || ticket.requesterEmail,
+        })
+        .catch((err: unknown) =>
+          this.logger.error(`Reply email failed for ticket ${ticket.mask}: ${String(err)}`),
+        );
+    }
 
     // Emit domain event
     this.emitDomainEvent('ticket.replied', ticketId);

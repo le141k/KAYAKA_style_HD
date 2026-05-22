@@ -48,6 +48,12 @@ export class AlarisService {
     const dept = await this.prisma.department.findFirst({ orderBy: { isDefault: 'desc' } });
     const departmentId = dept?.id ?? 1;
 
+    // Resolve the "Alaris Incident" TicketType by title
+    const alarisType = await this.prisma.ticketType.findFirst({
+      where: { title: { equals: 'Alaris Incident', mode: 'insensitive' } },
+    });
+    const typeId = alarisType?.id ?? undefined;
+
     // Build subject from message
     const subject = `[ALARIS-AUTO] ${payload.message}`.slice(0, 500);
 
@@ -57,6 +63,7 @@ export class AlarisService {
       contents: JSON.stringify(payload, null, 2),
       isHtml: false,
       departmentId,
+      typeId,
       requesterEmail: 'alaris@system.internal',
       requesterName: 'Alaris Monitor',
       creationMode: 'ALARIS',

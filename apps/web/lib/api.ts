@@ -10,6 +10,50 @@ function getToken(): string | null {
   return localStorage.getItem('auth_token');
 }
 
+function storeTokens(accessToken: string): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem('auth_token', accessToken);
+  document.cookie = `auth_token=${accessToken}; path=/; max-age=${7 * 86400}; SameSite=Strict`;
+}
+
+function clearTokens(): void {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem('auth_token');
+  localStorage.removeItem('refresh_token');
+  document.cookie = 'auth_token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+}
+
+/** Attempt a token refresh. Returns true if a new token was stored. */
+let _refreshing: Promise<boolean> | null = null;
+async function tryRefresh(): Promise<boolean> {
+  // Coalesce concurrent refresh attempts
+  if (_refreshing) return _refreshing;
+  _refreshing = (async () => {
+    try {
+      const refreshToken = typeof window !== 'undefined' ? localStorage.getItem('refresh_token') : null;
+      if (!refreshToken) return false;
+      const res = await fetch(`${API_URL}/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken }),
+      });
+      if (!res.ok) {
+        clearTokens();
+        return false;
+      }
+      const data = (await res.json()) as { accessToken: string };
+      storeTokens(data.accessToken);
+      return true;
+    } catch {
+      clearTokens();
+      return false;
+    } finally {
+      _refreshing = null;
+    }
+  })();
+  return _refreshing;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -21,7 +65,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}, _retry = false): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -30,6 +74,16 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   if (token) headers['Authorization'] = `Bearer ${token}`;
 
   const res = await fetch(`${API_URL}${path}`, { ...options, headers });
+
+  if (res.status === 401 && !_retry) {
+    const refreshed = await tryRefresh();
+    if (refreshed) {
+      // Retry the original request once with the new token
+      return request<T>(path, options, true);
+    }
+    // Refresh failed — throw so callers can redirect to login
+    throw new ApiError(401, 'Unauthorized');
+  }
 
   if (!res.ok) {
     let data: unknown;

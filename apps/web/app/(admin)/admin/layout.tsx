@@ -1,21 +1,58 @@
-import Link from "next/link";
-import { ThemeToggle } from "@/components/premium/ThemeToggle";
+'use client';
+
+import { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
+import { Loader2 } from 'lucide-react';
+import { ThemeToggle } from '@/components/premium/ThemeToggle';
+import { useMe } from '@/lib/hooks/use-auth';
 
 const ADMIN_TABS = [
-  { label: "Отделы", href: "/admin/departments" },
-  { label: "Статусы и приоритеты", href: "/admin/statuses" },
-  { label: "SLA-планы", href: "/admin/sla" },
-  { label: "Правила и макросы", href: "/admin/workflows" },
-  { label: "Сотрудники и группы", href: "/admin/staff" },
-  { label: "Пользовательские поля", href: "/admin/custom-fields" },
-  { label: "Интеграция Alaris", href: "/admin/alaris" },
+  { label: 'Отделы', href: '/admin/departments' },
+  { label: 'Статусы и приоритеты', href: '/admin/statuses' },
+  { label: 'SLA-планы', href: '/admin/sla' },
+  { label: 'Правила и макросы', href: '/admin/workflows' },
+  { label: 'Сотрудники и группы', href: '/admin/staff' },
+  { label: 'Пользовательские поля', href: '/admin/custom-fields' },
+  { label: 'Интеграция Alaris', href: '/admin/alaris' },
 ];
 
-export default function AdminLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function AdminLayout({ children }: { children: React.ReactNode }) {
+  const router = useRouter();
+  const { data: user, isLoading, isError } = useMe();
+
+  useEffect(() => {
+    if (isLoading) return;
+
+    const hasToken =
+      typeof window !== 'undefined' &&
+      (localStorage.getItem('auth_token') ||
+        document.cookie.split('; ').some((r) => r.startsWith('auth_token=')));
+
+    if (!hasToken || isError) {
+      router.replace('/login');
+      return;
+    }
+
+    if (user && user.role !== 'admin') {
+      router.replace('/staff/dashboard');
+    }
+  }, [isLoading, isError, user, router]);
+
+  // Brief loading state to avoid flicker
+  if (isLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-background">
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  // While redirecting, render nothing
+  if (isError || !user || user.role !== 'admin') {
+    return null;
+  }
+
   return (
     <div className="min-h-screen bg-background">
       {/* Admin topbar */}
@@ -26,9 +63,7 @@ export default function AdminLayout({
               23
             </div>
           </Link>
-          <span className="text-sm font-semibold text-muted-foreground">
-            / Администрирование
-          </span>
+          <span className="text-sm font-semibold text-muted-foreground">/ Администрирование</span>
           <div className="ml-auto">
             <ThemeToggle />
           </div>

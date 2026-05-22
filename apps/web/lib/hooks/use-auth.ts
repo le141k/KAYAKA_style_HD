@@ -15,17 +15,21 @@ interface MePrincipal {
   permissions: string[];
 }
 
+function principalToUser(p: MePrincipal): User {
+  return {
+    id: p.staffId,
+    name: p.email,
+    email: p.email,
+    role: p.isAdmin ? 'admin' : 'agent',
+  } as User;
+}
+
 export function useMe() {
   return useQuery({
     queryKey: authKeys.me,
     queryFn: async (): Promise<User> => {
       const p = await api.get<MePrincipal>('/auth/me');
-      return {
-        id: p.staffId,
-        name: p.email,
-        email: p.email,
-        role: p.isAdmin ? 'admin' : 'agent',
-      } as User;
+      return principalToUser(p);
     },
     retry: false,
     staleTime: 5 * 60_000,
@@ -48,8 +52,14 @@ export function useLogin() {
         // also set cookie for SSR / middleware
         document.cookie = `auth_token=${res.accessToken}; path=/; max-age=${7 * 86400}; SameSite=Strict`;
       }
-      // /auth/me returns the staff principal; map onto the cached display user.
-      qc.setQueryData(authKeys.me, res.staff as unknown as User);
+      // Map the returned staff principal to the same display User shape as useMe()
+      const user: User = principalToUser({
+        staffId: res.staff.staffId,
+        email: res.staff.email,
+        isAdmin: res.staff.isAdmin,
+        permissions: res.staff.permissions,
+      });
+      qc.setQueryData(authKeys.me, user);
     },
   });
 }
@@ -60,6 +70,7 @@ export function useLogout() {
     logout: () => {
       if (typeof window !== 'undefined') {
         localStorage.removeItem('auth_token');
+        localStorage.removeItem('refresh_token');
         document.cookie = 'auth_token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
       }
       qc.clear();

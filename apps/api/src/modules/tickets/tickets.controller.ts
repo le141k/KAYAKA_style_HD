@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -68,6 +69,18 @@ export class TicketsController {
       tags: [],
       customFields: dto.customFields,
     });
+  }
+
+  // ─────────────────── Client: my tickets ───────────────────
+
+  @Public()
+  @Get('my')
+  @ApiOperation({ summary: "List the current requester's tickets by email (client portal)" })
+  listMy(@Query('email') email: string | undefined) {
+    if (!email) {
+      throw new BadRequestException('Query parameter "email" is required');
+    }
+    return this.ticketsService.listMyTickets(email);
   }
 
   // ─────────────────── Staff routes ───────────────────

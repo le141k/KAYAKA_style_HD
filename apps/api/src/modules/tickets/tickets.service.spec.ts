@@ -5,6 +5,8 @@ import { formatTicketMask } from './ticket-mask.util';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { UsersService } from '../users/users.service';
 import type { SlaService } from '../sla/sla.service';
+import type { MailService } from '../mail/mail.service';
+import type { AdminService } from '../admin/admin.service';
 import type { EventEmitter2 } from '@nestjs/event-emitter';
 import type { Ticket } from '@prisma/client';
 
@@ -126,7 +128,20 @@ describe('TicketsService', () => {
       computeDueDates: vi.fn().mockResolvedValue({ dueAt: null, resolutionDueAt: null }),
     } as unknown as SlaService;
     const eventEmitterMock = { emit: vi.fn() } as unknown as EventEmitter2;
-    service = new TicketsService(prisma as unknown as PrismaService, users, slaMock, eventEmitterMock);
+    const mailMock = {
+      sendTemplate: vi.fn().mockResolvedValue(undefined),
+    } as unknown as MailService;
+    const adminMock = {
+      validateCustomFields: vi.fn().mockResolvedValue(undefined),
+    } as unknown as AdminService;
+    service = new TicketsService(
+      prisma as unknown as PrismaService,
+      users,
+      slaMock,
+      eventEmitterMock,
+      mailMock,
+      adminMock,
+    );
   });
 
   // ─── createTicket ─────────────────────────────────────────────────────────

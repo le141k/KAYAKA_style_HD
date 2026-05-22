@@ -13,7 +13,13 @@ const schema = z.object({
   TELECOM_HD_JWT_REFRESH_TTL: z.coerce.number().default(2592000),
   TELECOM_HD_SMTP_HOST: z.string().default('localhost'),
   TELECOM_HD_SMTP_PORT: z.coerce.number().default(1025),
-  TELECOM_HD_SMTP_SECURE: z.coerce.boolean().default(false),
+  // NB: z.coerce.boolean() treats the string "false" as truthy → parse explicitly.
+  TELECOM_HD_SMTP_SECURE: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
   TELECOM_HD_MAIL_FROM: z.string().default('23 Telecom Help Desk <support@23telecom.example>'),
   TELECOM_HD_LOG_LEVEL: z.string().default('info'),
   TELECOM_HD_ALARIS_WEBHOOK_SECRET: z.string().default('alaris-dev-secret'),

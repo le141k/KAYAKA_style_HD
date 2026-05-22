@@ -1,13 +1,13 @@
-"use client";
+'use client';
 
-import Link from "next/link";
-import { TicketRow } from "@/components/premium/TicketRow";
-import { TicketListSkeleton } from "@/components/premium/SkeletonLoaders";
-import { useTickets } from "@/lib/hooks/use-tickets";
-import { Button } from "@/components/ui/button";
+import Link from 'next/link';
+import { TicketRow } from '@/components/premium/TicketRow';
+import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
+import { useClientTickets } from '@/lib/hooks/use-client-tickets';
+import { Button } from '@/components/ui/button';
 
 export function ClientTicketsContent() {
-  const { data, isLoading } = useTickets({ per_page: 20 });
+  const { data, isLoading } = useClientTickets();
   const tickets = data?.data ?? [];
 
   if (isLoading) return <TicketListSkeleton count={5} />;
@@ -26,11 +26,7 @@ export function ClientTicketsContent() {
   return (
     <div className="space-y-2">
       {tickets.map((ticket) => (
-        <TicketRow
-          key={ticket.id}
-          ticket={ticket}
-          href={`/tickets/${ticket.id}`}
-        />
+        <TicketRow key={ticket.id} ticket={ticket} href={`/tickets/${ticket.id}`} />
       ))}
     </div>
   );

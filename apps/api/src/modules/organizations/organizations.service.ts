@@ -1,15 +1,15 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
-import type {
-  CreateOrganizationDto,
-  UpdateOrganizationDto,
-  ListOrganizationsQueryDto,
-} from './dto';
+import { AdminService } from '../admin/admin.service';
+import type { CreateOrganizationDto, UpdateOrganizationDto, ListOrganizationsQueryDto } from './dto';
 import type { Organization } from '@prisma/client';
 
 @Injectable()
 export class OrganizationsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly adminService: AdminService,
+  ) {}
 
   async list(query: ListOrganizationsQueryDto): Promise<{ data: Organization[]; total: number }> {
     const { page, limit, search } = query;
@@ -43,6 +43,14 @@ export class OrganizationsService {
   }
 
   async create(dto: CreateOrganizationDto): Promise<Organization> {
+    // Validate custom fields against ORGANIZATION scope definitions
+    if (dto.customFields && typeof dto.customFields === 'object') {
+      await this.adminService.validateCustomFields(
+        'ORGANIZATION',
+        dto.customFields as Record<string, unknown>,
+      );
+    }
+
     return this.prisma.organization.create({
       data: dto as Parameters<typeof this.prisma.organization.create>[0]['data'],
     });
@@ -50,6 +58,15 @@ export class OrganizationsService {
 
   async update(id: number, dto: UpdateOrganizationDto): Promise<Organization> {
     await this.get(id);
+
+    // Validate custom fields against ORGANIZATION scope definitions (if provided)
+    if (dto.customFields && typeof dto.customFields === 'object') {
+      await this.adminService.validateCustomFields(
+        'ORGANIZATION',
+        dto.customFields as Record<string, unknown>,
+      );
+    }
+
     return this.prisma.organization.update({
       where: { id },
       data: dto as Parameters<typeof this.prisma.organization.update>[0]['data'],

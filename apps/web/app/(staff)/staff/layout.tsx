@@ -1,7 +1,8 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import { Menu } from 'lucide-react';
+import { useRouter } from 'next/navigation';
+import { Menu, Loader2 } from 'lucide-react';
 import { SidebarNav } from '@/components/premium/SidebarNav';
 import { CommandPalette } from '@/components/premium/CommandPalette';
 import { NotificationBell } from '@/components/premium/NotificationBell';
@@ -18,15 +19,26 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { getInitials } from '@/lib/utils';
-import { useLogout } from '@/lib/hooks/use-auth';
-
-// Mocked current user for shell display
-const CURRENT_USER = { name: 'Александр Петров', email: 'a.petrov@23telecom.ru' };
+import { useLogout, useMe } from '@/lib/hooks/use-auth';
 
 export default function StaffLayout({ children }: { children: React.ReactNode }) {
   const [commandOpen, setCommandOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const { logout } = useLogout();
+  const router = useRouter();
+  const { data: user, isLoading, isError } = useMe();
+
+  // Auth guard: redirect to /login if no token / API returns error
+  useEffect(() => {
+    if (isLoading) return;
+    const hasToken =
+      typeof window !== 'undefined' &&
+      (localStorage.getItem('auth_token') ||
+        document.cookie.split('; ').some((r) => r.startsWith('auth_token=')));
+    if (!hasToken || isError) {
+      router.replace('/login');
+    }
+  }, [isLoading, isError, router]);
 
   // Global ⌘K hotkey
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
@@ -40,6 +52,23 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
+
+  // Brief loading state to avoid flicker before auth resolves
+  if (isLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-background">
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  // While redirecting (no token / error), render nothing
+  if (isError || !user) {
+    return null;
+  }
+
+  const displayName = user.name;
+  const displayEmail = user.email;
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
@@ -87,15 +116,15 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
                 aria-label="Меню профиля"
               >
                 <Avatar className="h-7 w-7">
-                  <AvatarFallback className="text-[11px]">{getInitials(CURRENT_USER.name)}</AvatarFallback>
+                  <AvatarFallback className="text-[11px]">{getInitials(displayName)}</AvatarFallback>
                 </Avatar>
-                <span className="hidden text-sm font-medium lg:block">{CURRENT_USER.name}</span>
+                <span className="hidden text-sm font-medium lg:block">{displayName}</span>
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-48">
               <div className="px-2 py-1.5">
-                <p className="text-xs font-medium">{CURRENT_USER.name}</p>
-                <p className="text-xs text-muted-foreground">{CURRENT_USER.email}</p>
+                <p className="text-xs font-medium">{displayName}</p>
+                <p className="text-xs text-muted-foreground">{displayEmail}</p>
               </div>
               <DropdownMenuSeparator />
               <DropdownMenuItem>Профиль</DropdownMenuItem>

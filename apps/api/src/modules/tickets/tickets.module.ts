@@ -1,13 +1,15 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { TicketsService } from './tickets.service';
 import { TicketsController } from './tickets.controller';
 import { ReferenceService } from './reference.service';
 import { ReferenceController } from './reference.controller';
 import { UsersModule } from '../users/users.module';
 import { SlaModule } from '../sla/sla.module';
+import { MailModule } from '../mail/mail.module';
+import { AdminModule } from '../admin/admin.module';
 
 @Module({
-  imports: [UsersModule, SlaModule],
+  imports: [UsersModule, SlaModule, forwardRef(() => MailModule), AdminModule],
   controllers: [TicketsController, ReferenceController],
   providers: [TicketsService, ReferenceService],
   exports: [TicketsService],

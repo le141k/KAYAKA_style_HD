@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException } from '@nestjs/common';
+import { NotFoundException, BadRequestException } from '@nestjs/common';
 import { OrganizationsService } from './organizations.service';
 import type { PrismaService } from '../../prisma/prisma.service';
+import type { AdminService } from '../admin/admin.service';
 
 function makePrismaMock() {
   return {
@@ -29,13 +30,21 @@ const MOCK_ORG = {
   updatedAt: new Date(),
 };
 
+function makeAdminMock(): AdminService {
+  return {
+    validateCustomFields: vi.fn().mockResolvedValue(undefined),
+  } as unknown as AdminService;
+}
+
 describe('OrganizationsService', () => {
   let service: OrganizationsService;
   let prisma: ReturnType<typeof makePrismaMock>;
+  let adminMock: AdminService;
 
   beforeEach(() => {
     prisma = makePrismaMock();
-    service = new OrganizationsService(prisma as unknown as PrismaService);
+    adminMock = makeAdminMock();
+    service = new OrganizationsService(prisma as unknown as PrismaService, adminMock);
   });
 
   // ─── list ────────────────────────────────────────────────────────────────────
@@ -105,6 +114,24 @@ describe('OrganizationsService', () => {
       const result = await service.create({ name: 'Acme Corp' } as any);
       expect(result.name).toBe('Acme Corp');
     });
+
+    it('calls validateCustomFields with ORGANIZATION scope when customFields provided', async () => {
+      (prisma.organization.create as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_ORG);
+
+      await service.create({ name: 'Acme Corp', customFields: { region: 'EU' } } as any);
+
+      expect(adminMock.validateCustomFields).toHaveBeenCalledWith('ORGANIZATION', { region: 'EU' });
+    });
+
+    it('throws BadRequestException when validateCustomFields rejects on create', async () => {
+      (adminMock.validateCustomFields as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new BadRequestException('Custom field "region" is required'),
+      );
+
+      await expect(service.create({ name: 'Acme Corp', customFields: {} } as any)).rejects.toThrow(
+        BadRequestException,
+      );
+    });
   });
 
   // ─── update ──────────────────────────────────────────────────────────────────
@@ -124,6 +151,24 @@ describe('OrganizationsService', () => {
     it('throws NotFoundException when org not found', async () => {
       (prisma.organization.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.update(99, { name: 'X' } as any)).rejects.toThrow(NotFoundException);
+    });
+
+    it('calls validateCustomFields with ORGANIZATION scope when customFields provided on update', async () => {
+      (prisma.organization.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_ORG);
+      (prisma.organization.update as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_ORG);
+
+      await service.update(1, { customFields: { region: 'APAC' } } as any);
+
+      expect(adminMock.validateCustomFields).toHaveBeenCalledWith('ORGANIZATION', { region: 'APAC' });
+    });
+
+    it('throws BadRequestException when validateCustomFields rejects on update', async () => {
+      (prisma.organization.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_ORG);
+      (adminMock.validateCustomFields as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new BadRequestException('Custom field "region" is required'),
+      );
+
+      await expect(service.update(1, { customFields: {} } as any)).rejects.toThrow(BadRequestException);
     });
   });
 

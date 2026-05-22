@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException, ConflictException } from '@nestjs/common';
+import { NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { UsersService } from './users.service';
 import type { PrismaService } from '../../prisma/prisma.service';
+import type { AdminService } from '../admin/admin.service';
 
 function makePrismaMock() {
   return {
@@ -43,13 +44,21 @@ const SAFE_USER = {
   emails: [{ id: 1, userId: 1, email: 'jane@example.com', isPrimary: true, createdAt: new Date() }],
 };
 
+function makeAdminMock(): AdminService {
+  return {
+    validateCustomFields: vi.fn().mockResolvedValue(undefined),
+  } as unknown as AdminService;
+}
+
 describe('UsersService', () => {
   let service: UsersService;
   let prisma: ReturnType<typeof makePrismaMock>;
+  let adminMock: AdminService;
 
   beforeEach(() => {
     prisma = makePrismaMock();
-    service = new UsersService(prisma as unknown as PrismaService);
+    adminMock = makeAdminMock();
+    service = new UsersService(prisma as unknown as PrismaService, adminMock);
   });
 
   // ─── list ────────────────────────────────────────────────────────────────────
@@ -195,6 +204,35 @@ describe('UsersService', () => {
         } as any),
       ).rejects.toThrow(ConflictException);
     });
+
+    it('calls validateCustomFields with USER scope when customFields provided', async () => {
+      (prisma.userEmail.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.user.create as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_USER);
+
+      await service.create({
+        primaryEmail: 'jane@example.com',
+        fullName: 'Jane Doe',
+        additionalEmails: [],
+        customFields: { account_number: 'ACC-123' },
+      } as any);
+
+      expect(adminMock.validateCustomFields).toHaveBeenCalledWith('USER', { account_number: 'ACC-123' });
+    });
+
+    it('throws BadRequestException when validateCustomFields rejects (create)', async () => {
+      (adminMock.validateCustomFields as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new BadRequestException('Custom field "account_number" is required'),
+      );
+
+      await expect(
+        service.create({
+          primaryEmail: 'jane@example.com',
+          fullName: 'Jane Doe',
+          additionalEmails: [],
+          customFields: {},
+        } as any),
+      ).rejects.toThrow(BadRequestException);
+    });
   });
 
   // ─── update ──────────────────────────────────────────────────────────────────
@@ -214,6 +252,24 @@ describe('UsersService', () => {
     it('throws NotFoundException if user does not exist', async () => {
       (prisma.user.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.update(999, { fullName: 'X' } as any)).rejects.toThrow(NotFoundException);
+    });
+
+    it('calls validateCustomFields with USER scope when customFields provided on update', async () => {
+      (prisma.user.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_USER);
+      (prisma.user.update as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_USER);
+
+      await service.update(1, { customFields: { account_number: 'ACC-456' } } as any);
+
+      expect(adminMock.validateCustomFields).toHaveBeenCalledWith('USER', { account_number: 'ACC-456' });
+    });
+
+    it('throws BadRequestException when validateCustomFields rejects (update)', async () => {
+      (prisma.user.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_USER);
+      (adminMock.validateCustomFields as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new BadRequestException('Custom field "account_number" is required'),
+      );
+
+      await expect(service.update(1, { customFields: {} } as any)).rejects.toThrow(BadRequestException);
     });
   });
 

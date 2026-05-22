@@ -208,7 +208,7 @@ describe('KnowledgebaseService', () => {
         Promise.resolve({ ...MOCK_ARTICLE, contentsText: data.contentsText }),
       );
 
-      const result = await service.createArticle({
+      await service.createArticle({
         title: 'Test',
         categoryId: 1,
         contents: '<style>body{}</style><p>Plain <b>text</b> here</p>',

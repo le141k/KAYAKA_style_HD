@@ -9,6 +9,8 @@ import { TicketsService } from './tickets.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { UsersService } from '../users/users.service';
 import type { SlaService } from '../sla/sla.service';
+import type { MailService } from '../mail/mail.service';
+import type { AdminService } from '../admin/admin.service';
 import type { EventEmitter2 } from '@nestjs/event-emitter';
 import type { Ticket } from '@prisma/client';
 
@@ -117,7 +119,56 @@ describe('TicketsService (extra coverage)', () => {
       computeDueDates: vi.fn().mockResolvedValue({ dueAt: null, resolutionDueAt: null }),
     } as unknown as SlaService;
     eventEmitterMock = { emit: vi.fn() } as unknown as EventEmitter2;
-    service = new TicketsService(prisma as unknown as PrismaService, users, slaMock, eventEmitterMock);
+    const mailMock = {
+      sendTemplate: vi.fn().mockResolvedValue(undefined),
+    } as unknown as MailService;
+    const adminMock = {
+      validateCustomFields: vi.fn().mockResolvedValue(undefined),
+    } as unknown as AdminService;
+    service = new TicketsService(
+      prisma as unknown as PrismaService,
+      users,
+      slaMock,
+      eventEmitterMock,
+      mailMock,
+      adminMock,
+    );
+  });
+
+  // ─── listMyTickets ───────────────────────────────────────────────────────────
+
+  describe('listMyTickets', () => {
+    it('returns tickets matching requesterEmail', async () => {
+      const ticket = makeTicket({ requesterEmail: 'jane@example.com' });
+      (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([ticket]);
+      (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+
+      const result = await service.listMyTickets('jane@example.com');
+      expect(result.data).toHaveLength(1);
+      expect(result.total).toBe(1);
+    });
+
+    it('passes OR clause covering requesterEmail and user.emails', async () => {
+      (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+
+      await service.listMyTickets('test@example.com');
+
+      expect(prisma.ticket.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ OR: expect.any(Array), mergedIntoId: null }),
+        }),
+      );
+    });
+
+    it('returns empty list when no tickets match', async () => {
+      (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+
+      const result = await service.listMyTickets('nobody@example.com');
+      expect(result.data).toHaveLength(0);
+      expect(result.total).toBe(0);
+    });
   });
 
   // ─── listTickets ─────────────────────────────────────────────────────────────
@@ -295,7 +346,7 @@ describe('TicketsService (extra coverage)', () => {
       (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
       (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
 
-      const result = await service.reply(
+      await service.reply(
         1,
         {
           contents: 'Internal note',
