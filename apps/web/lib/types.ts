@@ -1,13 +1,8 @@
-export type TicketStatus =
-  | "open"
-  | "pending"
-  | "in_progress"
-  | "resolved"
-  | "closed";
+export type TicketStatus = 'open' | 'pending' | 'in_progress' | 'resolved' | 'closed';
 
-export type TicketPriority = "urgent" | "high" | "normal" | "low";
+export type TicketPriority = 'urgent' | 'high' | 'normal' | 'low';
 
-export type UserRole = "admin" | "agent" | "client";
+export type UserRole = 'admin' | 'agent' | 'client';
 
 export interface User {
   id: number;
@@ -114,6 +109,9 @@ export interface AuthStaffPrincipal {
   email: string;
   isAdmin: boolean;
   permissions: string[];
+  firstName?: string;
+  lastName?: string;
+  fullName?: string;
 }
 
 export interface LoginResponse {

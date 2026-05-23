@@ -46,4 +46,13 @@
 
 - ☐ React #418 hydration mismatch на SSR staff-страниц (обнажилось hard-nav; вероятно относительные даты/анимации) — разобрать в кластере dashboard/tickets
 
-## P2/P3 + паритет — после P0/P1 (см. QA_AUDIT_REPORT.md)
+## Блок 6 (паритет + P2)
+
+- ☑ apply-macro POST /tickets/:id/apply-macro (макросы применяются) [parity P0]
+- ☑ TD-6 смена отдела PATCH /tickets/:id/department
+- ☑ Email-queue CRUD admin/email-queues (password скрыт) [parity P0]
+- ☑ DK-12 имя вместо email (/auth/me firstName/lastName/fullName)
+- ☑ DK-10 кликабельные стат-карты; DK-11 меню Профиль/Настройки; DK-13 нотификации (mock убран)
+- ☑ TL-10 кнопка/диалог «Создать заявку» (staff create)
+
+## P2/P3 (остаток) + крупный паритет — после P0/P1 (см. QA_AUDIT_REPORT.md)

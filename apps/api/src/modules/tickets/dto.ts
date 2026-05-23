@@ -131,3 +131,17 @@ export const PublicReplySchema = z.object({
   requesterEmail: z.string().email().optional(),
 });
 export type PublicReplyDto = z.infer<typeof PublicReplySchema>;
+
+// ─────────────────── apply-macro ───────────────────
+
+export const ApplyMacroSchema = z.object({
+  macroId: z.number().int().positive(),
+});
+export type ApplyMacroDto = z.infer<typeof ApplyMacroSchema>;
+
+// ─────────────────── change department ───────────────────
+
+export const ChangeDepartmentSchema = z.object({
+  departmentId: z.number().int().positive(),
+});
+export type ChangeDepartmentDto = z.infer<typeof ChangeDepartmentSchema>;

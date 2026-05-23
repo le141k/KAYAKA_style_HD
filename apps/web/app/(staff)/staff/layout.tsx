@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { Menu, Loader2 } from 'lucide-react';
 import { SidebarNav } from '@/components/premium/SidebarNav';
@@ -127,8 +128,12 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
                 <p className="text-xs text-muted-foreground">{displayEmail}</p>
               </div>
               <DropdownMenuSeparator />
-              <DropdownMenuItem>Профиль</DropdownMenuItem>
-              <DropdownMenuItem>Настройки</DropdownMenuItem>
+              <DropdownMenuItem asChild>
+                <Link href="/admin/staff">Профиль</Link>
+              </DropdownMenuItem>
+              <DropdownMenuItem asChild>
+                <Link href="/admin">Настройки</Link>
+              </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={logout}>
                 Выйти

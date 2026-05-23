@@ -45,6 +45,10 @@ export class JwtAuthGuard implements CanActivate {
         email: payload.email,
         isAdmin: payload.isAdmin,
         permissions: payload.permissions,
+        // Carry the display-name claims through so /auth/me exposes them.
+        firstName: payload.firstName,
+        lastName: payload.lastName,
+        fullName: payload.fullName,
       };
       (request as Request & { user: AuthStaff }).user = staff;
     } catch {

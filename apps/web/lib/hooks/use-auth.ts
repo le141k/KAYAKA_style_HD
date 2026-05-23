@@ -13,12 +13,16 @@ interface MePrincipal {
   email: string;
   isAdmin: boolean;
   permissions: string[];
+  firstName?: string;
+  lastName?: string;
+  fullName?: string;
 }
 
 function principalToUser(p: MePrincipal): User {
+  const name = p.fullName || [p.firstName, p.lastName].filter(Boolean).join(' ') || p.email;
   return {
     id: p.staffId,
-    name: p.email,
+    name,
     email: p.email,
     role: p.isAdmin ? 'admin' : 'agent',
   } as User;
@@ -61,6 +65,9 @@ export function useLogin() {
         email: res.staff.email,
         isAdmin: res.staff.isAdmin,
         permissions: res.staff.permissions,
+        firstName: res.staff.firstName,
+        lastName: res.staff.lastName,
+        fullName: res.staff.fullName,
       });
       qc.setQueryData(authKeys.me, user);
     },

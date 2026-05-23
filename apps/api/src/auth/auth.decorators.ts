@@ -1,4 +1,10 @@
-import { applyDecorators, createParamDecorator, ExecutionContext, SetMetadata, UseGuards } from '@nestjs/common';
+import {
+  applyDecorators,
+  createParamDecorator,
+  ExecutionContext,
+  SetMetadata,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiBearerAuth } from '@nestjs/swagger';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { PermissionsGuard, PERMISSIONS_KEY } from './permissions.guard';
@@ -9,6 +15,9 @@ export interface AuthStaff {
   email: string;
   isAdmin: boolean;
   permissions: Permission[];
+  firstName?: string;
+  lastName?: string;
+  fullName?: string;
 }
 
 /** Marks a route as public (skips JwtAuthGuard). */

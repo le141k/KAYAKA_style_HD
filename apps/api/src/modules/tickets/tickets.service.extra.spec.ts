@@ -97,6 +97,12 @@ function makePrismaMock() {
     ticketTag: {
       findUnique: vi.fn(),
     },
+    macro: {
+      findUnique: vi.fn(),
+    },
+    department: {
+      findUnique: vi.fn(),
+    },
     $transaction: vi.fn(),
   } as unknown as PrismaService;
 }
@@ -548,6 +554,171 @@ describe('TicketsService (extra coverage)', () => {
     it('throws NotFoundException when ticket not found', async () => {
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.removeTag(999, 'vip')).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  // ─── applyMacro ──────────────────────────────────────────────────────────────
+
+  describe('applyMacro', () => {
+    it('posts reply text when macro has replyText', async () => {
+      const ticket = makeTicket({ firstResponseAt: null });
+      const macro = {
+        id: 1,
+        title: 'Test Macro',
+        replyText: 'Hello from macro',
+        actions: [],
+        categoryId: null,
+        createdAt: new Date(),
+      };
+      const updatedTicket = makeTicket();
+
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.macro.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(macro);
+      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 10 });
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTicket);
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticket.findUniqueOrThrow as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTicket);
+
+      const result = await service.applyMacro(1, { macroId: 1 }, 5);
+
+      expect(prisma.ticketPost.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ contents: 'Hello from macro', staffId: 5 }),
+        }),
+      );
+      expect(result).toBe(updatedTicket);
+    });
+
+    it('executes set_status and set_priority actions', async () => {
+      const ticket = makeTicket({ firstResponseAt: new Date() });
+      const macro = {
+        id: 2,
+        title: 'Status Macro',
+        replyText: '',
+        actions: [
+          { type: 'set_status', statusId: 3 },
+          { type: 'set_priority', priorityId: 2 },
+        ],
+        categoryId: null,
+        createdAt: new Date(),
+      };
+      const updatedTicket = makeTicket({ statusId: 3, priorityId: 2 });
+
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.macro.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(macro);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTicket);
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticket.findUniqueOrThrow as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTicket);
+
+      await service.applyMacro(1, { macroId: 2 }, 5);
+
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ statusId: 3, priorityId: 2 }),
+        }),
+      );
+    });
+
+    it('executes add_tag action', async () => {
+      const ticket = makeTicket();
+      const macro = {
+        id: 3,
+        title: 'Tag Macro',
+        replyText: '',
+        actions: [{ type: 'add_tag', tag: 'urgent' }],
+        categoryId: null,
+        createdAt: new Date(),
+      };
+
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.macro.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(macro);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticket.findUniqueOrThrow as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+
+      await service.applyMacro(1, { macroId: 3 }, 5);
+
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            tags: expect.objectContaining({ connectOrCreate: expect.any(Object) }),
+          }),
+        }),
+      );
+    });
+
+    it('writes audit log entry with MACRO_APPLIED action', async () => {
+      const ticket = makeTicket();
+      const macro = {
+        id: 4,
+        title: 'Audit Macro',
+        replyText: '',
+        actions: [],
+        categoryId: null,
+        createdAt: new Date(),
+      };
+
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.macro.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(macro);
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticket.findUniqueOrThrow as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+
+      await service.applyMacro(1, { macroId: 4 }, 5);
+
+      expect(prisma.ticketAuditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ action: 'MACRO_APPLIED' }),
+        }),
+      );
+    });
+
+    it('throws NotFoundException when ticket not found', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(service.applyMacro(999, { macroId: 1 }, 5)).rejects.toThrow(NotFoundException);
+    });
+
+    it('throws NotFoundException when macro not found', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeTicket());
+      (prisma.macro.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(service.applyMacro(1, { macroId: 999 }, 5)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  // ─── changeDepartment ─────────────────────────────────────────────────────────
+
+  describe('changeDepartment', () => {
+    it('updates departmentId and writes audit log', async () => {
+      const ticket = makeTicket({ departmentId: 1 });
+      const dept = { id: 2, title: 'Support' };
+      const updatedTicket = makeTicket({ departmentId: 2 });
+
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.department.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(dept);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTicket);
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      const result = await service.changeDepartment(1, { departmentId: 2 }, 5);
+
+      expect(result.departmentId).toBe(2);
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ departmentId: 2 }) }),
+      );
+      expect(prisma.ticketAuditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ action: 'DEPARTMENT_CHANGE', field: 'departmentId' }),
+        }),
+      );
+    });
+
+    it('throws NotFoundException when ticket not found', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(service.changeDepartment(999, { departmentId: 1 }, 5)).rejects.toThrow(NotFoundException);
+    });
+
+    it('throws NotFoundException when department not found', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeTicket());
+      (prisma.department.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(service.changeDepartment(1, { departmentId: 999 }, 5)).rejects.toThrow(NotFoundException);
     });
   });
 

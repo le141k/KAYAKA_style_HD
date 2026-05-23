@@ -1,8 +1,11 @@
 'use client';
 
 import { useState, useCallback, useEffect, useMemo } from 'react';
-import { useRouter } from 'next/navigation';
-import { Search, SlidersHorizontal, LayoutGrid, CalendarDays, X } from 'lucide-react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
+import { Search, SlidersHorizontal, LayoutGrid, CalendarDays, X, Plus } from 'lucide-react';
 import { format } from 'date-fns';
 import { ru } from 'date-fns/locale';
 import type { DateRange } from 'react-day-picker';
@@ -11,21 +14,75 @@ import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Calendar } from '@/components/ui/calendar';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
 import { TicketRow } from '@/components/premium/TicketRow';
 import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
-import { useTickets } from '@/lib/hooks/use-tickets';
+import { useTickets, useCreateTicket } from '@/lib/hooks/use-tickets';
+import { useToast } from '@/components/ui/use-toast';
 import { useI18n } from '@/lib/i18n';
 import Link from 'next/link';
+
+// ─── Create ticket form schema ───────────────────────────────────────────────
+const createTicketSchema = z.object({
+  subject: z.string().min(3, 'Тема должна содержать не менее 3 символов'),
+  body: z.string().min(5, 'Текст должен содержать не менее 5 символов'),
+  requesterEmail: z.string().email('Введите корректный email'),
+  requesterName: z.string().optional(),
+  priority: z.enum(['urgent', 'high', 'normal', 'low']).optional(),
+});
+type CreateTicketFormData = z.infer<typeof createTicketSchema>;
 
 export function TicketsListContent() {
   const { t } = useI18n();
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const { toast } = useToast();
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState('all');
   const [priority, setPriority] = useState('all');
   const [dateRange, setDateRange] = useState<DateRange | undefined>(undefined);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [debouncedSearch, setDebouncedSearch] = useState('');
+
+  // Create dialog state — open when ?create=1 is present
+  const [createOpen, setCreateOpen] = useState(() => searchParams.get('create') === '1');
+
+  const createMutation = useCreateTicket();
+  const {
+    register,
+    handleSubmit,
+    reset,
+    formState: { errors, isSubmitting },
+  } = useForm<CreateTicketFormData>({
+    resolver: zodResolver(createTicketSchema),
+    defaultValues: { priority: 'normal' },
+  });
+
+  const openCreate = () => {
+    reset({ priority: 'normal' });
+    setCreateOpen(true);
+  };
+
+  const closeCreate = () => {
+    setCreateOpen(false);
+    // Remove ?create=1 from URL without full reload
+    const params = new URLSearchParams(Array.from(searchParams.entries()));
+    params.delete('create');
+    const qs = params.toString();
+    router.replace(`/staff/tickets${qs ? `?${qs}` : ''}`, { scroll: false });
+  };
+
+  const onSubmitCreate = async (data: CreateTicketFormData) => {
+    try {
+      await createMutation.mutateAsync(data);
+      toast({ title: 'Заявка создана', description: `Тема: ${data.subject}` });
+      closeCreate();
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось создать заявку', variant: 'destructive' });
+    }
+  };
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(search), 300);
@@ -159,6 +216,10 @@ export function TicketsListContent() {
         </Popover>
 
         <div className="ml-auto flex gap-2">
+          <Button size="sm" onClick={openCreate} className="h-8 gap-1.5">
+            <Plus className="h-3.5 w-3.5" />
+            Создать заявку
+          </Button>
           <Button variant="outline" size="sm" asChild>
             <Link href="/staff/kanban">
               <LayoutGrid className="mr-1.5 h-3.5 w-3.5" />
@@ -200,6 +261,74 @@ export function TicketsListContent() {
           </div>
         )}
       </div>
+
+      {/* Create Ticket Dialog */}
+      <Dialog
+        open={createOpen}
+        onOpenChange={(open) => {
+          if (!open) closeCreate();
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Создать заявку</DialogTitle>
+          </DialogHeader>
+          <form onSubmit={handleSubmit(onSubmitCreate)} className="space-y-4">
+            <div className="space-y-1.5">
+              <Label htmlFor="ct-subject">Тема *</Label>
+              <Input id="ct-subject" placeholder="Краткое описание проблемы" {...register('subject')} />
+              {errors.subject && <p className="text-xs text-destructive">{errors.subject.message}</p>}
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="ct-body">Сообщение *</Label>
+              <Textarea id="ct-body" rows={4} placeholder="Подробное описание..." {...register('body')} />
+              {errors.body && <p className="text-xs text-destructive">{errors.body.message}</p>}
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="ct-email">Email клиента *</Label>
+              <Input
+                id="ct-email"
+                type="email"
+                placeholder="client@example.com"
+                {...register('requesterEmail')}
+              />
+              {errors.requesterEmail && (
+                <p className="text-xs text-destructive">{errors.requesterEmail.message}</p>
+              )}
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="ct-name">Имя клиента</Label>
+              <Input id="ct-name" placeholder="Иван Иванов" {...register('requesterName')} />
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="ct-priority">Приоритет</Label>
+              <select
+                id="ct-priority"
+                {...register('priority')}
+                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                <option value="normal">Обычный</option>
+                <option value="low">Низкий</option>
+                <option value="high">Высокий</option>
+                <option value="urgent">Критический</option>
+              </select>
+            </div>
+
+            <DialogFooter className="pt-2">
+              <Button type="button" variant="outline" onClick={closeCreate}>
+                Отмена
+              </Button>
+              <Button type="submit" disabled={isSubmitting}>
+                {isSubmitting ? 'Создание...' : 'Создать'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

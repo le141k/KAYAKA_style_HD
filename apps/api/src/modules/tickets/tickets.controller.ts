@@ -32,6 +32,8 @@ import {
   WatcherSchema,
   ListTicketsQuerySchema,
   PublicCreateTicketSchema,
+  ApplyMacroSchema,
+  ChangeDepartmentSchema,
   type CreateTicketDto,
   type ReplyTicketDto,
   type AssignTicketDto,
@@ -46,6 +48,8 @@ import {
   type PublicCreateTicketDto,
   PublicReplySchema,
   type PublicReplyDto,
+  type ApplyMacroDto,
+  type ChangeDepartmentDto,
 } from './dto';
 
 @ApiTags('tickets')
@@ -226,6 +230,29 @@ export class TicketsController {
     @CurrentStaff() staff: AuthStaff,
   ) {
     return this.ticketsService.split(id, dto, staff.staffId);
+  }
+
+  @Post(':id/apply-macro')
+  @RequirePermissions(PERMISSIONS.TICKET_EDIT)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Apply a macro to a ticket (posts reply text and executes actions)' })
+  applyMacro(
+    @Param('id', ParseIntPipe) id: number,
+    @Body(new ZodValidationPipe(ApplyMacroSchema)) dto: ApplyMacroDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.ticketsService.applyMacro(id, dto, staff.staffId);
+  }
+
+  @Patch(':id/department')
+  @RequirePermissions(PERMISSIONS.TICKET_EDIT)
+  @ApiOperation({ summary: 'Change the department of a ticket' })
+  changeDepartment(
+    @Param('id', ParseIntPipe) id: number,
+    @Body(new ZodValidationPipe(ChangeDepartmentSchema)) dto: ChangeDepartmentDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.ticketsService.changeDepartment(id, dto, staff.staffId);
   }
 
   // ─────────────────── Watchers ───────────────────

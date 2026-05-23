@@ -19,6 +19,8 @@ import type {
   TagDto,
   WatcherDto,
   PublicReplyDto,
+  ApplyMacroDto,
+  ChangeDepartmentDto,
 } from './dto';
 import type { ActorType, CreationMode, Ticket, TicketPost, TicketNote } from '@prisma/client';
 
@@ -819,6 +821,149 @@ export class TicketsService {
       where: { id: ticketId },
       data: { tags: { disconnect: { name: tagName } } },
     });
+  }
+
+  // ─────────────────────────── Apply Macro ───────────────────────────
+
+  /**
+   * Apply a macro to a ticket.
+   * If the macro has reply text, it is posted as a staff reply.
+   * Each action in actions[] is executed (set_status / set_priority / assign / add_tag /
+   * change_status / change_priority / change_owner / add_tag — tolerates both naming schemes).
+   */
+  async applyMacro(ticketId: number, dto: ApplyMacroDto, staffId: number): Promise<Ticket> {
+    const ticket = await this.findOrThrow(ticketId);
+
+    const macro = await this.prisma.macro.findUnique({ where: { id: dto.macroId } });
+    if (!macro) throw new NotFoundException(`Macro ${dto.macroId} not found`);
+
+    // 1. Post the reply text if present
+    if (macro.replyText && macro.replyText.trim()) {
+      const staff = await this.prisma.staff.findUnique({ where: { id: staffId } });
+      const now = new Date();
+
+      await this.prisma.ticketPost.create({
+        data: {
+          ticketId,
+          authorType: 'STAFF',
+          staffId,
+          fullName: staff ? `${staff.firstName} ${staff.lastName}`.trim() || staff.email : undefined,
+          email: staff?.email,
+          subject: ticket.subject,
+          contents: macro.replyText,
+          isHtml: false,
+          creationMode: 'STAFF',
+          ipAddress: '0.0.0.0',
+        },
+      });
+
+      await this.prisma.ticket.update({
+        where: { id: ticketId },
+        data: {
+          totalReplies: { increment: 1 },
+          lastReplyAt: now,
+          lastActivityAt: now,
+          ...(ticket.firstResponseAt === null ? { firstResponseAt: now } : {}),
+        },
+      });
+    }
+
+    // 2. Execute actions[]
+    const actions = macro.actions as unknown as Array<Record<string, unknown>>;
+    if (Array.isArray(actions) && actions.length > 0) {
+      const ticketUpdate: Partial<Record<string, unknown>> = {};
+
+      for (const action of actions) {
+        const type = action['type'] as string | undefined;
+        try {
+          switch (type) {
+            case 'set_status':
+            case 'change_status':
+              if (action['statusId']) ticketUpdate['statusId'] = action['statusId'];
+              break;
+            case 'set_priority':
+            case 'change_priority':
+              if (action['priorityId']) ticketUpdate['priorityId'] = action['priorityId'];
+              break;
+            case 'assign':
+            case 'change_owner':
+              ticketUpdate['ownerStaffId'] = action['ownerStaffId'] ?? null;
+              break;
+            case 'change_department':
+              if (action['departmentId']) ticketUpdate['departmentId'] = action['departmentId'];
+              break;
+            case 'add_tag':
+              if (typeof action['tag'] === 'string' && action['tag']) {
+                await this.prisma.ticket.update({
+                  where: { id: ticketId },
+                  data: {
+                    tags: {
+                      connectOrCreate: {
+                        where: { name: action['tag'] as string },
+                        create: { name: action['tag'] as string },
+                      },
+                    },
+                  },
+                });
+              }
+              break;
+            case 'add_note':
+              if (typeof action['note'] === 'string' && action['note']) {
+                await this.prisma.ticketNote.create({
+                  data: {
+                    ticketId,
+                    staffId,
+                    contents: `[Macro: ${macro.title}] ${action['note']}`,
+                  },
+                });
+              }
+              break;
+          }
+        } catch (err) {
+          this.logger.error(
+            `Macro ${macro.id} action ${type ?? 'unknown'} failed on ticket ${ticket.mask}: ${String(err)}`,
+          );
+        }
+      }
+
+      if (Object.keys(ticketUpdate).length > 0) {
+        ticketUpdate['lastActivityAt'] = new Date();
+        await this.prisma.ticket.update({ where: { id: ticketId }, data: ticketUpdate });
+      }
+    }
+
+    await this.writeAudit(ticketId, 'MACRO_APPLIED', staffId, 'STAFF', {
+      field: 'macroId',
+      newValue: String(macro.id),
+    });
+
+    this.logger.log(`Macro ${macro.id} applied to ticket ${ticket.mask} by staff ${staffId}`);
+    return this.prisma.ticket.findUniqueOrThrow({ where: { id: ticketId } });
+  }
+
+  // ─────────────────────────── Change Department ───────────────────────────
+
+  /**
+   * Change the department a ticket belongs to.
+   */
+  async changeDepartment(ticketId: number, dto: ChangeDepartmentDto, staffId: number): Promise<Ticket> {
+    const ticket = await this.findOrThrow(ticketId);
+
+    const dept = await this.prisma.department.findUnique({ where: { id: dto.departmentId } });
+    if (!dept) throw new NotFoundException(`Department ${dto.departmentId} not found`);
+
+    const updated = await this.prisma.ticket.update({
+      where: { id: ticketId },
+      data: { departmentId: dto.departmentId, lastActivityAt: new Date() },
+    });
+
+    await this.writeAudit(ticketId, 'DEPARTMENT_CHANGE', staffId, 'STAFF', {
+      field: 'departmentId',
+      oldValue: ticket.departmentId.toString(),
+      newValue: dto.departmentId.toString(),
+    });
+
+    return updated;
   }
 
   // ─────────────────────────── Domain events ───────────────────────────

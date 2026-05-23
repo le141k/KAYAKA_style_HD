@@ -1,9 +1,4 @@
-import {
-  Injectable,
-  UnauthorizedException,
-  Logger,
-  Inject,
-} from '@nestjs/common';
+import { Injectable, UnauthorizedException, Logger, Inject } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppConfig, APP_CONFIG } from '../config/configuration';
@@ -145,11 +140,17 @@ export class AuthService {
 
   /** Build the AuthStaff principal from a Staff+Group record. */
   buildPrincipal(staff: StaffWithGroup): AuthStaff {
+    const firstName = staff.firstName ?? '';
+    const lastName = staff.lastName ?? '';
+    const fullName = [firstName, lastName].filter(Boolean).join(' ') || staff.email;
     return {
       staffId: staff.id,
       email: staff.email,
       isAdmin: staff.staffGroup.isAdmin,
       permissions: staff.staffGroup.permissions as Permission[],
+      firstName,
+      lastName,
+      fullName,
     };
   }
 
@@ -186,4 +187,3 @@ export class AuthService {
     });
   }
 }
-

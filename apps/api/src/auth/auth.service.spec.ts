@@ -107,9 +107,7 @@ describe('AuthService', () => {
     it('throws UnauthorizedException when staff not found', async () => {
       (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
-      await expect(service.validateStaff('bad@example.com', 'pass')).rejects.toThrow(
-        UnauthorizedException,
-      );
+      await expect(service.validateStaff('bad@example.com', 'pass')).rejects.toThrow(UnauthorizedException);
     });
 
     it('throws UnauthorizedException when staff is disabled', async () => {
@@ -127,9 +125,9 @@ describe('AuthService', () => {
       (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
       vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(false);
 
-      await expect(
-        service.validateStaff('test@23telecom.example', 'wrong-password'),
-      ).rejects.toThrow(UnauthorizedException);
+      await expect(service.validateStaff('test@23telecom.example', 'wrong-password')).rejects.toThrow(
+        UnauthorizedException,
+      );
     });
   });
 
@@ -179,6 +177,9 @@ describe('AuthService', () => {
         email: 'test@23telecom.example',
         isAdmin: true,
         permissions: ['ticket.view'],
+        firstName: 'Test',
+        lastName: 'Staff',
+        fullName: 'Test Staff',
       });
     });
   });

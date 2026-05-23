@@ -36,30 +36,36 @@ export function DashboardContent() {
         <DashboardStatsSkeleton />
       ) : (
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4 xl:grid-cols-5">
-          <AnimatedStatCard
-            title={t.dashboard.openTickets}
-            value={stats.open_tickets}
-            icon={Ticket}
-            colorClass="brand"
-          />
-          <AnimatedStatCard
-            title={t.dashboard.pendingTickets}
-            value={stats.pending_tickets}
-            icon={Clock}
-            colorClass="amber"
-          />
+          <Link href="/staff/tickets?status=open" className="block">
+            <AnimatedStatCard
+              title={t.dashboard.openTickets}
+              value={stats.open_tickets}
+              icon={Ticket}
+              colorClass="brand"
+            />
+          </Link>
+          <Link href="/staff/tickets?status=pending" className="block">
+            <AnimatedStatCard
+              title={t.dashboard.pendingTickets}
+              value={stats.pending_tickets}
+              icon={Clock}
+              colorClass="amber"
+            />
+          </Link>
           <AnimatedStatCard
             title={t.dashboard.resolvedToday}
             value={stats.resolved_today}
             icon={CheckCircle2}
             colorClass="green"
           />
-          <AnimatedStatCard
-            title={t.dashboard.slaBreached}
-            value={stats.sla_breached}
-            icon={AlertTriangle}
-            colorClass="red"
-          />
+          <Link href="/staff/tickets?status=open&sla_breached=1" className="block">
+            <AnimatedStatCard
+              title={t.dashboard.slaBreached}
+              value={stats.sla_breached}
+              icon={AlertTriangle}
+              colorClass="red"
+            />
+          </Link>
           <AnimatedStatCard
             title={t.dashboard.avgResponse}
             value={stats.avg_first_response_minutes}
