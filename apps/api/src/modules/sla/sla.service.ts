@@ -381,6 +381,7 @@ export class SlaService {
   // ─────────────────── SlaHoliday CRUD ───────────────────
 
   async listHolidays(scheduleId: number): Promise<SlaHoliday[]> {
+    await this.getSchedule(scheduleId); // 404 if the parent schedule doesn't exist
     return this.prisma.slaHoliday.findMany({ where: { scheduleId } });
   }
 
@@ -452,6 +453,7 @@ export class SlaService {
   // ─────────────────── EscalationRule CRUD ───────────────────
 
   async listRules(slaPlanId: number): Promise<EscalationRule[]> {
+    await this.getPlan(slaPlanId); // 404 if the parent plan doesn't exist
     return this.prisma.escalationRule.findMany({ where: { slaPlanId } });
   }
 

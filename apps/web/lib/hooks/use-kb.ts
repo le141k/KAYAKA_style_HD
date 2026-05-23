@@ -18,6 +18,7 @@ interface ApiArticle {
   contents?: string;
   contentsText?: string;
   categoryId?: number | null;
+  category?: { title: string } | null;
   views?: number;
   createdAt?: string;
   updatedAt?: string;
@@ -38,8 +39,9 @@ function mapArticle(a: ApiArticle): KBArticle {
   // body holds the HTML when available (for article detail rendering), or a plaintext
   // snippet (≤120 chars) when only contentsText is available (list card preview).
   const body = a.contents ?? (a.contentsText ? a.contentsText.slice(0, 120) : '');
-  // Category name: show "Общее" when there is no category (KB-4)
-  const categoryName = a.categoryId ? '' : 'Общее';
+  // Category name: real title when present, "Общее" when uncategorised (KB-4 fix —
+  // the previous logic was inverted and blanked categorised articles).
+  const categoryName = a.category?.title ?? (a.categoryId ? '' : 'Общее');
   return {
     id: a.id,
     slug: a.slug,

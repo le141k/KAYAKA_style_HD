@@ -258,7 +258,7 @@ export class TicketsController {
   // ─────────────────── Watchers ───────────────────
 
   @Post(':id/watchers')
-  @RequirePermissions(PERMISSIONS.TICKET_VIEW)
+  @RequirePermissions(PERMISSIONS.TICKET_EDIT)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Add a watcher to a ticket' })
   addWatcher(
@@ -269,7 +269,7 @@ export class TicketsController {
   }
 
   @Delete(':id/watchers/:staffId')
-  @RequirePermissions(PERMISSIONS.TICKET_VIEW)
+  @RequirePermissions(PERMISSIONS.TICKET_EDIT)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Remove a watcher from a ticket' })
   removeWatcher(@Param('id', ParseIntPipe) id: number, @Param('staffId', ParseIntPipe) staffId: number) {

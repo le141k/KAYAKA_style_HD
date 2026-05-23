@@ -71,6 +71,7 @@ export class KnowledgebaseService {
           title: true,
           slug: true,
           categoryId: true,
+          category: { select: { title: true } },
           isPublished: true,
           views: true,
           updatedAt: true,

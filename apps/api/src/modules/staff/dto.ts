@@ -7,7 +7,9 @@ export const CreateStaffGroupSchema = z.object({
 });
 export type CreateStaffGroupDto = z.infer<typeof CreateStaffGroupSchema>;
 
-export const UpdateStaffGroupSchema = CreateStaffGroupSchema.partial();
+// `isAdmin` is intentionally NOT updatable here — allowing it would let any
+// holder of staff.manage escalate a group to admin (privilege escalation).
+export const UpdateStaffGroupSchema = CreateStaffGroupSchema.partial().omit({ isAdmin: true });
 export type UpdateStaffGroupDto = z.infer<typeof UpdateStaffGroupSchema>;
 
 export const CreateStaffSchema = z.object({

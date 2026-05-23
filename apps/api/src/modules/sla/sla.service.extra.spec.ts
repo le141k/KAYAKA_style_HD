@@ -234,6 +234,7 @@ describe('SlaService (extra coverage)', () => {
 
   describe('listHolidays', () => {
     it('returns holidays for a schedule', async () => {
+      (prisma.slaSchedule.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_SCHEDULE);
       (prisma.slaHoliday.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([MOCK_HOLIDAY]);
       const result = await service.listHolidays(1);
       expect(result).toHaveLength(1);
@@ -367,6 +368,7 @@ describe('SlaService (extra coverage)', () => {
 
   describe('listRules', () => {
     it('returns all rules for a plan', async () => {
+      (prisma.slaPlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_PLAN);
       (prisma.escalationRule.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([MOCK_RULE]);
       const result = await service.listRules(1);
       expect(result).toHaveLength(1);

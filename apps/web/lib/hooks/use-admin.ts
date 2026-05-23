@@ -323,7 +323,8 @@ function mapSchedule(s: ApiSlaSchedule): AdminSlaSchedule {
 }
 
 function mapHoliday(h: ApiSlaHoliday): AdminSlaHoliday {
-  return { id: h.id, scheduleId: h.scheduleId, title: h.title, date: h.date };
+  // API returns a full ISO datetime; <input type="date"> needs YYYY-MM-DD.
+  return { id: h.id, scheduleId: h.scheduleId, title: h.title, date: h.date.slice(0, 10) };
 }
 
 function mapStaff(s: ApiStaffMember): AdminStaffMember {

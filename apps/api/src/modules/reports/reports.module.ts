@@ -85,7 +85,13 @@ export class ReportsService {
       this.execute({ source: 'tickets', groupBy: 'statusId', filters: {}, metric: 'count' }),
       this.execute({ source: 'tickets', groupBy: 'priorityId', filters: {}, metric: 'count' }),
       this.prisma.ticket.count(),
-      this.prisma.ticket.count({ where: { isResolved: true } }),
+      // "resolved today" — resolved with resolvedAt since local midnight
+      this.prisma.ticket.count({
+        where: {
+          isResolved: true,
+          resolvedAt: { gte: new Date(new Date().setHours(0, 0, 0, 0)) },
+        },
+      }),
       // SLA breached: past due and not yet resolved
       this.prisma.ticket.count({ where: { isResolved: false, dueAt: { lt: now } } }),
       // For avg first-response time, pull (createdAt, firstResponseAt) of responded tickets
