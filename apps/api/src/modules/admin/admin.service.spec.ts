@@ -251,6 +251,25 @@ describe('AdminService', () => {
       ).resolves.toBeUndefined();
     });
 
+    it('throws BadRequestException on type mismatch (NUMBER expects numeric)', async () => {
+      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { ...MOCK_FIELD, fieldKey: 'amount', isRequired: false, type: 'NUMBER' },
+      ]);
+
+      await expect(service.validateCustomFields('TICKET', { amount: 'abc' })).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('passes for NUMBER type with a numeric string or number', async () => {
+      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { ...MOCK_FIELD, fieldKey: 'amount', isRequired: false, type: 'NUMBER' },
+      ]);
+
+      await expect(service.validateCustomFields('TICKET', { amount: '42.5' })).resolves.toBeUndefined();
+      await expect(service.validateCustomFields('TICKET', { amount: 7 })).resolves.toBeUndefined();
+    });
+
     it('throws BadRequestException on type mismatch (MULTISELECT expects array)', async () => {
       (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
         { ...MOCK_FIELD, fieldKey: 'tags', isRequired: false, type: 'MULTISELECT' },

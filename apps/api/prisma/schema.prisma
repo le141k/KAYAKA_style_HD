@@ -58,6 +58,7 @@ enum CustomFieldType {
   SELECT
   MULTISELECT
   DATE
+  NUMBER
   FILE
   CUSTOM
 }

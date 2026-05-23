@@ -62,6 +62,17 @@ export function CustomFieldsSection({ fields, values, onChange, errors }: Props)
               />
             )}
 
+            {f.type === 'NUMBER' && (
+              <Input
+                id={id}
+                type="number"
+                value={typeof value === 'string' || typeof value === 'number' ? String(value) : ''}
+                onChange={(e) => onChange(f.fieldKey, e.target.value)}
+                aria-invalid={!!error}
+                aria-required={required}
+              />
+            )}
+
             {f.type === 'DATE' && (
               <Input
                 id={id}

@@ -980,6 +980,7 @@ const FIELD_TYPE_MAP: Record<string, string> = {
   select: 'SELECT',
   multiselect: 'MULTISELECT',
   date: 'DATE',
+  number: 'NUMBER',
   file: 'FILE',
   custom: 'CUSTOM',
 };

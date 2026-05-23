@@ -30,6 +30,7 @@ export const CreateCustomFieldSchema = z.object({
     'SELECT',
     'MULTISELECT',
     'DATE',
+    'NUMBER',
     'FILE',
     'CUSTOM',
   ]),

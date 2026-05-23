@@ -101,6 +101,11 @@ export class AdminService {
         return typeof value === 'string' && !Number.isNaN(Date.parse(value));
       case 'MULTISELECT':
         return Array.isArray(value);
+      case 'NUMBER':
+        return (
+          typeof value === 'number' ||
+          (typeof value === 'string' && value.trim() !== '' && !Number.isNaN(Number(value)))
+        );
       case 'TEXT':
       case 'TEXTAREA':
       case 'PASSWORD':
