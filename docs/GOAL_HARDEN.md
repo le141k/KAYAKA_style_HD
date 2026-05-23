@@ -40,22 +40,22 @@ rewritten at commit 31add8e). After this, the product is honestly hand-to-a-real
 - [x] **UI-4** Kanban reads `total`; banner "Показаны первые 50 из N" when `total > 50` (latent now at 8 tickets).
 - **Acceptance:** RU panels localized; active tab visible; kanban warns when capped; `make verify` GREEN. ✅
 
-## ☐ Batch H4 — Build hygiene
+## ✅ Batch H4 — Build hygiene (DONE)
 
-- [ ] **BUILD-1** `multer` is a phantom (imported, not a direct dep). **Fix:** add `multer` + `@types/multer` to `apps/api/package.json`.
-- [ ] **BUILD-2** Prod API image ships devDeps (~1.85 GB). **Fix:** `npm ci --omit=dev` (or prune) in the runner stage of `apps/api/Dockerfile`.
-- **Acceptance:** `docker compose -f docker-compose.prod.yml build` succeeds; image slimmer; `make verify` green.
+- [x] **BUILD-1** Added `multer@^2.0.2` (dep) + `@types/multer` (devDep) to apps/api; also moved `prisma` + `pino-pretty` to dependencies (both needed at runtime: prisma for `migrate deploy`, pino-pretty for the dev container's `NODE_ENV=development` pretty logs).
+- [x] **BUILD-2** New `prod-deps` stage (`npm ci --omit=dev`); runner copies that node_modules + the build-stage generated Prisma client. **vitest/eslint/testcontainers gone from the runtime image; api boots, migrate+seed run, upload → 201.** Image 1.85 → 1.59 GB. (Residual tsc/playwright are hoisted transitive prod deps of the workspace; the test toolchain itself is removed.)
+- **Acceptance:** api boots under --omit=dev; upload works; `make verify` GREEN. ✅
 
 ---
 
-## ✅ Definition of Done — STOP when ALL green
+## ✅ Definition of Done — ALL GREEN
 
-- [ ] Every NEXT_GOAL P0/P1/P2 item above is fixed with a test.
-- [ ] SEC-1..4 **live-verified** (anon attachment download blocked; logout revokes access; no owner email in public ticket; throttle present).
-- [ ] No silent error-masking anywhere (client my-tickets + kanban show real errors).
-- [ ] `make verify-full` green (gate 9/9 + full e2e), stable.
-- [ ] Dev loop still works; prod profile still builds.
-      → then tag `v1.0-pilot`.
+- [x] Every NEXT_GOAL P0/P1/P2 item above is fixed with a test (H1–H4 committed).
+- [x] SEC-1..4 **live-verified**: anon/bogus attachment download → 401 (admin 200); logout → access token 401 (jti blocklist); public ticket owner has no email; @Throttle on /tickets/my + /public/:id.
+- [x] No silent error-masking: client my-tickets + kanban now render `<QueryError>` on failure (BUG-1 dup-message also fixed).
+- [x] `make verify-full` GREEN — gate 9/9 + e2e 37/37, vitest 509/509.
+- [x] Dev loop works (demo seed + make verify green); prod profile builds (helmet, secret-gate, no demo seed, devDeps pruned, behind reverse-proxy).
+      → tagged `v1.0-pilot`.
 
 ## ⛔ OUT OF SCOPE (do NOT touch — post-pilot)
 

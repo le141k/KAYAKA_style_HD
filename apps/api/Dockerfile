@@ -17,10 +17,23 @@ COPY . .
 RUN npx -w apps/api prisma generate \
   && npm run build --workspace=apps/api
 
+# Production-only dependencies — no vitest/eslint/tsc/testcontainers in the runtime image.
+FROM node:22-alpine AS prod-deps
+WORKDIR /app
+COPY package.json package-lock.json* ./
+COPY apps/api/package.json apps/api/package.json
+COPY apps/web/package.json apps/web/package.json
+COPY packages/shared/package.json packages/shared/package.json
+RUN npm ci --omit=dev
+
 FROM node:22-alpine AS runner
 ENV NODE_ENV=production
 WORKDIR /app
-COPY --from=build /app/node_modules ./node_modules
+# Prod deps only (prisma CLI is now a prod dep so `migrate deploy` works at boot)…
+COPY --from=prod-deps /app/node_modules ./node_modules
+# …plus the Prisma client generated during the build stage (prisma generate runs there).
+COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=build /app/node_modules/@prisma/client ./node_modules/@prisma/client
 COPY --from=build /app/apps/api/dist ./dist
 COPY --from=build /app/apps/api/prisma ./prisma
 COPY --from=build /app/apps/api/package.json ./package.json
