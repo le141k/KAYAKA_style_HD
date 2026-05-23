@@ -89,6 +89,9 @@ export const ListTicketsQuerySchema = z.object({
   /** Filter by requester user id */
   userId: z.coerce.number().int().positive().optional(),
   isResolved: z.coerce.boolean().optional(),
+  /** Filter by createdAt range (ISO timestamps) */
+  createdAfter: z.coerce.date().optional(),
+  createdBefore: z.coerce.date().optional(),
   /** Sort field */
   sortBy: z.enum(['createdAt', 'lastActivityAt', 'lastReplyAt']).default('lastActivityAt'),
   sortDir: z.enum(['asc', 'desc']).default('desc'),

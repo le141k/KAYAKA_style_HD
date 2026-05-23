@@ -1,11 +1,11 @@
-"use client";
+'use client';
 
-import Link from "next/link";
-import { ArrowLeft, Eye, Calendar } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
-import { useKBArticle } from "@/lib/hooks/use-kb";
-import { formatDate } from "@/lib/utils";
+import Link from 'next/link';
+import { ArrowLeft, Eye, Calendar } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
+import { useKBArticle } from '@/lib/hooks/use-kb';
+import { formatDate } from '@/lib/utils';
 
 export function KBArticleContent({ slug }: { slug: string }) {
   const { data: article, isLoading } = useKBArticle(slug);
@@ -44,9 +44,10 @@ export function KBArticleContent({ slug }: { slug: string }) {
       </Button>
 
       <div>
-        <span className="text-xs text-primary font-medium">
-          {article.category.name}
-        </span>
+        {/* show category label only when we have a name (KB-4) */}
+        {article.category.name ? (
+          <span className="text-xs text-primary font-medium">{article.category.name}</span>
+        ) : null}
         <h1 className="mt-1 text-2xl font-bold">{article.title}</h1>
         <div className="mt-2 flex items-center gap-4 text-xs text-muted-foreground">
           <span className="flex items-center gap-1">
@@ -61,15 +62,15 @@ export function KBArticleContent({ slug }: { slug: string }) {
         </div>
       </div>
 
-      <div className="prose prose-sm max-w-none text-foreground">
-        <p>{article.body}</p>
-      </div>
+      {/* body is staff-authored HTML — render it as markup (KB-3) */}
+      <div
+        className="prose prose-sm max-w-none text-foreground"
+        dangerouslySetInnerHTML={{ __html: article.body }}
+      />
 
       <div className="rounded-xl border border-border bg-card p-5">
         <p className="text-sm font-semibold">Не нашли ответ?</p>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Наши специалисты помогут разобраться
-        </p>
+        <p className="mt-1 text-xs text-muted-foreground">Наши специалисты помогут разобраться</p>
         <Button asChild className="mt-3" size="sm">
           <Link href="/submit">Создать обращение</Link>
         </Button>

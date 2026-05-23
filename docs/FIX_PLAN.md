@@ -28,17 +28,17 @@
 - ☑ P0-9 departments parentId null (S1)
 - ☑ P0-10 SLA edit (S2 ✓ — проверить)
 - ☑ P0-1 login redirect /staff/dashboard + hard-nav (verify)
-- ☐ P0-2/3 kanban DnD persist (@dnd-kit)
+- ☑ P0-2/3 kanban DnD persist (native HTML5 DnD + closed column)
 
 ## P1 (кластерами)
 
 - ☑ Ticket detail: статус/приоритет/ассайн(ownerStaffId)/закрыть + notes + авторы + dedup [TD-1,2,3,4,5,8,9,10,11] (◐ остаётся TD-6 отдел, TD-7 теги, TD-12 вложения, TD-13 макрос, TD-14 merge, TD-16 dup-id)
-- ☐ Tickets list: server-side фильтры + счётчик + период [TL-1..3]
-- ☐ Dashboard: реальные SLA/avg/тренды [DK-4,5]; CommandPalette enabled:open [DK-7]; closed-колонка [DK-8]
+- ☑ Tickets list: server-side фильтры + счётчик + период [TL-1,2,3]
+- ☑ Dashboard: реальные SLA/avg [DK-4], убраны фейк-тренды [DK-5], CommandPalette enabled:open [DK-7], closed-колонка [DK-8]
 - ☐ Client: client_email запись + публичные detail/reply эндпоинты + dept dropdown [CL-1..5]
-- ☐ Workflows/macros: билдеры, edit-кнопка макроса, категории, isShared [WF-2,3,4,6]
-- ☐ SLA UI: расписания/праздники/эскалации [SLA-3,4,5]; ApiEscalationRule интерфейс [SLA-6]
-- ☐ Staff: isEnabled toggle [ST-4]; KB: превью/счётчик/HTML [KB-1,2,3]
+- ☑ Workflows/macros: билдеры criteria/actions, edit макроса, категории, isShared [WF-2,3,4,6]
+- ☑ SLA UI: расписания/праздники/эскалации [SLA-3,4,5] + ApiEscalationRule [SLA-6]
+- ☑ KB: превью/счётчик/HTML/драфты [KB-1,2,3,4 + RBAC-1]; ☐ Staff isEnabled toggle [ST-4]
 - ☐ Security: throttler login/public; KB-черновики; /tickets/my scope; HttpOnly cookie [RBAC-1,2; AU-1,2,4]
 
 ## Обнаружено в ходе фиксов

@@ -1,22 +1,13 @@
-"use client";
+'use client';
 
-import Link from "next/link";
-import {
-  Ticket,
-  Clock,
-  CheckCircle2,
-  AlertTriangle,
-  Timer,
-} from "lucide-react";
-import { AnimatedStatCard } from "@/components/premium/AnimatedStatCard";
-import { TicketRow } from "@/components/premium/TicketRow";
-import {
-  DashboardStatsSkeleton,
-  TicketListSkeleton,
-} from "@/components/premium/SkeletonLoaders";
-import { useDashboardStats, useTickets } from "@/lib/hooks/use-tickets";
-import { Button } from "@/components/ui/button";
-import { useI18n } from "@/lib/i18n";
+import Link from 'next/link';
+import { Ticket, Clock, CheckCircle2, AlertTriangle, Timer } from 'lucide-react';
+import { AnimatedStatCard } from '@/components/premium/AnimatedStatCard';
+import { TicketRow } from '@/components/premium/TicketRow';
+import { DashboardStatsSkeleton, TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
+import { useDashboardStats, useTickets } from '@/lib/hooks/use-tickets';
+import { Button } from '@/components/ui/button';
+import { useI18n } from '@/lib/i18n';
 
 export function DashboardContent() {
   const { t } = useI18n();
@@ -33,9 +24,7 @@ export function DashboardContent() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">{t.dashboard.title}</h1>
-          <p className="text-sm text-muted-foreground">
-            Добро пожаловать в 23T Help Desk
-          </p>
+          <p className="text-sm text-muted-foreground">Добро пожаловать в 23T Help Desk</p>
         </div>
         <Button asChild>
           <Link href="/staff/tickets?create=1">{t.nav.newTicket}</Link>
@@ -52,7 +41,6 @@ export function DashboardContent() {
             value={stats.open_tickets}
             icon={Ticket}
             colorClass="brand"
-            trend={{ value: +5, label: "за неделю" }}
           />
           <AnimatedStatCard
             title={t.dashboard.pendingTickets}
@@ -65,7 +53,6 @@ export function DashboardContent() {
             value={stats.resolved_today}
             icon={CheckCircle2}
             colorClass="green"
-            trend={{ value: +12, label: "vs вчера" }}
           />
           <AnimatedStatCard
             title={t.dashboard.slaBreached}
@@ -102,11 +89,7 @@ export function DashboardContent() {
         ) : (
           <div className="space-y-2">
             {recentTickets.map((ticket) => (
-              <TicketRow
-                key={ticket.id}
-                ticket={ticket}
-                href={`/staff/tickets/${ticket.id}`}
-              />
+              <TicketRow key={ticket.id} ticket={ticket} href={`/staff/tickets/${ticket.id}`} />
             ))}
           </div>
         )}

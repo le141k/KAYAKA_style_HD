@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Injectable, Module, Param, ParseIntPipe, Post, UsePipes } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Injectable,
+  Module,
+  Param,
+  ParseIntPipe,
+  Post,
+  UsePipes,
+} from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { z } from 'zod';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -11,7 +21,14 @@ import { PERMISSIONS } from '../../auth/permissions';
  *   { source: 'tickets', groupBy?: <field>, filters?: {field: value}, metric: 'count' }
  * Full KQL (lexer/parser/compiler) is a future enhancement (see docs/adr).
  */
-const GROUPABLE = ['statusId', 'priorityId', 'departmentId', 'typeId', 'ownerStaffId', 'creationMode'] as const;
+const GROUPABLE = [
+  'statusId',
+  'priorityId',
+  'departmentId',
+  'typeId',
+  'ownerStaffId',
+  'creationMode',
+] as const;
 const DefinitionSchema = z.object({
   source: z.literal('tickets').default('tickets'),
   groupBy: z.enum(GROUPABLE).optional(),
@@ -35,7 +52,9 @@ export class ReportsService {
   }
 
   create(dto: z.infer<typeof ReportSchema>) {
-    return this.prisma.report.create({ data: { title: dto.title, kind: dto.kind, definition: dto.definition } });
+    return this.prisma.report.create({
+      data: { title: dto.title, kind: dto.kind, definition: dto.definition },
+    });
   }
 
   /** Executes a stored report's definition and returns aggregated rows. */
@@ -61,13 +80,30 @@ export class ReportsService {
 
   /** Convenience dashboard summary used by the staff home screen. */
   async dashboard() {
-    const [byStatus, byPriority, total, resolved] = await Promise.all([
+    const now = new Date();
+    const [byStatus, byPriority, total, resolved, slaBreached, firstResponded] = await Promise.all([
       this.execute({ source: 'tickets', groupBy: 'statusId', filters: {}, metric: 'count' }),
       this.execute({ source: 'tickets', groupBy: 'priorityId', filters: {}, metric: 'count' }),
       this.prisma.ticket.count(),
       this.prisma.ticket.count({ where: { isResolved: true } }),
+      // SLA breached: past due and not yet resolved
+      this.prisma.ticket.count({ where: { isResolved: false, dueAt: { lt: now } } }),
+      // For avg first-response time, pull (createdAt, firstResponseAt) of responded tickets
+      this.prisma.ticket.findMany({
+        where: { firstResponseAt: { not: null } },
+        select: { createdAt: true, firstResponseAt: true },
+      }),
     ]);
-    return { total, resolved, byStatus, byPriority };
+    const avgFirstResponseMinutes =
+      firstResponded.length === 0
+        ? 0
+        : Math.round(
+            firstResponded.reduce(
+              (acc, t) => acc + (t.firstResponseAt!.getTime() - t.createdAt.getTime()) / 60_000,
+              0,
+            ) / firstResponded.length,
+          );
+    return { total, resolved, slaBreached, avgFirstResponseMinutes, byStatus, byPriority };
   }
 }
 
@@ -76,17 +112,31 @@ export class ReportsService {
 export class ReportsController {
   constructor(private readonly reports: ReportsService) {}
 
-  @RequirePermissions(PERMISSIONS.TICKET_VIEW) @Get('dashboard') @ApiOperation({ summary: 'Dashboard summary metrics' })
-  dashboard() { return this.reports.dashboard(); }
+  @RequirePermissions(PERMISSIONS.TICKET_VIEW)
+  @Get('dashboard')
+  @ApiOperation({ summary: 'Dashboard summary metrics' })
+  dashboard() {
+    return this.reports.dashboard();
+  }
 
-  @RequirePermissions(PERMISSIONS.TICKET_VIEW) @Get()
-  list() { return this.reports.list(); }
+  @RequirePermissions(PERMISSIONS.TICKET_VIEW)
+  @Get()
+  list() {
+    return this.reports.list();
+  }
 
-  @RequirePermissions(PERMISSIONS.TICKET_VIEW) @Get(':id/run')
-  run(@Param('id', ParseIntPipe) id: number) { return this.reports.run(id); }
+  @RequirePermissions(PERMISSIONS.TICKET_VIEW)
+  @Get(':id/run')
+  run(@Param('id', ParseIntPipe) id: number) {
+    return this.reports.run(id);
+  }
 
-  @RequirePermissions(PERMISSIONS.ADMIN_SETTINGS) @Post() @UsePipes(new ZodValidationPipe(ReportSchema))
-  create(@Body() dto: z.infer<typeof ReportSchema>) { return this.reports.create(dto); }
+  @RequirePermissions(PERMISSIONS.ADMIN_SETTINGS)
+  @Post()
+  @UsePipes(new ZodValidationPipe(ReportSchema))
+  create(@Body() dto: z.infer<typeof ReportSchema>) {
+    return this.reports.create(dto);
+  }
 }
 
 @Module({

@@ -26,7 +26,8 @@ export class KnowledgebaseController {
   @ApiOperation({ summary: 'List/search knowledgebase articles' })
   @UsePipes(new ZodValidationPipe(ListArticlesSchema))
   list(@Query() query: ListArticlesDto) {
-    return this.kb.listArticles(query);
+    // Public endpoint must always show published articles only (RBAC-1)
+    return this.kb.listArticles({ ...query, publishedOnly: true });
   }
 
   @Public()
@@ -65,7 +66,10 @@ export class KnowledgebaseController {
 
   @RequirePermissions(PERMISSIONS.KB_MANAGE)
   @Post('articles')
-  create(@Body(new ZodValidationPipe(CreateArticleSchema)) dto: CreateArticleDto, @CurrentStaff() staff: AuthStaff) {
+  create(
+    @Body(new ZodValidationPipe(CreateArticleSchema)) dto: CreateArticleDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
     return this.kb.createArticle(dto, staff.staffId);
   }
 

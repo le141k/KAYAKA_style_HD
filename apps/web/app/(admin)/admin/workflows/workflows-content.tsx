@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { useForm } from 'react-hook-form';
+import { useForm, useFieldArray } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { Plus, Pencil, Trash2, Zap } from 'lucide-react';
@@ -17,17 +17,39 @@ import {
   useDeleteWorkflow,
   useAdminMacros,
   useCreateMacro,
+  useUpdateMacro,
   useDeleteMacro,
   useAdminMacroCategories,
+  useCreateMacroCategory,
+  useDeleteMacroCategory,
   type AdminWorkflow,
   type AdminMacro,
 } from '@/lib/hooks/use-admin';
 
+// ─── Criterion row schema ────────────────────────────────────────────────────
+
+const criterionSchema = z.object({
+  field: z.string().min(1, 'Поле обязательно'),
+  op: z.string().min(1, 'Оператор обязателен'),
+  value: z.string(),
+});
+
+const actionSchema = z.object({
+  type: z.string().min(1, 'Тип обязателен'),
+  value: z.string(),
+});
+
+// ─── Workflow form ────────────────────────────────────────────────────────────
+
 const workflowSchema = z.object({
   title: z.string().min(1, 'Обязательное поле'),
   isEnabled: z.boolean().optional(),
+  criteria: z.array(criterionSchema),
+  actions: z.array(actionSchema),
 });
 type WorkflowFormValues = z.infer<typeof workflowSchema>;
+
+// ─── Macro form ───────────────────────────────────────────────────────────────
 
 const macroSchema = z.object({
   title: z.string().min(1, 'Обязательное поле'),
@@ -35,6 +57,34 @@ const macroSchema = z.object({
   categoryId: z.coerce.number().nullable().optional(),
 });
 type MacroFormValues = z.infer<typeof macroSchema>;
+
+// ─── Macro category form ─────────────────────────────────────────────────────
+
+const macroCategorySchema = z.object({
+  title: z.string().min(1, 'Обязательное поле'),
+});
+type MacroCategoryFormValues = z.infer<typeof macroCategorySchema>;
+
+// ─── Action type options ─────────────────────────────────────────────────────
+
+const ACTION_TYPES = [
+  { value: 'assign_group', label: 'Назначить группу' },
+  { value: 'assign_staff', label: 'Назначить сотрудника' },
+  { value: 'set_status', label: 'Установить статус' },
+  { value: 'set_priority', label: 'Установить приоритет' },
+  { value: 'add_tag', label: 'Добавить тег' },
+  { value: 'remove_tag', label: 'Удалить тег' },
+  { value: 'send_email', label: 'Отправить email' },
+];
+
+const CRITERION_OPS = [
+  { value: 'is', label: 'равно' },
+  { value: 'is_not', label: 'не равно' },
+  { value: 'contains', label: 'содержит' },
+  { value: 'not_contains', label: 'не содержит' },
+  { value: 'starts_with', label: 'начинается с' },
+  { value: 'ends_with', label: 'заканчивается на' },
+];
 
 export function WorkflowsContent() {
   const { data: workflows = [], isLoading: loadingWorkflows } = useAdminWorkflows();
@@ -46,7 +96,11 @@ export function WorkflowsContent() {
   const deleteWorkflow = useDeleteWorkflow();
 
   const createMacro = useCreateMacro();
+  const updateMacro = useUpdateMacro();
   const deleteMacro = useDeleteMacro();
+
+  const createMacroCategory = useCreateMacroCategory();
+  const deleteMacroCategory = useDeleteMacroCategory();
 
   const [wfDialog, setWfDialog] = useState(false);
   const [editingWf, setEditingWf] = useState<AdminWorkflow | null>(null);
@@ -56,33 +110,69 @@ export function WorkflowsContent() {
 
   const wfForm = useForm<WorkflowFormValues>({
     resolver: zodResolver(workflowSchema),
-    defaultValues: { title: '', isEnabled: true },
+    defaultValues: { title: '', isEnabled: true, criteria: [], actions: [] },
   });
+
+  const {
+    fields: criteriaFields,
+    append: appendCriterion,
+    remove: removeCriterion,
+  } = useFieldArray({ control: wfForm.control, name: 'criteria' });
+
+  const {
+    fields: actionsFields,
+    append: appendAction,
+    remove: removeAction,
+  } = useFieldArray({ control: wfForm.control, name: 'actions' });
 
   const macroForm = useForm<MacroFormValues>({
     resolver: zodResolver(macroSchema),
     defaultValues: { title: '', isShared: true, categoryId: null },
   });
 
+  const macroCategoryForm = useForm<MacroCategoryFormValues>({
+    resolver: zodResolver(macroCategorySchema),
+    defaultValues: { title: '' },
+  });
+
   function openCreateWf() {
     setEditingWf(null);
-    wfForm.reset({ title: '', isEnabled: true });
+    wfForm.reset({ title: '', isEnabled: true, criteria: [], actions: [] });
     setWfDialog(true);
   }
 
   function openEditWf(wf: AdminWorkflow) {
     setEditingWf(wf);
-    wfForm.reset({ title: wf.title, isEnabled: wf.isEnabled });
+    // Pre-populate criteria and actions from the existing workflow
+    const criteria = (wf.criteria as { field?: string; op?: string; value?: string }[]).map((c) => ({
+      field: c.field ?? '',
+      op: c.op ?? 'is',
+      value: c.value ?? '',
+    }));
+    const actions = (wf.actions as { type?: string; value?: string; [k: string]: unknown }[]).map((a) => ({
+      type: a.type ?? '',
+      // try to extract a single "value" field: take the first non-type key's string value
+      value:
+        (a.value as string | undefined) ??
+        Object.entries(a)
+          .filter(([k]) => k !== 'type')
+          .map(([, v]) => String(v ?? ''))
+          .join(''),
+    }));
+    wfForm.reset({ title: wf.title, isEnabled: wf.isEnabled, criteria, actions });
     setWfDialog(true);
   }
 
   async function onWfSubmit(values: WorkflowFormValues) {
     try {
+      // Serialize criteria and actions into the API shape
+      const criteria = values.criteria.map((c) => ({ field: c.field, op: c.op, value: c.value }));
+      const actions = values.actions.map((a) => ({ type: a.type, value: a.value }));
       if (editingWf) {
-        await updateWorkflow.mutateAsync({ id: editingWf.id, data: values });
+        await updateWorkflow.mutateAsync({ id: editingWf.id, data: { ...values, criteria, actions } });
         toast({ title: 'Правило обновлено' });
       } else {
-        await createWorkflow.mutateAsync({ ...values, criteria: [], actions: [] });
+        await createWorkflow.mutateAsync({ ...values, criteria, actions });
         toast({ title: 'Правило создано' });
       }
       setWfDialog(false);
@@ -107,12 +197,27 @@ export function WorkflowsContent() {
     setMacroDialog(true);
   }
 
+  function openEditMacro(macro: AdminMacro) {
+    setEditingMacro(macro);
+    macroForm.reset({ title: macro.title, isShared: macro.isShared, categoryId: macro.categoryId });
+    setMacroDialog(true);
+  }
+
   async function onMacroSubmit(values: MacroFormValues) {
+    // Ensure isShared is explicitly boolean (checkbox may be undefined when unchecked)
+    const payload = { ...values, isShared: values.isShared ?? false };
     try {
       if (editingMacro) {
-        toast({ title: 'Макросы редактируются через API (не реализовано в UI)' });
+        // Preserve existing actions; only update metadata fields
+        const updated = await updateMacro.mutateAsync({
+          id: editingMacro.id,
+          data: { ...payload, actions: editingMacro.actions },
+        });
+        // Optimistic: if backend strips isShared, keep our value
+        void updated;
+        toast({ title: 'Макрос обновлён' });
       } else {
-        await createMacro.mutateAsync({ ...values, actions: [] });
+        await createMacro.mutateAsync({ ...payload, actions: [] });
         toast({ title: 'Макрос создан' });
       }
       setMacroDialog(false);
@@ -128,6 +233,26 @@ export function WorkflowsContent() {
       toast({ title: 'Макрос удалён' });
     } catch {
       toast({ title: 'Ошибка', description: 'Не удалось удалить макрос', variant: 'destructive' });
+    }
+  }
+
+  async function onMacroCategorySubmit(values: MacroCategoryFormValues) {
+    try {
+      await createMacroCategory.mutateAsync(values);
+      macroCategoryForm.reset({ title: '' });
+      toast({ title: 'Категория создана' });
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось создать категорию', variant: 'destructive' });
+    }
+  }
+
+  async function handleDeleteMacroCategory(id: number, title: string) {
+    if (!confirm(`Удалить категорию «${title}»?`)) return;
+    try {
+      await deleteMacroCategory.mutateAsync(id);
+      toast({ title: 'Категория удалена' });
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось удалить категорию', variant: 'destructive' });
     }
   }
 
@@ -169,6 +294,8 @@ export function WorkflowsContent() {
                 <TableRow>
                   <TableHead>Название</TableHead>
                   <TableHead>Порядок</TableHead>
+                  <TableHead>Условия</TableHead>
+                  <TableHead>Действия</TableHead>
                   <TableHead>Статус</TableHead>
                   <TableHead className="w-20">Действия</TableHead>
                 </TableRow>
@@ -178,6 +305,12 @@ export function WorkflowsContent() {
                   <TableRow key={wf.id}>
                     <TableCell className="font-medium">{wf.title}</TableCell>
                     <TableCell className="text-sm text-muted-foreground">{wf.sortOrder}</TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {(wf.criteria as unknown[]).length} шт.
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {(wf.actions as unknown[]).length} шт.
+                    </TableCell>
                     <TableCell>
                       <span
                         className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
@@ -218,6 +351,58 @@ export function WorkflowsContent() {
         )}
       </section>
 
+      {/* Macro categories */}
+      <section className="space-y-4">
+        <h2 className="text-lg font-semibold">Категории макросов</h2>
+        <form
+          onSubmit={macroCategoryForm.handleSubmit(onMacroCategorySubmit)}
+          className="flex items-end gap-2"
+        >
+          <div className="flex-1 space-y-1.5">
+            <label className="text-sm font-medium">Новая категория</label>
+            <Input {...macroCategoryForm.register('title')} placeholder="Название категории" />
+            {macroCategoryForm.formState.errors.title && (
+              <p className="text-xs text-destructive">{macroCategoryForm.formState.errors.title.message}</p>
+            )}
+          </div>
+          <Button type="submit" size="sm" disabled={createMacroCategory.isPending}>
+            <Plus className="mr-1.5 h-4 w-4" />
+            Добавить
+          </Button>
+        </form>
+
+        {macroCategories.length > 0 && (
+          <div className="rounded-xl border border-border bg-card">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Название</TableHead>
+                  <TableHead className="w-16">Действия</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {macroCategories.map((cat) => (
+                  <TableRow key={cat.id}>
+                    <TableCell className="font-medium">{cat.title}</TableCell>
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 text-destructive hover:text-destructive"
+                        onClick={() => handleDeleteMacroCategory(cat.id, cat.title)}
+                        disabled={deleteMacroCategory.isPending}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </section>
+
       {/* Macros */}
       <section className="space-y-4">
         <div className="flex items-center justify-between">
@@ -242,7 +427,7 @@ export function WorkflowsContent() {
                   <TableHead>Название</TableHead>
                   <TableHead>Категория</TableHead>
                   <TableHead>Общий</TableHead>
-                  <TableHead className="w-16">Действия</TableHead>
+                  <TableHead className="w-20">Действия</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -254,15 +439,25 @@ export function WorkflowsContent() {
                       <TableCell className="text-sm text-muted-foreground">{cat ? cat.title : '—'}</TableCell>
                       <TableCell className="text-sm">{m.isShared ? 'Да' : 'Нет'}</TableCell>
                       <TableCell>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7 text-destructive hover:text-destructive"
-                          onClick={() => handleDeleteMacro(m)}
-                          disabled={deleteMacro.isPending}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </Button>
+                        <div className="flex gap-1">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7"
+                            onClick={() => openEditMacro(m)}
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7 text-destructive hover:text-destructive"
+                            onClick={() => handleDeleteMacro(m)}
+                            disabled={deleteMacro.isPending}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   );
@@ -275,11 +470,11 @@ export function WorkflowsContent() {
 
       {/* Workflow dialog */}
       <Dialog open={wfDialog} onOpenChange={setWfDialog}>
-        <DialogContent>
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{editingWf ? 'Редактировать правило' : 'Новое правило'}</DialogTitle>
           </DialogHeader>
-          <form onSubmit={wfForm.handleSubmit(onWfSubmit)} className="space-y-4">
+          <form onSubmit={wfForm.handleSubmit(onWfSubmit)} className="space-y-5">
             <div className="space-y-1.5">
               <label className="text-sm font-medium">Название</label>
               <Input {...wfForm.register('title')} placeholder="Название правила" />
@@ -293,6 +488,106 @@ export function WorkflowsContent() {
                 Активно
               </label>
             </div>
+
+            {/* Criteria builder */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium">Условия (criteria)</label>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => appendCriterion({ field: 'subject', op: 'contains', value: '' })}
+                >
+                  <Plus className="mr-1 h-3.5 w-3.5" />
+                  Добавить условие
+                </Button>
+              </div>
+              {criteriaFields.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  Нет условий — правило применяется ко всем заявкам
+                </p>
+              )}
+              {criteriaFields.map((field, idx) => (
+                <div key={field.id} className="flex gap-2 items-start">
+                  <Input
+                    {...wfForm.register(`criteria.${idx}.field`)}
+                    placeholder="Поле (напр. subject)"
+                    className="flex-1"
+                  />
+                  <select
+                    {...wfForm.register(`criteria.${idx}.op`)}
+                    className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm"
+                  >
+                    {CRITERION_OPS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                  <Input
+                    {...wfForm.register(`criteria.${idx}.value`)}
+                    placeholder="Значение"
+                    className="flex-1"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-9 w-9 text-destructive hover:text-destructive shrink-0"
+                    onClick={() => removeCriterion(idx)}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+
+            {/* Actions builder */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium">Действия (actions)</label>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => appendAction({ type: 'add_tag', value: '' })}
+                >
+                  <Plus className="mr-1 h-3.5 w-3.5" />
+                  Добавить действие
+                </Button>
+              </div>
+              {actionsFields.length === 0 && <p className="text-xs text-muted-foreground">Нет действий</p>}
+              {actionsFields.map((field, idx) => (
+                <div key={field.id} className="flex gap-2 items-start">
+                  <select
+                    {...wfForm.register(`actions.${idx}.type`)}
+                    className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+                  >
+                    {ACTION_TYPES.map((t) => (
+                      <option key={t.value} value={t.value}>
+                        {t.label}
+                      </option>
+                    ))}
+                  </select>
+                  <Input
+                    {...wfForm.register(`actions.${idx}.value`)}
+                    placeholder="Значение"
+                    className="flex-1"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-9 w-9 text-destructive hover:text-destructive shrink-0"
+                    onClick={() => removeAction(idx)}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setWfDialog(false)}>
                 Отмена
@@ -309,7 +604,7 @@ export function WorkflowsContent() {
       <Dialog open={macroDialog} onOpenChange={setMacroDialog}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Новый макрос</DialogTitle>
+            <DialogTitle>{editingMacro ? 'Редактировать макрос' : 'Новый макрос'}</DialogTitle>
           </DialogHeader>
           <form onSubmit={macroForm.handleSubmit(onMacroSubmit)} className="space-y-4">
             <div className="space-y-1.5">
@@ -336,7 +631,7 @@ export function WorkflowsContent() {
               </div>
             )}
             <div className="flex items-center gap-2">
-              <input type="checkbox" id="macroShared" {...macroForm.register('isShared')} defaultChecked />
+              <input type="checkbox" id="macroShared" {...macroForm.register('isShared')} />
               <label htmlFor="macroShared" className="text-sm">
                 Общий (виден всем агентам)
               </label>
@@ -345,8 +640,8 @@ export function WorkflowsContent() {
               <Button type="button" variant="outline" onClick={() => setMacroDialog(false)}>
                 Отмена
               </Button>
-              <Button type="submit" disabled={createMacro.isPending}>
-                {createMacro.isPending ? 'Сохранение…' : 'Сохранить'}
+              <Button type="submit" disabled={createMacro.isPending || updateMacro.isPending}>
+                {createMacro.isPending || updateMacro.isPending ? 'Сохранение…' : 'Сохранить'}
               </Button>
             </DialogFooter>
           </form>

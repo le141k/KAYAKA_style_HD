@@ -9,12 +9,14 @@ import { MOCK_KB_ARTICLES, MOCK_KB_CATEGORIES } from '@/lib/mock-data';
 interface ApiCategory {
   id: number;
   title: string;
+  article_count?: number;
 }
 interface ApiArticle {
   id: number;
   title: string;
   slug: string;
   contents?: string;
+  contentsText?: string;
   categoryId?: number | null;
   views?: number;
   createdAt?: string;
@@ -28,16 +30,22 @@ const PLACEHOLDER_AUTHOR = {
 } as unknown as User;
 
 function mapCategory(c: ApiCategory): KBCategory {
-  return { id: c.id, name: c.title, description: '', article_count: 0 };
+  return { id: c.id, name: c.title, description: '', article_count: c.article_count ?? 0 };
 }
 
 function mapArticle(a: ApiArticle): KBArticle {
+  // List endpoint returns contentsText (plaintext). Detail endpoint returns contents (HTML).
+  // body holds the HTML when available (for article detail rendering), or a plaintext
+  // snippet (≤120 chars) when only contentsText is available (list card preview).
+  const body = a.contents ?? (a.contentsText ? a.contentsText.slice(0, 120) : '');
+  // Category name: show "Общее" when there is no category (KB-4)
+  const categoryName = a.categoryId ? '' : 'Общее';
   return {
     id: a.id,
     slug: a.slug,
     title: a.title,
-    body: a.contents ?? '',
-    category: { id: a.categoryId ?? 0, name: '', description: '', article_count: 0 },
+    body,
+    category: { id: a.categoryId ?? 0, name: categoryName, description: '', article_count: 0 },
     author: PLACEHOLDER_AUTHOR,
     created_at: a.createdAt ?? a.updatedAt ?? new Date().toISOString(),
     views: a.views ?? 0,

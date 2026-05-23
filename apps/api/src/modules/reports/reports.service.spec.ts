@@ -12,6 +12,7 @@ function makePrismaMock() {
     ticket: {
       groupBy: vi.fn(),
       count: vi.fn(),
+      findMany: vi.fn().mockResolvedValue([]),
     },
   } as unknown as PrismaService;
 }
@@ -121,12 +122,18 @@ describe('ReportsService', () => {
       ]);
       (prisma.ticket.count as ReturnType<typeof vi.fn>)
         .mockResolvedValueOnce(100) // total
-        .mockResolvedValueOnce(40); // resolved
+        .mockResolvedValueOnce(40) // resolved
+        .mockResolvedValueOnce(5); // slaBreached
+      (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { createdAt: new Date('2026-01-01T00:00:00Z'), firstResponseAt: new Date('2026-01-01T00:30:00Z') },
+      ]);
 
       const result = await service.dashboard();
 
       expect(result).toHaveProperty('total');
       expect(result).toHaveProperty('resolved');
+      expect(result).toHaveProperty('slaBreached', 5);
+      expect(result).toHaveProperty('avgFirstResponseMinutes', 30);
       expect(result).toHaveProperty('byStatus');
       expect(result).toHaveProperty('byPriority');
     });
@@ -134,6 +141,7 @@ describe('ReportsService', () => {
     it('executes groupBy for both statusId and priorityId', async () => {
       (prisma.ticket.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+      (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 
       await service.dashboard();
 

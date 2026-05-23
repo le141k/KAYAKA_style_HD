@@ -1,21 +1,18 @@
-"use client";
+'use client';
 
-import { useState } from "react";
-import Link from "next/link";
-import { Search, BookOpen, Eye } from "lucide-react";
-import { Input } from "@/components/ui/input";
-import { Skeleton } from "@/components/ui/skeleton";
-import { useKBCategories, useKBArticles } from "@/lib/hooks/use-kb";
-import { formatDate } from "@/lib/utils";
+import { useState } from 'react';
+import Link from 'next/link';
+import { Search, BookOpen, Eye } from 'lucide-react';
+import { Input } from '@/components/ui/input';
+import { Skeleton } from '@/components/ui/skeleton';
+import { useKBCategories, useKBArticles } from '@/lib/hooks/use-kb';
+import { formatDate } from '@/lib/utils';
 
 export function KBContent() {
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<number | undefined>();
   const { data: categories, isLoading: catLoading } = useKBCategories();
-  const { data: articles, isLoading: artLoading } = useKBArticles(
-    selectedCategory,
-    query || undefined
-  );
+  const { data: articles, isLoading: artLoading } = useKBArticles(selectedCategory, query || undefined);
 
   return (
     <div className="space-y-8">
@@ -23,9 +20,7 @@ export function KBContent() {
       <div className="rounded-2xl bg-gradient-brand p-8 text-center text-white">
         <BookOpen className="mx-auto mb-3 h-10 w-10 opacity-80" />
         <h1 className="text-2xl font-bold">База знаний</h1>
-        <p className="mt-1 text-sm text-white/75">
-          Найдите ответ на свой вопрос самостоятельно
-        </p>
+        <p className="mt-1 text-sm text-white/75">Найдите ответ на свой вопрос самостоятельно</p>
         <div className="relative mx-auto mt-5 max-w-md">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -45,28 +40,18 @@ export function KBContent() {
           <h2 className="mb-4 text-lg font-semibold">Разделы</h2>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             {catLoading
-              ? Array.from({ length: 4 }).map((_, i) => (
-                  <Skeleton key={i} className="h-24 rounded-xl" />
-                ))
+              ? Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-24 rounded-xl" />)
               : categories?.map((cat) => (
                   <button
                     key={cat.id}
-                    onClick={() =>
-                      setSelectedCategory(
-                        selectedCategory === cat.id ? undefined : cat.id
-                      )
-                    }
+                    onClick={() => setSelectedCategory(selectedCategory === cat.id ? undefined : cat.id)}
                     className={`rounded-xl border p-4 text-left transition-all hover:border-primary/40 hover:bg-primary/5 ${
-                      selectedCategory === cat.id
-                        ? "border-primary bg-primary/10"
-                        : "border-border bg-card"
+                      selectedCategory === cat.id ? 'border-primary bg-primary/10' : 'border-border bg-card'
                     }`}
                     aria-pressed={selectedCategory === cat.id}
                   >
                     <p className="font-semibold text-sm">{cat.name}</p>
-                    <p className="mt-1 text-xs text-muted-foreground line-clamp-2">
-                      {cat.description}
-                    </p>
+                    <p className="mt-1 text-xs text-muted-foreground line-clamp-2">{cat.description}</p>
                     <p className="mt-2 text-xs text-primary">{cat.article_count} статей</p>
                   </button>
                 ))}
@@ -76,9 +61,7 @@ export function KBContent() {
 
       {/* Articles */}
       <div>
-        <h2 className="mb-4 text-lg font-semibold">
-          {query ? `Результаты поиска: «${query}»` : "Статьи"}
-        </h2>
+        <h2 className="mb-4 text-lg font-semibold">{query ? `Результаты поиска: «${query}»` : 'Статьи'}</h2>
         {artLoading ? (
           <div className="space-y-3">
             {Array.from({ length: 3 }).map((_, i) => (
@@ -100,15 +83,16 @@ export function KBContent() {
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="font-semibold text-sm hover:text-primary">
-                      {article.title}
-                    </p>
-                    <p className="mt-1 line-clamp-1 text-xs text-muted-foreground">
-                      {article.body}
-                    </p>
+                    <p className="font-semibold text-sm hover:text-primary">{article.title}</p>
+                    <p className="mt-1 line-clamp-1 text-xs text-muted-foreground">{article.body}</p>
                     <div className="mt-2 flex items-center gap-3 text-xs text-muted-foreground">
-                      <span>{article.category.name}</span>
-                      <span>·</span>
+                      {/* hide category chip when name is not resolved (KB-4) */}
+                      {article.category.name ? (
+                        <>
+                          <span>{article.category.name}</span>
+                          <span>·</span>
+                        </>
+                      ) : null}
                       <span>{formatDate(article.created_at)}</span>
                     </div>
                   </div>

@@ -1,8 +1,8 @@
-"use client";
+'use client';
 
-import { useEffect, useState, useCallback } from "react";
-import { useRouter } from "next/navigation";
-import { motion, AnimatePresence } from "framer-motion";
+import { useEffect, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
+import { motion, AnimatePresence } from 'framer-motion';
 import {
   LayoutDashboard,
   Ticket,
@@ -12,7 +12,7 @@ import {
   Users,
   Search,
   ArrowRight,
-} from "lucide-react";
+} from 'lucide-react';
 import {
   Command,
   CommandEmpty,
@@ -21,16 +21,16 @@ import {
   CommandItem,
   CommandList,
   CommandSeparator,
-} from "@/components/ui/command";
-import { useTickets } from "@/lib/hooks/use-tickets";
+} from '@/components/ui/command';
+import { useTickets } from '@/lib/hooks/use-tickets';
 
 const NAV_ITEMS = [
-  { label: "Дашборд", href: "/staff/dashboard", Icon: LayoutDashboard },
-  { label: "Заявки (список)", href: "/staff/tickets", Icon: Ticket },
-  { label: "Канбан", href: "/staff/kanban", Icon: KanbanSquare },
-  { label: "База знаний", href: "/kb", Icon: BookOpen },
-  { label: "Настройки", href: "/admin", Icon: Settings },
-  { label: "Сотрудники", href: "/admin/staff", Icon: Users },
+  { label: 'Дашборд', href: '/staff/dashboard', Icon: LayoutDashboard },
+  { label: 'Заявки (список)', href: '/staff/tickets', Icon: Ticket },
+  { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare },
+  { label: 'База знаний', href: '/kb', Icon: BookOpen },
+  { label: 'Настройки', href: '/admin', Icon: Settings },
+  { label: 'Сотрудники', href: '/admin/staff', Icon: Users },
 ];
 
 interface CommandPaletteProps {
@@ -40,27 +40,27 @@ interface CommandPaletteProps {
 
 export function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const router = useRouter();
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState('');
 
-  const { data } = useTickets({ q: query || undefined, per_page: 5 });
+  const { data } = useTickets({ q: query || undefined, per_page: 5, enabled: open });
   const tickets = data?.data ?? [];
 
   const navigate = useCallback(
     (href: string) => {
       router.push(href);
       onClose();
-      setQuery("");
+      setQuery('');
     },
-    [router, onClose]
+    [router, onClose],
   );
 
   // Close on Escape
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === 'Escape') onClose();
     };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
   }, [onClose]);
 
   return (
@@ -83,7 +83,7 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
             initial={{ opacity: 0, scale: 0.95, y: -12 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.95, y: -12 }}
-            transition={{ duration: 0.2, ease: "easeOut" }}
+            transition={{ duration: 0.2, ease: 'easeOut' }}
             className="fixed left-[50%] top-[20%] z-50 w-full max-w-lg -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-popover shadow-lg"
             role="dialog"
             aria-label="Командная строка"
@@ -106,9 +106,7 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
                 {/* Navigation */}
                 <CommandGroup heading="Навигация">
                   {NAV_ITEMS.filter((item) =>
-                    query
-                      ? item.label.toLowerCase().includes(query.toLowerCase())
-                      : true
+                    query ? item.label.toLowerCase().includes(query.toLowerCase()) : true,
                   ).map((item) => (
                     <CommandItem
                       key={item.href}
@@ -132,17 +130,11 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
                         <CommandItem
                           key={ticket.id}
                           value={`ticket-${ticket.id}`}
-                          onSelect={() =>
-                            navigate(`/staff/tickets/${ticket.id}`)
-                          }
+                          onSelect={() => navigate(`/staff/tickets/${ticket.id}`)}
                           className="gap-3"
                         >
-                          <span className="font-mono text-xs text-muted-foreground">
-                            {ticket.mask}
-                          </span>
-                          <span className="line-clamp-1 flex-1 text-sm">
-                            {ticket.subject}
-                          </span>
+                          <span className="font-mono text-xs text-muted-foreground">{ticket.mask}</span>
+                          <span className="line-clamp-1 flex-1 text-sm">{ticket.subject}</span>
                           <ArrowRight className="h-3 w-3 opacity-40" />
                         </CommandItem>
                       ))}
@@ -153,12 +145,9 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
 
               {/* Footer hint */}
               <div className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
-                <kbd className="rounded bg-muted px-1.5 py-0.5 font-mono">↑↓</kbd>{" "}
-                навигация·{" "}
-                <kbd className="rounded bg-muted px-1.5 py-0.5 font-mono">↵</kbd>{" "}
-                выбрать·{" "}
-                <kbd className="rounded bg-muted px-1.5 py-0.5 font-mono">Esc</kbd>{" "}
-                закрыть
+                <kbd className="rounded bg-muted px-1.5 py-0.5 font-mono">↑↓</kbd> навигация·{' '}
+                <kbd className="rounded bg-muted px-1.5 py-0.5 font-mono">↵</kbd> выбрать·{' '}
+                <kbd className="rounded bg-muted px-1.5 py-0.5 font-mono">Esc</kbd> закрыть
               </div>
             </Command>
           </motion.div>

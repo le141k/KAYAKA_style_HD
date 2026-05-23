@@ -53,12 +53,12 @@ export interface ApiSlaHoliday {
 
 export interface ApiEscalationRule {
   id: number;
-  planId: number;
-  afterSeconds: number;
-  assignGroupId: number | null;
-  assignStaffId: number | null;
-  notifyGroupId: number | null;
-  notifyStaffId: number | null;
+  slaPlanId: number;
+  name: string;
+  targetType: 'FIRST_RESPONSE' | 'RESOLUTION';
+  thresholdSeconds: number;
+  actions: unknown[];
+  isEnabled: boolean;
 }
 
 export interface ApiSlaPlan {
@@ -171,6 +171,16 @@ export interface AdminTicketPriority {
   bgColor: string;
 }
 
+export interface AdminEscalationRule {
+  id: number;
+  slaPlanId: number;
+  name: string;
+  targetType: 'FIRST_RESPONSE' | 'RESOLUTION';
+  thresholdSeconds: number;
+  actions: unknown[];
+  isEnabled: boolean;
+}
+
 export interface AdminSlaPlan {
   id: number;
   title: string;
@@ -178,7 +188,7 @@ export interface AdminSlaPlan {
   firstResponseSeconds: number;
   resolutionSeconds: number;
   scheduleId: number | null;
-  escalationRules: ApiEscalationRule[];
+  escalationRules: AdminEscalationRule[];
 }
 
 export interface AdminSlaSchedule {
@@ -284,6 +294,18 @@ function mapPriority(p: ApiTicketPriority): AdminTicketPriority {
   return { id: p.id, title: p.title, displayOrder: p.displayOrder, color: p.color, bgColor: p.bgColor };
 }
 
+function mapEscalationRule(r: ApiEscalationRule): AdminEscalationRule {
+  return {
+    id: r.id,
+    slaPlanId: r.slaPlanId,
+    name: r.name,
+    targetType: r.targetType,
+    thresholdSeconds: r.thresholdSeconds,
+    actions: r.actions ?? [],
+    isEnabled: r.isEnabled,
+  };
+}
+
 function mapSlaPlan(p: ApiSlaPlan): AdminSlaPlan {
   return {
     id: p.id,
@@ -292,7 +314,7 @@ function mapSlaPlan(p: ApiSlaPlan): AdminSlaPlan {
     firstResponseSeconds: p.firstResponseSeconds,
     resolutionSeconds: p.resolutionSeconds,
     scheduleId: p.scheduleId,
-    escalationRules: p.escalationRules ?? [],
+    escalationRules: (p.escalationRules ?? []).map(mapEscalationRule),
   };
 }
 
@@ -368,6 +390,7 @@ export const adminKeys = {
   slaPlans: ['admin', 'sla', 'plans'] as const,
   slaSchedules: ['admin', 'sla', 'schedules'] as const,
   slaHolidays: (scheduleId: number) => ['admin', 'sla', 'holidays', scheduleId] as const,
+  escalationRules: (planId: number) => ['admin', 'sla', 'escalation-rules', planId] as const,
   staff: ['admin', 'staff'] as const,
   staffGroups: ['admin', 'staff', 'groups'] as const,
   workflows: ['admin', 'workflows'] as const,
@@ -585,6 +608,23 @@ export function useCreateSlaSchedule() {
   });
 }
 
+export function useUpdateSlaSchedule() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: SlaScheduleInput }) =>
+      api.put<ApiSlaSchedule>(`/admin/sla/schedules/${id}`, data),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.slaSchedules }),
+  });
+}
+
+export function useDeleteSlaSchedule() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.delete<void>(`/admin/sla/schedules/${id}`),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.slaSchedules }),
+  });
+}
+
 export function useAdminSlaHolidays(scheduleId: number) {
   return useQuery({
     queryKey: adminKeys.slaHolidays(scheduleId),
@@ -616,6 +656,75 @@ export function useDeleteSlaHoliday(scheduleId: number) {
     mutationFn: (holidayId: number) =>
       api.delete<void>(`/admin/sla/schedules/${scheduleId}/holidays/${holidayId}`),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.slaHolidays(scheduleId) }),
+  });
+}
+
+export function useUpdateSlaHoliday(scheduleId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: SlaHolidayInput }) =>
+      api.put<ApiSlaHoliday>(`/admin/sla/schedules/${scheduleId}/holidays/${id}`, data),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.slaHolidays(scheduleId) }),
+  });
+}
+
+// ─── Escalation rules ────────────────────────────────────────────────────────
+
+export function useAdminEscalationRules(planId: number) {
+  return useQuery({
+    queryKey: adminKeys.escalationRules(planId),
+    queryFn: async () => {
+      const data = await api.get<ApiEscalationRule[]>(`/admin/sla/plans/${planId}/escalation-rules`);
+      return data.map(mapEscalationRule);
+    },
+    enabled: planId > 0,
+  });
+}
+
+export interface EscalationRuleInput {
+  name: string;
+  targetType: 'FIRST_RESPONSE' | 'RESOLUTION';
+  thresholdSeconds: number;
+  actions?: unknown[];
+  isEnabled?: boolean;
+}
+
+export function useCreateEscalationRule(planId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: EscalationRuleInput) =>
+      api.post<ApiEscalationRule>(`/admin/sla/plans/${planId}/escalation-rules`, {
+        ...data,
+        actions: data.actions ?? [],
+        isEnabled: data.isEnabled ?? true,
+      }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: adminKeys.escalationRules(planId) });
+      void qc.invalidateQueries({ queryKey: adminKeys.slaPlans });
+    },
+  });
+}
+
+export function useUpdateEscalationRule(planId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: EscalationRuleInput }) =>
+      api.put<ApiEscalationRule>(`/admin/sla/plans/${planId}/escalation-rules/${id}`, data),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: adminKeys.escalationRules(planId) });
+      void qc.invalidateQueries({ queryKey: adminKeys.slaPlans });
+    },
+  });
+}
+
+export function useDeleteEscalationRule(planId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.delete<void>(`/admin/sla/plans/${planId}/escalation-rules/${id}`),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: adminKeys.escalationRules(planId) });
+      void qc.invalidateQueries({ queryKey: adminKeys.slaPlans });
+    },
   });
 }
 

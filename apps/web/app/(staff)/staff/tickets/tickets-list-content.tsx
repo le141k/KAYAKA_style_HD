@@ -36,6 +36,8 @@ export function TicketsListContent() {
     q: debouncedSearch || undefined,
     status: status === 'all' ? undefined : status,
     priority: priority === 'all' ? undefined : priority,
+    date_from: dateRange?.from ? dateRange.from.toISOString() : undefined,
+    date_to: dateRange?.to ? new Date(dateRange.to.getTime() + 86_399_000).toISOString() : undefined,
   });
 
   const tickets = useMemo(() => data?.data ?? [], [data]);

@@ -179,6 +179,21 @@ export interface TicketListParams {
   department_id?: number;
   assignee_id?: number;
   q?: string;
+  date_from?: string;
+  date_to?: string;
+  /** Skip the query entirely (e.g. command palette while closed). */
+  enabled?: boolean;
+}
+
+// Resolve a status/priority slug to its backend id so filtering happens
+// server-side (client-side filtering only saw the current page → wrong counts).
+async function statusIdForSlug(slug: string): Promise<number | undefined> {
+  const statuses = await api.get<ApiRef[]>('/ticket-statuses');
+  return statuses.find((s) => statusSlug(s.title) === slug)?.id;
+}
+async function priorityIdForSlug(slug: string): Promise<number | undefined> {
+  const priorities = await api.get<ApiRef[]>('/ticket-priorities');
+  return priorities.find((p) => prioritySlug(p.title) === slug)?.id;
 }
 
 export function useTickets(params: TicketListParams = {}) {
@@ -192,11 +207,19 @@ export function useTickets(params: TicketListParams = {}) {
         if (params.q) qs.set('search', params.q);
         if (params.department_id) qs.set('departmentId', String(params.department_id));
         if (params.assignee_id) qs.set('ownerStaffId', String(params.assignee_id));
+        if (params.date_from) qs.set('createdAfter', params.date_from);
+        if (params.date_to) qs.set('createdBefore', params.date_to);
+        // Map slug filters → ids and push to the server (correct totals + paging).
+        if (params.status) {
+          const id = await statusIdForSlug(params.status);
+          if (id) qs.set('statusId', String(id));
+        }
+        if (params.priority) {
+          const id = await priorityIdForSlug(params.priority);
+          if (id) qs.set('priorityId', String(id));
+        }
         const res = await api.get<{ data: ApiTicket[]; total: number }>(`/tickets?${qs}`);
-        let data = res.data.map(mapTicket);
-        // status/priority dropdowns send slugs; filter client-side after mapping
-        if (params.status) data = data.filter((t) => t.status === params.status);
-        if (params.priority) data = data.filter((t) => t.priority === params.priority);
+        const data = res.data.map(mapTicket);
         return { data, total: res.total, page: params.page ?? 1, per_page: params.per_page ?? 25 };
       } catch {
         let data = [...MOCK_TICKETS];
@@ -209,6 +232,7 @@ export function useTickets(params: TicketListParams = {}) {
       }
     },
     staleTime: 30_000,
+    enabled: params.enabled ?? true,
   });
 }
 
@@ -334,6 +358,20 @@ export function useUpdateTicket(ticketId: number) {
   });
 }
 
+// Generic status change for any ticket id (used by the kanban drag-and-drop).
+export function useChangeTicketStatus() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ ticketId, status }: { ticketId: number; status: Ticket['status'] }) => {
+      const id = await statusIdForSlug(status);
+      if (id) await api.patch(`/tickets/${ticketId}/status`, { statusId: id });
+    },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ticketKeys.lists() });
+    },
+  });
+}
+
 // Real staff list for the assignee picker (replaces hardcoded MOCK_USERS).
 interface ApiStaffOption {
   id: number;
@@ -368,9 +406,13 @@ export function useDashboardStats() {
     queryFn: async (): Promise<DashboardStats> => {
       try {
         const [dash, statuses] = await Promise.all([
-          api.get<{ total: number; resolved: number; byStatus: { key: number; count: number }[] }>(
-            '/reports/dashboard',
-          ),
+          api.get<{
+            total: number;
+            resolved: number;
+            slaBreached?: number;
+            avgFirstResponseMinutes?: number;
+            byStatus: { key: number; count: number }[];
+          }>('/reports/dashboard'),
           api.get<ApiRef[]>('/ticket-statuses'),
         ]);
         const idToSlug = new Map(statuses.map((s) => [s.id, statusSlug(s.title)]));
@@ -380,8 +422,8 @@ export function useDashboardStats() {
           open_tickets: countBy('open'),
           pending_tickets: countBy('pending'),
           resolved_today: dash.resolved,
-          sla_breached: 0,
-          avg_first_response_minutes: 0,
+          sla_breached: dash.slaBreached ?? 0,
+          avg_first_response_minutes: dash.avgFirstResponseMinutes ?? 0,
         };
       } catch {
         return MOCK_STATS;

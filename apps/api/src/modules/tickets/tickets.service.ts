@@ -228,6 +228,13 @@ export class TicketsService {
     if (filters.ownerStaffId !== undefined) where['ownerStaffId'] = filters.ownerStaffId;
     if (unassigned) where['ownerStaffId'] = null;
 
+    if (filters.createdAfter || filters.createdBefore) {
+      where['createdAt'] = {
+        ...(filters.createdAfter ? { gte: filters.createdAfter } : {}),
+        ...(filters.createdBefore ? { lte: filters.createdBefore } : {}),
+      };
+    }
+
     if (search) {
       where['OR'] = [
         { subject: { contains: search, mode: 'insensitive' } },

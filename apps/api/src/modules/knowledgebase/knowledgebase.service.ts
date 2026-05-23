@@ -27,8 +27,19 @@ export class KnowledgebaseService {
   constructor(private readonly prisma: PrismaService) {}
 
   // ── categories ──
-  listCategories() {
-    return this.prisma.kbCategory.findMany({ orderBy: { displayOrder: 'asc' } });
+  async listCategories() {
+    const rows = await this.prisma.kbCategory.findMany({
+      orderBy: { displayOrder: 'asc' },
+      include: { _count: { select: { articles: true } } },
+    });
+    return rows.map((c) => ({
+      id: c.id,
+      title: c.title,
+      displayOrder: c.displayOrder,
+      isPublished: c.isPublished,
+      parentId: c.parentId,
+      article_count: c._count.articles,
+    }));
   }
 
   createCategory(dto: CreateCategoryDto) {
@@ -55,7 +66,16 @@ export class KnowledgebaseService {
         orderBy: { updatedAt: 'desc' },
         skip: (dto.page - 1) * dto.pageSize,
         take: dto.pageSize,
-        select: { id: true, title: true, slug: true, categoryId: true, isPublished: true, views: true, updatedAt: true },
+        select: {
+          id: true,
+          title: true,
+          slug: true,
+          categoryId: true,
+          isPublished: true,
+          views: true,
+          updatedAt: true,
+          contentsText: true,
+        },
       }),
       this.prisma.kbArticle.count({ where }),
     ]);
@@ -70,7 +90,7 @@ export class KnowledgebaseService {
 
   async getArticleBySlug(slug: string) {
     const article = await this.prisma.kbArticle.findUnique({ where: { slug } });
-    if (!article) throw new NotFoundException('Article not found');
+    if (!article || !article.isPublished) throw new NotFoundException('Article not found');
     await this.prisma.kbArticle.update({ where: { id: article.id }, data: { views: { increment: 1 } } });
     return article;
   }
@@ -78,7 +98,8 @@ export class KnowledgebaseService {
   async createArticle(dto: CreateArticleDto, authorStaffId?: number) {
     let slug = slugify(dto.title);
     // ensure unique slug
-    if (await this.prisma.kbArticle.findUnique({ where: { slug } })) slug = `${slug}-${Date.now().toString(36)}`;
+    if (await this.prisma.kbArticle.findUnique({ where: { slug } }))
+      slug = `${slug}-${Date.now().toString(36)}`;
     return this.prisma.kbArticle.create({
       data: {
         title: dto.title,

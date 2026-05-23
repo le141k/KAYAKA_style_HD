@@ -41,8 +41,9 @@ const MOCK_CATEGORY = {
   id: 1,
   title: 'General',
   displayOrder: 1,
-  createdAt: new Date(),
-  updatedAt: new Date(),
+  isPublished: true,
+  parentId: null,
+  _count: { articles: 3 },
 };
 
 describe('KnowledgebaseService', () => {
@@ -61,7 +62,15 @@ describe('KnowledgebaseService', () => {
       (prisma.kbCategory.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([MOCK_CATEGORY]);
       const result = await service.listCategories();
       expect(result).toHaveLength(1);
-      expect(prisma.kbCategory.findMany).toHaveBeenCalledWith({ orderBy: { displayOrder: 'asc' } });
+      expect(prisma.kbCategory.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ orderBy: { displayOrder: 'asc' } }),
+      );
+    });
+
+    it('returns article_count from _count.articles', async () => {
+      (prisma.kbCategory.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([MOCK_CATEGORY]);
+      const result = await service.listCategories();
+      expect(result[0]!.article_count).toBe(3);
     });
   });
 
@@ -69,7 +78,9 @@ describe('KnowledgebaseService', () => {
 
   describe('createCategory', () => {
     it('creates a new category', async () => {
-      (prisma.kbCategory.create as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_CATEGORY);
+      // createCategory still delegates straight to prisma.kbCategory.create
+      const rawCategory = { ...MOCK_CATEGORY };
+      (prisma.kbCategory.create as ReturnType<typeof vi.fn>).mockResolvedValue(rawCategory);
       const result = await service.createCategory({ title: 'General', displayOrder: 1 } as any);
       expect(result.title).toBe('General');
     });
@@ -107,6 +118,19 @@ describe('KnowledgebaseService', () => {
 
       expect(prisma.kbArticle.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: expect.objectContaining({ isPublished: true }) }),
+      );
+    });
+
+    it('includes contentsText in selected fields for body previews', async () => {
+      (prisma.kbArticle.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([MOCK_ARTICLE]);
+      (prisma.kbArticle.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+
+      await service.listArticles({ page: 1, pageSize: 10 } as any);
+
+      expect(prisma.kbArticle.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          select: expect.objectContaining({ contentsText: true }),
+        }),
       );
     });
 
@@ -154,6 +178,15 @@ describe('KnowledgebaseService', () => {
     it('throws NotFoundException when slug not found', async () => {
       (prisma.kbArticle.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.getArticleBySlug('nonexistent')).rejects.toThrow(NotFoundException);
+    });
+
+    // RBAC-1: draft articles must not be leaked via the public slug endpoint
+    it('throws NotFoundException when article exists but is a draft (isPublished=false)', async () => {
+      const draftArticle = { ...MOCK_ARTICLE, isPublished: false };
+      (prisma.kbArticle.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(draftArticle);
+      await expect(service.getArticleBySlug('getting-started')).rejects.toThrow(NotFoundException);
+      // view counter must NOT be incremented for a draft
+      expect(prisma.kbArticle.update).not.toHaveBeenCalled();
     });
   });
 
