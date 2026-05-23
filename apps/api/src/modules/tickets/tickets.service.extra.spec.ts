@@ -78,6 +78,10 @@ function makePrismaMock() {
       create: vi.fn(),
       updateMany: vi.fn(),
       findMany: vi.fn(),
+      findFirst: vi.fn().mockResolvedValue(null),
+    },
+    emailQueue: {
+      findFirst: vi.fn().mockResolvedValue(null),
     },
     ticketNote: {
       create: vi.fn(),

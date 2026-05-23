@@ -23,6 +23,8 @@ import {
   datelineToDate,
   classifyOrg,
   groupUserEmails,
+  mapQueueType,
+  mapRuleOp,
   IdMap,
   type ParsedTable,
 } from '../src/migration/kayako-parser';
@@ -157,6 +159,84 @@ async function importUsers(
   console.log(`  → imported ${imported} users, ${emailCount} emails, ${noteCount} notes`);
 }
 
+/**
+ * Import swemailqueues→EmailQueue and swparserrules(+criteria+actions)→
+ * EmailParserRule. Passwords are NOT migrated (Kayako encrypts with a key we
+ * don't have) — queues import DISABLED with an empty passwordEnc; an admin sets
+ * the password and re-enables. The 3 enabled bounce-ignore rules are critical
+ * (mail-loop prevention) so they import as PRE_PARSE + {type:'ignore'}.
+ */
+async function importEmailConfig(
+  queuesT: ParsedTable,
+  rulesT: ParsedTable,
+  criteriaT: ParsedTable,
+  actionsT: ParsedTable,
+): Promise<void> {
+  const defaultDept = await prisma.department.findFirst({ where: { isDefault: true }, select: { id: true } });
+
+  let qCount = 0;
+  for (const row of queuesT.rows) {
+    const emailAddress = (row['email'] ?? '').trim().toLowerCase();
+    if (!emailAddress) continue;
+    const data = {
+      type: mapQueueType(row['fetchtype'] ?? row['type']),
+      emailAddress,
+      host: row['host'] ?? '',
+      port: Number(row['port']) || 993,
+      username: row['username'] ?? '',
+      // Password not migrated — Kayako's encryption key is unavailable.
+      passwordEnc: '',
+      sendAutoresponder: row['ticketautoresponder'] === '1',
+      departmentId: defaultDept?.id ?? null,
+      // Import disabled (no password) so the poller doesn't try to connect.
+      isEnabled: false,
+    };
+    const existing = await prisma.emailQueue.findFirst({ where: { emailAddress } });
+    if (existing) await prisma.emailQueue.update({ where: { id: existing.id }, data });
+    else await prisma.emailQueue.create({ data });
+    qCount++;
+  }
+
+  // Group criteria/actions by parserruleid.
+  const critByRule = new Map<number, Array<{ field: string; op: string; value: string }>>();
+  for (const c of criteriaT.rows) {
+    const rid = Number(c['parserruleid']);
+    if (!critByRule.has(rid)) critByRule.set(rid, []);
+    critByRule.get(rid)!.push({
+      field: c['name'] ?? 'subject',
+      op: mapRuleOp(c['ruleop']),
+      value: c['rulematch'] ?? '',
+    });
+  }
+  const actByRule = new Map<number, Array<{ type: string; value?: string }>>();
+  for (const a of actionsT.rows) {
+    const rid = Number(a['parserruleid']);
+    if (!actByRule.has(rid)) actByRule.set(rid, []);
+    actByRule.get(rid)!.push({ type: a['name'] ?? 'ignore', value: a['typedata'] || undefined });
+  }
+
+  let rCount = 0;
+  for (const row of rulesT.rows) {
+    const kid = Number(row['parserruleid']);
+    const data = {
+      title: row['title'] ?? `Rule ${kid}`,
+      ruleType: row['ruletype'] === '2' ? ('POST_PARSE' as const) : ('PRE_PARSE' as const),
+      matchType: row['matchtype'] === '3' ? ('ALL' as const) : ('ANY' as const),
+      stopProcessing: row['stopprocessing'] === '1',
+      isEnabled: row['isenabled'] === '1',
+      sortOrder: Number(row['sortorder']) || 0,
+      criteria: critByRule.get(kid) ?? [],
+      actions: actByRule.get(kid) ?? [],
+    };
+    const existing = await prisma.emailParserRule.findFirst({ where: { title: data.title } });
+    if (existing) await prisma.emailParserRule.update({ where: { id: existing.id }, data });
+    else await prisma.emailParserRule.create({ data });
+    rCount++;
+  }
+
+  console.log(`  → imported ${qCount} email queues (disabled, no password), ${rCount} parser rules`);
+}
+
 const DEPENDENCY_ORDER = [
   'swuserorganizations', // → Organization      (M0/M1)
   'swusers', // → User                          (M1)
@@ -203,6 +283,8 @@ async function main() {
   const orgLinks = parseTable(sql, 'swuserorganizationlinks');
   const userNotes = parseTable(sql, 'swusernotes');
   const userNoteData = parseTable(sql, 'swusernotedata');
+  const ruleCriteria = parseTable(sql, 'swparserrulecriteria');
+  const ruleActions = parseTable(sql, 'swparserruleactions');
 
   // Import in dependency order.
   if (tables['swuserorganizations']?.rows.length) {
@@ -218,7 +300,15 @@ async function main() {
       ids,
     );
   }
-  // email queues/parser rules → M2; macros → M4.
+  if (tables['swemailqueues']?.rows.length || tables['swparserrules']?.rows.length) {
+    await importEmailConfig(
+      tables['swemailqueues'] ?? { columns: [], rows: [] },
+      tables['swparserrules'] ?? { columns: [], rows: [] },
+      ruleCriteria,
+      ruleActions,
+    );
+  }
+  // macros → M4.
 
   if (sampled) {
     console.log(

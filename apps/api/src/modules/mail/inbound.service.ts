@@ -14,6 +14,7 @@ import { AttachmentsService } from '../attachments/attachments.service';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
 import { PrismaService } from '../../prisma/prisma.service';
 import { decryptField } from '../../common/field-encrypt.util';
+import { stripQuotedReply } from './quoted-reply.util';
 import type { EmailParserRule } from '@prisma/client';
 
 /** Parsed email fields used for rule evaluation */
@@ -241,7 +242,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const from = parsed.from?.value?.[0];
     const fromEmail = from?.address ?? 'unknown@example.com';
     const fromName = from?.name ?? fromEmail;
-    const textBody = parsed.text ?? '';
+    // Strip the quoted reply history so a threaded reply stores only the new text
+    // (Kayako keeps the whole quoted chain on every message). HTML is left as-is —
+    // the plain-text body is what we persist when there is no HTML part.
+    const textBody = stripQuotedReply(parsed.text ?? '');
     const htmlBody = parsed.html || undefined;
 
     // Persist email attachments if AttachmentsService is available

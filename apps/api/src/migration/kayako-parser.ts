@@ -162,3 +162,31 @@ export function classifyOrg(name: string): OrgType {
   if (SUPPLIER_NAMES.some((s) => n.includes(s))) return 'SUPPLIER';
   return 'CLIENT';
 }
+
+/** Map Kayako swemailqueues.fetchtype/type → our EmailQueueType. */
+export function mapQueueType(fetchtype: string | null): 'IMAP' | 'POP3' | 'PIPE' {
+  const f = (fetchtype ?? '').toLowerCase();
+  if (f.includes('pop')) return 'POP3';
+  if (f.includes('pipe')) return 'PIPE';
+  return 'IMAP';
+}
+
+/** Map Kayako parser-criterion `ruleop` codes → our op vocabulary. */
+export function mapRuleOp(code: string | null): string {
+  switch (Number(code)) {
+    case 1:
+      return 'eq';
+    case 4:
+      return 'contains';
+    case 5:
+      return 'not_contains';
+    case 6:
+      return 'starts_with';
+    case 7:
+      return 'ends_with';
+    case 8:
+      return 'regex';
+    default:
+      return 'contains';
+  }
+}

@@ -596,6 +596,9 @@ model EmailQueue {
   department     Department?    @relation(fields: [departmentId], references: [id])
   departmentId   Int?
   signature      String         @default("")
+  // Kayako `ticketautoresponder`: only send the autoresponder for EMAIL tickets
+  // when the receiving queue opts in (noc@/rates@ are OFF in the source system).
+  sendAutoresponder Boolean      @default(false)
   isEnabled      Boolean        @default(false)
   createdAt      DateTime       @default(now())
 }

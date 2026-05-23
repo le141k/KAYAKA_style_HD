@@ -237,7 +237,18 @@ export class TicketsService {
     // Skip for system-generated tickets (e.g. Alaris) — their requesterEmail is a
     // non-deliverable internal address and should not receive an autoresponder.
     const isSystemTicket = dto.creationMode === 'ALARIS';
-    if (dto.requesterEmail && !isSystemTicket) {
+    // Per-queue autoresponder (Kayako): for inbound EMAIL tickets, only send the
+    // autoresponder when the receiving queue opts in (noc@/rates@ are OFF). Web/
+    // staff/API tickets keep the previous always-send behaviour.
+    let suppressAutoresponder = false;
+    if (dto.creationMode === 'EMAIL') {
+      const queue = await this.prisma.emailQueue.findFirst({
+        where: { departmentId: dto.departmentId },
+        select: { sendAutoresponder: true },
+      });
+      suppressAutoresponder = !queue?.sendAutoresponder;
+    }
+    if (dto.requesterEmail && !isSystemTicket && !suppressAutoresponder) {
       const requesterName = dto.requesterName || dto.requesterEmail;
       this.mailService
         .sendTemplate(dto.requesterEmail, 'autoresponder', 'en', {
@@ -669,6 +680,32 @@ export class TicketsService {
         ...(dto.bccEmails ?? []),
         ...recipients.filter((r) => r.role === 'BCC').map((r) => r.email),
       ];
+
+      // RFC threading: reply In-Reply-To the most recent prior post that carries a
+      // Message-ID (the customer's inbound mail), so their MUA threads our reply.
+      const priorMsg = await this.prisma.ticketPost.findFirst({
+        where: { ticketId, id: { not: post.id }, messageId: { not: null }, NOT: { messageId: '' } },
+        orderBy: { createdAt: 'desc' },
+        select: { messageId: true },
+      });
+
+      // Append the staff + queue signature (Kayako EmailQueue.signature is never
+      // appended otherwise). Queue is resolved by the ticket's department.
+      const [staff, queue] = await Promise.all([
+        staffId
+          ? this.prisma.staff.findUnique({ where: { id: staffId }, select: { signature: true } })
+          : null,
+        this.prisma.emailQueue.findFirst({
+          where: { departmentId: ticket.departmentId },
+          select: { signature: true },
+        }),
+      ]);
+      const sig = [staff?.signature, queue?.signature]
+        .map((s) => s?.trim())
+        .filter(Boolean)
+        .join('\n\n');
+      const contents = sig ? `${dto.contents}\n\n--\n${sig}` : dto.contents;
+
       this.mailService
         .sendTemplate(
           ticket.requesterEmail,
@@ -677,7 +714,7 @@ export class TicketsService {
           {
             mask: ticket.mask,
             subject: ticket.subject,
-            contents: dto.contents,
+            contents,
             // Templates reference {{name}}; keep requesterName too for forward-compat.
             name: requesterName,
             requesterName,
@@ -685,6 +722,7 @@ export class TicketsService {
           {
             cc: ccEmails.length > 0 ? ccEmails : undefined,
             bcc: bccEmails.length > 0 ? bccEmails : undefined,
+            ...(priorMsg?.messageId ? { inReplyTo: priorMsg.messageId, references: priorMsg.messageId } : {}),
           },
         )
         .catch((err: unknown) =>

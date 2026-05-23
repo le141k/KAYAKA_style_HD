@@ -12,6 +12,10 @@ export interface SendMailOptions {
   from?: string;
   cc?: string | string[];
   bcc?: string | string[];
+  /** RFC threading: the Message-ID this mail replies to (so MUAs thread it). */
+  inReplyTo?: string;
+  /** RFC threading: the References chain. */
+  references?: string | string[];
 }
 
 export interface RenderedTemplate {
@@ -53,6 +57,8 @@ export class MailService {
         text: opts.text,
         ...(ccStr ? { cc: ccStr } : {}),
         ...(bccStr ? { bcc: bccStr } : {}),
+        ...(opts.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}),
+        ...(opts.references ? { references: opts.references } : {}),
       });
       this.logger.debug(`Mail sent to ${opts.to}: ${opts.subject}`);
     } catch (err) {
@@ -107,7 +113,7 @@ export class MailService {
     templateKey: string,
     locale: string,
     vars: Record<string, string>,
-    opts?: { cc?: string[]; bcc?: string[] },
+    opts?: { cc?: string[]; bcc?: string[]; inReplyTo?: string; references?: string | string[] },
   ): Promise<void> {
     const rendered = await this.renderTemplate(templateKey, locale, vars);
     await this.send({
@@ -117,6 +123,8 @@ export class MailService {
       text: rendered.text,
       ...(opts?.cc?.length ? { cc: opts.cc } : {}),
       ...(opts?.bcc?.length ? { bcc: opts.bcc } : {}),
+      ...(opts?.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}),
+      ...(opts?.references ? { references: opts.references } : {}),
     });
   }
 }

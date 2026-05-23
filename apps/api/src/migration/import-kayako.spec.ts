@@ -4,7 +4,15 @@
  * type-check it (scripts/ is outside the build's src/ include).
  */
 import { describe, it, expect } from 'vitest';
-import { parseTable, datelineToDate, classifyOrg, groupUserEmails, IdMap } from './kayako-parser';
+import {
+  parseTable,
+  datelineToDate,
+  classifyOrg,
+  groupUserEmails,
+  mapQueueType,
+  mapRuleOp,
+  IdMap,
+} from './kayako-parser';
 
 const ORG_SQL = `
 INSERT INTO \`swuserorganizations\` (\`userorganizationid\`,\`organizationname\`,\`organizationtype\`,\`country\`,\`dateline\`) VALUES (1,'23 Telecom',1,'United States',1599137796),(2,'Lleida',1,'Spain',1600776894),(7,'O\\'Brien Ltd',0,'UK',0);
@@ -78,6 +86,24 @@ describe('groupUserEmails', () => {
       { email: 'one@x.com', isPrimary: true },
       { email: 'two@x.com', isPrimary: false },
     ]);
+  });
+});
+
+describe('mapQueueType', () => {
+  it('maps fetchtype to our queue type', () => {
+    expect(mapQueueType('imapssl')).toBe('IMAP');
+    expect(mapQueueType('pop3')).toBe('POP3');
+    expect(mapQueueType('pipe')).toBe('PIPE');
+    expect(mapQueueType(null)).toBe('IMAP');
+  });
+});
+
+describe('mapRuleOp', () => {
+  it('maps Kayako ruleop codes to our ops (4=contains for bounce rules)', () => {
+    expect(mapRuleOp('1')).toBe('eq');
+    expect(mapRuleOp('4')).toBe('contains');
+    expect(mapRuleOp('8')).toBe('regex');
+    expect(mapRuleOp('99')).toBe('contains'); // unknown → safe default
   });
 });
 

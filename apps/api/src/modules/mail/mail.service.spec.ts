@@ -154,6 +154,31 @@ describe('MailService', () => {
         service.send({ to: ['a@example.com', 'b@example.com'], subject: 'Multi', text: 'body' }),
       ).resolves.toBeUndefined();
     });
+
+    it('forwards In-Reply-To / References threading headers to the transport', async () => {
+      const sendMail = (service as unknown as { transporter: { sendMail: ReturnType<typeof vi.fn> } })
+        .transporter.sendMail;
+      await service.send({
+        to: 'user@example.com',
+        subject: 'Re: TT-1',
+        text: 'reply',
+        inReplyTo: '<abc@mail>',
+        references: '<abc@mail>',
+      });
+      expect(sendMail).toHaveBeenCalledWith(
+        expect.objectContaining({ inReplyTo: '<abc@mail>', references: '<abc@mail>' }),
+      );
+    });
+
+    it('omits threading headers when not provided', async () => {
+      const sendMail = (service as unknown as { transporter: { sendMail: ReturnType<typeof vi.fn> } })
+        .transporter.sendMail;
+      sendMail.mockClear();
+      await service.send({ to: 'user@example.com', subject: 'No thread', text: 'x' });
+      const arg = sendMail.mock.calls[0]![0] as Record<string, unknown>;
+      expect(arg).not.toHaveProperty('inReplyTo');
+      expect(arg).not.toHaveProperty('references');
+    });
   });
 
   // ─── sendTemplate ────────────────────────────────────────────────────────────
