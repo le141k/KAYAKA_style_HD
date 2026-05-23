@@ -1,0 +1,94 @@
+# 23 Telecom Help Desk — PRODUCTION compose profile.
+#
+# Differences vs the dev docker-compose.yml:
+#   - NODE_ENV=production everywhere (secure cookies, info logging).
+#   - The API refuses to boot with default/placeholder secrets (see
+#     configuration.ts assertProductionSecrets) — set strong values in .env.prod.
+#   - No automatic seed (TELECOM_HD_SEED unset → seed skips in production), so the
+#     demo admin is NOT recreated. Run it once intentionally with TELECOM_HD_SEED=1.
+#   - No MailHog: point TELECOM_HD_SMTP_* at a real SMTP relay in .env.prod.
+#   - restart: unless-stopped on every service.
+#   - Postgres/Redis are NOT published to the host (internal network only).
+#   - The browser API origin is baked at build time via the NEXT_PUBLIC_API_URL
+#     build arg (Next inlines NEXT_PUBLIC_* — runtime env has no effect).
+#
+# Usage:
+#   cp .env.example .env.prod   # then fill in STRONG secrets + real SMTP + URLs
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# TLS: terminate HTTPS at a reverse proxy (nginx/Caddy/Traefik) in front of web:3000
+# and api:4000 — this compose intentionally does not handle certificates.
+
+name: telecom-hd-prod
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${TELECOM_HD_DB_USER:?set in .env.prod}
+      POSTGRES_PASSWORD: ${TELECOM_HD_DB_PASSWORD:?set in .env.prod}
+      POSTGRES_DB: ${TELECOM_HD_DB_NAME:?set in .env.prod}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TELECOM_HD_DB_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    env_file: .env.prod
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${TELECOM_HD_DB_USER}:${TELECOM_HD_DB_PASSWORD}@postgres:5432/${TELECOM_HD_DB_NAME}?schema=public
+      REDIS_URL: redis://redis:6379
+    expose:
+      - "4000"
+    ports:
+      - "4000:4000"   # remove if the reverse proxy is on the same docker network
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Apply migrations, then start. Seed is intentionally NOT run (it self-skips in
+    # production unless TELECOM_HD_SEED=1).
+    command: ["sh", "-c", "npx prisma migrate deploy && node dist/seed/seed.js && node dist/main.js"]
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Public origin the browser uses to reach the API (baked at build time).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set in .env.prod, e.g. https://help.example.com}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      TELECOM_HD_API_URL: http://api:4000
+    expose:
+      - "3000"
+    ports:
+      - "3000:3000"   # remove if the reverse proxy is on the same docker network
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  uploads:

@@ -35,6 +35,14 @@ async function findOrCreateWhere<T extends { id: number }>(
 }
 
 async function main(): Promise<void> {
+  // The seed creates a demo admin (admin@23telecom.example / demo1234). Never do
+  // that automatically in production — it would recreate a known-password account
+  // on every restart. Opt in explicitly with TELECOM_HD_SEED=1.
+  if (process.env.NODE_ENV === 'production' && process.env.TELECOM_HD_SEED !== '1') {
+    console.log('⏭️  Seed skipped (NODE_ENV=production and TELECOM_HD_SEED!=1).');
+    return;
+  }
+
   console.log('🌱 Seeding 23 Telecom Help Desk…');
 
   // ─────────────────── Staff Groups ───────────────────

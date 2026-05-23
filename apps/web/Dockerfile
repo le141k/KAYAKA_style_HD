@@ -15,6 +15,11 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
+# NEXT_PUBLIC_* is inlined at build time, so the browser API base URL must be a
+# build arg (the runtime compose `environment:` has no effect on it). Defaults to
+# localhost for dev; prod passes the public API origin via build args.
+ARG NEXT_PUBLIC_API_URL=http://localhost:4000
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 RUN npm run build --workspace=apps/web
 
 FROM node:22-alpine AS runner

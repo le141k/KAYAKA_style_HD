@@ -38,6 +38,47 @@ export type AppConfig = z.infer<typeof schema>;
 /** Injection token for AppConfig (use with @Inject(APP_CONFIG)). */
 export const APP_CONFIG = Symbol('APP_CONFIG');
 
+/** Default/placeholder secret that must never reach production. */
+const ALARIS_DEFAULT_SECRET = 'alaris-dev-secret-change-me-0000';
+/** Patterns that mark a secret as a non-production placeholder. */
+const PLACEHOLDER_PATTERN = /change[-_]?me|dev[-_]?secret|placeholder|example|changeme|0{4,}/i;
+
+/**
+ * In production, reject default/placeholder secrets at boot so a deployment can
+ * never run with the shipped dev values. Dev/test keep the convenient defaults.
+ */
+export function assertProductionSecrets(cfg: AppConfig): void {
+  if (cfg.NODE_ENV !== 'production') return;
+
+  const problems: string[] = [];
+  const checkSecret = (name: string, value: string | undefined) => {
+    if (!value || value.trim() === '' || PLACEHOLDER_PATTERN.test(value)) {
+      problems.push(`  - ${name}: must be a strong non-default value in production`);
+    }
+  };
+
+  checkSecret('TELECOM_HD_JWT_ACCESS_SECRET', cfg.TELECOM_HD_JWT_ACCESS_SECRET);
+  checkSecret('TELECOM_HD_JWT_REFRESH_SECRET', cfg.TELECOM_HD_JWT_REFRESH_SECRET);
+  checkSecret('TELECOM_HD_ALARIS_WEBHOOK_SECRET', cfg.TELECOM_HD_ALARIS_WEBHOOK_SECRET);
+  if (cfg.TELECOM_HD_ALARIS_WEBHOOK_SECRET === ALARIS_DEFAULT_SECRET) {
+    problems.push('  - TELECOM_HD_ALARIS_WEBHOOK_SECRET: must not be the shipped default');
+  }
+  if (cfg.TELECOM_HD_JWT_ACCESS_SECRET === cfg.TELECOM_HD_JWT_REFRESH_SECRET) {
+    problems.push('  - TELECOM_HD_JWT_REFRESH_SECRET: must differ from the access secret');
+  }
+  // Field-encryption key, if provided, must be a real 64-hex (256-bit) key.
+  if (cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY && !/^[0-9a-f]{64}$/i.test(cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY)) {
+    problems.push('  - TELECOM_HD_FIELD_ENCRYPTION_KEY: must be 64 hex chars (256-bit) when set');
+  }
+
+  if (problems.length) {
+    throw new Error(
+      `Refusing to start in production with insecure secrets:\n${problems.join('\n')}\n` +
+        `Generate strong values: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`,
+    );
+  }
+}
+
 export function loadConfig(): AppConfig {
   const parsed = schema.safeParse(process.env);
   if (!parsed.success) {
@@ -45,5 +86,6 @@ export function loadConfig(): AppConfig {
     const issues = parsed.error.issues.map((i) => `  - ${i.path.join('.')}: ${i.message}`).join('\n');
     throw new Error(`Invalid environment configuration:\n${issues}`);
   }
+  assertProductionSecrets(parsed.data);
   return parsed.data;
 }
