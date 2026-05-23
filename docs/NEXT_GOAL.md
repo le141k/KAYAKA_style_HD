@@ -73,3 +73,10 @@
 ## Confirmed working (do NOT re-touch)
 
 All last-pass fixes verified live: login throttle→429, login→/staff/dashboard, guards, 401-refresh, KB drafts hidden, ticket status/priority/assignee/close/tags/notes/authors, kanban DnD persist, dashboard real metrics, server-side filters, /auth/me real name, apply-macro/dept-change/email-queue endpoints, mail "Hello <name>", Alaris no-autoresponder/400/403/dedup, SLA+auto-close jobs, custom-field validation, admin CRUD (dept/status/priority/staff/workflow/macro/CF create+edit), client portal submit/my-tickets/public-detail/reply. Test suite: api vitest 325/325, web build clean.
+
+---
+
+## Addendum — needs live verification next pass
+
+- **SLA admin UI** (new schedules / holidays / escalation-rules CRUD from this pass) — re-audit agent did not return in time; exercise create/edit/delete on each via the UI and confirm correct seconds/camelCase payloads + nested routes (`/admin/sla/schedules/:id/holidays`, `/admin/sla/plans/:id/escalation-rules`).
+- Department parent-selector in admin form (parentId now accepted) — confirm sub-department creation via UI.
