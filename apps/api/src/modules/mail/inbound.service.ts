@@ -13,6 +13,26 @@ import { MailService } from './mail.service';
 import { AttachmentsService } from '../attachments/attachments.service';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
 import { PrismaService } from '../../prisma/prisma.service';
+import { decryptField } from '../../common/field-encrypt.util';
+import type { EmailParserRule } from '@prisma/client';
+
+/** Parsed email fields used for rule evaluation */
+interface ParsedEmail {
+  subject: string;
+  fromEmail: string;
+  fromName: string;
+  toEmail?: string;
+  body: string;
+}
+
+/** Result of applyParserRules */
+export interface ParserRuleResult {
+  skip: boolean;
+  departmentId?: number;
+  priorityId?: number;
+  ownerStaffId?: number;
+  tags: string[];
+}
 
 /** Ticket mask pattern used to thread inbound replies, e.g. TT-000042 */
 const MASK_RE = /TT-\d{6,}/i;
@@ -57,14 +77,22 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     }
 
     // Connect to each queue
+    const encKey = this.config.TELECOM_HD_FIELD_ENCRYPTION_KEY;
     for (const queue of queues) {
+      let plainPassword: string;
+      try {
+        plainPassword = decryptField(queue.passwordEnc, encKey);
+      } catch (err) {
+        this.logger.error(`Failed to decrypt IMAP password for queue ${queue.id}: ${String(err)}`);
+        continue;
+      }
       await this.connectQueue(queue.id, {
         host: queue.host,
         port: queue.port,
         secure: queue.useTls,
         auth: {
           user: queue.username,
-          pass: queue.passwordEnc, // TODO: decrypt at-rest encrypted password
+          pass: plainPassword,
         },
       });
     }
@@ -144,7 +172,8 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    * Threading priority:
    *   1. In-Reply-To / References header → look up TicketPost.messageId
    *   2. Subject mask TT-XXXXXX
-   *   3. Fall back to creating a new ticket
+   *   3. Apply parser rules (PRE_PARSE) — may discard or override routing
+   *   4. Fall back to creating a new ticket
    */
   private async processMessage(msg: FetchMessageObject, departmentId: number | undefined): Promise<void> {
     const { simpleParser } = await import('mailparser');
@@ -245,8 +274,27 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // 3. Create new ticket
-    const deptId = departmentId ?? (await this.defaultDeptId());
+    // 3. Apply PRE_PARSE parser rules (before creating a new ticket)
+    const toField = parsed.to;
+    const toAddress = !Array.isArray(toField)
+      ? toField?.value?.[0]?.address
+      : toField?.[0]?.value?.[0]?.address;
+    const parsedEmail: ParsedEmail = {
+      subject,
+      fromEmail,
+      fromName,
+      toEmail: toAddress,
+      body: textBody,
+    };
+    const ruleResult = await this.applyParserRules(parsedEmail, departmentId);
+
+    if (ruleResult.skip) {
+      this.logger.log(`IMAP: message from ${fromEmail} discarded by parser rule — "${subject}"`);
+      return;
+    }
+
+    // 4. Create new ticket
+    const deptId = ruleResult.departmentId ?? departmentId ?? (await this.defaultDeptId());
     const newTicket = await this.ticketsService.createTicket({
       subject,
       contents: htmlBody ?? textBody,
@@ -256,9 +304,11 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       requesterName: fromName,
       creationMode: 'EMAIL',
       ipAddress: '0.0.0.0',
-      tags: [],
+      tags: ruleResult.tags,
       customFields: {},
       attachmentIds: emailAttachmentIds,
+      ...(ruleResult.priorityId !== undefined ? { priorityId: ruleResult.priorityId } : {}),
+      ...(ruleResult.ownerStaffId !== undefined ? { ownerStaffId: ruleResult.ownerStaffId } : {}),
     });
 
     // Store the incoming messageId on the first post
@@ -290,6 +340,126 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         where: { id: post.id },
         data: { messageId },
       });
+    }
+  }
+
+  /**
+   * Apply enabled PRE_PARSE parser rules to a parsed inbound email.
+   * Rules are evaluated in sortOrder ascending.
+   * Returns overrides to apply when creating the ticket, or skip=true to discard.
+   */
+  async applyParserRules(parsed: ParsedEmail, _deptId: number | undefined): Promise<ParserRuleResult> {
+    const result: ParserRuleResult = { skip: false, tags: [] };
+
+    let rules: EmailParserRule[];
+    try {
+      rules = await this.prisma.emailParserRule.findMany({
+        where: { isEnabled: true, ruleType: 'PRE_PARSE' },
+        orderBy: { sortOrder: 'asc' },
+      });
+    } catch {
+      // Table may not exist yet (migration pending) — skip rules gracefully
+      return result;
+    }
+
+    for (const rule of rules) {
+      const criteria = (Array.isArray(rule.criteria) ? rule.criteria : []) as Array<{
+        field: string;
+        op: string;
+        value: string;
+      }>;
+      const actions = (Array.isArray(rule.actions) ? rule.actions : []) as Array<{
+        type: string;
+        value?: string | number;
+      }>;
+
+      const matches = this.evaluateCriteria(parsed, criteria, rule.matchType);
+      if (!matches) continue;
+
+      // Apply actions
+      for (const action of actions) {
+        switch (action.type) {
+          case 'ignore':
+            result.skip = true;
+            break;
+          case 'route_dept':
+            if (action.value !== undefined) result.departmentId = Number(action.value);
+            break;
+          case 'set_priority':
+            if (action.value !== undefined) result.priorityId = Number(action.value);
+            break;
+          case 'assign_staff':
+            if (action.value !== undefined) result.ownerStaffId = Number(action.value);
+            break;
+          case 'add_tag':
+            if (typeof action.value === 'string' && action.value) result.tags.push(action.value);
+            break;
+        }
+      }
+
+      if (rule.stopProcessing) break;
+    }
+
+    return result;
+  }
+
+  /**
+   * Evaluate a set of criteria against a parsed email.
+   * matchType=ALL: all criteria must match. matchType=ANY: at least one must match.
+   */
+  evaluateCriteria(
+    parsed: ParsedEmail,
+    criteria: Array<{ field: string; op: string; value: string }>,
+    matchType: string,
+  ): boolean {
+    if (criteria.length === 0) return true;
+
+    const results = criteria.map((c) => this.matchCriterion(parsed, c));
+
+    return matchType === 'ANY' ? results.some(Boolean) : results.every(Boolean);
+  }
+
+  private matchCriterion(parsed: ParsedEmail, c: { field: string; op: string; value: string }): boolean {
+    const fieldVal = this.extractField(parsed, c.field);
+    const target = c.value ?? '';
+
+    switch (c.op) {
+      case 'eq':
+        return fieldVal.toLowerCase() === target.toLowerCase();
+      case 'contains':
+        return fieldVal.toLowerCase().includes(target.toLowerCase());
+      case 'not_contains':
+        return !fieldVal.toLowerCase().includes(target.toLowerCase());
+      case 'starts_with':
+        return fieldVal.toLowerCase().startsWith(target.toLowerCase());
+      case 'ends_with':
+        return fieldVal.toLowerCase().endsWith(target.toLowerCase());
+      case 'regex': {
+        try {
+          return new RegExp(target, 'i').test(fieldVal);
+        } catch {
+          return false;
+        }
+      }
+      default:
+        return false;
+    }
+  }
+
+  private extractField(parsed: ParsedEmail, field: string): string {
+    switch (field) {
+      case 'subject':
+        return parsed.subject;
+      case 'sender':
+        return parsed.fromEmail;
+      case 'sendername':
+        return parsed.fromName;
+      case 'recipient':
+        return parsed.toEmail ?? '';
+      case 'body':
+        return parsed.body;
+      default:
+        return '';
     }
   }
 

@@ -105,6 +105,10 @@ function makePrismaMock() {
     ticketTag: {
       findUnique: vi.fn(),
     },
+    ticketRecipient: {
+      findMany: vi.fn().mockResolvedValue([]),
+      createMany: vi.fn().mockResolvedValue({}),
+    },
     $transaction: vi.fn(),
   } as unknown as PrismaService;
 }
@@ -224,6 +228,47 @@ describe('TicketsService', () => {
             field: 'ownerStaffId',
             newValue: '5',
           }),
+        }),
+      );
+    });
+  });
+
+  // ─── recipient upsert (createTicket cc/bcc) ──────────────────────────────
+
+  describe('createTicket with cc/bcc', () => {
+    it('saves CC and BCC recipients after ticket creation', async () => {
+      const mockTicket = makeTicket({ id: 42 });
+
+      (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
+      (prisma.ticketPriority.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 2 });
+      (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue(mockTicket);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...mockTicket,
+        mask: 'TT-000042',
+      });
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      await service.createTicket({
+        subject: 'Test',
+        contents: 'Body',
+        isHtml: false,
+        departmentId: 1,
+        requesterEmail: 'test@example.com',
+        requesterName: 'Test User',
+        creationMode: 'STAFF',
+        ipAddress: '127.0.0.1',
+        tags: [],
+        customFields: {},
+        ccEmails: ['cc@example.com'],
+        bccEmails: ['bcc@example.com'],
+      });
+
+      expect(prisma.ticketRecipient.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.arrayContaining([
+            expect.objectContaining({ email: 'cc@example.com', role: 'CC' }),
+            expect.objectContaining({ email: 'bcc@example.com', role: 'BCC' }),
+          ]),
         }),
       );
     });

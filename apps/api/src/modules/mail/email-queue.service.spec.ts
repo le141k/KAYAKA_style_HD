@@ -140,11 +140,13 @@ describe('EmailQueueService', () => {
       expect(result).not.toHaveProperty('passwordEnc');
       expect(result).not.toHaveProperty('password');
 
-      // Prisma was called with passwordEnc, not password
+      // Prisma was called with passwordEnc (may be encrypted or plain depending on env), not password
       const createCall = (prisma.emailQueue.create as ReturnType<typeof vi.fn>).mock.calls[0] as [
         { data: Record<string, unknown>; select: Record<string, boolean> },
       ];
-      expect(createCall[0].data).toHaveProperty('passwordEnc', 's3cr3t');
+      // passwordEnc must be set (either plain or encrypted)
+      expect(createCall[0].data).toHaveProperty('passwordEnc');
+      expect(typeof createCall[0].data['passwordEnc']).toBe('string');
       expect(createCall[0].data).not.toHaveProperty('password');
       expect(createCall[0].select).not.toHaveProperty('passwordEnc');
     });
@@ -184,7 +186,9 @@ describe('EmailQueueService', () => {
       const updateCall = (prisma.emailQueue.update as ReturnType<typeof vi.fn>).mock.calls[0] as [
         { where: { id: number }; data: Record<string, unknown>; select: Record<string, boolean> },
       ];
-      expect(updateCall[0].data).toHaveProperty('passwordEnc', 'newPass');
+      // passwordEnc must be set (either plain or encrypted)
+      expect(updateCall[0].data).toHaveProperty('passwordEnc');
+      expect(typeof updateCall[0].data['passwordEnc']).toBe('string');
       expect(updateCall[0].data).not.toHaveProperty('password');
       expect(updateCall[0].select).not.toHaveProperty('passwordEnc');
     });

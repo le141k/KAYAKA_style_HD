@@ -83,6 +83,21 @@ enum FlagType {
   BLUE
 }
 
+enum RecipientRole {
+  CC
+  BCC
+}
+
+enum ParserRuleType {
+  PRE_PARSE
+  POST_PARSE
+}
+
+enum ParserMatchType {
+  ALL
+  ANY
+}
+
 // ───────────────────────────── staff / RBAC ─────────────────────────────
 
 model StaffGroup {
@@ -326,6 +341,7 @@ model Ticket {
   linksFrom       TicketLink[]   @relation("LinkSource")
   linksTo         TicketLink[]   @relation("LinkTarget")
   alarisEvent     AlarisEvent?
+  recipients      TicketRecipient[]
 
   lastReplyAt     DateTime?
   lastActivityAt  DateTime       @default(now())
@@ -437,6 +453,18 @@ model TicketLink {
   linkType  String @default("related")
 
   @@unique([sourceId, targetId])
+}
+
+model TicketRecipient {
+  id       Int           @id @default(autoincrement())
+  ticket   Ticket        @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId Int
+  email    String
+  role     RecipientRole
+  addedAt  DateTime      @default(now())
+
+  @@unique([ticketId, email])
+  @@index([ticketId])
 }
 
 // ───────────────────────────── SLA / escalation ─────────────────────────────
@@ -553,6 +581,20 @@ model EmailTemplate {
   updatedAt DateTime @updatedAt
 
   @@unique([key, locale])
+}
+
+model EmailParserRule {
+  id              Int             @id @default(autoincrement())
+  title           String
+  ruleType        ParserRuleType  @default(PRE_PARSE)
+  matchType       ParserMatchType @default(ALL)
+  stopProcessing  Boolean         @default(false)
+  isEnabled       Boolean         @default(true)
+  sortOrder       Int             @default(0)
+  criteria        Json            @default("[]")
+  actions         Json            @default("[]")
+
+  @@index([isEnabled, sortOrder])
 }
 
 // ───────────────────────────── custom fields (metadata only; values live as JSONB) ─────────────────────────────

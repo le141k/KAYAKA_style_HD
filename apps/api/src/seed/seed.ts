@@ -296,6 +296,24 @@ async function main(): Promise<void> {
       textBody:
         'SLA BREACH\nTicket: {{mask}}\nType: {{breachType}}\nOverdue: {{minutesOverdue}}m\nSubject: {{subject}}\n\nPlease take immediate action.',
     },
+    {
+      key: 'notify_staff_assigned',
+      locale: 'en',
+      subject: '[Assigned] {{mask}}: {{subject}}',
+      htmlBody:
+        '<p>Hello {{name}},</p><p>Ticket <strong>{{mask}}</strong> has been assigned to you.</p><p>Subject: {{subject}}</p><p>Please review and respond within your SLA window.</p><p>Best regards,<br>23 Telecom Help Desk</p>',
+      textBody:
+        'Hello {{name}},\n\nTicket {{mask}} has been assigned to you.\nSubject: {{subject}}\n\nPlease review and respond within your SLA window.\n\n23 Telecom Help Desk',
+    },
+    {
+      key: 'notify_staff_user_replied',
+      locale: 'en',
+      subject: '[User Reply] {{mask}}: {{subject}}',
+      htmlBody:
+        '<p>Hello {{name}},</p><p>A customer has replied to ticket <strong>{{mask}}</strong>.</p><p>Subject: {{subject}}</p><p>Please review and respond as needed.</p><p>Best regards,<br>23 Telecom Help Desk</p>',
+      textBody:
+        'Hello {{name}},\n\nA customer has replied to ticket {{mask}}.\nSubject: {{subject}}\n\nPlease review and respond as needed.\n\n23 Telecom Help Desk',
+    },
   ];
 
   for (const tpl of templates) {

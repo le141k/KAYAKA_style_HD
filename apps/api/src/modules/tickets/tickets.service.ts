@@ -6,6 +6,7 @@ import { SlaService } from '../sla/sla.service';
 import { MailService } from '../mail/mail.service';
 import { AdminService } from '../admin/admin.service';
 import { AttachmentsService } from '../attachments/attachments.service';
+import { NotificationService } from './notification.service';
 import { formatTicketMask } from './ticket-mask.util';
 import type {
   CreateTicketDto,
@@ -56,6 +57,7 @@ export class TicketsService {
     private readonly mailService: MailService,
     private readonly adminService: AdminService,
     @Optional() private readonly attachmentsService?: AttachmentsService,
+    @Optional() private readonly notificationService?: NotificationService,
   ) {}
 
   // ─────────────────────────── Create ───────────────────────────
@@ -166,6 +168,18 @@ export class TicketsService {
         await this.attachmentsService.linkToPost(dto.attachmentIds, firstPost.id, ticket.id);
         await this.prisma.ticket.update({ where: { id: ticket.id }, data: { hasAttachments: true } });
       }
+    }
+
+    // Persist CC/BCC recipients
+    const allRecipients = [
+      ...(dto.ccEmails ?? []).map((email) => ({ email, role: 'CC' as const })),
+      ...(dto.bccEmails ?? []).map((email) => ({ email, role: 'BCC' as const })),
+    ];
+    if (allRecipients.length > 0) {
+      await this.prisma.ticketRecipient.createMany({
+        data: allRecipients.map((r) => ({ ticketId: ticket.id, email: r.email, role: r.role })),
+        skipDuplicates: true,
+      });
     }
 
     // Write audit log
@@ -403,6 +417,7 @@ export class TicketsService {
         watchers: { select: { staffId: true } },
         tags: { select: { name: true } },
         auditLogs: { orderBy: { createdAt: 'desc' }, take: 50 },
+        recipients: { orderBy: { addedAt: 'asc' } },
       },
     });
 
@@ -509,17 +524,45 @@ export class TicketsService {
     // Send outbound email to requester when a staff member replies (non-blocking)
     if (isStaffReply && ticket.requesterEmail) {
       const requesterName = ticket.requesterName || ticket.requesterEmail;
+      // Load CC/BCC recipients for this ticket
+      const recipients = await this.prisma.ticketRecipient.findMany({ where: { ticketId } });
+      const ccEmails = [
+        ...(dto.ccEmails ?? []),
+        ...recipients.filter((r) => r.role === 'CC').map((r) => r.email),
+      ];
+      const bccEmails = [
+        ...(dto.bccEmails ?? []),
+        ...recipients.filter((r) => r.role === 'BCC').map((r) => r.email),
+      ];
       this.mailService
-        .sendTemplate(ticket.requesterEmail, 'ticket_user_reply', 'en', {
-          mask: ticket.mask,
-          subject: ticket.subject,
-          contents: dto.contents,
-          // Templates reference {{name}}; keep requesterName too for forward-compat.
-          name: requesterName,
-          requesterName,
-        })
+        .sendTemplate(
+          ticket.requesterEmail,
+          'ticket_user_reply',
+          'en',
+          {
+            mask: ticket.mask,
+            subject: ticket.subject,
+            contents: dto.contents,
+            // Templates reference {{name}}; keep requesterName too for forward-compat.
+            name: requesterName,
+            requesterName,
+          },
+          {
+            cc: ccEmails.length > 0 ? ccEmails : undefined,
+            bcc: bccEmails.length > 0 ? bccEmails : undefined,
+          },
+        )
         .catch((err: unknown) =>
           this.logger.error(`Reply email failed for ticket ${ticket.mask}: ${String(err)}`),
+        );
+    }
+
+    // Notify watchers when a user (customer) replies
+    if (!isStaffReply && this.notificationService) {
+      this.notificationService
+        .notifyWatchersOnUserReply(ticketId)
+        .catch((err: unknown) =>
+          this.logger.error(`Watcher notification failed for ticket ${ticket.mask}: ${String(err)}`),
         );
     }
 
@@ -561,6 +604,15 @@ export class TicketsService {
       oldValue: ticket.ownerStaffId?.toString() ?? null,
       newValue: dto.ownerStaffId?.toString() ?? null,
     });
+
+    // Notify the newly assigned staff member (non-blocking)
+    if (dto.ownerStaffId && this.notificationService) {
+      this.notificationService
+        .notifyOnAssign(ticketId, dto.ownerStaffId)
+        .catch((err: unknown) =>
+          this.logger.error(`Assignment notification failed for ticket ${ticketId}: ${String(err)}`),
+        );
+    }
 
     return updated;
   }

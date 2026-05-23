@@ -25,6 +25,9 @@ const schema = z.object({
   TELECOM_HD_ALARIS_WEBHOOK_SECRET: z.string().default('alaris-dev-secret'),
   TELECOM_HD_UPLOAD_DIR: z.string().default('/app/uploads'),
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: z.coerce.number().default(25),
+  // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
+  // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+  TELECOM_HD_FIELD_ENCRYPTION_KEY: z.string().optional(),
 });
 
 export type AppConfig = z.infer<typeof schema>;

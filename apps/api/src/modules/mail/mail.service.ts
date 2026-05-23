@@ -10,6 +10,8 @@ export interface SendMailOptions {
   html?: string;
   text?: string;
   from?: string;
+  cc?: string | string[];
+  bcc?: string | string[];
 }
 
 export interface RenderedTemplate {
@@ -40,12 +42,17 @@ export class MailService {
    */
   async send(opts: SendMailOptions): Promise<void> {
     try {
+      const toStr = Array.isArray(opts.to) ? opts.to.join(', ') : opts.to;
+      const ccStr = opts.cc ? (Array.isArray(opts.cc) ? opts.cc.join(', ') : opts.cc) : undefined;
+      const bccStr = opts.bcc ? (Array.isArray(opts.bcc) ? opts.bcc.join(', ') : opts.bcc) : undefined;
       await this.transporter.sendMail({
         from: opts.from ?? this.config.TELECOM_HD_MAIL_FROM,
-        to: Array.isArray(opts.to) ? opts.to.join(', ') : opts.to,
+        to: toStr,
         subject: opts.subject,
         html: opts.html,
         text: opts.text,
+        ...(ccStr ? { cc: ccStr } : {}),
+        ...(bccStr ? { bcc: bccStr } : {}),
       });
       this.logger.debug(`Mail sent to ${opts.to}: ${opts.subject}`);
     } catch (err) {
@@ -61,11 +68,7 @@ export class MailService {
    * @param locale Locale code, defaults to 'en'; falls back to 'en' if not found
    * @param vars   Record of {{key}} → value replacements
    */
-  async renderTemplate(
-    key: string,
-    locale: string,
-    vars: Record<string, string>,
-  ): Promise<RenderedTemplate> {
+  async renderTemplate(key: string, locale: string, vars: Record<string, string>): Promise<RenderedTemplate> {
     // Try requested locale first, then fall back to English
     let tpl = await this.prisma.emailTemplate.findUnique({
       where: { key_locale: { key, locale } },
@@ -86,8 +89,7 @@ export class MailService {
       };
     }
 
-    const replace = (str: string): string =>
-      str.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => vars[k] ?? '');
+    const replace = (str: string): string => str.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => vars[k] ?? '');
 
     return {
       subject: replace(tpl.subject),
@@ -98,14 +100,23 @@ export class MailService {
 
   /**
    * Convenience: render and send a template email.
+   * Optionally pass cc/bcc arrays for CC/BCC recipients.
    */
   async sendTemplate(
     to: string | string[],
     templateKey: string,
     locale: string,
     vars: Record<string, string>,
+    opts?: { cc?: string[]; bcc?: string[] },
   ): Promise<void> {
     const rendered = await this.renderTemplate(templateKey, locale, vars);
-    await this.send({ to, subject: rendered.subject, html: rendered.html, text: rendered.text });
+    await this.send({
+      to,
+      subject: rendered.subject,
+      html: rendered.html,
+      text: rendered.text,
+      ...(opts?.cc?.length ? { cc: opts.cc } : {}),
+      ...(opts?.bcc?.length ? { bcc: opts.bcc } : {}),
+    });
   }
 }

@@ -176,5 +176,64 @@ describe('MailService', () => {
         }),
       );
     });
+
+    it('forwards cc and bcc when provided', async () => {
+      (prisma.emailTemplate.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TEMPLATE);
+
+      const sendSpy = vi.spyOn(service, 'send').mockResolvedValue(undefined);
+
+      await service.sendTemplate(
+        'user@example.com',
+        'ticket_created',
+        'en',
+        { name: 'Test', mask: 'TT-001' },
+        { cc: ['cc@example.com'], bcc: ['bcc@example.com'] },
+      );
+
+      expect(sendSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cc: ['cc@example.com'],
+          bcc: ['bcc@example.com'],
+        }),
+      );
+    });
+  });
+
+  // ─── send (cc/bcc) ─────────────────────────────────────────────────────────
+
+  describe('send with cc/bcc', () => {
+    it('includes cc in the sendMail call when provided', async () => {
+      const sendMailSpy = vi.fn().mockResolvedValue({ messageId: 'id' });
+      // Access the private transporter via type cast
+      (service as unknown as { transporter: { sendMail: ReturnType<typeof vi.fn> } }).transporter.sendMail =
+        sendMailSpy;
+
+      await service.send({
+        to: 'to@example.com',
+        subject: 'Test',
+        html: '<p>body</p>',
+        cc: ['cc1@example.com', 'cc2@example.com'],
+        bcc: 'bcc@example.com',
+      });
+
+      expect(sendMailSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cc: 'cc1@example.com, cc2@example.com',
+          bcc: 'bcc@example.com',
+        }),
+      );
+    });
+
+    it('omits cc/bcc from sendMail when not provided', async () => {
+      const sendMailSpy = vi.fn().mockResolvedValue({ messageId: 'id' });
+      (service as unknown as { transporter: { sendMail: ReturnType<typeof vi.fn> } }).transporter.sendMail =
+        sendMailSpy;
+
+      await service.send({ to: 'to@example.com', subject: 'Test', text: 'body' });
+
+      const callArg = sendMailSpy.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(callArg).not.toHaveProperty('cc');
+      expect(callArg).not.toHaveProperty('bcc');
+    });
   });
 });

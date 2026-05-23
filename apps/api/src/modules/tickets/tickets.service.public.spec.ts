@@ -120,6 +120,10 @@ function makePrismaMock() {
     ticketTag: {
       findUnique: vi.fn(),
     },
+    ticketRecipient: {
+      findMany: vi.fn().mockResolvedValue([]),
+      createMany: vi.fn().mockResolvedValue({}),
+    },
     $transaction: vi.fn(),
   } as unknown as PrismaService;
 }

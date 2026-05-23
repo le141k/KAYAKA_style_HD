@@ -23,6 +23,9 @@ export const CreateTicketSchema = z.object({
   creationMode: z.enum(['WEB', 'EMAIL', 'API', 'STAFF', 'ALARIS']).default('STAFF'),
   ipAddress: z.string().default('0.0.0.0'),
   attachmentIds: z.array(z.number().int().positive()).optional(),
+  /** CC/BCC recipients stored in TicketRecipient */
+  ccEmails: z.array(z.string().email()).optional(),
+  bccEmails: z.array(z.string().email()).optional(),
 });
 export type CreateTicketDto = z.infer<typeof CreateTicketSchema>;
 
@@ -38,6 +41,9 @@ export const ReplyTicketSchema = z.object({
   creationMode: z.enum(['WEB', 'EMAIL', 'API', 'STAFF', 'ALARIS']).default('STAFF'),
   ipAddress: z.string().default('0.0.0.0'),
   attachmentIds: z.array(z.number().int().positive()).optional(),
+  /** CC/BCC recipients for outbound staff reply email */
+  ccEmails: z.array(z.string().email()).optional(),
+  bccEmails: z.array(z.string().email()).optional(),
 });
 export type ReplyTicketDto = z.infer<typeof ReplyTicketSchema>;
 

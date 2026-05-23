@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
+import { encryptField } from '../../common/field-encrypt.util';
 import type { CreateEmailQueueDto, UpdateEmailQueueDto } from './dto';
 
 /** Fields that are always omitted from responses (stored password). */
@@ -39,26 +40,27 @@ export class EmailQueueService {
     return queue;
   }
 
-  /** Create a new email queue. The caller-supplied password is stored as passwordEnc
-   *  (plain-text here; apply encryption before calling in production). */
+  /** Create a new email queue. The caller-supplied password is encrypted at rest. */
   create(dto: CreateEmailQueueDto) {
     const { password, ...rest } = dto;
+    const encKey = process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
     return this.prisma.emailQueue.create({
       data: {
         ...rest,
-        passwordEnc: password ?? '',
+        passwordEnc: encryptField(password ?? '', encKey),
       },
       select: SAFE_SELECT,
     });
   }
 
-  /** Update an existing email queue (partial). */
+  /** Update an existing email queue (partial). Password is encrypted at rest if provided. */
   async update(id: number, dto: UpdateEmailQueueDto) {
     await this.get(id); // throws NotFoundException when missing
     const { password, ...rest } = dto;
     const data: Record<string, unknown> = { ...rest };
     if (password !== undefined) {
-      data.passwordEnc = password;
+      const encKey = process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
+      data.passwordEnc = encryptField(password, encKey);
     }
     return this.prisma.emailQueue.update({
       where: { id },
