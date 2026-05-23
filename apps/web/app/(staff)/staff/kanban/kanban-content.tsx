@@ -6,9 +6,12 @@ import { KanbanSkeleton } from '@/components/premium/SkeletonLoaders';
 import { useTickets, useChangeTicketStatus } from '@/lib/hooks/use-tickets';
 import { QueryError } from '@/components/QueryError';
 import { toast } from '@/components/ui/use-toast';
+import { useI18n } from '@/lib/i18n';
 
 export function KanbanPageContent() {
   const router = useRouter();
+  const { t } = useI18n();
+  const k = t.kanbanPage;
   const KANBAN_LIMIT = 50;
   const { data, isLoading, isError, refetch } = useTickets({ per_page: KANBAN_LIMIT });
   const changeStatus = useChangeTicketStatus();
@@ -19,20 +22,19 @@ export function KanbanPageContent() {
   return (
     <div className="flex h-full flex-col">
       <div className="border-b border-border bg-card px-6 py-3">
-        <h1 className="text-lg font-semibold">Канбан</h1>
-        <p className="text-xs text-muted-foreground">Перетаскивайте карточки для смены статуса</p>
+        <h1 className="text-lg font-semibold">{k.title}</h1>
+        <p className="text-xs text-muted-foreground">{k.subtitle}</p>
       </div>
       {truncated && (
         <div className="border-b border-sla-warn/30 bg-sla-warn/10 px-6 py-2 text-xs text-sla-warn">
-          Показаны первые {KANBAN_LIMIT} из {total} заявок. Используйте список с фильтрами, чтобы увидеть
-          остальные.
+          {k.cap.replace('{shown}', String(KANBAN_LIMIT)).replace('{total}', String(total))}
         </div>
       )}
       <div className="flex-1 overflow-auto p-6">
         {isLoading ? (
           <KanbanSkeleton />
         ) : isError ? (
-          <QueryError message="Не удалось загрузить канбан-доску." onRetry={() => void refetch()} />
+          <QueryError message={k.loadError} onRetry={() => void refetch()} />
         ) : (
           <KanbanBoard
             tickets={tickets}
@@ -41,11 +43,11 @@ export function KanbanPageContent() {
               changeStatus.mutate(
                 { ticketId, status },
                 {
-                  onSuccess: () => toast({ title: 'Статус обновлён' }),
+                  onSuccess: () => toast({ title: k.statusUpdated }),
                   onError: () =>
                     toast({
-                      title: 'Ошибка',
-                      description: 'Не удалось сменить статус',
+                      title: k.errorTitle,
+                      description: k.statusError,
                       variant: 'destructive',
                     }),
                 },

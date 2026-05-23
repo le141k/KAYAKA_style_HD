@@ -137,6 +137,16 @@ export const ru = {
     save: 'Сохранить',
     saveCurrent: 'Сохранить текущие фильтры',
   },
+  kanbanPage: {
+    title: 'Канбан',
+    subtitle: 'Перетаскивайте карточки для смены статуса',
+    // {shown}/{total} are interpolated in the component.
+    cap: 'Показаны первые {shown} из {total} заявок. Используйте список с фильтрами, чтобы увидеть остальные.',
+    loadError: 'Не удалось загрузить канбан-доску.',
+    statusUpdated: 'Статус обновлён',
+    errorTitle: 'Ошибка',
+    statusError: 'Не удалось сменить статус',
+  },
 };
 
 export type Dictionary = typeof ru;

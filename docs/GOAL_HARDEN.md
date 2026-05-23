@@ -55,6 +55,18 @@ rewritten at commit 31add8e). After this, the product is honestly hand-to-a-real
 - [x] 🟠 **SEC-2b** jti blocklist stays fail-open but now emits a **throttled ERROR** ("Redis unreachable, fail-open BYPASS active") so the revocation-bypass window is observable (alert/metric hook); ≤1 log / 30s to avoid flooding.
 - **Acceptance:** all 4 security repros blocked live; api vitest +6 (controller throttle/claimToken, linkToPost token-scope, uploadFiles token, public-posts select); `make verify` GREEN 9/9; e2e 37/37. ✅
 
+## ✅ Batch H6 — Polish quick-wins (DONE — from second acceptance pass)
+
+- [x] 🟡 **UI-5** Kanban cap banner + page strings were hardcoded RU → added `kanbanPage` i18n section (ru/en/uk) with a `{shown}/{total}` interpolated `cap`; wired the page through `useI18n`.
+- [x] 🟡 **UI-6** Staff user-menu "Профиль" pointed at `/admin/staff` (dead link for agents; no profile page exists) → dropped it; "Настройки" → `/admin` now gated behind `user.role === 'admin'`.
+- [x] 🟡 **SEC-7** `StorageService.createReadStream`/`delete` now resolve the storageKey and assert it stays inside the upload dir (defense-in-depth path-traversal guard; storageKeys are DB-sourced). +4 unit tests.
+- **Acceptance:** `make verify` GREEN 9/9; e2e 37/37. ✅
+
+## ⏳ Batch H7 — Admin workflow/macro builders (real feature gaps)
+
+- [ ] 🟠 **ADM-1** Macro create/edit dialog had no actions builder (`macroSchema = {title,isShared,categoryId}`) → a UI-made macro did nothing. Add an actions field-array (reuse `ACTION_TYPES` + per-type value input).
+- [ ] 🟠 **ADM-2** Workflow rule criterion _field_ was a free-text `<input>` → admin could silently save a non-matching rule. Replace with a dropdown of real ticket fields.
+
 ---
 
 ## ✅ Definition of Done — ALL GREEN

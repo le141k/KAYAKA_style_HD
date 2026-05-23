@@ -139,4 +139,13 @@ export const en: Dictionary = {
     save: 'Save',
     saveCurrent: 'Save current filters',
   },
+  kanbanPage: {
+    title: 'Kanban',
+    subtitle: 'Drag cards to change status',
+    cap: 'Showing the first {shown} of {total} tickets. Use the filtered list to see the rest.',
+    loadError: 'Failed to load the kanban board.',
+    statusUpdated: 'Status updated',
+    errorTitle: 'Error',
+    statusError: 'Failed to change status',
+  },
 };

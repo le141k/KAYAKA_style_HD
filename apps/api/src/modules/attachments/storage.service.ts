@@ -1,7 +1,7 @@
-import { Injectable, Inject, Logger } from '@nestjs/common';
+import { Injectable, Inject, Logger, BadRequestException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { createReadStream, promises as fs } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve, relative, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { ReadStream } from 'node:fs';
 import { APP_CONFIG, AppConfig } from '../../config/configuration';
@@ -38,15 +38,30 @@ export class StorageService {
     return { storageKey: keyRelative, sha1 };
   }
 
+  /**
+   * Resolve a storageKey to an absolute path and assert it stays inside the
+   * upload dir. storageKeys are DB-sourced (our own uuid names), so this is
+   * defense-in-depth against a poisoned/legacy row containing `..` or an
+   * absolute path — never let a read/delete escape the upload root.
+   */
+  private resolveWithinUploadDir(storageKey: string): string {
+    const root = resolve(this.config.TELECOM_HD_UPLOAD_DIR);
+    const fullPath = resolve(root, storageKey);
+    const rel = relative(root, fullPath);
+    if (rel.startsWith('..') || isAbsolute(rel)) {
+      throw new BadRequestException('Invalid storage key');
+    }
+    return fullPath;
+  }
+
   /** Open a read stream for an existing storageKey. */
   createReadStream(storageKey: string): ReadStream {
-    const fullPath = join(this.config.TELECOM_HD_UPLOAD_DIR, storageKey);
-    return createReadStream(fullPath);
+    return createReadStream(this.resolveWithinUploadDir(storageKey));
   }
 
   /** Delete a file by storageKey. Silently ignores missing files. */
   async delete(storageKey: string): Promise<void> {
-    const fullPath = join(this.config.TELECOM_HD_UPLOAD_DIR, storageKey);
+    const fullPath = this.resolveWithinUploadDir(storageKey);
     try {
       await fs.unlink(fullPath);
     } catch (err: unknown) {

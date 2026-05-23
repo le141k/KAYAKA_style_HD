@@ -137,13 +137,17 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
                 <p className="text-xs text-muted-foreground">{displayEmail}</p>
               </div>
               <DropdownMenuSeparator />
-              <DropdownMenuItem asChild>
-                <Link href="/admin/staff">Профиль</Link>
-              </DropdownMenuItem>
-              <DropdownMenuItem asChild>
-                <Link href="/admin">Настройки</Link>
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
+              {/* Admin-only destinations — agents are bounced by the admin guard, so
+                  showing these to non-admins is a dead link. There is no personal
+                  profile page yet, so the old "Профиль" → /admin/staff item is dropped. */}
+              {user.role === 'admin' && (
+                <>
+                  <DropdownMenuItem asChild>
+                    <Link href="/admin">Настройки</Link>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                </>
+              )}
               <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={logout}>
                 Выйти
               </DropdownMenuItem>
