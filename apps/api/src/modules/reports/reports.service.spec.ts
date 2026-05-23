@@ -226,4 +226,25 @@ describe('ReportsService', () => {
       );
     });
   });
+
+  describe('createSchedule', () => {
+    it('seeds a non-NULL nextRunAt from the cron (so the processor can pick it up)', async () => {
+      (prisma.reportSchedule.create as ReturnType<typeof vi.fn>).mockImplementation((args: unknown) => ({
+        id: 1,
+        ...(args as { data: Record<string, unknown> }).data,
+      }));
+
+      const before = Date.now();
+      const res = (await service.createSchedule(7, {
+        cron: '*/5 * * * *',
+        recipients: [],
+        isEnabled: true,
+        format: 'json',
+      })) as { nextRunAt: Date };
+
+      expect(res.nextRunAt).toBeInstanceOf(Date);
+      // Next */5 fire is in the future (never NULL → the `nextRunAt <= now` scan works).
+      expect(res.nextRunAt.getTime()).toBeGreaterThan(before);
+    });
+  });
 });

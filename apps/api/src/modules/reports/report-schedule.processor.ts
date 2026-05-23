@@ -11,18 +11,18 @@ import { MailService } from '../mail/mail.service';
 import { ReportCompiler } from './report-compiler';
 import { ReportDefinitionSchema } from './report-definition.schema';
 import { toCsv } from './reports.utils';
+import { nextRunFromCron } from './cron.util';
 
 /**
- * Advance a nextRunAt by naively adding the cron interval.
- * For a full implementation cron-parser would be used; here we use a simple
- * 5-minute default or attempt a basic periodic interval calculation.
- * This keeps the dependency list minimal (cron-parser not installed).
+ * Advance nextRunAt to the next cron fire time after `from`. Falls back to +1h
+ * if the stored cron is unparseable (shouldn't happen — validated on write).
  */
 function advanceNextRunAt(cron: string, from: Date): Date {
-  // Basic cron-less fallback: advance by 1 hour for any cron pattern.
-  // In production, install cron-parser and replace with parseExpression(cron).next().toDate()
-  void cron;
-  return new Date(from.getTime() + 60 * 60_000);
+  try {
+    return nextRunFromCron(cron, from);
+  } catch {
+    return new Date(from.getTime() + 60 * 60_000);
+  }
 }
 
 @Processor('reports')

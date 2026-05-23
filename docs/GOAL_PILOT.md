@@ -34,10 +34,10 @@ File:line detail for each item is in `docs/NEXT_GOAL.md`.
 - [x] Reply drafts: per-tab keys (`th_reply_draft_<id>_<tab>`); switching ticket/tab reloads that key (reset); restored-key ref avoids the save/restore race.
 - **Acceptance:** API errors surface as `<QueryError>` (not blank/fake); no fake notifications; bulk reopen recomputes SLA. `make verify` GREEN 9/9. ✅
 
-## ☐ Batch C — Scheduled reports
+## ✅ Batch C — Scheduled reports (DONE)
 
-- [ ] Set `nextRunAt` from the cron on `createSchedule` (`reports.service.ts:173`); real cron-parse in `advanceNextRunAt` (`report-schedule.processor.ts:21`). Add a test that a due schedule fires.
-- **Acceptance:** a created schedule has a non-NULL `nextRunAt` and the processor runs it.
+- [x] `createSchedule` seeds `nextRunAt` from the cron (UTC); `updateSchedule` recomputes it when the cron changes; `advanceNextRunAt` now uses real `cron-parser` (added as a direct dep) instead of the fixed +1h hack. Cron is validated on write (`ScheduleCreateSchema` refine → 400 on garbage). New `cron.util` + spec; createSchedule test asserts non-NULL nextRunAt.
+- **Acceptance:** live — created schedule `nextRunAt` is non-NULL (`2026-…T18:25:00Z`); invalid cron → 400; the processor's due-scan (`nextRunAt <= now`) now matches real schedules. `make verify` GREEN. ✅
 
 ## ☐ Batch D — Test lock-in (DO LAST so the gate is strongest)
 

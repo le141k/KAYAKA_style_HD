@@ -4,6 +4,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { ReportDefinitionSchema, ReportDefinition } from './report-definition.schema';
 import { ReportCompiler } from './report-compiler';
 import { toCsv as _toCsv } from './reports.utils';
+import { isValidCron, nextRunFromCron } from './cron.util';
 
 // ─── DTOs (re-exported for use in module) ─────────────────────────────────────
 
@@ -16,7 +17,7 @@ export const ReportCreateSchema = z.object({
 export const ReportUpdateSchema = ReportCreateSchema.partial();
 
 export const ScheduleCreateSchema = z.object({
-  cron: z.string().min(1),
+  cron: z.string().min(1).refine(isValidCron, { message: 'Invalid cron expression' }),
   recipients: z.array(z.string().email()).default([]),
   isEnabled: z.boolean().default(true),
   format: z.enum(['json', 'csv']).default('json'),
@@ -179,6 +180,9 @@ export class ReportsService {
         recipients: dto.recipients,
         isEnabled: dto.isEnabled,
         format: dto.format,
+        // Seed the first fire time from the cron so the processor can pick it up
+        // (a NULL nextRunAt is never `<= now`, so the schedule would never run).
+        nextRunAt: nextRunFromCron(dto.cron, new Date()),
       },
     });
   }
@@ -188,8 +192,11 @@ export class ReportsService {
   }
 
   async updateSchedule(scheduleId: number, dto: Partial<z.infer<typeof ScheduleCreateSchema>>) {
+    // Recompute the next fire time when the cron expression changes.
+    const data: Record<string, unknown> = { ...dto };
+    if (dto.cron) data['nextRunAt'] = nextRunFromCron(dto.cron, new Date());
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (this.prisma.reportSchedule as any).update({ where: { id: scheduleId }, data: dto });
+    return (this.prisma.reportSchedule as any).update({ where: { id: scheduleId }, data });
   }
 
   async removeSchedule(scheduleId: number) {
