@@ -54,14 +54,14 @@ export function useLogin() {
     mutationFn: (data: LoginInput) => api.post<LoginResponse>('/auth/login', data),
     onSuccess: (res) => {
       if (typeof window !== 'undefined') {
-        // Keep localStorage tokens for the Bearer fallback (backward compatible).
-        // The authoritative access + refresh tokens are ALSO set as HttpOnly cookies
-        // by the server on this same response, so JS never needs the raw token.
-        localStorage.setItem('auth_token', res.accessToken);
-        localStorage.setItem('refresh_token', res.refreshToken);
-        // Non-sensitive presence marker so the Next.js middleware can guard /staff
-        // and /admin server-side without exposing the token to JS.
+        // The access + refresh JWTs are set as HttpOnly cookies by the server on this
+        // same response — JS never stores them (XSS can't read them). We only set a
+        // non-sensitive presence marker so hasToken() and the Next.js middleware can
+        // guard /staff and /admin without exposing the token.
         document.cookie = `th_authed=1; path=/; max-age=${7 * 86400}; SameSite=Lax`;
+        // Drop any tokens persisted by older builds.
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('refresh_token');
       }
       // Map the returned staff principal to the same display User shape as useMe()
       const user: User = principalToUser({

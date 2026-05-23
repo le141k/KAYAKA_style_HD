@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { Loader2 } from 'lucide-react';
 import { ThemeToggle } from '@/components/premium/ThemeToggle';
+import { hasToken } from '@/lib/api';
 import { useMe } from '@/lib/hooks/use-auth';
 
 const ADMIN_TABS = [
@@ -30,12 +31,9 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   useEffect(() => {
     if (isLoading) return;
 
-    const hasToken =
-      typeof window !== 'undefined' &&
-      (localStorage.getItem('auth_token') ||
-        document.cookie.split('; ').some((r) => r.startsWith('auth_token=')));
-
-    if (!hasToken || isError) {
+    // hasToken() reads the non-sensitive th_authed presence marker (the JWT lives
+    // only in HttpOnly cookies, unreadable from JS).
+    if (!hasToken() || isError) {
       router.replace('/login');
       return;
     }

@@ -2,68 +2,50 @@
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
-// Cookie name set non-HttpOnly by the legacy client; the auth source of truth is
-// now the server-set HttpOnly cookie (invisible to JS). This local marker cookie
-// only exists so the Next.js middleware can do a coarse server-side route guard
-// without the token value leaking to JS XSS in a usable way.
+// The access/refresh JWTs live ONLY in server-set HttpOnly cookies (invisible to
+// JS), so an XSS payload cannot read or exfiltrate them. This non-sensitive marker
+// cookie carries no token — it only lets JS (hasToken) and the Next.js middleware
+// distinguish "logged in" vs "anonymous" for coarse route guarding.
 const PRESENCE_COOKIE = 'th_authed';
 
-export function getToken(): string | null {
-  if (typeof window === 'undefined') return null;
-  // Bearer fallback for the legacy localStorage flow. When absent, requests still
-  // authenticate via the HttpOnly cookie sent automatically with credentials:'include'.
-  return localStorage.getItem('auth_token');
-}
-
 /**
- * True when the user appears authenticated. Checks the localStorage token (legacy
- * Bearer flow) OR the th_authed presence marker cookie (cookie flow). We can't read
- * the HttpOnly cookie from JS, so we rely on the presence marker set at login.
+ * True when the user appears authenticated. The real credential is the HttpOnly
+ * cookie (unreadable from JS), so we rely on the non-sensitive th_authed presence
+ * marker set at login. No JWT is ever stored in JS-readable storage.
  */
 export function hasToken(): boolean {
   if (typeof window === 'undefined') return false;
-  if (localStorage.getItem('auth_token') != null) return true;
   return document.cookie.split('; ').some((row) => row.startsWith(`${PRESENCE_COOKIE}=`));
-}
-
-function storeTokens(accessToken: string): void {
-  if (typeof window === 'undefined') return;
-  // Keep the localStorage copy so the Bearer fallback keeps working seamlessly.
-  // The authoritative access token also arrives as an HttpOnly cookie from the server.
-  localStorage.setItem('auth_token', accessToken);
 }
 
 function clearTokens(): void {
   if (typeof window === 'undefined') return;
+  document.cookie = `${PRESENCE_COOKIE}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+  // Clean up any tokens left in localStorage / non-HttpOnly cookie by older builds.
   localStorage.removeItem('auth_token');
   localStorage.removeItem('refresh_token');
-  document.cookie = `${PRESENCE_COOKIE}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT`;
-  // Clean up the legacy non-HttpOnly token cookie if it lingers from an old session.
   document.cookie = 'auth_token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
 }
 
-/** Attempt a token refresh. Returns true if a new token was stored. */
+/** Attempt a token refresh using the HttpOnly th_refresh cookie. */
 let _refreshing: Promise<boolean> | null = null;
 async function tryRefresh(): Promise<boolean> {
   // Coalesce concurrent refresh attempts
   if (_refreshing) return _refreshing;
   _refreshing = (async () => {
     try {
-      const refreshToken = typeof window !== 'undefined' ? localStorage.getItem('refresh_token') : null;
-      // No body refresh token means we rely on the HttpOnly th_refresh cookie sent
-      // via credentials:'include'. Only bail if BOTH are unavailable.
+      // The refresh token is the HttpOnly th_refresh cookie, sent automatically via
+      // credentials:'include'. The server rotates the th_access cookie on success.
       const res = await fetch(`${API_URL}/auth/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify(refreshToken ? { refreshToken } : {}),
+        body: '{}',
       });
       if (!res.ok) {
         clearTokens();
         return false;
       }
-      const data = (await res.json()) as { accessToken: string };
-      storeTokens(data.accessToken);
       return true;
     } catch {
       clearTokens();
@@ -87,15 +69,13 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, options: RequestInit = {}, _retry = false): Promise<T> {
-  const token = getToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string>),
   };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
 
-  // credentials:'include' sends the HttpOnly auth cookie alongside (or instead of)
-  // the Bearer header — the API guard accepts either.
+  // Auth is the HttpOnly cookie, sent automatically by credentials:'include'.
+  // No Authorization header — the JWT is never read into JS.
   const res = await fetch(`${API_URL}${path}`, { ...options, headers, credentials: 'include' });
 
   if (res.status === 401 && !_retry) {

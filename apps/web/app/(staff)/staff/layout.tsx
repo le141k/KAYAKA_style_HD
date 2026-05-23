@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { getInitials } from '@/lib/utils';
+import { hasToken } from '@/lib/api';
 import { useLogout, useMe } from '@/lib/hooks/use-auth';
 
 export default function StaffLayout({ children }: { children: React.ReactNode }) {
@@ -37,14 +38,12 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
-  // Auth guard: redirect to /login if no token / API returns error
+  // Auth guard: redirect to /login if not authenticated / API returns error.
+  // hasToken() reads the non-sensitive th_authed presence marker (the JWT lives
+  // only in HttpOnly cookies, unreadable from JS).
   useEffect(() => {
     if (isLoading) return;
-    const hasToken =
-      typeof window !== 'undefined' &&
-      (localStorage.getItem('auth_token') ||
-        document.cookie.split('; ').some((r) => r.startsWith('auth_token=')));
-    if (!hasToken || isError) {
+    if (!hasToken() || isError) {
       router.replace('/login');
     }
   }, [isLoading, isError, router]);

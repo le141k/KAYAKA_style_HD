@@ -4,7 +4,6 @@ import { useState, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, X, FileText, CheckCircle2, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { getToken } from '@/lib/api';
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
@@ -64,15 +63,14 @@ export function FileUploadZone({
       const formData = new FormData();
       formData.append('files', upload.file);
 
-      const headers: HeadersInit = {};
-      const token = getToken();
-      if (token) headers['Authorization'] = `Bearer ${token}`;
-      // Do NOT set Content-Type manually — let the browser set the multipart boundary.
+      // Auth travels via the HttpOnly cookie (credentials:'include'); no Bearer
+      // header — the JWT is never exposed to JS. Do NOT set Content-Type manually:
+      // let the browser set the multipart boundary.
 
       try {
         const res = await fetch(`${API_URL}${uploadEndpoint}`, {
           method: 'POST',
-          headers,
+          credentials: 'include',
           body: formData,
         });
 
