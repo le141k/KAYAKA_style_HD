@@ -21,6 +21,7 @@ import { TroubleshooterModule } from './modules/troubleshooter/troubleshooter.mo
 import { ReportsModule } from './modules/reports/reports.module';
 import { WorkflowModule } from './modules/workflow/workflow.module';
 import { AdminModule } from './modules/admin/admin.module';
+import { AttachmentsModule } from './modules/attachments/attachments.module';
 import { PrismaExceptionFilter } from './common/prisma-exception.filter';
 
 const config = loadConfig();
@@ -77,6 +78,7 @@ const redisUrl = new URL(config.REDIS_URL);
     ReportsModule,
     WorkflowModule,
     AdminModule,
+    AttachmentsModule,
   ],
   providers: [
     // Provide AppConfig as a VALUE token so it can be constructor-injected via @Inject(APP_CONFIG)

@@ -1,5 +1,7 @@
 # NEXT-GOAL WORKLIST — 23 Telecom Help Desk
 
+> ✅ IMPLEMENTED this session (live-verify pending rebuild): **Attachments** (storage/upload/download + inbound email attachments + frontend FileUploadZone real upload + per-post download chips) and **Reports/KQL engine** (safe declarative model + compiler + ReportRun + schedule processor + 10 seed reports + CSV). Remaining big feature: email-parity (CC/BCC + parser-rules + IMAP-encryption + notifications) — spec in docs/specs/email-parity.md.
+
 > Authoritative, prioritized worklist for the next `/goal` pass. Built from the post-fix
 > re-audit (1 coordinator + 14 agents): functional parity vs original Kayako + full
 > module bug sweep + deep-dive specs for the big parity features. Every item has a fix

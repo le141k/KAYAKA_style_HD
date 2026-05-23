@@ -46,6 +46,8 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_MAIL_FROM: 'test@test.example',
   TELECOM_HD_LOG_LEVEL: 'silent',
   TELECOM_HD_ALARIS_WEBHOOK_SECRET: 'test-secret',
+  TELECOM_HD_UPLOAD_DIR: '/tmp/uploads',
+  TELECOM_HD_UPLOAD_MAX_SIZE_MB: 25,
 };
 
 const MOCK_STAFF_GROUP = {

@@ -1,10 +1,11 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import { SlaService } from '../sla/sla.service';
 import { MailService } from '../mail/mail.service';
 import { AdminService } from '../admin/admin.service';
+import { AttachmentsService } from '../attachments/attachments.service';
 import { formatTicketMask } from './ticket-mask.util';
 import type {
   CreateTicketDto,
@@ -54,6 +55,7 @@ export class TicketsService {
     private readonly eventEmitter: EventEmitter2,
     private readonly mailService: MailService,
     private readonly adminService: AdminService,
+    @Optional() private readonly attachmentsService?: AttachmentsService,
   ) {}
 
   // ─────────────────────────── Create ───────────────────────────
@@ -153,6 +155,18 @@ export class TicketsService {
       where: { id: ticket.id },
       data: { mask },
     });
+
+    // Link attachment orphans to the first post (if any attachmentIds were supplied)
+    if (dto.attachmentIds?.length && this.attachmentsService) {
+      const firstPost = await this.prisma.ticketPost.findFirst({
+        where: { ticketId: ticket.id },
+        orderBy: { id: 'asc' },
+      });
+      if (firstPost) {
+        await this.attachmentsService.linkToPost(dto.attachmentIds, firstPost.id, ticket.id);
+        await this.prisma.ticket.update({ where: { id: ticket.id }, data: { hasAttachments: true } });
+      }
+    }
 
     // Write audit log
     await this.writeAudit(ticket.id, 'CREATE', creatorStaffId, creatorActor, {
@@ -283,12 +297,19 @@ export class TicketsService {
       },
     });
 
+    // Link attachment orphans to the new post
+    const hasPublicAttachments = !!(dto.attachmentIds?.length && this.attachmentsService);
+    if (hasPublicAttachments && this.attachmentsService) {
+      await this.attachmentsService.linkToPost(dto.attachmentIds!, post.id, ticketId);
+    }
+
     await this.prisma.ticket.update({
       where: { id: ticketId },
       data: {
         totalReplies: { increment: 1 },
         lastReplyAt: now,
         lastActivityAt: now,
+        ...(hasPublicAttachments && { hasAttachments: true }),
       },
     });
 
@@ -464,6 +485,12 @@ export class TicketsService {
       },
     });
 
+    // Link attachment orphans to the new post
+    const hasNewAttachments = !!(dto.attachmentIds?.length && this.attachmentsService);
+    if (hasNewAttachments && this.attachmentsService) {
+      await this.attachmentsService.linkToPost(dto.attachmentIds!, post.id, ticketId);
+    }
+
     await this.prisma.ticket.update({
       where: { id: ticketId },
       data: {
@@ -472,6 +499,8 @@ export class TicketsService {
         lastActivityAt: now,
         // Mark first staff response time if not yet set
         ...(firstResponse && { firstResponseAt: now }),
+        // Set hasAttachments if new attachments were linked
+        ...(hasNewAttachments && { hasAttachments: true }),
       },
     });
 

@@ -22,6 +22,7 @@ export const CreateTicketSchema = z.object({
   tags: z.array(z.string()).default([]),
   creationMode: z.enum(['WEB', 'EMAIL', 'API', 'STAFF', 'ALARIS']).default('STAFF'),
   ipAddress: z.string().default('0.0.0.0'),
+  attachmentIds: z.array(z.number().int().positive()).optional(),
 });
 export type CreateTicketDto = z.infer<typeof CreateTicketSchema>;
 
@@ -36,6 +37,7 @@ export const ReplyTicketSchema = z.object({
   isThirdParty: z.boolean().default(false),
   creationMode: z.enum(['WEB', 'EMAIL', 'API', 'STAFF', 'ALARIS']).default('STAFF'),
   ipAddress: z.string().default('0.0.0.0'),
+  attachmentIds: z.array(z.number().int().positive()).optional(),
 });
 export type ReplyTicketDto = z.infer<typeof ReplyTicketSchema>;
 
@@ -120,6 +122,7 @@ export const PublicCreateTicketSchema = z.object({
   departmentId: z.number().int().positive().optional(),
   typeId: z.number().int().positive().optional(),
   customFields: z.record(z.unknown()).default({}),
+  attachmentIds: z.array(z.number().int().positive()).optional(),
 });
 export type PublicCreateTicketDto = z.infer<typeof PublicCreateTicketSchema>;
 
@@ -129,6 +132,7 @@ export const PublicReplySchema = z.object({
   contents: z.string().min(1),
   /** The requester's email — used to attribute the post to the right user. */
   requesterEmail: z.string().email().optional(),
+  attachmentIds: z.array(z.number().int().positive()).optional(),
 });
 export type PublicReplyDto = z.infer<typeof PublicReplySchema>;
 

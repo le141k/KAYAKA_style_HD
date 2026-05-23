@@ -18,6 +18,7 @@
 import { PrismaClient } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { ALL_PERMISSIONS, ROLE_PRESETS } from '../auth/permissions';
+import { seedReports } from './report-seeds';
 
 const prisma = new PrismaClient();
 
@@ -577,6 +578,11 @@ async function main(): Promise<void> {
     }
   }
   console.log('  Knowledgebase: 3 categories, 3 articles');
+
+  // ── Reports (P0: R-01..R-06 + P1: R-07..R-10) ──
+  console.log('  Seeding reports...');
+  await seedReports(prisma);
+  console.log('  Reports: 10 canonical reports seeded');
 
   console.log('\n✅ Seed complete.');
 }

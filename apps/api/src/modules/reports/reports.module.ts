@@ -1,123 +1,47 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
-  Injectable,
   Module,
+  OnModuleInit,
+  Logger,
   Param,
   ParseIntPipe,
   Post,
-  UsePipes,
+  Put,
+  Delete,
+  Query,
+  Res,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { z } from 'zod';
-import { PrismaService } from '../../prisma/prisma.service';
-import { ZodValidationPipe } from '../../common/zod-validation.pipe';
+import { BullModule, InjectQueue } from '@nestjs/bullmq';
+import type { Queue } from 'bullmq';
+import type { Response } from 'express';
 import { RequirePermissions } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
+import {
+  ReportsService,
+  ReportCreateSchema,
+  ReportUpdateSchema,
+  ScheduleCreateSchema,
+} from './reports.service';
+import { ReportCompiler } from './report-compiler';
+import { toCsv } from './reports.utils';
+import { ReportScheduleProcessor } from './report-schedule.processor';
+import { MailModule } from '../mail/mail.module';
 
-/**
- * "KQL-lite" report definition. A safe, declarative subset of Kayako's KQL:
- *   { source: 'tickets', groupBy?: <field>, filters?: {field: value}, metric: 'count' }
- * Full KQL (lexer/parser/compiler) is a future enhancement (see docs/adr).
- */
-const GROUPABLE = [
-  'statusId',
-  'priorityId',
-  'departmentId',
-  'typeId',
-  'ownerStaffId',
-  'creationMode',
-] as const;
-const DefinitionSchema = z.object({
-  source: z.literal('tickets').default('tickets'),
-  groupBy: z.enum(GROUPABLE).optional(),
-  filters: z.record(z.union([z.string(), z.number(), z.boolean()])).default({}),
-  metric: z.literal('count').default('count'),
-});
-type Definition = z.infer<typeof DefinitionSchema>;
+// Re-export service for existing imports
+export { ReportsService } from './reports.service';
 
-const ReportSchema = z.object({
-  title: z.string().min(1),
-  kind: z.enum(['TABULAR', 'SUMMARY', 'MATRIX']).default('SUMMARY'),
-  definition: DefinitionSchema,
-});
-
-@Injectable()
-export class ReportsService {
-  constructor(private readonly prisma: PrismaService) {}
-
-  list() {
-    return this.prisma.report.findMany({ orderBy: { createdAt: 'desc' } });
-  }
-
-  create(dto: z.infer<typeof ReportSchema>) {
-    return this.prisma.report.create({
-      data: { title: dto.title, kind: dto.kind, definition: dto.definition },
-    });
-  }
-
-  /** Executes a stored report's definition and returns aggregated rows. */
-  async run(id: number) {
-    const report = await this.prisma.report.findUniqueOrThrow({ where: { id } });
-    return this.execute(report.definition as Definition);
-  }
-
-  /** Ad-hoc execution of a definition (used by dashboards). */
-  async execute(def: Definition) {
-    const where = def.filters as Record<string, unknown>;
-    if (def.groupBy) {
-      const rows = await this.prisma.ticket.groupBy({
-        by: [def.groupBy],
-        where,
-        _count: { _all: true },
-      });
-      return rows.map((r) => ({ key: r[def.groupBy as keyof typeof r], count: r._count._all }));
-    }
-    const total = await this.prisma.ticket.count({ where });
-    return [{ key: 'total', count: total }];
-  }
-
-  /** Convenience dashboard summary used by the staff home screen. */
-  async dashboard() {
-    const now = new Date();
-    const [byStatus, byPriority, total, resolved, slaBreached, firstResponded] = await Promise.all([
-      this.execute({ source: 'tickets', groupBy: 'statusId', filters: {}, metric: 'count' }),
-      this.execute({ source: 'tickets', groupBy: 'priorityId', filters: {}, metric: 'count' }),
-      this.prisma.ticket.count(),
-      // "resolved today" — resolved with resolvedAt since local midnight
-      this.prisma.ticket.count({
-        where: {
-          isResolved: true,
-          resolvedAt: { gte: new Date(new Date().setHours(0, 0, 0, 0)) },
-        },
-      }),
-      // SLA breached: past due and not yet resolved
-      this.prisma.ticket.count({ where: { isResolved: false, dueAt: { lt: now } } }),
-      // For avg first-response time, pull (createdAt, firstResponseAt) of responded tickets
-      this.prisma.ticket.findMany({
-        where: { firstResponseAt: { not: null } },
-        select: { createdAt: true, firstResponseAt: true },
-      }),
-    ]);
-    const avgFirstResponseMinutes =
-      firstResponded.length === 0
-        ? 0
-        : Math.round(
-            firstResponded.reduce(
-              (acc, t) => acc + (t.firstResponseAt!.getTime() - t.createdAt.getTime()) / 60_000,
-              0,
-            ) / firstResponded.length,
-          );
-    return { total, resolved, slaBreached, avgFirstResponseMinutes, byStatus, byPriority };
-  }
-}
+// ─── Controller ───────────────────────────────────────────────────────────────
 
 @ApiTags('reports')
 @Controller('reports')
 export class ReportsController {
   constructor(private readonly reports: ReportsService) {}
 
+  /** UNCHANGED: dashboard endpoint */
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   @Get('dashboard')
   @ApiOperation({ summary: 'Dashboard summary metrics' })
@@ -125,29 +49,111 @@ export class ReportsController {
     return this.reports.dashboard();
   }
 
-  @RequirePermissions(PERMISSIONS.TICKET_VIEW)
+  @RequirePermissions(PERMISSIONS.REPORT_RUN)
   @Get()
   list() {
     return this.reports.list();
   }
 
-  @RequirePermissions(PERMISSIONS.TICKET_VIEW)
+  @RequirePermissions(PERMISSIONS.REPORT_RUN)
   @Get(':id/run')
-  run(@Param('id', ParseIntPipe) id: number) {
-    return this.reports.run(id);
+  async run(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('format') format: string,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const rows = await this.reports.run(id);
+    if (format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="report-${id}.csv"`);
+      return res.send(toCsv(rows as Record<string, unknown>[]));
+    }
+    return rows;
   }
 
-  @RequirePermissions(PERMISSIONS.ADMIN_SETTINGS)
+  @RequirePermissions(PERMISSIONS.REPORT_RUN)
+  @Get(':id/runs')
+  listRuns(@Param('id', ParseIntPipe) id: number) {
+    return this.reports.listRuns(id);
+  }
+
+  @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
   @Post()
-  @UsePipes(new ZodValidationPipe(ReportSchema))
-  create(@Body() dto: z.infer<typeof ReportSchema>) {
-    return this.reports.create(dto);
+  async create(@Body() body: unknown) {
+    const parsed = ReportCreateSchema.safeParse(body);
+    if (!parsed.success) throw new BadRequestException(parsed.error.flatten());
+    return this.reports.create(parsed.data);
+  }
+
+  @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
+  @Put(':id')
+  async update(@Param('id', ParseIntPipe) id: number, @Body() body: unknown) {
+    const parsed = ReportUpdateSchema.safeParse(body);
+    if (!parsed.success) throw new BadRequestException(parsed.error.flatten());
+    return this.reports.update(id, parsed.data);
+  }
+
+  @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
+  @Delete(':id')
+  remove(@Param('id', ParseIntPipe) id: number) {
+    return this.reports.remove(id);
+  }
+
+  // ─── Schedule endpoints ─────────────────────────────────────────────────
+
+  @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
+  @Get(':id/schedules')
+  listSchedules(@Param('id', ParseIntPipe) id: number) {
+    return this.reports.listSchedules(id);
+  }
+
+  @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
+  @Post(':id/schedules')
+  async createSchedule(@Param('id', ParseIntPipe) id: number, @Body() body: unknown) {
+    const parsed = ScheduleCreateSchema.safeParse(body);
+    if (!parsed.success) throw new BadRequestException(parsed.error.flatten());
+    return this.reports.createSchedule(id, parsed.data);
+  }
+
+  @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
+  @Put('schedules/:scheduleId')
+  async updateSchedule(@Param('scheduleId', ParseIntPipe) scheduleId: number, @Body() body: unknown) {
+    const parsed = ScheduleCreateSchema.partial().safeParse(body);
+    if (!parsed.success) throw new BadRequestException(parsed.error.flatten());
+    return this.reports.updateSchedule(scheduleId, parsed.data);
+  }
+
+  @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
+  @Delete('schedules/:scheduleId')
+  removeSchedule(@Param('scheduleId', ParseIntPipe) scheduleId: number) {
+    return this.reports.removeSchedule(scheduleId);
   }
 }
 
+// ─── Module ───────────────────────────────────────────────────────────────────
+
 @Module({
+  imports: [BullModule.registerQueue({ name: 'reports' }), MailModule],
   controllers: [ReportsController],
-  providers: [ReportsService],
+  providers: [ReportsService, ReportCompiler, ReportScheduleProcessor],
   exports: [ReportsService],
 })
-export class ReportsModule {}
+export class ReportsModule implements OnModuleInit {
+  private readonly logger = new Logger(ReportsModule.name);
+
+  constructor(@InjectQueue('reports') private readonly reportsQueue: Queue) {}
+
+  async onModuleInit(): Promise<void> {
+    await this.reportsQueue.add(
+      'schedule-scan',
+      {},
+      {
+        jobId: 'reports-schedule-scan-repeatable',
+        repeat: { every: 5 * 60_000 }, // every 5 minutes
+        removeOnComplete: true,
+        removeOnFail: false,
+      },
+    );
+    this.logger.log('Reports schedule-scan job registered (every 5min)');
+  }
+}

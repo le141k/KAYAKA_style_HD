@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Lock, Send, Loader2 } from 'lucide-react';
+import { ArrowLeft, Lock, Send, Loader2, Paperclip } from 'lucide-react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -14,7 +14,7 @@ import {
   useStaffOptions,
   useTicketTags,
 } from '@/lib/hooks/use-tickets';
-import type { Ticket } from '@/lib/types';
+import type { Ticket, Attachment } from '@/lib/types';
 import { StatusBadge } from '@/components/premium/StatusBadge';
 import { PriorityChip } from '@/components/premium/PriorityChip';
 import { SlaPill } from '@/components/premium/SlaPill';
@@ -57,8 +57,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const [newTag, setNewTag] = useState('');
 
   const [replyTab, setReplyTab] = useState<'reply' | 'note'>('reply');
-  // Files are collected for UX; the reply endpoint does not yet accept uploads.
-  const [, setAttachedFiles] = useState<File[]>([]);
+  const [attachmentIds, setAttachmentIds] = useState<number[]>([]);
   const [assigneeId, setAssigneeId] = useState<string>('');
 
   // Sync the assignee picker once the ticket loads (it starts undefined).
@@ -120,8 +119,10 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
     await replyMutation.mutateAsync({
       body: data.body,
       is_internal: replyTab === 'note',
+      attachmentIds,
     });
     reset();
+    setAttachmentIds([]);
     toast({
       title: replyTab === 'note' ? 'Заметка добавлена' : 'Ответ отправлен',
     });
@@ -217,6 +218,21 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                   </div>
                 </div>
                 <p className="text-sm leading-relaxed whitespace-pre-line">{reply.body}</p>
+                {reply.attachments && reply.attachments.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {reply.attachments.map((att: Attachment) => (
+                      <a
+                        key={att.id}
+                        href={att.url}
+                        download={att.filename}
+                        className="inline-flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                      >
+                        <Paperclip className="h-2.5 w-2.5" />
+                        {att.filename}
+                      </a>
+                    ))}
+                  </div>
+                )}
               </motion.div>
             ))}
           </div>
@@ -250,7 +266,12 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                 {errors.body && <p className="mt-1 text-xs text-destructive">{errors.body.message}</p>}
 
                 <div className="mt-3 space-y-3">
-                  <FileUploadZone onFiles={setAttachedFiles} maxFiles={5} className="text-sm" />
+                  <FileUploadZone
+                    uploadEndpoint="/attachments/upload"
+                    onUploaded={(ids) => setAttachmentIds((prev) => [...prev, ...ids])}
+                    maxFiles={10}
+                    className="text-sm"
+                  />
                   <div className="flex justify-end">
                     <Button type="submit" disabled={replyMutation.isPending} className="gap-2">
                       {replyMutation.isPending ? (

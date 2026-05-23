@@ -710,20 +710,39 @@ model Report {
   id         Int              @id @default(autoincrement())
   title      String
   kind       ReportKind       @default(SUMMARY)
-  // declarative definition: { source, columns, filters, groupBy, aggregates } (KQL-lite)
+  // declarative definition: { source, filters, groupBy, aggregates, orderBy, limit }
   definition Json             @default("{}")
   schedules  ReportSchedule[]
+  runs       ReportRun[]
   createdAt  DateTime         @default(now())
   updatedAt  DateTime         @updatedAt
 }
 
 model ReportSchedule {
-  id         Int      @id @default(autoincrement())
-  report     Report   @relation(fields: [reportId], references: [id], onDelete: Cascade)
-  reportId   Int
-  cron       String
-  recipients Json     @default("[]")
-  isEnabled  Boolean  @default(true)
+  id          Int       @id @default(autoincrement())
+  report      Report    @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  reportId    Int
+  cron        String
+  recipients  Json      @default("[]")
+  isEnabled   Boolean   @default(true)
+  format      String    @default("json")
+  lastRunAt   DateTime?
+  nextRunAt   DateTime?
+
+  @@index([reportId])
+}
+
+model ReportRun {
+  id          Int      @id @default(autoincrement())
+  report      Report   @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  reportId    Int
+  triggeredBy String   @default("manual")   // "manual" | "schedule"
+  staffId     Int?
+  rowCount    Int      @default(0)
+  durationMs  Int      @default(0)
+  error       String?
+  resultKey   String?  // storage key for large results (future)
+  createdAt   DateTime @default(now())
 
   @@index([reportId])
 }

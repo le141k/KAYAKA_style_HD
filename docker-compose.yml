@@ -43,6 +43,8 @@ services:
       REDIS_URL: redis://redis:6379
     ports:
       - "4000:4000"
+    volumes:
+      - uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,3 +69,4 @@ services:
 
 volumes:
   pgdata:
+  uploads:

@@ -1,7 +1,16 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit, Inject, forwardRef } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+  Inject,
+  forwardRef,
+  Optional,
+} from '@nestjs/common';
 import type { ImapFlow, FetchMessageObject } from 'imapflow';
 import { TicketsService } from '../tickets/tickets.service';
 import { MailService } from './mail.service';
+import { AttachmentsService } from '../attachments/attachments.service';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
 import { PrismaService } from '../../prisma/prisma.service';
 
@@ -33,6 +42,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     private readonly prisma: PrismaService,
     @Inject(forwardRef(() => TicketsService)) private readonly ticketsService: TicketsService,
     private readonly mailService: MailService,
+    @Optional() private readonly attachmentsService?: AttachmentsService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -149,6 +159,22 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const textBody = parsed.text ?? '';
     const htmlBody = parsed.html || undefined;
 
+    // Persist email attachments if AttachmentsService is available
+    let emailAttachmentIds: number[] = [];
+    if (this.attachmentsService && parsed.attachments?.length) {
+      const uploaded = await this.attachmentsService.uploadFiles(
+        parsed.attachments
+          .filter((a) => a.content instanceof Buffer)
+          .map((a) => ({
+            originalname: a.filename ?? 'attachment',
+            mimetype: a.contentType ?? 'application/octet-stream',
+            size: (a.content as Buffer).length,
+            buffer: a.content as Buffer,
+          })),
+      );
+      emailAttachmentIds = uploaded.map((a) => a.id);
+    }
+
     // RFC threading identifiers
     const incomingMessageId = parsed.messageId ?? undefined;
     const inReplyTo = parsed.inReplyTo ?? undefined;
@@ -181,6 +207,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           isThirdParty: false,
           creationMode: 'EMAIL',
           ipAddress: '0.0.0.0',
+          attachmentIds: emailAttachmentIds,
         });
         // Store the incoming messageId on the new post
         if (incomingMessageId) {
@@ -205,6 +232,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           isThirdParty: false,
           creationMode: 'EMAIL',
           ipAddress: '0.0.0.0',
+          attachmentIds: emailAttachmentIds,
         });
         if (incomingMessageId) {
           await this.storeMessageIdOnLatestPost(ticket.id, incomingMessageId);
@@ -230,6 +258,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       ipAddress: '0.0.0.0',
       tags: [],
       customFields: {},
+      attachmentIds: emailAttachmentIds,
     });
 
     // Store the incoming messageId on the first post

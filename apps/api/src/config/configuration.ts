@@ -23,6 +23,8 @@ const schema = z.object({
   TELECOM_HD_MAIL_FROM: z.string().default('23 Telecom Help Desk <support@23telecom.example>'),
   TELECOM_HD_LOG_LEVEL: z.string().default('info'),
   TELECOM_HD_ALARIS_WEBHOOK_SECRET: z.string().default('alaris-dev-secret'),
+  TELECOM_HD_UPLOAD_DIR: z.string().default('/app/uploads'),
+  TELECOM_HD_UPLOAD_MAX_SIZE_MB: z.coerce.number().default(25),
 });
 
 export type AppConfig = z.infer<typeof schema>;

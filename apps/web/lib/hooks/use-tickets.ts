@@ -5,6 +5,8 @@ import { api } from '@/lib/api';
 import type { Ticket, Reply, PaginatedResponse, DashboardStats, User, Department } from '@/lib/types';
 import { MOCK_TICKETS, MOCK_REPLIES, MOCK_STATS } from '@/lib/mock-data';
 
+const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
+
 // ─── API raw shapes (backend) ───────────────────────────────────────────────
 interface ApiRef {
   id: number;
@@ -21,6 +23,12 @@ interface ApiStaffRel {
   lastName: string;
   email: string;
 }
+interface ApiAttachment {
+  id: number;
+  fileName: string;
+  mimeType: string;
+  size: number;
+}
 interface ApiPost {
   id: number;
   ticketId: number;
@@ -32,6 +40,7 @@ interface ApiPost {
   contents: string;
   createdAt: string;
   staff?: ApiStaffRel | null;
+  attachments?: ApiAttachment[];
 }
 interface ApiNote {
   id: number;
@@ -100,6 +109,13 @@ function mapPostToReply(p: ApiPost): Reply {
     body: p.contents,
     is_internal: false,
     created_at: p.createdAt,
+    attachments: p.attachments?.map((a) => ({
+      id: a.id,
+      filename: a.fileName,
+      size: a.size,
+      mime_type: a.mimeType,
+      url: `${API_URL}/attachments/${a.id}/download`,
+    })),
   };
 }
 
@@ -319,6 +335,7 @@ export function useSubmitPublicTicket() {
 export interface CreateReplyInput {
   body: string;
   is_internal?: boolean;
+  attachmentIds?: number[];
 }
 
 export function useReply(ticketId: number) {
@@ -327,7 +344,10 @@ export function useReply(ticketId: number) {
     mutationFn: (data: CreateReplyInput) =>
       data.is_internal
         ? api.post(`/tickets/${ticketId}/notes`, { contents: data.body })
-        : api.post(`/tickets/${ticketId}/reply`, { contents: data.body }),
+        : api.post(`/tickets/${ticketId}/reply`, {
+            contents: data.body,
+            ...(data.attachmentIds?.length ? { attachmentIds: data.attachmentIds } : {}),
+          }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ticketKeys.replies(ticketId) });
       void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });

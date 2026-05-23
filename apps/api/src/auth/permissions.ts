@@ -21,6 +21,9 @@ export const PERMISSIONS = {
   USER_MANAGE: 'user.manage',
   STAFF_MANAGE: 'staff.manage',
   ORG_MANAGE: 'org.manage',
+  // reports
+  REPORT_RUN: 'report.run',
+  REPORT_MANAGE: 'report.manage',
   // admin / config
   ADMIN_SETTINGS: 'admin.settings',
   ADMIN_SLA: 'admin.sla',
@@ -50,5 +53,6 @@ export const ROLE_PRESETS = {
     PERMISSIONS.KB_MANAGE,
     PERMISSIONS.USER_MANAGE,
     PERMISSIONS.ORG_MANAGE,
+    PERMISSIONS.REPORT_RUN,
   ] as Permission[],
 };

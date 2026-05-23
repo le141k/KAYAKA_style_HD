@@ -43,8 +43,7 @@ export function SubmitTicketForm() {
   const createTicket = useSubmitPublicTicket();
   const [successMask, setSuccessMask] = useState<string | null>(null);
   const [departments, setDepartments] = useState<Department[]>([]);
-  // Attachments are collected for UX; the public submit endpoint does not yet accept uploads.
-  const [, setFiles] = useState<File[]>([]);
+  const [attachmentIds, setAttachmentIds] = useState<number[]>([]);
 
   // Fetch departments on mount; gracefully degrade if the endpoint is auth-gated.
   useEffect(() => {
@@ -82,6 +81,7 @@ export function SubmitTicketForm() {
         // CL-6: wire priority slug → numeric priorityId (cast needed because PublicTicketInput
         // does not declare priorityId; value is still forwarded to the API at runtime)
         ...({ priorityId: PRIORITY_MAP[data.priority] } as object),
+        ...(attachmentIds.length ? { attachmentIds } : {}),
       } as Parameters<typeof createTicket.mutateAsync>[0]);
       // CL-3: persist the email so "Мои заявки" can filter by it
       if (typeof window !== 'undefined') {
@@ -210,7 +210,8 @@ export function SubmitTicketForm() {
       <div className="space-y-1.5">
         <Label>Вложения (необязательно)</Label>
         <FileUploadZone
-          onFiles={setFiles}
+          uploadEndpoint="/attachments/upload/public"
+          onUploaded={(ids) => setAttachmentIds((prev) => [...prev, ...ids])}
           accept="image/*,.pdf,.txt,.log,.pcap"
           maxSizeMb={25}
           maxFiles={5}
