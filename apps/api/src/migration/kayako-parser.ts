@@ -128,6 +128,29 @@ export class IdMap {
 }
 
 /**
+ * Group swuseremails rows by their owning userId, keeping only user-linked rows
+ * (linktype=1; linktype=2 are organization emails). If no row is flagged primary
+ * for a user, the first becomes primary (sampled rows are all isprimary=0).
+ */
+export function groupUserEmails(
+  rows: Array<Record<string, string | null>>,
+): Map<number, Array<{ email: string; isPrimary: boolean }>> {
+  const byUser = new Map<number, Array<{ email: string; isPrimary: boolean }>>();
+  for (const r of rows) {
+    if (r['linktype'] !== '1') continue;
+    const uid = Number(r['linktypeid']);
+    const email = (r['email'] ?? '').trim().toLowerCase();
+    if (!email) continue;
+    if (!byUser.has(uid)) byUser.set(uid, []);
+    byUser.get(uid)!.push({ email, isPrimary: r['isprimary'] === '1' });
+  }
+  for (const list of byUser.values()) {
+    if (!list.some((e) => e.isPrimary) && list[0]) list[0].isPrimary = true;
+  }
+  return byUser;
+}
+
+/**
  * Classify a Kayako organization. Kayako has no client/supplier flag — 23T's
  * "to customer"/"to vendor" macro split confirms the model. 23 Telecom itself is
  * INTERNAL; known carriers are SUPPLIER; everyone else is a CLIENT.

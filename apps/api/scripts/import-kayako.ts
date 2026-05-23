@@ -22,6 +22,7 @@ import {
   parseTable,
   datelineToDate,
   classifyOrg,
+  groupUserEmails,
   IdMap,
   type ParsedTable,
 } from '../src/migration/kayako-parser';
@@ -61,6 +62,101 @@ async function importOrganizations(parsed: ParsedTable, ids: IdMap): Promise<voi
   }
 }
 
+/**
+ * Import swusers→User (no passwords — legacy SHA1 is dropped, users reset on
+ * first login), swuseremails→UserEmail (linktype=1 only; linktype=2 are org
+ * emails), and the single swusernote→User.customFields (we have no UserNote model).
+ */
+async function importUsers(
+  usersT: ParsedTable,
+  emailsT: ParsedTable,
+  linksT: ParsedTable,
+  notesT: ParsedTable,
+  noteDataT: ParsedTable,
+  ids: IdMap,
+): Promise<void> {
+  // userId → primary orgId fallback from the multi-org link table.
+  const linkOrg = new Map<number, number>();
+  for (const r of linksT.rows) {
+    const uid = Number(r['userid']);
+    if (!linkOrg.has(uid)) linkOrg.set(uid, Number(r['userorganizationid']));
+  }
+
+  let imported = 0;
+  for (const row of usersT.rows) {
+    const kayakoId = Number(row['userid']);
+    const orgKayako = Number(row['userorganizationid']) || linkOrg.get(kayakoId) || 0;
+    const organizationId = ids.get('swuserorganizations', orgKayako) ?? null;
+    const data = {
+      fullName: row['fullname'] || `User ${kayakoId}`,
+      phone: row['phone'] ?? '',
+      designation: row['userdesignation'] ?? '',
+      isEnabled: row['isenabled'] === '1',
+      isValidated: Number(row['isvalidated']) > 0,
+      timezone: row['timezonephp'] || 'UTC',
+      organizationId,
+      createdAt: datelineToDate(row['dateline'] ?? null),
+      // passwordHash intentionally left null — no legacy password migration.
+    };
+    const user = await prisma.user.upsert({
+      where: { kayakoId },
+      create: { kayakoId, ...data },
+      update: data,
+    });
+    ids.set('swusers', kayakoId, user.id);
+    imported++;
+  }
+
+  // Emails: group user-linked (linktype=1) rows by userId; mark first primary if none.
+  const byUser = groupUserEmails(emailsT.rows);
+  let emailCount = 0;
+  for (const [uid, list] of byUser) {
+    const userId = ids.get('swusers', uid);
+    if (!userId) continue; // user not in this (sampled) dump
+    for (const e of list) {
+      await prisma.userEmail.upsert({
+        where: { email: e.email },
+        create: { email: e.email, isPrimary: e.isPrimary, userId },
+        update: { isPrimary: e.isPrimary, userId },
+      });
+      emailCount++;
+    }
+  }
+
+  // User notes → User.customFields.notes (no dedicated model; only 1 in the dump).
+  const noteText = new Map<number, string>();
+  for (const d of noteDataT.rows) noteText.set(Number(d['usernoteid']), d['notecontents'] ?? '');
+  let noteCount = 0;
+  for (const n of notesT.rows) {
+    if (n['linktype'] !== '1') continue;
+    const userId = ids.get('swusers', Number(n['linktypeid']));
+    if (!userId) continue;
+    const contents = noteText.get(Number(n['usernoteid'])) ?? '';
+    if (!contents) continue;
+    const note = {
+      by: n['staffname'] ?? '',
+      at: datelineToDate(n['dateline'] ?? null).toISOString(),
+      contents,
+    };
+    const current = await prisma.user.findUnique({ where: { id: userId }, select: { customFields: true } });
+    const cf = (current?.customFields as Record<string, unknown>) ?? {};
+    const notes = Array.isArray(cf['notes']) ? (cf['notes'] as unknown[]) : [];
+    // Idempotent: replace any prior import-sourced notes rather than appending dupes.
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        customFields: {
+          ...cf,
+          notes: [...notes.filter((x) => (x as { contents?: string }).contents !== contents), note],
+        },
+      },
+    });
+    noteCount++;
+  }
+
+  console.log(`  → imported ${imported} users, ${emailCount} emails, ${noteCount} notes`);
+}
+
 const DEPENDENCY_ORDER = [
   'swuserorganizations', // → Organization      (M0/M1)
   'swusers', // → User                          (M1)
@@ -94,18 +190,35 @@ async function main() {
 
   console.log(`Importing from ${dumpPath}`);
   let sampled = false;
+  const tables: Record<string, ParsedTable> = {};
   for (const table of DEPENDENCY_ORDER) {
     const parsed = parseTable(sql, table);
+    tables[table] = parsed;
     const exp = expected.get(table);
     const note = exp != null ? ` (dump has ${parsed.rows.length}/${exp} expected)` : '';
     if (exp != null && parsed.rows.length < exp) sampled = true;
     console.log(`• ${table}: parsed ${parsed.rows.length} rows${note}`);
-
-    if (table === 'swuserorganizations' && parsed.rows.length) {
-      await importOrganizations(parsed, ids);
-    }
-    // swusers/emails/notes → M1; queues/parser → M2; macros → M4.
   }
+  // Side tables (not in the logged dependency list).
+  const orgLinks = parseTable(sql, 'swuserorganizationlinks');
+  const userNotes = parseTable(sql, 'swusernotes');
+  const userNoteData = parseTable(sql, 'swusernotedata');
+
+  // Import in dependency order.
+  if (tables['swuserorganizations']?.rows.length) {
+    await importOrganizations(tables['swuserorganizations'], ids);
+  }
+  if (tables['swusers']?.rows.length) {
+    await importUsers(
+      tables['swusers'],
+      tables['swuseremails'] ?? { columns: [], rows: [] },
+      orgLinks,
+      userNotes,
+      userNoteData,
+      ids,
+    );
+  }
+  // email queues/parser rules → M2; macros → M4.
 
   if (sampled) {
     console.log(

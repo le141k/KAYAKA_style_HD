@@ -4,7 +4,7 @@
  * type-check it (scripts/ is outside the build's src/ include).
  */
 import { describe, it, expect } from 'vitest';
-import { parseTable, datelineToDate, classifyOrg, IdMap } from './kayako-parser';
+import { parseTable, datelineToDate, classifyOrg, groupUserEmails, IdMap } from './kayako-parser';
 
 const ORG_SQL = `
 INSERT INTO \`swuserorganizations\` (\`userorganizationid\`,\`organizationname\`,\`organizationtype\`,\`country\`,\`dateline\`) VALUES (1,'23 Telecom',1,'United States',1599137796),(2,'Lleida',1,'Spain',1600776894),(7,'O\\'Brien Ltd',0,'UK',0);
@@ -54,6 +54,30 @@ describe('classifyOrg', () => {
     expect(classifyOrg('Broadnet Networks')).toBe('SUPPLIER');
     expect(classifyOrg('Sinch')).toBe('SUPPLIER');
     expect(classifyOrg('Acme Corp')).toBe('CLIENT');
+  });
+});
+
+describe('groupUserEmails', () => {
+  it('keeps only user-linked emails (linktype=1), skips org emails (linktype=2)', () => {
+    const m = groupUserEmails([
+      { linktype: '1', linktypeid: '1', email: 'A@X.com', isprimary: '0' },
+      { linktype: '2', linktypeid: '1', email: 'org@x.com', isprimary: '0' },
+      { linktype: '1', linktypeid: '2', email: 'b@x.com', isprimary: '1' },
+    ]);
+    expect([...m.keys()].sort()).toEqual([1, 2]);
+    expect(m.get(1)).toEqual([{ email: 'a@x.com', isPrimary: true }]); // lowercased + first→primary
+    expect(m.get(2)).toEqual([{ email: 'b@x.com', isPrimary: true }]);
+  });
+
+  it('defaults the first email to primary only when none is flagged', () => {
+    const m = groupUserEmails([
+      { linktype: '1', linktypeid: '5', email: 'one@x.com', isprimary: '0' },
+      { linktype: '1', linktypeid: '5', email: 'two@x.com', isprimary: '0' },
+    ]);
+    expect(m.get(5)).toEqual([
+      { email: 'one@x.com', isPrimary: true },
+      { email: 'two@x.com', isPrimary: false },
+    ]);
   });
 });
 

@@ -51,11 +51,12 @@ email path correct. Built from a 5-agent analysis of the dump (`../kayako_db_exp
 - **Acceptance:** migration applies; importer runs on `samples.sql` without error + idempotent; linking API live-verified; `make verify` GREEN 9/9. ✅
 - **⚠️ DATA REALITY:** only `samples.sql` exists (3-row samples per table) — **the full mysqldump is absent.** Org list shows only **3 of 9** (23 Telecom=INTERNAL, Lleida + Broadnet=SUPPLIER); the other 6 orgs, all real users, the full 63 macros, and 3 of 8 status names need the full dump.
 
-## ☐ Batch M1 — Clients & suppliers (Task 1)
+## ✅ Batch M1 — Clients & suppliers (DONE)
 
-- [ ] Import `swuserorganizations`→Organization (name, address.\*, phone, website, dateline→createdAt). **Classify orgType** via a curated list in the script: `23 Telecom`→INTERNAL; known carriers (`Lleida`, `Broadnet`, `Sinch`, `NRS Gateway`, …)→SUPPLIER; rest→CLIENT. (No flag exists in Kayako — the `to customer`/`to vendor` macro categories confirm the concept. Print the full 9-org list with chosen orgType for human confirmation.)
-- [ ] Import `swusers`→User (fullName, phone, isEnabled, isValidated, organizationId via `swusers.userorganizationid` + `swuserorganizationlinks` for multi-org). **Do NOT migrate passwords** (legacy SHA1) — users reset on first login. `swuseremails`→UserEmail (multi-email; verify `isPrimary` — sampled rows are all 0, pick first if none primary). `swusernotes(+data)`→ user notes.
-- **Acceptance:** all orgs+users+emails from the dump imported, counts match `tables_inventory.csv` (or the sampled subset, logged); each Organization has a sensible orgType; re-running the importer changes nothing (idempotent). `make verify` green.
+- [x] `swuserorganizations`→Organization (done in M0): name/address/phone/website, dateline→createdAt, orgType via `classifyOrg` (23 Telecom→INTERNAL; Lleida/Broadnet/Sinch/NRS/…→SUPPLIER; rest→CLIENT). Prints the org list for confirmation.
+- [x] `swusers`→User: fullName, phone, designation, isEnabled, isValidated, timezone, organizationId via `userorganizationid` (fallback to `swuserorganizationlinks`), dateline→createdAt. **Passwords NOT migrated** (passwordHash null → reset on first login). `swuseremails`→UserEmail (`groupUserEmails`: only `linktype=1` user emails; org emails `linktype=2` skipped; first→primary when none flagged; lowercased, upsert by email). `swusernotes(+data)`→`User.customFields.notes` (no UserNote model; 1 note in dump, targets a user absent from the sample). +2 parser tests (`groupUserEmails`).
+- **Acceptance:** orgs+users+emails imported from the (sampled) dump; counts logged vs inventory; orgType sensible; **idempotent re-run verified** (no unique-violation, counts stable). **Live: 3 users, 2 emails (user-4 email is an org email → skipped), 0 notes (owner absent); users linked to mapped org.** `make verify` GREEN 9/9.
+- **⚠️ Sampled:** only 3/339 users, 3/350 emails, 3/9 orgs present — full mysqldump needed for the rest (importer ready to consume it).
 
 ## ☐ Batch M2 — Email path: verify & fix (Task 2)
 
