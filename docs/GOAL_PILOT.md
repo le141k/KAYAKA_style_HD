@@ -59,15 +59,6 @@ File:line detail for each item is in `docs/NEXT_GOAL.md`.
 
 ---
 
-## ✅ Definition of Ready — STOP when ALL are green
-
-- [ ] `make verify` green (tsc · vitest · build · lint · smoke).
-- [ ] Full e2e green AND stable (not throttle-flaky).
-- [ ] Agent role does the whole loop in the UI: list/filter → open → reply → internal note → status/priority → **assign** → **macro** → time/follow-up.
-- [ ] Client self-service: submit with the **correct** priority → my-tickets → reply → reopen.
-- [ ] No silent failure-masking; no fake data shown as real; notifications real or removed.
-- [ ] Prod profile exists & builds: `NODE_ENV=production`, helmet, real secrets, **no demo seed**, behind reverse-proxy — documented. Dev loop still works.
-
 ## ⛔ OUT OF SCOPE for pilot — do NOT touch
 
 i18n switch/persistence; kanban onDragLeave flicker / 50-cap / skeleton count; CommandPalette eager fetch; KB category draft count & `/kb/categories` isPublished; my-tickets React-Query key; Radix `DialogDescription` a11y; sub-department deep nesting. Parity (CF options editor, POP3, jti blocklist, SLA working-hours editor, saved-view date-range, CC/BCC, KQL breadth) = Phase 3. Multi-tenant/load/backup/OTel = Phase 2.
