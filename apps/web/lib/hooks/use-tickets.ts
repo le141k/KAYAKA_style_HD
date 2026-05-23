@@ -155,7 +155,9 @@ function mapTicket(t: ApiTicket): Ticket {
     updated_at: t.updatedAt,
     reply_count: t.totalReplies ?? 0,
     tags: t.tags?.map((tag) => tag.name),
-    replies: [...(t.posts?.map(mapPostToReply) ?? []), ...(t.notes?.map(mapNoteToReply) ?? [])].sort(
+    // posts[0] is rendered separately as the original message (ticket.body); skip it
+    // here so it isn't duplicated in the conversation thread.
+    replies: [...(t.posts?.slice(1).map(mapPostToReply) ?? []), ...(t.notes?.map(mapNoteToReply) ?? [])].sort(
       (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
     ),
   } as Ticket;
@@ -278,14 +280,19 @@ export interface CreateTicketInput {
 export function useCreateTicket() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: CreateTicketInput) =>
-      api.post<ApiTicket>('/tickets', {
+    mutationFn: async (data: CreateTicketInput) => {
+      // Map the priority slug → id (API wants priorityId); departmentId is required.
+      let priorityId: number | undefined;
+      if (data.priority) priorityId = await priorityIdForSlug(data.priority);
+      return api.post<ApiTicket>('/tickets', {
         subject: data.subject,
         contents: data.body,
         requesterEmail: data.requesterEmail,
         requesterName: data.requesterName ?? data.requesterEmail,
         departmentId: data.department_id,
-      }),
+        ...(priorityId ? { priorityId } : {}),
+      });
+    },
     onSuccess: () => void qc.invalidateQueries({ queryKey: ticketKeys.lists() }),
   });
 }
@@ -402,6 +409,22 @@ export interface AssigneeOption {
   label: string;
   description: string;
 }
+// Department options for create/assign dropdowns.
+export interface DepartmentOption {
+  value: string;
+  label: string;
+}
+export function useDepartmentOptions() {
+  return useQuery({
+    queryKey: ['departments', 'options'],
+    queryFn: async (): Promise<DepartmentOption[]> => {
+      const res = await api.get<{ id: number; title: string }[]>('/departments');
+      return res.map((d) => ({ value: String(d.id), label: d.title }));
+    },
+    staleTime: 5 * 60_000,
+  });
+}
+
 export function useStaffOptions() {
   return useQuery({
     queryKey: ['staff', 'options'],

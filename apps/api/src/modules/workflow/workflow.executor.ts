@@ -8,23 +8,19 @@ interface TicketEvent {
   ticketId: number;
 }
 
-/** A single workflow criterion: { field, op, value } */
+/** A single workflow criterion. Accepts both the admin-UI vocab (is/is_not/
+ *  starts_with/ends_with/not_contains, value is a string) and the legacy vocab. */
 interface WorkflowCriterion {
   field: string;
-  op: 'eq' | 'neq' | 'contains' | 'gt' | 'lt';
-  value: unknown;
+  op: string;
+  value?: unknown;
 }
 
-/** A single workflow action */
+/** A single workflow action. The admin UI emits { type, value } where value is a
+ *  string; legacy/typed actions carry explicit id fields. Both are supported. */
 interface WorkflowAction {
-  type:
-    | 'change_department'
-    | 'change_owner'
-    | 'change_status'
-    | 'change_priority'
-    | 'change_type'
-    | 'add_tag'
-    | 'add_note';
+  type: string;
+  value?: string;
   departmentId?: number;
   ownerStaffId?: number;
   statusId?: number;
@@ -76,20 +72,28 @@ export class WorkflowExecutor {
     if (!Array.isArray(criteria) || criteria.length === 0) return true;
 
     return criteria.every((c) => {
-      const fieldValue = (ticket as Record<string, unknown>)[c.field];
+      const raw = (ticket as Record<string, unknown>)[c.field];
+      const fv = String(raw ?? '').toLowerCase();
+      const cv = String(c.value ?? '').toLowerCase();
       switch (c.op) {
         case 'eq':
-          return fieldValue === c.value;
+        case 'is':
+          return fv === cv;
         case 'neq':
-          return fieldValue !== c.value;
+        case 'is_not':
+          return fv !== cv;
         case 'contains':
-          return (
-            typeof fieldValue === 'string' && fieldValue.toLowerCase().includes(String(c.value).toLowerCase())
-          );
+          return fv.includes(cv);
+        case 'not_contains':
+          return !fv.includes(cv);
+        case 'starts_with':
+          return fv.startsWith(cv);
+        case 'ends_with':
+          return fv.endsWith(cv);
         case 'gt':
-          return typeof fieldValue === 'number' && fieldValue > (c.value as number);
+          return typeof raw === 'number' && raw > Number(c.value);
         case 'lt':
-          return typeof fieldValue === 'number' && fieldValue < (c.value as number);
+          return typeof raw === 'number' && raw < Number(c.value);
         default:
           return false;
       }
@@ -104,47 +108,64 @@ export class WorkflowExecutor {
 
     for (const action of actions) {
       try {
+        // Effective scalar value: legacy typed field OR the UI's string `value`.
+        const num = (legacy?: number) => legacy ?? (action.value != null ? Number(action.value) : undefined);
+        const str = (legacy?: string) => legacy ?? action.value;
         switch (action.type) {
           case 'change_department':
-            if (action.departmentId) ticketUpdate['departmentId'] = action.departmentId;
+          case 'assign_group': // UI label; ticket has no group → treat as department
+            if (num(action.departmentId)) ticketUpdate['departmentId'] = num(action.departmentId);
             break;
           case 'change_owner':
-            ticketUpdate['ownerStaffId'] = action.ownerStaffId ?? null;
+          case 'assign_staff': {
+            const owner = num(action.ownerStaffId);
+            ticketUpdate['ownerStaffId'] = owner && !Number.isNaN(owner) ? owner : null;
             break;
+          }
           case 'change_status':
-            if (action.statusId) ticketUpdate['statusId'] = action.statusId;
+          case 'set_status':
+            if (num(action.statusId)) ticketUpdate['statusId'] = num(action.statusId);
             break;
           case 'change_priority':
-            if (action.priorityId) ticketUpdate['priorityId'] = action.priorityId;
+          case 'set_priority':
+            if (num(action.priorityId)) ticketUpdate['priorityId'] = num(action.priorityId);
             break;
           case 'change_type':
-            ticketUpdate['typeId'] = action.typeId ?? null;
+            ticketUpdate['typeId'] = num(action.typeId) ?? null;
             break;
-          case 'add_tag':
-            if (action.tag) {
+          case 'add_tag': {
+            const tag = str(action.tag);
+            if (tag) {
               await this.prisma.ticket.update({
                 where: { id: ticket.id },
-                data: {
-                  tags: {
-                    connectOrCreate: {
-                      where: { name: action.tag },
-                      create: { name: action.tag },
-                    },
-                  },
-                },
+                data: { tags: { connectOrCreate: { where: { name: tag }, create: { name: tag } } } },
               });
             }
             break;
+          }
+          case 'remove_tag': {
+            const tag = str(action.tag);
+            if (tag) {
+              await this.prisma.ticket.update({
+                where: { id: ticket.id },
+                data: { tags: { disconnect: { name: tag } } },
+              });
+            }
+            break;
+          }
           case 'add_note':
-            if (action.note) {
+            if (str(action.note)) {
               await this.prisma.ticketNote.create({
-                data: {
-                  ticketId: ticket.id,
-                  contents: `[Workflow: ${workflow.title}] ${action.note}`,
-                },
+                data: { ticketId: ticket.id, contents: `[Workflow: ${workflow.title}] ${str(action.note)}` },
               });
             }
             break;
+          case 'send_email':
+            // No mail wiring in the executor yet — logged for the next pass (see NEXT_GOAL.md).
+            this.logger.warn(`Workflow ${workflow.id}: send_email action not yet implemented`);
+            break;
+          default:
+            this.logger.warn(`Workflow ${workflow.id}: unknown action type "${action.type}"`);
         }
       } catch (err) {
         this.logger.error(

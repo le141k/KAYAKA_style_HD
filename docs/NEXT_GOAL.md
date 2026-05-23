@@ -14,6 +14,8 @@
 
 ## P0 — must fix first
 
+> ✅ The 4 last-pass regressions below were FIXED & live-verified (commit pending): first-post dedup (use-tickets slice(1)), staff-create departmentId selector + priority map, workflow UI-vocab alias in executor (verified firing → tag added), applyMacro change_status routed via changeStatus. Kept for history.
+
 ### Regressions introduced by the last fix pass (quick, high-value)
 
 - **TD: first post duplicated in thread** — `ticket.body = posts[0].contents` AND `replies` includes posts[0]. Fix `mapTicket` → `t.posts?.slice(1).map(mapPostToReply)`. `apps/web/lib/hooks/use-tickets.ts:158`.

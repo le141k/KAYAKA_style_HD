@@ -82,7 +82,7 @@ function makePrismaMock() {
     },
     ticketStatus: {
       findFirst: vi.fn(),
-      findUnique: vi.fn(),
+      findUnique: vi.fn().mockResolvedValue({ id: 3, title: 'In Progress', markAsResolved: false }),
     },
     ticketPriority: {
       findFirst: vi.fn(),
@@ -612,11 +612,12 @@ describe('TicketsService (extra coverage)', () => {
 
       await service.applyMacro(1, { macroId: 2 }, 5);
 
-      expect(prisma.ticket.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ statusId: 3, priorityId: 2 }),
-        }),
-      );
+      // statusId is applied via changeStatus() (its own update), priorityId via the
+      // macro's raw update — assert both happened across the update calls.
+      const updateCalls = (prisma.ticket.update as ReturnType<typeof vi.fn>).mock.calls;
+      const dataObjs = updateCalls.map((c: unknown[]) => (c[0] as { data: Record<string, unknown> }).data);
+      expect(dataObjs.some((d) => d.statusId === 3)).toBe(true);
+      expect(dataObjs.some((d) => d.priorityId === 2)).toBe(true);
     });
 
     it('executes add_tag action', async () => {

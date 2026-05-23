@@ -19,7 +19,7 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { TicketRow } from '@/components/premium/TicketRow';
 import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
-import { useTickets, useCreateTicket } from '@/lib/hooks/use-tickets';
+import { useTickets, useCreateTicket, useDepartmentOptions } from '@/lib/hooks/use-tickets';
 import { useToast } from '@/components/ui/use-toast';
 import { useI18n } from '@/lib/i18n';
 import Link from 'next/link';
@@ -31,6 +31,8 @@ const createTicketSchema = z.object({
   requesterEmail: z.string().email('Введите корректный email'),
   requesterName: z.string().optional(),
   priority: z.enum(['urgent', 'high', 'normal', 'low']).optional(),
+  // API requires a department; coerce the select's string value to a positive id.
+  department_id: z.coerce.number({ invalid_type_error: 'Выберите отдел' }).int().positive('Выберите отдел'),
 });
 type CreateTicketFormData = z.infer<typeof createTicketSchema>;
 
@@ -50,6 +52,7 @@ export function TicketsListContent() {
   const [createOpen, setCreateOpen] = useState(() => searchParams.get('create') === '1');
 
   const createMutation = useCreateTicket();
+  const { data: departmentOptions = [] } = useDepartmentOptions();
   const {
     register,
     handleSubmit,
@@ -302,6 +305,25 @@ export function TicketsListContent() {
             <div className="space-y-1.5">
               <Label htmlFor="ct-name">Имя клиента</Label>
               <Input id="ct-name" placeholder="Иван Иванов" {...register('requesterName')} />
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="ct-department">Отдел</Label>
+              <select
+                id="ct-department"
+                {...register('department_id')}
+                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                <option value="">— Выберите отдел —</option>
+                {departmentOptions.map((d) => (
+                  <option key={d.value} value={d.value}>
+                    {d.label}
+                  </option>
+                ))}
+              </select>
+              {errors.department_id && (
+                <p className="text-xs text-destructive">{errors.department_id.message}</p>
+              )}
             </div>
 
             <div className="space-y-1.5">

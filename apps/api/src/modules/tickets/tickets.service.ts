@@ -926,6 +926,13 @@ export class TicketsService {
         }
       }
 
+      // A status change must go through changeStatus() so isResolved/resolvedAt and
+      // SLA timers are updated correctly (a raw update would leave them stale).
+      if (ticketUpdate['statusId']) {
+        await this.changeStatus(ticketId, { statusId: ticketUpdate['statusId'] as number }, staffId);
+        delete ticketUpdate['statusId'];
+      }
+
       if (Object.keys(ticketUpdate).length > 0) {
         ticketUpdate['lastActivityAt'] = new Date();
         await this.prisma.ticket.update({ where: { id: ticketId }, data: ticketUpdate });
