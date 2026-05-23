@@ -3,7 +3,8 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Bell, X, AlertTriangle, CheckCircle2, Clock } from 'lucide-react';
-import { cn, formatRelative } from '@/lib/utils';
+import { cn } from '@/lib/utils';
+import { RelativeTime } from '@/components/RelativeTime';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -115,7 +116,7 @@ export function NotificationBell() {
                       <p className={cn('text-xs', !n.read && 'font-semibold')}>{n.message}</p>
                       <div className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
                         <Clock className="h-3 w-3" />
-                        {formatRelative(n.time)}
+                        <RelativeTime date={n.time} />
                       </div>
                     </div>
                     <button

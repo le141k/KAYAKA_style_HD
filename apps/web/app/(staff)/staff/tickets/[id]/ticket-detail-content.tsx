@@ -30,7 +30,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { Separator } from '@/components/ui/separator';
 import { Combobox } from '@/components/ui/combobox';
-import { cn, formatDate, formatRelative, getInitials } from '@/lib/utils';
+import { cn, formatDate, getInitials } from '@/lib/utils';
+import { RelativeTime } from '@/components/RelativeTime';
 import { toast } from '@/components/ui/use-toast';
 
 const STATUS_OPTIONS: { value: Ticket['status']; label: string }[] = [
@@ -250,7 +251,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                         </span>
                       )}
                     </div>
-                    <p className="text-xs text-muted-foreground">{formatRelative(reply.created_at)}</p>
+                    <RelativeTime className="text-xs text-muted-foreground" date={reply.created_at} />
                   </div>
                 </div>
                 <p className="text-sm leading-relaxed whitespace-pre-line">{reply.body}</p>

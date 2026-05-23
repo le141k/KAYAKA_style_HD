@@ -1,7 +1,8 @@
-"use client";
+'use client';
 
-import { cn } from "@/lib/utils";
-import { Clock, AlertTriangle, CheckCircle2 } from "lucide-react";
+import { useEffect, useState } from 'react';
+import { cn } from '@/lib/utils';
+import { Clock, AlertTriangle, CheckCircle2 } from 'lucide-react';
 
 interface SlaPillProps {
   dueAt?: string | null;
@@ -15,27 +16,33 @@ function getSlaState(dueAt: string | null | undefined) {
   const diff = due - now;
   const minutesLeft = Math.round(diff / 60_000);
 
-  if (diff < 0) return { state: "breach" as const, label: "SLA нарушен", minutesLeft };
-  if (minutesLeft < 60) return { state: "warn" as const, label: `${minutesLeft} мин`, minutesLeft };
+  if (diff < 0) return { state: 'breach' as const, label: 'SLA нарушен', minutesLeft };
+  if (minutesLeft < 60) return { state: 'warn' as const, label: `${minutesLeft} мин`, minutesLeft };
   const hoursLeft = Math.round(minutesLeft / 60);
-  return { state: "ok" as const, label: `${hoursLeft} ч`, minutesLeft };
+  return { state: 'ok' as const, label: `${hoursLeft} ч`, minutesLeft };
 }
 
 export function SlaPill({ dueAt, className }: SlaPillProps) {
+  // The pill's label/state derive from Date.now(), which differs between the
+  // server render and client hydration. Render nothing until mounted so the
+  // time-relative content only appears client-side (avoids React #418).
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
   const sla = getSlaState(dueAt);
-  if (!sla) return null;
+  if (!mounted || !sla) return null;
 
   const configs = {
     ok: {
-      classes: "bg-sla-ok/10 text-sla-ok border-sla-ok/20",
+      classes: 'bg-sla-ok/10 text-sla-ok border-sla-ok/20',
       Icon: CheckCircle2,
     },
     warn: {
-      classes: "bg-sla-warn/10 text-sla-warn border-sla-warn/20",
+      classes: 'bg-sla-warn/10 text-sla-warn border-sla-warn/20',
       Icon: Clock,
     },
     breach: {
-      classes: "bg-sla-breach/10 text-sla-breach border-sla-breach/20",
+      classes: 'bg-sla-breach/10 text-sla-breach border-sla-breach/20',
       Icon: AlertTriangle,
     },
   };
@@ -45,10 +52,10 @@ export function SlaPill({ dueAt, className }: SlaPillProps) {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium",
+        'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium',
         classes,
-        sla.state === "breach" && "animate-status-pulse",
-        className
+        sla.state === 'breach' && 'animate-status-pulse',
+        className,
       )}
       aria-label={`SLA: ${sla.label}`}
     >

@@ -13,7 +13,8 @@ import { TicketDetailSkeleton } from '@/components/premium/SkeletonLoaders';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
-import { formatDate, formatRelative, getInitials } from '@/lib/utils';
+import { formatDate, getInitials } from '@/lib/utils';
+import { RelativeTime } from '@/components/RelativeTime';
 import { toast } from '@/components/ui/use-toast';
 
 const replySchema = z.object({
@@ -97,9 +98,7 @@ export function ClientTicketDetail({ ticketId }: { ticketId: number }) {
                   <span className="ml-1.5 text-xs text-primary">· Специалист</span>
                 )}
               </div>
-              <span className="ml-auto text-xs text-muted-foreground">
-                {formatRelative(reply.created_at)}
-              </span>
+              <RelativeTime className="ml-auto text-xs text-muted-foreground" date={reply.created_at} />
             </div>
             <p className="text-sm leading-relaxed whitespace-pre-line">{reply.body}</p>
           </motion.div>

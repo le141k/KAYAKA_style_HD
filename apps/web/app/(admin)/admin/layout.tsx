@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { Loader2 } from 'lucide-react';
@@ -21,6 +21,12 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   const router = useRouter();
   const { data: user, isLoading, isError } = useMe();
 
+  // `useMe` is disabled during SSR (hasToken() false) but enabled on the
+  // authenticated client, so SSR renders null while the first client paint
+  // renders the spinner → hydration mismatch (#418). Gate on `mounted`.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
   useEffect(() => {
     if (isLoading) return;
 
@@ -39,8 +45,9 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
     }
   }, [isLoading, isError, user, router]);
 
-  // Brief loading state to avoid flicker
-  if (isLoading) {
+  // Brief loading state to avoid flicker.
+  // `!mounted` keeps SSR and first client paint identical (see note above).
+  if (!mounted || isLoading) {
     return (
       <div className="flex h-screen items-center justify-center bg-background">
         <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />

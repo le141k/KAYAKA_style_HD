@@ -29,6 +29,14 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
   const router = useRouter();
   const { data: user, isLoading, isError } = useMe();
 
+  // `useMe` is `enabled: hasToken()`, which is false during SSR (no
+  // localStorage) but true on the client once authenticated. That makes the
+  // server render `null` while the first client paint renders the spinner —
+  // a hydration mismatch (#418). Gate on `mounted` so both render the loader
+  // first, then resolve auth purely on the client.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
   // Auth guard: redirect to /login if no token / API returns error
   useEffect(() => {
     if (isLoading) return;
@@ -54,8 +62,9 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
 
-  // Brief loading state to avoid flicker before auth resolves
-  if (isLoading) {
+  // Brief loading state to avoid flicker before auth resolves.
+  // `!mounted` keeps SSR and first client paint identical (see note above).
+  if (!mounted || isLoading) {
     return (
       <div className="flex h-screen items-center justify-center bg-background">
         <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
