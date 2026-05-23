@@ -449,7 +449,7 @@ export class TicketsService {
           type: true,
           department: true,
           owner: { select: { id: true, firstName: true, lastName: true, email: true } },
-          user: { include: { emails: true } },
+          user: { select: PUBLIC_USER_SELECT },
         },
       }),
       this.prisma.ticket.count({ where }),
@@ -469,7 +469,7 @@ export class TicketsService {
         type: true,
         department: true,
         owner: { select: { id: true, firstName: true, lastName: true, email: true } },
-        user: { include: { emails: true } },
+        user: { select: PUBLIC_USER_SELECT },
         posts: {
           orderBy: { createdAt: 'asc' },
           include: {
@@ -502,7 +502,7 @@ export class TicketsService {
         type: true,
         department: true,
         owner: { select: { id: true, firstName: true, lastName: true, email: true } },
-        user: { include: { emails: true } },
+        user: { select: PUBLIC_USER_SELECT },
         posts: {
           orderBy: { createdAt: 'asc' },
           include: {

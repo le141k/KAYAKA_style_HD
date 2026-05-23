@@ -84,3 +84,38 @@ All last-pass fixes verified live: login throttle→429, login→/staff/dashboar
 
 - **SLA admin UI** (new schedules / holidays / escalation-rules CRUD from this pass) — re-audit agent did not return in time; exercise create/edit/delete on each via the UI and confirm correct seconds/camelCase payloads + nested routes (`/admin/sla/schedules/:id/holidays`, `/admin/sla/plans/:id/escalation-rules`).
 - Department parent-selector in admin form (parentId now accepted) — confirm sub-department creation via UI.
+
+---
+
+## Round 2 — newly reported (2026-05-23, user audit)
+
+> Fix order: SEC-1 (P0) → SEC-2 → PROD-1..5. Discipline unchanged (test → tsc/lint/vitest
+> green → rebuild no-cache → live-verify → commit).
+
+### SEC-1 (P0) — passwordHash leak on STAFF ticket endpoints
+
+Public endpoints were narrowed last pass, but the **staff** reads were missed.
+`GET /tickets/:id` / `getTicketByMask` (tickets.service.ts:~472) still do
+`user: { include: { emails: true } }` and return the raw Prisma object → the portal
+user's `passwordHash` lands in the JSON. Fix: explicit non-sensitive `select` for `user`
+(id, fullName, emails{email,isPrimary}) on every staff ticket read; never `include` the
+raw user. Test that passwordHash is absent.
+
+### SEC-2 (P1) — HttpOnly cookie added but XSS not closed
+
+Tokens still duplicated in `localStorage` (api.ts:~33) "for compatibility" → XSS can still
+exfiltrate the JWT. Move the browser app to **cookie-only**: drop localStorage token
+storage + Bearer header from the web client (guard already accepts the HttpOnly cookie);
+`hasToken()` reads the non-sensitive `th_authed` marker, not the JWT. Keep SameSite=Lax.
+
+### PROD-1..5 (P1) — configuration is dev/demo, not production-safe
+
+1. **NODE_ENV=development in container** → cookie `secure=false`, dev logging. Provide a
+   prod profile with NODE_ENV=production.
+2. **Seed runs every start** → demo admin recreated on restart. Gate behind an env flag
+   (TELECOM_HD_SEED) / skip in production.
+3. **NEXT_PUBLIC_API_URL hardcoded to localhost:4000** → broken off the dev machine.
+4. **No TLS/reverse-proxy, restart policies, secret management**; mail = MailHog.
+5. **Weak secret validation** (configuration.ts:~10): only `min(32)` — placeholder
+   `...-change-me-...` secrets pass; Alaris webhook has a known default. In production,
+   reject default/placeholder secrets (JWT, Alaris, field-encryption) at boot.

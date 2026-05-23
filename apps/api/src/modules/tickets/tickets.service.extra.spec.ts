@@ -300,6 +300,31 @@ describe('TicketsService (extra coverage)', () => {
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.getTicket(999)).rejects.toThrow(NotFoundException);
     });
+
+    it('selects only non-sensitive user fields (never passwordHash via include)', async () => {
+      const ticket = {
+        ...makeTicket(),
+        posts: [],
+        notes: [],
+        watchers: [],
+        tags: [],
+        attachments: [],
+        auditLogs: [],
+      };
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+
+      await service.getTicket(1);
+
+      const arg = (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        include: { user: { include?: unknown; select?: Record<string, unknown> } };
+      };
+      const userClause = arg.include.user;
+      // Must use a narrow `select`, never `include` (which pulls passwordHash).
+      expect(userClause.include).toBeUndefined();
+      expect(userClause.select).toBeDefined();
+      expect(userClause.select!['passwordHash']).toBeUndefined();
+      expect(userClause.select!['fullName']).toBe(true);
+    });
   });
 
   // ─── getTicketByMask ──────────────────────────────────────────────────────────
