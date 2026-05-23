@@ -41,7 +41,7 @@ export interface PublicTicketDetail extends Ticket {
   status: { id: number; title: string } | null;
   priority: { id: number; title: string } | null;
   department: { id: number; title: string } | null;
-  owner: { id: number; firstName: string; lastName: string; email: string } | null;
+  owner: { id: number; firstName: string; lastName: string } | null;
   user: { id: number; fullName: string; emails: { email: string; isPrimary: boolean }[] } | null;
   tags: Array<{ name: string }>;
 }
@@ -282,7 +282,8 @@ export class TicketsService {
         status: { select: { id: true, title: true } },
         priority: { select: { id: true, title: true } },
         department: { select: { id: true, title: true } },
-        owner: { select: { id: true, firstName: true, lastName: true, email: true } },
+        // Client-facing: expose the agent's display name only — NOT their email (PII).
+        owner: { select: { id: true, firstName: true, lastName: true } },
         // Narrow select — NEVER expose passwordHash or other sensitive user fields
         user: { select: PUBLIC_USER_SELECT },
         // Only posts (USER/STAFF replies) — notes are intentionally excluded

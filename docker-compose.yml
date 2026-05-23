@@ -45,6 +45,7 @@ services:
       # deterministic. Prod (.env.prod) leaves these unset → strict 5/10 per 60s.
       TELECOM_HD_PUBLIC_SUBMIT_LIMIT: "100"
       TELECOM_HD_PUBLIC_REPLY_LIMIT: "100"
+      TELECOM_HD_PUBLIC_READ_LIMIT: "100"
     ports:
       - "4000:4000"
     volumes:

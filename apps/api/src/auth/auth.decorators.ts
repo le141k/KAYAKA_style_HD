@@ -18,6 +18,9 @@ export interface AuthStaff {
   firstName?: string;
   lastName?: string;
   fullName?: string;
+  /** Access-token id + expiry (epoch s) — carried through for logout revocation. */
+  jti?: string;
+  exp?: number;
 }
 
 /** Marks a route as public (skips JwtAuthGuard). */

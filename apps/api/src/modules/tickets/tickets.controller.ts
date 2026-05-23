@@ -60,6 +60,8 @@ import {
 // e2e/dev can raise them for determinism; prod leaves them at the strict defaults.
 const PUBLIC_SUBMIT_LIMIT = Number(process.env['TELECOM_HD_PUBLIC_SUBMIT_LIMIT']) || 5;
 const PUBLIC_REPLY_LIMIT = Number(process.env['TELECOM_HD_PUBLIC_REPLY_LIMIT']) || 10;
+// Read endpoints (my-tickets, public ticket detail) — higher than writes; portals poll.
+const PUBLIC_READ_LIMIT = Number(process.env['TELECOM_HD_PUBLIC_READ_LIMIT']) || 30;
 
 @ApiTags('tickets')
 @Controller('tickets')
@@ -91,6 +93,7 @@ export class TicketsController {
 
   @Public()
   @Get('my')
+  @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
   @ApiOperation({ summary: "List the current requester's tickets by email (client portal)" })
   listMy(@Query('email') email: string | undefined) {
     if (!email) {
@@ -103,6 +106,7 @@ export class TicketsController {
 
   @Public()
   @Get('public/:id')
+  @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
   @ApiOperation({
     summary:
       'Get a single ticket (no auth) with public posts only — no internal notes. Requires ?email= matching the ticket requester.',

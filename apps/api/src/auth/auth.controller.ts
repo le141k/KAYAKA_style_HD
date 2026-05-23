@@ -115,7 +115,7 @@ export class AuthController {
   @RequirePermissions()
   @ApiOperation({ summary: 'Revoke all refresh tokens for the current staff member' })
   async logout(@CurrentStaff() staff: AuthStaff, @Res({ passthrough: true }) res: Response) {
-    await this.authService.logout(staff.staffId);
+    await this.authService.logout(staff.staffId, staff.jti, staff.exp);
     this.clearAuthCookies(res);
   }
 

@@ -4,6 +4,7 @@ import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { PermissionsGuard } from './permissions.guard';
+import { TokenBlocklistService } from './token-blocklist.service';
 import { loadConfig, APP_CONFIG } from '../config/configuration';
 
 const config = loadConfig();
@@ -23,7 +24,8 @@ const config = loadConfig();
     AuthService,
     JwtAuthGuard,
     PermissionsGuard,
+    TokenBlocklistService,
   ],
-  exports: [AuthService, JwtAuthGuard, PermissionsGuard, JwtModule, APP_CONFIG],
+  exports: [AuthService, JwtAuthGuard, PermissionsGuard, TokenBlocklistService, JwtModule, APP_CONFIG],
 })
 export class AuthModule {}

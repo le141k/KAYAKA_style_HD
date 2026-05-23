@@ -131,9 +131,14 @@ export class AttachmentsController {
     return { attachmentIds: attachments.map((a) => a.id) };
   }
 
-  /** Download an attachment by id. Public — no auth required. */
+  /**
+   * Download an attachment by id. Authenticated staff only (TICKET_VIEW) — NOT
+   * public: previously any integer id was downloadable with no token (mass IDOR).
+   * The link is an <a href> from the staff ticket detail, so the HttpOnly auth
+   * cookie is sent automatically on the GET navigation.
+   */
   @Get(':id/download')
-  @Public()
+  @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   async download(@Param('id', ParseIntPipe) id: number, @Res() res: Response): Promise<void> {
     const attachment = await this.attachmentsService.getAttachmentOrThrow(id);
 

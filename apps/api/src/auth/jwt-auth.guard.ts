@@ -1,8 +1,16 @@
-import { CanActivate, ExecutionContext, Inject, Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  CanActivate,
+  ExecutionContext,
+  Inject,
+  Injectable,
+  Optional,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
 import { IS_PUBLIC_KEY, AuthStaff } from './auth.decorators';
 import { AppConfig, APP_CONFIG } from '../config/configuration';
+import { TokenBlocklistService } from './token-blocklist.service';
 import type { Request } from 'express';
 
 /** Name of the HttpOnly access-token cookie set by AuthController on login/refresh. */
@@ -23,6 +31,9 @@ export class JwtAuthGuard implements CanActivate {
     private readonly jwtService: JwtService,
     private readonly reflector: Reflector,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
+    // Optional so unit tests can construct the guard without Redis; in the app
+    // DI always provides it (AuthModule is @Global).
+    @Optional() private readonly blocklist?: TokenBlocklistService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -40,26 +51,35 @@ export class JwtAuthGuard implements CanActivate {
       throw new UnauthorizedException('Missing access token');
     }
 
+    let payload: AuthStaff & { sub: number; jti?: string; exp?: number };
     try {
-      const payload = await this.jwtService.verifyAsync<AuthStaff & { sub: number }>(token, {
+      payload = await this.jwtService.verifyAsync(token, {
         secret: this.config.TELECOM_HD_JWT_ACCESS_SECRET,
       });
-
-      // Normalise: staffId is stored in `sub` by AuthService
-      const staff: AuthStaff = {
-        staffId: payload.staffId ?? payload.sub,
-        email: payload.email,
-        isAdmin: payload.isAdmin,
-        permissions: payload.permissions,
-        // Carry the display-name claims through so /auth/me exposes them.
-        firstName: payload.firstName,
-        lastName: payload.lastName,
-        fullName: payload.fullName,
-      };
-      (request as Request & { user: AuthStaff }).user = staff;
     } catch {
       throw new UnauthorizedException('Invalid or expired access token');
     }
+
+    // Reject tokens revoked on logout (jti blocklist). Fail-open if Redis is down.
+    if (payload.jti && this.blocklist && (await this.blocklist.isBlocked(payload.jti))) {
+      throw new UnauthorizedException('Token has been revoked');
+    }
+
+    // Normalise: staffId is stored in `sub` by AuthService
+    const staff: AuthStaff = {
+      staffId: payload.staffId ?? payload.sub,
+      email: payload.email,
+      isAdmin: payload.isAdmin,
+      permissions: payload.permissions,
+      // Carry the display-name claims through so /auth/me exposes them.
+      firstName: payload.firstName,
+      lastName: payload.lastName,
+      fullName: payload.fullName,
+      // Carry jti + exp so logout can revoke this exact token.
+      jti: payload.jti,
+      exp: payload.exp,
+    };
+    (request as Request & { user: AuthStaff }).user = staff;
 
     return true;
   }

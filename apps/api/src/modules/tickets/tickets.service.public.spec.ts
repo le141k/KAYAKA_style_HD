@@ -183,6 +183,28 @@ describe('TicketsService — public endpoints', () => {
       expect(result.posts[0]!.contents).toBe('Hello, I need help.');
     });
 
+    it('does NOT expose the assigned agent email (owner select = id + name only)', async () => {
+      const ticketWithRelations = {
+        ...makeTicket(),
+        posts: [],
+        status: null,
+        priority: null,
+        department: null,
+        owner: null,
+        user: null,
+        tags: [],
+      };
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticketWithRelations);
+
+      await service.getPublicTicket(1, 'alice@example.com');
+
+      const arg = (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        include: { owner: { select: Record<string, unknown> } };
+      };
+      expect(arg.include.owner.select).toEqual({ id: true, firstName: true, lastName: true });
+      expect(arg.include.owner.select['email']).toBeUndefined();
+    });
+
     it('does NOT include internal notes — only posts are returned', async () => {
       const ticket = makeTicket({ hasNotes: true });
       const post = makePost();

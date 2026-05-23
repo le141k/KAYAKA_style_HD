@@ -17,7 +17,12 @@ function makeContext(req: Record<string, unknown>): ExecutionContext {
   } as unknown as ExecutionContext;
 }
 
-function makeGuard(opts: { isPublic?: boolean; verifyResult?: unknown; verifyThrows?: boolean }) {
+function makeGuard(opts: {
+  isPublic?: boolean;
+  verifyResult?: unknown;
+  verifyThrows?: boolean;
+  blocked?: boolean;
+}) {
   const reflector = {
     getAllAndOverride: vi.fn((key: string) => (key === IS_PUBLIC_KEY ? opts.isPublic : undefined)),
   } as unknown as Reflector;
@@ -27,7 +32,12 @@ function makeGuard(opts: { isPublic?: boolean; verifyResult?: unknown; verifyThr
       return opts.verifyResult ?? { sub: 1, email: 'a@b.c', isAdmin: false, permissions: [] };
     }),
   } as unknown as JwtService;
-  return { guard: new JwtAuthGuard(jwt, reflector, CONFIG), jwt };
+  const blocklist = { isBlocked: vi.fn(async () => opts.blocked ?? false) };
+  return {
+    guard: new JwtAuthGuard(jwt, reflector, CONFIG, blocklist as never),
+    jwt,
+    blocklist,
+  };
 }
 
 describe('JwtAuthGuard', () => {
@@ -72,5 +82,27 @@ describe('JwtAuthGuard', () => {
     const { guard } = makeGuard({ isPublic: false, verifyThrows: true });
     const req = { headers: { authorization: 'Bearer rotten' } };
     await expect(guard.canActivate(makeContext(req))).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('rejects a revoked (blocklisted) jti → 401', async () => {
+    const { guard, blocklist } = makeGuard({
+      isPublic: false,
+      verifyResult: { sub: 7, email: 's@x.com', isAdmin: false, permissions: [], jti: 'revoked-jti' },
+      blocked: true,
+    });
+    const req = { headers: { authorization: 'Bearer good-but-revoked' } };
+    await expect(guard.canActivate(makeContext(req))).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(blocklist.isBlocked).toHaveBeenCalledWith('revoked-jti');
+  });
+
+  it('carries jti + exp onto req.user for logout revocation', async () => {
+    const { guard } = makeGuard({
+      isPublic: false,
+      verifyResult: { sub: 7, email: 's@x.com', isAdmin: false, permissions: [], jti: 'jti-1', exp: 999 },
+    });
+    const req: Record<string, unknown> = { headers: { authorization: 'Bearer t' } };
+    await guard.canActivate(makeContext(req));
+    expect((req as { user: { jti?: string; exp?: number } }).user.jti).toBe('jti-1');
+    expect((req as { user: { jti?: string; exp?: number } }).user.exp).toBe(999);
   });
 });

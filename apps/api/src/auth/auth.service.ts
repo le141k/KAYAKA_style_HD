@@ -1,7 +1,8 @@
-import { Injectable, UnauthorizedException, Logger, Inject } from '@nestjs/common';
+import { Injectable, UnauthorizedException, Logger, Inject, Optional } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppConfig, APP_CONFIG } from '../config/configuration';
+import { TokenBlocklistService } from './token-blocklist.service';
 import { verifyPassword, hashPassword } from './password.util';
 import { type AuthStaff } from './auth.decorators';
 import type { Permission } from './permissions';
@@ -26,6 +27,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
+    @Optional() private readonly blocklist?: TokenBlocklistService,
   ) {}
 
   /** Validate credentials; returns Staff+Group on success, throws otherwise. */
@@ -128,11 +130,19 @@ export class AuthService {
    * Revoke all refresh tokens for the given staff member (logout).
    * The staffId comes from the verified JWT principal passed in by the controller.
    */
-  async logout(staffId: number): Promise<void> {
+  async logout(staffId: number, accessJti?: string, accessExp?: number): Promise<void> {
     await this.prisma.refreshToken.updateMany({
       where: { staffId, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    // Revoke the current access token too (jti blocklist) so it can't be used for
+    // its remaining ~15 min after logout.
+    if (accessJti && this.blocklist) {
+      const ttl = accessExp
+        ? accessExp - Math.floor(Date.now() / 1000)
+        : this.config.TELECOM_HD_JWT_ACCESS_TTL;
+      await this.blocklist.block(accessJti, ttl);
+    }
     this.logger.log(`Staff ${staffId} logged out (tokens revoked)`);
   }
 
@@ -159,7 +169,8 @@ export class AuthService {
     const jti = crypto.randomUUID();
 
     const accessToken = await this.jwt.signAsync(
-      { ...principal, sub: staffId },
+      // Distinct jti on the access token so logout can revoke it via the blocklist.
+      { ...principal, sub: staffId, jti: crypto.randomUUID() },
       {
         secret: this.config.TELECOM_HD_JWT_ACCESS_SECRET,
         expiresIn: this.config.TELECOM_HD_JWT_ACCESS_TTL,
