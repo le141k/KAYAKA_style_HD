@@ -21,6 +21,7 @@ function makePrismaMock() {
 function makeTicket(overrides: Partial<Ticket> = {}): Ticket {
   return {
     id: 1,
+    kayakoId: null,
     mask: 'TT-000001',
     subject: 'Test subject',
     departmentId: 1,

@@ -101,6 +101,16 @@ export type TagDto = z.infer<typeof TagSchema>;
 export const WatcherSchema = z.object({ staffId: z.number().int().positive() });
 export type WatcherDto = z.infer<typeof WatcherSchema>;
 
+// ─────────────────── ticket links (client ↔ supplier) ───────────────────
+
+export const LinkTicketSchema = z.object({
+  /** The other ticket to link to. */
+  targetId: z.number().int().positive(),
+  /** Relationship from the current ticket's perspective. */
+  linkType: z.enum(['supplier', 'client', 'related']).default('related'),
+});
+export type LinkTicketDto = z.infer<typeof LinkTicketSchema>;
+
 // ─────────────────── list query ───────────────────
 
 export const ListTicketsQuerySchema = z.object({

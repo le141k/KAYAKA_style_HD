@@ -11,6 +11,7 @@ export type SafeUser = Omit<User, 'passwordHash'> & { emails: UserEmail[] };
 
 const SAFE_USER_SELECT = {
   id: true,
+  kayakoId: true,
   fullName: true,
   phone: true,
   designation: true,

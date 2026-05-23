@@ -108,6 +108,7 @@ const MOCK_RULE = {
 
 const MOCK_TICKET = {
   id: 1,
+  kayakoId: null,
   mask: 'TT-000001',
   subject: 'Test',
   dueAt: new Date(Date.now() - 60_000),

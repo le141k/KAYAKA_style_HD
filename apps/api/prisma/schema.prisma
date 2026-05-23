@@ -28,6 +28,14 @@ enum UserGroupType {
   REGISTERED
 }
 
+// 23 Telecom is a broker in the middle: customers (CLIENT) email in, 23T (INTERNAL)
+// works the issue and contacts carriers (SUPPLIER). Used to classify orgs on import.
+enum OrgType {
+  CLIENT
+  SUPPLIER
+  INTERNAL
+}
+
 enum ActorType {
   STAFF
   USER
@@ -169,6 +177,9 @@ model UserGroup {
 
 model Organization {
   id          Int      @id @default(autoincrement())
+  // Kayako source id — set by the importer for idempotent upserts/FK resolution.
+  kayakoId    Int?     @unique
+  orgType     OrgType  @default(CLIENT)
   name        String
   address     String   @default("")
   city        String   @default("")
@@ -187,6 +198,7 @@ model Organization {
 
 model User {
   id             Int           @id @default(autoincrement())
+  kayakoId       Int?          @unique
   fullName       String
   phone          String        @default("")
   designation    String        @default("")
@@ -283,6 +295,7 @@ model TicketType {
 
 model Ticket {
   id              Int            @id @default(autoincrement())
+  kayakoId        Int?           @unique
   mask            String         @unique          // human ID, e.g. TT-000123
   subject         String
 
@@ -544,10 +557,13 @@ model MacroCategory {
 
 model Macro {
   id         Int            @id @default(autoincrement())
+  kayakoId   Int?           @unique
   category   MacroCategory? @relation(fields: [categoryId], references: [id])
   categoryId Int?
   title      String
+  subject    String         @default("")
   replyText  String         @default("")
+  isHtml     Boolean        @default(false)
   // bulk actions applied with the macro
   actions    Json           @default("[]")
   // shared = visible to all agents; false = owner-only (UI toggle)

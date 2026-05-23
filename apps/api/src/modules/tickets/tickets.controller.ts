@@ -33,6 +33,7 @@ import {
   SplitTicketSchema,
   TagSchema,
   WatcherSchema,
+  LinkTicketSchema,
   ListTicketsQuerySchema,
   PublicCreateTicketSchema,
   ApplyMacroSchema,
@@ -47,6 +48,7 @@ import {
   type SplitTicketDto,
   type TagDto,
   type WatcherDto,
+  type LinkTicketDto,
   type ListTicketsQueryDto,
   type PublicCreateTicketDto,
   PublicReplySchema,
@@ -313,6 +315,33 @@ export class TicketsController {
   @ApiOperation({ summary: 'Remove a watcher from a ticket' })
   removeWatcher(@Param('id', ParseIntPipe) id: number, @Param('staffId', ParseIntPipe) staffId: number) {
     return this.ticketsService.removeWatcher(id, staffId);
+  }
+
+  // ─────────────────── Ticket links (client ↔ supplier) ───────────────────
+
+  @Get(':id/links')
+  @RequirePermissions(PERMISSIONS.TICKET_VIEW)
+  @ApiOperation({ summary: 'List tickets linked to this one (client ↔ supplier counterpart)' })
+  listLinks(@Param('id', ParseIntPipe) id: number) {
+    return this.ticketsService.listLinks(id);
+  }
+
+  @Post(':id/links')
+  @RequirePermissions(PERMISSIONS.TICKET_EDIT)
+  @ApiOperation({ summary: 'Link this ticket to another (e.g. a spawned supplier ticket)' })
+  addLink(
+    @Param('id', ParseIntPipe) id: number,
+    @Body(new ZodValidationPipe(LinkTicketSchema)) dto: LinkTicketDto,
+  ) {
+    return this.ticketsService.addLink(id, dto);
+  }
+
+  @Delete(':id/links/:linkId')
+  @RequirePermissions(PERMISSIONS.TICKET_EDIT)
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Remove a link between two tickets' })
+  removeLink(@Param('id', ParseIntPipe) id: number, @Param('linkId', ParseIntPipe) linkId: number) {
+    return this.ticketsService.removeLink(id, linkId);
   }
 
   // ─────────────────── Tags ───────────────────

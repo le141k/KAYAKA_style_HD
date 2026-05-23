@@ -148,4 +148,16 @@ export const uk: Dictionary = {
     errorTitle: 'Помилка',
     statusError: 'Не вдалося змінити статус',
   },
+  linkedTickets: {
+    title: 'Повʼязані тикети',
+    loading: 'Завантаження…',
+    empty: 'Немає повʼязаних тикетів',
+    supplier: 'постачальник',
+    client: 'клієнт',
+    related: 'повʼязаний',
+    unlink: 'Відвʼязати',
+    addPlaceholder: '№ тикета (id)',
+    add: 'Звʼязати',
+    linkError: 'Не вдалося звʼязати тикети',
+  },
 };

@@ -185,6 +185,7 @@ export const ticketKeys = {
   list: (params: Record<string, unknown>) => [...ticketKeys.lists(), params] as const,
   detail: (id: number) => [...ticketKeys.all, 'detail', id] as const,
   replies: (id: number) => [...ticketKeys.all, id, 'replies'] as const,
+  links: (id: number) => [...ticketKeys.all, id, 'links'] as const,
   stats: ['dashboard-stats'] as const,
 };
 
@@ -474,6 +475,32 @@ export function useChangeTicketStatus() {
 }
 
 // Add / remove a tag on a ticket (TICKET_EDIT). Used by the ticket detail panel.
+export interface TicketLink {
+  linkId: number;
+  linkType: string;
+  ticket: { id: number; mask: string; subject: string; status: string | null; isResolved: boolean };
+}
+
+/** Linked client↔supplier tickets for the ticket-detail "Связанные тикеты" panel. */
+export function useTicketLinks(ticketId: number) {
+  const qc = useQueryClient();
+  const invalidate = () => void qc.invalidateQueries({ queryKey: ticketKeys.links(ticketId) });
+  const list = useQuery({
+    queryKey: ticketKeys.links(ticketId),
+    queryFn: () => api.get<TicketLink[]>(`/tickets/${ticketId}/links`),
+  });
+  const add = useMutation({
+    mutationFn: (input: { targetId: number; linkType: 'supplier' | 'client' | 'related' }) =>
+      api.post(`/tickets/${ticketId}/links`, input),
+    onSuccess: invalidate,
+  });
+  const remove = useMutation({
+    mutationFn: (linkId: number) => api.delete(`/tickets/${ticketId}/links/${linkId}`),
+    onSuccess: invalidate,
+  });
+  return { list, add, remove };
+}
+
 export function useTicketTags(ticketId: number) {
   const qc = useQueryClient();
   const invalidate = () => {

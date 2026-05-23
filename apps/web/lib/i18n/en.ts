@@ -148,4 +148,16 @@ export const en: Dictionary = {
     errorTitle: 'Error',
     statusError: 'Failed to change status',
   },
+  linkedTickets: {
+    title: 'Linked tickets',
+    loading: 'Loading…',
+    empty: 'No linked tickets',
+    supplier: 'supplier',
+    client: 'client',
+    related: 'related',
+    unlink: 'Unlink',
+    addPlaceholder: 'Ticket # (id)',
+    add: 'Link',
+    linkError: 'Failed to link tickets',
+  },
 };

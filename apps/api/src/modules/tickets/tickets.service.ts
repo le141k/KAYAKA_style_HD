@@ -21,6 +21,7 @@ import type {
   ListTicketsQueryDto,
   TagDto,
   WatcherDto,
+  LinkTicketDto,
   PublicReplyDto,
   ApplyMacroDto,
   ChangeDepartmentDto,
@@ -1114,6 +1115,90 @@ export class TicketsService {
 
   async removeWatcher(ticketId: number, staffId: number): Promise<void> {
     await this.prisma.ticketWatcher.deleteMany({ where: { ticketId, staffId } });
+  }
+
+  // ─────────────────────────── Ticket links (client ↔ supplier) ─────────────
+
+  /**
+   * List every ticket linked to this one, in BOTH directions, flattened to the
+   * counterpart ticket + the relationship from this ticket's point of view. This
+   * is the backbone of the 23T broker model: a client ticket shows its supplier
+   * ticket(s) and vice-versa.
+   */
+  async listLinks(ticketId: number): Promise<
+    Array<{
+      linkId: number;
+      linkType: string;
+      ticket: { id: number; mask: string; subject: string; status: string | null; isResolved: boolean };
+    }>
+  > {
+    await this.findOrThrow(ticketId);
+    const counterpart = {
+      select: {
+        id: true,
+        mask: true,
+        subject: true,
+        isResolved: true,
+        status: { select: { title: true } },
+      },
+    } as const;
+    const links = await this.prisma.ticketLink.findMany({
+      where: { OR: [{ sourceId: ticketId }, { targetId: ticketId }] },
+      include: { source: counterpart, target: counterpart },
+    });
+    // Inverse label so the counterpart reads correctly from the other side.
+    const inverse: Record<string, string> = { supplier: 'client', client: 'supplier', related: 'related' };
+    return links.map((l) => {
+      const isSource = l.sourceId === ticketId;
+      const other = isSource ? l.target : l.source;
+      return {
+        linkId: l.id,
+        linkType: isSource ? l.linkType : (inverse[l.linkType] ?? l.linkType),
+        ticket: {
+          id: other.id,
+          mask: other.mask,
+          subject: other.subject,
+          status: other.status?.title ?? null,
+          isResolved: other.isResolved,
+        },
+      };
+    });
+  }
+
+  async addLink(
+    ticketId: number,
+    dto: LinkTicketDto,
+  ): Promise<{ linkId: number; linkType: string; targetId: number }> {
+    if (dto.targetId === ticketId) {
+      throw new BadRequestException('A ticket cannot be linked to itself');
+    }
+    await this.findOrThrow(ticketId);
+    await this.findOrThrow(dto.targetId);
+
+    // Reject a duplicate in either direction (the @@unique only covers one).
+    const existing = await this.prisma.ticketLink.findFirst({
+      where: {
+        OR: [
+          { sourceId: ticketId, targetId: dto.targetId },
+          { sourceId: dto.targetId, targetId: ticketId },
+        ],
+      },
+    });
+    if (existing) throw new BadRequestException('These tickets are already linked');
+
+    const link = await this.prisma.ticketLink.create({
+      data: { sourceId: ticketId, targetId: dto.targetId, linkType: dto.linkType },
+    });
+    return { linkId: link.id, linkType: link.linkType, targetId: link.targetId };
+  }
+
+  async removeLink(ticketId: number, linkId: number): Promise<void> {
+    // Scope the delete to links that actually involve this ticket (either end).
+    const link = await this.prisma.ticketLink.findUnique({ where: { id: linkId } });
+    if (!link || (link.sourceId !== ticketId && link.targetId !== ticketId)) {
+      throw new NotFoundException(`Link ${linkId} not found on ticket ${ticketId}`);
+    }
+    await this.prisma.ticketLink.delete({ where: { id: linkId } });
   }
 
   // ─────────────────────────── Tags ───────────────────────────

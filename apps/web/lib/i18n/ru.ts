@@ -147,6 +147,18 @@ export const ru = {
     errorTitle: 'Ошибка',
     statusError: 'Не удалось сменить статус',
   },
+  linkedTickets: {
+    title: 'Связанные тикеты',
+    loading: 'Загрузка…',
+    empty: 'Нет связанных тикетов',
+    supplier: 'поставщик',
+    client: 'клиент',
+    related: 'связан',
+    unlink: 'Отвязать',
+    addPlaceholder: '№ тикета (id)',
+    add: 'Связать',
+    linkError: 'Не удалось связать тикеты',
+  },
 };
 
 export type Dictionary = typeof ru;

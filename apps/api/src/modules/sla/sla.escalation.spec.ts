@@ -56,6 +56,7 @@ function makeMailMock() {
 function makeBreachedTicket(overrides = {}) {
   return {
     id: 1,
+    kayakoId: null,
     mask: 'TT-000001',
     subject: 'Test',
     dueAt: new Date(Date.now() - 120 * 60_000), // 2h overdue

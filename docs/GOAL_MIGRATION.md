@@ -42,13 +42,14 @@ email path correct. Built from a 5-agent analysis of the dump (`../kayako_db_exp
 
 ---
 
-## ☐ Batch M0 — Schema + importer scaffolding
+## ✅ Batch M0 — Schema + importer scaffolding (DONE)
 
-- [ ] Prisma additions + migration: `Organization.orgType` enum `CLIENT|SUPPLIER|INTERNAL` (default CLIENT); `Macro.subject String @default("")`; `Macro.isHtml Boolean @default(false)`. Add nullable `kayakoId Int? @unique` to Organization, User, Ticket, Macro (idempotent re-import + FK resolution). (TicketRecipient CC/BCC, EmailQueue, EmailParserRule, **`TicketLink`** already exist as models — no schema change.)
-- [ ] **Build the ticket-linking FEATURE** — `TicketLink` model exists (source/target/linkType) but has **NO API and NO UI**. Add: `POST /tickets/:id/links` (link to another ticket, `linkType` e.g. `supplier`/`client`/`related`), `GET /tickets/:id/links`, `DELETE …/links/:id`; a "Связанные тикеты / Linked tickets" panel in the ticket-detail UI (show the linked client/supplier ticket + open it). This is the backbone of the 23T client↔supplier model. (RBAC: `TICKET_EDIT`; tests.)
-- [ ] `apps/api/scripts/import-kayako.ts` (tsx, mirrors seed pattern): a MySQL-INSERT parser (table + columns + rows), in-memory id maps, `prisma.$transaction` inserts in order: Departments→StaffGroup→Staff→Organization→User→UserEmail→Status/Priority/Type→EmailQueue→Macro… Convert Kayako `dateline` (unix) → `DateTime`. Run: `tsx scripts/import-kayako.ts <dump.sql>` against dev DB after `npm run seed`.
-- [ ] Detect full-dump vs samples; log counts imported vs `tables_inventory.csv` expectations.
-- **Acceptance:** migration applies; importer runs on `samples.sql` without error; `make verify` green.
+- [x] Prisma + migration `20260530000000_kayako_migration_scaffold`: `OrgType` enum `CLIENT|SUPPLIER|INTERNAL` + `Organization.orgType` (default CLIENT); `Macro.subject`/`Macro.isHtml`; nullable `kayakoId Int? @unique` on Organization/User/Ticket/Macro. (Updated 6 ticket test-factories + `SAFE_USER_SELECT` for the new required field.)
+- [x] **Ticket-linking FEATURE built** — `POST /tickets/:id/links`, `GET /tickets/:id/links` (both directions, inverse label for inbound), `DELETE /tickets/:id/links/:linkId` (RBAC TICKET_EDIT; self-link + bi-directional-dup guarded). UI: `LinkedTicketsPanel` in the ticket-detail sidebar (i18n ru/en/uk), shows the linked counterpart + opens it + link/unlink. **Live: link 1→2 supplier; ticket-2 side reads `client`; dup 400; self-link 400.** +6 service tests.
+- [x] `scripts/import-kayako.ts` + `src/migration/kayako-parser.ts`: a mysqldump INSERT parser (quote/escape aware, multi-statement), `IdMap` (oldId→newId per table), `datelineToDate`, `classifyOrg`. Dependency-ordered runner; Organization import (upsert by `kayakoId`, orgType classification, prints the org list). +7 parser tests.
+- [x] Full-dump vs samples detection: logs parsed-vs-inventory counts per table; prints a SAMPLED-DUMP warning. **Live on samples.sql: orgs 3/9, users 3/339, macros 3/63 → flagged; idempotent re-run; DB has 1 INTERNAL + 2 SUPPLIER.**
+- **Acceptance:** migration applies; importer runs on `samples.sql` without error + idempotent; linking API live-verified; `make verify` GREEN 9/9. ✅
+- **⚠️ DATA REALITY:** only `samples.sql` exists (3-row samples per table) — **the full mysqldump is absent.** Org list shows only **3 of 9** (23 Telecom=INTERNAL, Lleida + Broadnet=SUPPLIER); the other 6 orgs, all real users, the full 63 macros, and 3 of 8 status names need the full dump.
 
 ## ☐ Batch M1 — Clients & suppliers (Task 1)
 
