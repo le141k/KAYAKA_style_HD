@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException } from '@nestjs/common';
+import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { FollowUpsService } from './follow-ups.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 
@@ -64,10 +64,10 @@ describe('FollowUpsService', () => {
 
   describe('setCompleted', () => {
     it('sets completed=true and a completedAt timestamp', async () => {
-      prisma.followUp.findUnique.mockResolvedValue({ id: 3, completed: false });
+      prisma.followUp.findUnique.mockResolvedValue({ id: 3, completed: false, staffId: 42 });
       prisma.followUp.update.mockResolvedValue({ id: 3, completed: true });
 
-      await service.setCompleted(3, true);
+      await service.setCompleted(3, true, 42);
 
       const arg = prisma.followUp.update.mock.calls[0]?.[0] as {
         where: unknown;
@@ -79,10 +79,10 @@ describe('FollowUpsService', () => {
     });
 
     it('clears completedAt when set to incomplete', async () => {
-      prisma.followUp.findUnique.mockResolvedValue({ id: 3, completed: true });
+      prisma.followUp.findUnique.mockResolvedValue({ id: 3, completed: true, staffId: 42 });
       prisma.followUp.update.mockResolvedValue({ id: 3, completed: false });
 
-      await service.setCompleted(3, false);
+      await service.setCompleted(3, false, 42);
 
       expect(prisma.followUp.update).toHaveBeenCalledWith({
         where: { id: 3 },
@@ -90,27 +90,39 @@ describe('FollowUpsService', () => {
       });
     });
 
+    it("throws ForbiddenException when toggling another staff member's follow-up", async () => {
+      prisma.followUp.findUnique.mockResolvedValue({ id: 3, completed: false, staffId: 42 });
+      await expect(service.setCompleted(3, true, 99)).rejects.toBeInstanceOf(ForbiddenException);
+      expect(prisma.followUp.update).not.toHaveBeenCalled();
+    });
+
     it('throws NotFoundException when the follow-up is missing', async () => {
       prisma.followUp.findUnique.mockResolvedValue(null);
-      await expect(service.setCompleted(999, true)).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.setCompleted(999, true, 42)).rejects.toBeInstanceOf(NotFoundException);
       expect(prisma.followUp.update).not.toHaveBeenCalled();
     });
   });
 
   describe('remove', () => {
-    it('deletes an existing follow-up', async () => {
-      prisma.followUp.findUnique.mockResolvedValue({ id: 5 });
+    it('deletes a follow-up owned by the acting staff', async () => {
+      prisma.followUp.findUnique.mockResolvedValue({ id: 5, staffId: 42 });
       prisma.followUp.delete.mockResolvedValue({ id: 5 });
 
-      const result = await service.remove(5);
+      const result = await service.remove(5, 42);
 
       expect(prisma.followUp.delete).toHaveBeenCalledWith({ where: { id: 5 } });
       expect(result).toEqual({ deleted: true });
     });
 
+    it("throws ForbiddenException when deleting another staff member's follow-up", async () => {
+      prisma.followUp.findUnique.mockResolvedValue({ id: 5, staffId: 42 });
+      await expect(service.remove(5, 99)).rejects.toBeInstanceOf(ForbiddenException);
+      expect(prisma.followUp.delete).not.toHaveBeenCalled();
+    });
+
     it('throws NotFoundException when the follow-up is missing', async () => {
       prisma.followUp.findUnique.mockResolvedValue(null);
-      await expect(service.remove(999)).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.remove(999, 42)).rejects.toBeInstanceOf(NotFoundException);
       expect(prisma.followUp.delete).not.toHaveBeenCalled();
     });
   });

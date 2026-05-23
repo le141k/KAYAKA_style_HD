@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import Link from 'next/link';
 import { ArrowLeft, Lock, Send, Loader2, Paperclip } from 'lucide-react';
 import { useForm } from 'react-hook-form';
@@ -24,6 +24,7 @@ import { PriorityChip } from '@/components/premium/PriorityChip';
 import { SlaPill } from '@/components/premium/SlaPill';
 import { FileUploadZone } from '@/components/premium/FileUploadZone';
 import { TicketDetailSkeleton } from '@/components/premium/SkeletonLoaders';
+import { QueryError } from '@/components/QueryError';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -56,7 +57,7 @@ const replySchema = z.object({
 type ReplyForm = z.infer<typeof replySchema>;
 
 export function TicketDetailContent({ ticketId }: { ticketId: number }) {
-  const { data: ticket, isLoading: ticketLoading } = useTicket(ticketId);
+  const { data: ticket, isLoading: ticketLoading, isError: ticketError, refetch } = useTicket(ticketId);
   const replyMutation = useReply(ticketId);
   const updateTicket = useUpdateTicket(ticketId);
   const { data: staffOptions = [] } = useStaffOptions();
@@ -143,22 +144,24 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   });
 
   // ── Reply draft auto-save ──
-  // Persist the in-progress reply per ticket so navigating away (or an accidental
-  // reload) doesn't lose it. Cleared on successful send.
-  const draftKey = `th_reply_draft_${ticketId}`;
-  const [draftRestored, setDraftRestored] = useState(false);
+  // Persist the in-progress reply per ticket AND per tab (reply vs internal note
+  // have separate drafts) so navigating away/reload doesn't lose it. Switching
+  // ticket or tab loads that key's draft (resets the field). Cleared on send.
+  const draftKey = `th_reply_draft_${ticketId}_${replyTab}`;
+  const restoredKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (typeof window === 'undefined' || draftRestored) return;
-    const saved = localStorage.getItem(draftKey);
-    if (saved) setValue('body', saved);
-    setDraftRestored(true);
-  }, [draftKey, draftRestored, setValue]);
+    if (typeof window === 'undefined') return;
+    setValue('body', localStorage.getItem(draftKey) ?? '');
+    restoredKeyRef.current = draftKey;
+  }, [draftKey, setValue]);
   const draftBody = watch('body');
   useEffect(() => {
-    if (typeof window === 'undefined' || !draftRestored) return;
+    // Only persist once the field has been (re)hydrated for the CURRENT key —
+    // prevents the restore→watch cycle from writing a stale value to the new key.
+    if (typeof window === 'undefined' || restoredKeyRef.current !== draftKey) return;
     if (draftBody && draftBody.trim() !== '') localStorage.setItem(draftKey, draftBody);
     else localStorage.removeItem(draftKey);
-  }, [draftBody, draftKey, draftRestored]);
+  }, [draftBody, draftKey]);
 
   // r hotkey → focus reply
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
@@ -194,6 +197,13 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
         <TicketDetailSkeleton />
       </div>
     );
+  if (ticketError) {
+    return (
+      <div className="p-6">
+        <QueryError message="Не удалось загрузить заявку." onRetry={() => void refetch()} />
+      </div>
+    );
+  }
   if (!ticket) {
     return (
       <div className="flex h-full items-center justify-center">

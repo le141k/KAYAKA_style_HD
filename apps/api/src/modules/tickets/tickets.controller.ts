@@ -3,6 +3,7 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   HttpCode,
   HttpStatus,
@@ -159,6 +160,14 @@ export class TicketsController {
     @Body(new ZodValidationPipe(BulkTicketActionSchema)) dto: BulkTicketActionDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
+    // Status changes need TICKET_EDIT (the route guard); (un)assignment additionally
+    // needs TICKET_ASSIGN, mirroring the single-ticket assign endpoint.
+    if (
+      (dto.action === 'assignee' || dto.action === 'unassign') &&
+      !staff.permissions.includes(PERMISSIONS.TICKET_ASSIGN)
+    ) {
+      throw new ForbiddenException('Bulk (un)assignment requires the ticket.assign permission');
+    }
     return this.ticketsService.bulkAction(dto, staff.staffId);
   }
 

@@ -804,7 +804,8 @@ model TimeEntry {
   id        Int      @id @default(autoincrement())
   ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
   ticketId  Int
-  staff     Staff    @relation(fields: [staffId], references: [id])
+  // Restrict: staff are soft-disabled (never hard-deleted), so attribution is preserved.
+  staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Restrict)
   staffId   Int
   minutes   Int
   note      String?
@@ -820,7 +821,7 @@ model FollowUp {
   id          Int       @id @default(autoincrement())
   ticket      Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
   ticketId    Int
-  staff       Staff     @relation(fields: [staffId], references: [id])
+  staff       Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict)
   staffId     Int
   dueAt       DateTime
   note        String?
@@ -830,6 +831,7 @@ model FollowUp {
 
   @@index([ticketId])
   @@index([dueAt])
+  @@index([staffId])
 }
 
 /** A named, reusable set of ticket-list filters saved by a staff member. */
@@ -842,5 +844,6 @@ model SavedView {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([staffId, name])
   @@index([staffId])
 }

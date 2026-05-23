@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException } from '@nestjs/common';
+import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { TimeTrackingService } from './time-tracking.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 
@@ -98,19 +98,26 @@ describe('TimeTrackingService', () => {
     expect(result.entries).toEqual([]);
   });
 
-  it('deletes an existing entry', async () => {
+  it('deletes an entry owned by the acting staff', async () => {
     (prisma.timeEntry.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_ENTRY);
     (prisma.timeEntry.delete as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_ENTRY);
 
-    await service.remove(1);
+    await service.remove(1, MOCK_ENTRY.staffId);
 
     expect(prisma.timeEntry.delete).toHaveBeenCalledWith({ where: { id: 1 } });
+  });
+
+  it("throws ForbiddenException when deleting another staff member's entry", async () => {
+    (prisma.timeEntry.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_ENTRY);
+
+    await expect(service.remove(1, MOCK_ENTRY.staffId + 1)).rejects.toBeInstanceOf(ForbiddenException);
+    expect(prisma.timeEntry.delete).not.toHaveBeenCalled();
   });
 
   it('throws NotFoundException when deleting a missing entry', async () => {
     (prisma.timeEntry.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
-    await expect(service.remove(999)).rejects.toBeInstanceOf(NotFoundException);
+    await expect(service.remove(999, 5)).rejects.toBeInstanceOf(NotFoundException);
     expect(prisma.timeEntry.delete).not.toHaveBeenCalled();
   });
 });

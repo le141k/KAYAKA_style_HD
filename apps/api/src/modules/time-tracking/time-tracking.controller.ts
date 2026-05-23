@@ -43,8 +43,8 @@ export class TimeTrackingController {
   @RequirePermissions(PERMISSIONS.TICKET_EDIT)
   @Delete('time/:id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Delete a time entry' })
-  deleteTime(@Param('id', ParseIntPipe) id: number) {
-    return this.timeTracking.remove(id);
+  @ApiOperation({ summary: 'Delete a time entry (owner only)' })
+  deleteTime(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
+    return this.timeTracking.remove(id, staff.staffId);
   }
 }

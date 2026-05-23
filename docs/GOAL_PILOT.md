@@ -24,15 +24,15 @@ File:line detail for each item is in `docs/NEXT_GOAL.md`.
 - [x] Prod-deploy section in `README.md` (nginx + TLS + reverse-proxy).
 - **Acceptance:** dev `make verify` GREEN (9/9); prod compose valid; placeholder secrets rejected at boot. ✅
 
-## ☐ Batch B — Safety / correctness (no silent lies)
+## ✅ Batch B — Safety / correctness (DONE)
 
-- [ ] Replace silent mock-fallbacks with real error states — `useDashboardStats`/`useTickets`/`useKB*`/`useClientTickets`: on API error show an error UI, never fake/empty-as-real data.
-- [ ] Notification bell: wire a minimal real `/notifications` feed OR hide the bell (remove the empty mock).
-- [ ] Ownership on time-entries & follow-ups: enforce `staffId` match on delete/patch (or, if team-shared is intended, document it AND still gate delete).
-- [ ] Bulk caveats: recompute SLA on bulk status change/reopen; gate bulk-assign on `TICKET_ASSIGN`; invalidate open ticket-detail query after a bulk op.
-- [ ] Schema: add `@@index([staffId])` to `FollowUp`; `@@unique([staffId,name])` to `SavedView`; decide `onDelete` for `TimeEntry`/`FollowUp` staff FK (migration).
-- [ ] Reply drafts: separate keys for reply vs internal-note tab; reset on ticket switch.
-- **Acceptance:** an API 500/403 surfaces as an error (not blank/fake); no fake notifications; bulk reopen recomputes SLA.
+- [x] Silent mock-fallbacks removed — `useTickets`/`useTicket`/`useReplies`/`useDashboardStats`/`useKB*` now propagate errors; consumers (dashboard, tickets-list, ticket-detail, kb list/article) render a real `<QueryError>` with retry. (useClientTickets keeps its legit staff→public route fallback — not mock data.)
+- [x] Notification bell removed (was an always-empty mock) — re-add when a real `/notifications` feed exists.
+- [x] Ownership enforced: time-entry delete + follow-up patch/delete now require the acting `staffId` to match (403 otherwise, 404 if missing). Tests added.
+- [x] Bulk caveats: SLA recomputed on bulk reopen; bulk (un)assign gated on `TICKET_ASSIGN`; bulk onSuccess invalidates ALL ticket queries (open detail refreshes). Tests added.
+- [x] Schema: `@@index([staffId])` on FollowUp; `@@unique([staffId,name])` on SavedView; staff FK `onDelete: Restrict` (explicit — staff are soft-disabled). Migration 20260528.
+- [x] Reply drafts: per-tab keys (`th_reply_draft_<id>_<tab>`); switching ticket/tab reloads that key (reset); restored-key ref avoids the save/restore race.
+- **Acceptance:** API errors surface as `<QueryError>` (not blank/fake); no fake notifications; bulk reopen recomputes SLA. `make verify` GREEN 9/9. ✅
 
 ## ☐ Batch C — Scheduled reports
 

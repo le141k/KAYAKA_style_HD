@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import type { CreateFollowUpDto } from './dto';
 
@@ -29,12 +29,9 @@ export class FollowUpsService {
     });
   }
 
-  /** Mark a follow-up complete (or not), updating completedAt accordingly. */
-  async setCompleted(id: number, completed: boolean) {
-    const existing = await this.prisma.followUp.findUnique({ where: { id } });
-    if (!existing) {
-      throw new NotFoundException(`Follow-up ${id} not found`);
-    }
+  /** Mark a follow-up complete (or not). 404 if missing, 403 if not the owner. */
+  async setCompleted(id: number, completed: boolean, staffId: number) {
+    await this.assertOwned(id, staffId);
     return this.prisma.followUp.update({
       where: { id },
       data: {
@@ -44,13 +41,19 @@ export class FollowUpsService {
     });
   }
 
-  /** Delete a follow-up. */
-  async remove(id: number) {
-    const existing = await this.prisma.followUp.findUnique({ where: { id } });
-    if (!existing) {
-      throw new NotFoundException(`Follow-up ${id} not found`);
-    }
+  /** Delete a follow-up. 404 if missing, 403 if not the owner. */
+  async remove(id: number, staffId: number) {
+    await this.assertOwned(id, staffId);
     await this.prisma.followUp.delete({ where: { id } });
     return { deleted: true };
+  }
+
+  /** Ensure the follow-up exists and belongs to the acting staff member. */
+  private async assertOwned(id: number, staffId: number): Promise<void> {
+    const existing = await this.prisma.followUp.findUnique({ where: { id } });
+    if (!existing) throw new NotFoundException(`Follow-up ${id} not found`);
+    if (existing.staffId !== staffId) {
+      throw new ForbiddenException('You can only modify your own follow-ups');
+    }
   }
 }

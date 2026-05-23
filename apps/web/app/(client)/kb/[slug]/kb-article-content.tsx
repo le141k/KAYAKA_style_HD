@@ -5,10 +5,15 @@ import { ArrowLeft, Eye, Calendar } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useKBArticle } from '@/lib/hooks/use-kb';
+import { QueryError } from '@/components/QueryError';
 import { formatDate } from '@/lib/utils';
 
 export function KBArticleContent({ slug }: { slug: string }) {
-  const { data: article, isLoading } = useKBArticle(slug);
+  const { data: article, isLoading, isError, refetch } = useKBArticle(slug);
+
+  if (isError) {
+    return <QueryError message="Не удалось загрузить статью." onRetry={() => void refetch()} />;
+  }
 
   if (isLoading) {
     return (

@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { Ticket, Clock, CheckCircle2, AlertTriangle, Timer } from 'lucide-react';
 import { AnimatedStatCard } from '@/components/premium/AnimatedStatCard';
+import { QueryError } from '@/components/QueryError';
 import { TicketRow } from '@/components/premium/TicketRow';
 import { DashboardStatsSkeleton, TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
 import { useDashboardStats, useTickets } from '@/lib/hooks/use-tickets';
@@ -11,7 +12,7 @@ import { useI18n } from '@/lib/i18n';
 
 export function DashboardContent() {
   const { t } = useI18n();
-  const { data: stats, isLoading: statsLoading } = useDashboardStats();
+  const { data: stats, isLoading: statsLoading, isError: statsError, refetch } = useDashboardStats();
   const { data: tickets, isLoading: ticketsLoading } = useTickets({
     per_page: 5,
   });
@@ -32,7 +33,9 @@ export function DashboardContent() {
       </div>
 
       {/* Stats */}
-      {statsLoading || !stats ? (
+      {statsError ? (
+        <QueryError message="Не удалось загрузить метрики дашборда." onRetry={() => void refetch()} />
+      ) : statsLoading || !stats ? (
         <DashboardStatsSkeleton />
       ) : (
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4 xl:grid-cols-5">

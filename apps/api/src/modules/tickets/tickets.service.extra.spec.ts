@@ -908,6 +908,32 @@ describe('TicketsService (extra coverage)', () => {
       );
     });
 
+    it('recomputes SLA when a bulk status change reopens a resolved ticket', async () => {
+      fm().mockResolvedValue([{ id: 1, isResolved: true, slaPlanId: 3 }]);
+      (prisma.ticketStatus.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        markAsResolved: false,
+      });
+      const due = {
+        dueAt: new Date('2026-07-01T00:00:00Z'),
+        resolutionDueAt: new Date('2026-07-02T00:00:00Z'),
+      };
+      (slaMock.computeDueDates as ReturnType<typeof vi.fn>).mockResolvedValue(due);
+
+      await service.bulkAction({ ids: [1], action: 'status', statusId: 2 }, 7);
+
+      expect(slaMock.computeDueDates).toHaveBeenCalledWith(3, expect.any(Date));
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            isResolved: false,
+            wasReopened: true,
+            dueAt: due.dueAt,
+            resolutionDueAt: due.resolutionDueAt,
+          }),
+        }),
+      );
+    });
+
     it('assigns an owner to every id', async () => {
       fm().mockResolvedValue([{ id: 10, isResolved: false }]);
       const res = await service.bulkAction({ ids: [10], action: 'assignee', ownerStaffId: 5 }, 7);

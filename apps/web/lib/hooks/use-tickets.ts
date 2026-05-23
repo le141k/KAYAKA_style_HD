@@ -3,7 +3,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import type { Ticket, Reply, PaginatedResponse, DashboardStats, User, Department } from '@/lib/types';
-import { MOCK_TICKETS, MOCK_REPLIES, MOCK_STATS } from '@/lib/mock-data';
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
@@ -223,45 +222,32 @@ export function useTickets(params: TicketListParams = {}) {
   return useQuery({
     queryKey: ticketKeys.list(params as Record<string, unknown>),
     queryFn: async (): Promise<PaginatedResponse<Ticket>> => {
-      try {
-        const qs = new URLSearchParams();
-        qs.set('limit', String(params.per_page ?? 25));
-        if (params.page) qs.set('page', String(params.page));
-        if (params.q) qs.set('search', params.q);
-        if (params.department_id) qs.set('departmentId', String(params.department_id));
-        if (params.assignee_id) qs.set('ownerStaffId', String(params.assignee_id));
-        if (params.date_from) qs.set('createdAfter', params.date_from);
-        if (params.date_to) qs.set('createdBefore', params.date_to);
-        if (params.sort_by) qs.set('sortBy', params.sort_by);
-        if (params.sort_dir) qs.set('sortDir', params.sort_dir);
-        // SLA breach is now filtered server-side (correct totals across pages).
-        if (params.sla_breached) qs.set('sla_breached', 'true');
-        // Map slug filters → ids and push to the server (correct totals + paging).
-        if (params.status) {
-          const id = await statusIdForSlug(params.status);
-          if (id) qs.set('statusId', String(id));
-        }
-        if (params.priority) {
-          const id = await priorityIdForSlug(params.priority);
-          if (id) qs.set('priorityId', String(id));
-        }
-        const res = await api.get<{ data: ApiTicket[]; total: number }>(`/tickets?${qs}`);
-        const data = res.data.map(mapTicket);
-        return { data, total: res.total, page: params.page ?? 1, per_page: params.per_page ?? 25 };
-      } catch {
-        let data = [...MOCK_TICKETS];
-        if (params.status) data = data.filter((t) => t.status === params.status);
-        if (params.priority) data = data.filter((t) => t.priority === params.priority);
-        if (params.sla_breached) {
-          const now = Date.now();
-          data = data.filter((t) => t.sla_due_at && new Date(t.sla_due_at).getTime() < now);
-        }
-        if (params.q) {
-          const q = params.q.toLowerCase();
-          data = data.filter((t) => t.subject.toLowerCase().includes(q) || t.mask.toLowerCase().includes(q));
-        }
-        return { data, total: data.length, page: params.page ?? 1, per_page: params.per_page ?? 25 };
+      // No mock fallback: on API error the query rejects so the UI shows a real
+      // error state (never fake/empty data presented as real).
+      const qs = new URLSearchParams();
+      qs.set('limit', String(params.per_page ?? 25));
+      if (params.page) qs.set('page', String(params.page));
+      if (params.q) qs.set('search', params.q);
+      if (params.department_id) qs.set('departmentId', String(params.department_id));
+      if (params.assignee_id) qs.set('ownerStaffId', String(params.assignee_id));
+      if (params.date_from) qs.set('createdAfter', params.date_from);
+      if (params.date_to) qs.set('createdBefore', params.date_to);
+      if (params.sort_by) qs.set('sortBy', params.sort_by);
+      if (params.sort_dir) qs.set('sortDir', params.sort_dir);
+      // SLA breach is now filtered server-side (correct totals across pages).
+      if (params.sla_breached) qs.set('sla_breached', 'true');
+      // Map slug filters → ids and push to the server (correct totals + paging).
+      if (params.status) {
+        const id = await statusIdForSlug(params.status);
+        if (id) qs.set('statusId', String(id));
       }
+      if (params.priority) {
+        const id = await priorityIdForSlug(params.priority);
+        if (id) qs.set('priorityId', String(id));
+      }
+      const res = await api.get<{ data: ApiTicket[]; total: number }>(`/tickets?${qs}`);
+      const data = res.data.map(mapTicket);
+      return { data, total: res.total, page: params.page ?? 1, per_page: params.per_page ?? 25 };
     },
     staleTime: 30_000,
     enabled: params.enabled ?? true,
@@ -271,13 +257,7 @@ export function useTickets(params: TicketListParams = {}) {
 export function useTicket(id: number) {
   return useQuery({
     queryKey: ticketKeys.detail(id),
-    queryFn: async () => {
-      try {
-        return mapTicket(await api.get<ApiTicket>(`/tickets/${id}`));
-      } catch {
-        return MOCK_TICKETS.find((t) => t.id === id) ?? null;
-      }
-    },
+    queryFn: async () => mapTicket(await api.get<ApiTicket>(`/tickets/${id}`)),
     enabled: id > 0,
   });
 }
@@ -287,12 +267,8 @@ export function useReplies(ticketId: number) {
   return useQuery({
     queryKey: ticketKeys.replies(ticketId),
     queryFn: async () => {
-      try {
-        const t = await api.get<ApiTicket>(`/tickets/${ticketId}`);
-        return (t.posts ?? []).map(mapPostToReply);
-      } catch {
-        return MOCK_REPLIES.filter((r) => r.ticket_id === ticketId);
-      }
+      const t = await api.get<ApiTicket>(`/tickets/${ticketId}`);
+      return (t.posts ?? []).map(mapPostToReply);
     },
     enabled: ticketId > 0,
   });
@@ -359,7 +335,9 @@ export function useBulkTicketAction() {
         ownerStaffId: input.ownerStaffId,
       });
     },
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ticketKeys.lists() }),
+    // Invalidate ALL ticket queries (lists + any open ticket-detail) so a bulk
+    // change to a ticket that's currently open on screen refreshes too.
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ticketKeys.all }),
   });
 }
 
@@ -560,30 +538,27 @@ export function useDashboardStats() {
   return useQuery({
     queryKey: ticketKeys.stats,
     queryFn: async (): Promise<DashboardStats> => {
-      try {
-        const [dash, statuses] = await Promise.all([
-          api.get<{
-            total: number;
-            resolved: number;
-            slaBreached?: number;
-            avgFirstResponseMinutes?: number;
-            byStatus: { key: number; count: number }[];
-          }>('/reports/dashboard'),
-          api.get<ApiRef[]>('/ticket-statuses'),
-        ]);
-        const idToSlug = new Map(statuses.map((s) => [s.id, statusSlug(s.title)]));
-        const countBy = (slug: string) =>
-          dash.byStatus.filter((b) => idToSlug.get(b.key) === slug).reduce((a, b) => a + b.count, 0);
-        return {
-          open_tickets: countBy('open'),
-          pending_tickets: countBy('pending'),
-          resolved_today: dash.resolved,
-          sla_breached: dash.slaBreached ?? 0,
-          avg_first_response_minutes: dash.avgFirstResponseMinutes ?? 0,
-        };
-      } catch {
-        return MOCK_STATS;
-      }
+      // No mock fallback: errors propagate so the dashboard can show a real error.
+      const [dash, statuses] = await Promise.all([
+        api.get<{
+          total: number;
+          resolved: number;
+          slaBreached?: number;
+          avgFirstResponseMinutes?: number;
+          byStatus: { key: number; count: number }[];
+        }>('/reports/dashboard'),
+        api.get<ApiRef[]>('/ticket-statuses'),
+      ]);
+      const idToSlug = new Map(statuses.map((s) => [s.id, statusSlug(s.title)]));
+      const countBy = (slug: string) =>
+        dash.byStatus.filter((b) => idToSlug.get(b.key) === slug).reduce((a, b) => a + b.count, 0);
+      return {
+        open_tickets: countBy('open'),
+        pending_tickets: countBy('pending'),
+        resolved_today: dash.resolved,
+        sla_breached: dash.slaBreached ?? 0,
+        avg_first_response_minutes: dash.avgFirstResponseMinutes ?? 0,
+      };
     },
     staleTime: 60_000,
   });

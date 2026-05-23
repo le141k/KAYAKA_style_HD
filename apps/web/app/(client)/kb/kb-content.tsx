@@ -6,13 +6,19 @@ import { Search, BookOpen, Eye } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useKBCategories, useKBArticles } from '@/lib/hooks/use-kb';
+import { QueryError } from '@/components/QueryError';
 import { formatDate } from '@/lib/utils';
 
 export function KBContent() {
   const [query, setQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<number | undefined>();
   const { data: categories, isLoading: catLoading } = useKBCategories();
-  const { data: articles, isLoading: artLoading } = useKBArticles(selectedCategory, query || undefined);
+  const {
+    data: articles,
+    isLoading: artLoading,
+    isError: artError,
+    refetch: refetchArticles,
+  } = useKBArticles(selectedCategory, query || undefined);
 
   return (
     <div className="space-y-8">
@@ -62,7 +68,9 @@ export function KBContent() {
       {/* Articles */}
       <div>
         <h2 className="mb-4 text-lg font-semibold">{query ? `Результаты поиска: «${query}»` : 'Статьи'}</h2>
-        {artLoading ? (
+        {artError ? (
+          <QueryError message="Не удалось загрузить статьи." onRetry={() => void refetchArticles()} />
+        ) : artLoading ? (
           <div className="space-y-3">
             {Array.from({ length: 3 }).map((_, i) => (
               <Skeleton key={i} className="h-20 rounded-xl" />

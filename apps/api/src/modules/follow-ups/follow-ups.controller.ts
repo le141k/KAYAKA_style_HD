@@ -41,14 +41,15 @@ export class FollowUpsController {
   toggle(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(ToggleFollowUpSchema)) dto: ToggleFollowUpDto,
+    @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.followUpsService.setCompleted(id, dto.completed);
+    return this.followUpsService.setCompleted(id, dto.completed, staff.staffId);
   }
 
   @Delete('follow-ups/:id')
   @RequirePermissions(PERMISSIONS.TICKET_EDIT)
-  @ApiOperation({ summary: 'Delete a follow-up' })
-  remove(@Param('id', ParseIntPipe) id: number) {
-    return this.followUpsService.remove(id);
+  @ApiOperation({ summary: 'Delete a follow-up (owner only)' })
+  remove(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
+    return this.followUpsService.remove(id, staff.staffId);
   }
 }

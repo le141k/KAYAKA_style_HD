@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import type { LogTimeDto } from './dto';
 
@@ -33,10 +33,13 @@ export class TimeTrackingService {
     return { entries, totalMinutes };
   }
 
-  /** Delete a single time entry. 404 when it does not exist. */
-  async remove(id: number) {
+  /** Delete a single time entry. 404 if missing, 403 if not the owner. */
+  async remove(id: number, staffId: number) {
     const entry = await this.prisma.timeEntry.findUnique({ where: { id } });
     if (!entry) throw new NotFoundException(`TimeEntry ${id} not found`);
+    if (entry.staffId !== staffId) {
+      throw new ForbiddenException('You can only delete your own time entries');
+    }
     await this.prisma.timeEntry.delete({ where: { id } });
   }
 }

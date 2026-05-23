@@ -30,6 +30,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { TicketRow } from '@/components/premium/TicketRow';
 import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
 import { SavedViews } from '@/components/tickets/SavedViews';
+import { QueryError } from '@/components/QueryError';
 import {
   useTickets,
   useCreateTicket,
@@ -175,7 +176,7 @@ export function TicketsListContent() {
     setPage(1);
   }, [debouncedSearch, status, priority, slaBreached, departmentId, assigneeId, sort, perPage, dateRange]);
 
-  const { data, isLoading } = useTickets({
+  const { data, isLoading, isError, refetch } = useTickets({
     page,
     per_page: perPage,
     q: debouncedSearch || undefined,
@@ -543,6 +544,8 @@ export function TicketsListContent() {
       <div className="flex-1 overflow-y-auto p-6">
         {isLoading ? (
           <TicketListSkeleton count={8} />
+        ) : isError ? (
+          <QueryError message="Не удалось загрузить заявки." onRetry={() => void refetch()} />
         ) : tickets.length === 0 ? (
           <div className="flex h-48 flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
             <SlidersHorizontal className="h-8 w-8 opacity-30" />

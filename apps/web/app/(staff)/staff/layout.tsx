@@ -6,7 +6,6 @@ import { useRouter } from 'next/navigation';
 import { Menu, Loader2 } from 'lucide-react';
 import { SidebarNav } from '@/components/premium/SidebarNav';
 import { CommandPalette } from '@/components/premium/CommandPalette';
-import { NotificationBell } from '@/components/premium/NotificationBell';
 import { ThemeToggle } from '@/components/premium/ThemeToggle';
 import { LocaleSwitcher } from '@/components/premium/LocaleSwitcher';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
@@ -115,7 +114,9 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
           </Sheet>
           <LocaleSwitcher />
           <ThemeToggle />
-          <NotificationBell />
+          {/* NotificationBell intentionally removed: there is no real notifications
+              feed yet, and showing an always-empty mock would be a fake UI. Re-add
+              once a /notifications endpoint exists. */}
 
           {/* User menu */}
           <DropdownMenu>

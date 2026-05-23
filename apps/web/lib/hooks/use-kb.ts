@@ -3,7 +3,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import type { KBArticle, KBCategory, User } from '@/lib/types';
-import { MOCK_KB_ARTICLES, MOCK_KB_CATEGORIES } from '@/lib/mock-data';
 
 // ─── API response shapes (backend) → mapped to the frontend view models ───
 interface ApiCategory {
@@ -59,12 +58,8 @@ export function useKBCategories() {
   return useQuery({
     queryKey: ['kb', 'categories'],
     queryFn: async () => {
-      try {
-        const data = await api.get<ApiCategory[]>('/kb/categories');
-        return Array.isArray(data) && data.length > 0 ? data.map(mapCategory) : MOCK_KB_CATEGORIES;
-      } catch {
-        return MOCK_KB_CATEGORIES;
-      }
+      const data = await api.get<ApiCategory[]>('/kb/categories');
+      return data.map(mapCategory);
     },
     staleTime: 5 * 60_000,
   });
@@ -74,22 +69,12 @@ export function useKBArticles(categoryId?: number, q?: string) {
   return useQuery({
     queryKey: ['kb', 'articles', { categoryId, q }],
     queryFn: async () => {
-      try {
-        const params = new URLSearchParams();
-        if (categoryId) params.set('categoryId', String(categoryId));
-        if (q) params.set('q', q);
-        params.set('publishedOnly', 'true');
-        const res = await api.get<{ items: ApiArticle[] }>(`/kb/articles?${params}`);
-        return (res.items ?? []).map(mapArticle);
-      } catch {
-        let data = [...MOCK_KB_ARTICLES];
-        if (categoryId) data = data.filter((a) => a.category.id === categoryId);
-        if (q) {
-          const lq = q.toLowerCase();
-          data = data.filter((a) => a.title.toLowerCase().includes(lq));
-        }
-        return data;
-      }
+      const params = new URLSearchParams();
+      if (categoryId) params.set('categoryId', String(categoryId));
+      if (q) params.set('q', q);
+      params.set('publishedOnly', 'true');
+      const res = await api.get<{ items: ApiArticle[] }>(`/kb/articles?${params}`);
+      return (res.items ?? []).map(mapArticle);
     },
     staleTime: 5 * 60_000,
   });
@@ -98,13 +83,7 @@ export function useKBArticles(categoryId?: number, q?: string) {
 export function useKBArticle(slug: string) {
   return useQuery({
     queryKey: ['kb', 'article', slug],
-    queryFn: async () => {
-      try {
-        return mapArticle(await api.get<ApiArticle>(`/kb/articles/slug/${slug}`));
-      } catch {
-        return MOCK_KB_ARTICLES.find((a) => a.slug === slug) ?? null;
-      }
-    },
+    queryFn: async () => mapArticle(await api.get<ApiArticle>(`/kb/articles/slug/${slug}`)),
     enabled: !!slug,
   });
 }

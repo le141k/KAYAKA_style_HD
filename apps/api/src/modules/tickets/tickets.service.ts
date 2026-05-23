@@ -698,7 +698,7 @@ export class TicketsService {
     // batch); the resolved-status side effect is preserved inline.
     const existing = await this.prisma.ticket.findMany({
       where: { id: { in: dto.ids }, mergedIntoId: null },
-      select: { id: true, isResolved: true },
+      select: { id: true, isResolved: true, slaPlanId: true },
     });
     const existingIds = new Set(existing.map((t) => t.id));
     const failed = dto.ids.filter((id) => !existingIds.has(id));
@@ -725,8 +725,13 @@ export class TicketsService {
           if (status!.markAsResolved) {
             Object.assign(data, { isResolved: true, resolvedAt: now, dueAt: null, resolutionDueAt: null });
           } else if (t.isResolved) {
-            // Reopen on bulk status change away from a resolved state.
+            // Reopen on bulk status change away from a resolved state — recompute
+            // the SLA clock from now (parity with the single-ticket changeStatus).
             Object.assign(data, { isResolved: false, resolvedAt: null, reopenedAt: now, wasReopened: true });
+            if (t.slaPlanId) {
+              const due = await this.slaService.computeDueDates(t.slaPlanId, now);
+              Object.assign(data, { dueAt: due.dueAt, resolutionDueAt: due.resolutionDueAt });
+            }
           }
           action = 'STATUS';
           newValue = String(dto.statusId);
