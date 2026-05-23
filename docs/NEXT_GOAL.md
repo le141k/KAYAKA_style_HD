@@ -68,9 +68,16 @@
 
 ## P2 / P3
 
-- Custom field "number" type → 422 (add NUMBER to enum/map or remove); CF type label raw uppercase; CF field-edit + group-scope + staff-group CRUD UI; select-type options editor.
-- Watchers add/remove require TICKET_VIEW→TICKET_EDIT; watcher/ticket delete silent 204; flag endpoint; ticket-link CRUD; search post bodies; reply drafts; time-tracking; user/org notes; POP3; KQL expansion.
-- Kanban: 50-cap pagination, onDragLeave flicker, skeleton 4-vs-5; client reply no try/catch; non-numeric ticket id NaN→notFound; useSearchParams Suspense boundary; duplicate id="reply-textarea"; sla_breach template vars; auto-close wrong template; SlaProcessor/MailProcessor debug→info logging; pagination 3 shapes standardize; @ApiResponse schemas; JWT revocation lag (Redis jti blocklist); dead NewsModule/Troubleshooter wiring; attachment fake-progress deceives user.
+> ✅ CLEARED this pass (live-verified): CF **NUMBER** type (was 422); **reply drafts**;
+> **time-tracking**; **bulk-actions** (status/assignee); **saved ticket-list views**;
+> **follow-ups**; duplicate `id="reply-textarea"` fixed; React #418 hydration. Plus
+> round-2 SEC-1/SEC-2/PROD-1..5 (see above).
+
+Remaining (genuinely optional polish, no live blocker):
+
+- CF type label raw uppercase; CF field-edit + group-scope + staff-group CRUD UI; select-type options editor.
+- Watchers add/remove require TICKET_VIEW→TICKET_EDIT (done last pass); watcher/ticket delete silent 204; flag endpoint; ticket-link CRUD; search post bodies; user/org notes; POP3; KQL expansion.
+- Kanban: 50-cap pagination, onDragLeave flicker, skeleton 4-vs-5; client reply no try/catch; non-numeric ticket id NaN→notFound; useSearchParams Suspense boundary; sla_breach template vars; auto-close wrong template; SlaProcessor/MailProcessor debug→info logging; pagination 3 shapes standardize; @ApiResponse schemas; JWT revocation lag (Redis jti blocklist); dead NewsModule/Troubleshooter wiring; attachment fake-progress deceives user.
 
 ---
 
