@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { boolParamWithDefault } from '../../common/zod-bool.util';
 
 export const CreateCategorySchema = z.object({
   title: z.string().min(1),
@@ -22,7 +23,7 @@ export type UpdateArticleDto = z.infer<typeof UpdateArticleSchema>;
 export const ListArticlesSchema = z.object({
   q: z.string().optional(),
   categoryId: z.coerce.number().int().positive().optional(),
-  publishedOnly: z.coerce.boolean().default(false),
+  publishedOnly: boolParamWithDefault(false),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
 });

@@ -28,12 +28,19 @@ interface Department {
   title: string;
 }
 
-const PRIORITY_MAP: Record<string, number | undefined> = {
-  urgent: 1,
-  high: 2,
-  normal: 3,
-  low: 4,
-};
+/**
+ * Resolve a priority slug → its DB id dynamically via the public endpoint, so we
+ * never assume seed-order ids. (The old static map was inverted: it sent
+ * urgent→1, but on a clean DB id 1 is Low — so "Критический" became "Низкий".)
+ */
+async function resolvePriorityId(slug: string): Promise<number | undefined> {
+  try {
+    const priorities = await api.get<{ id: number; title: string }[]>('/ticket-priorities/public');
+    return priorities.find((p) => p.title.toLowerCase() === slug)?.id;
+  } catch {
+    return undefined;
+  }
+}
 
 const submitSchema = z.object({
   name: z.string().min(2, 'Введите имя'),
@@ -91,15 +98,17 @@ export function SubmitTicketForm() {
     }
     setCfErrors({});
     try {
+      // CL-6: map priority slug → numeric priorityId dynamically (no seed-order assumptions).
+      const priorityId = await resolvePriorityId(data.priority);
       const ticket = await createTicket.mutateAsync({
         subject: data.subject,
         contents: data.body,
         requesterName: data.name,
         requesterEmail: data.email,
         departmentId: data.department_id ? parseInt(data.department_id) : undefined,
-        // CL-6: wire priority slug → numeric priorityId (cast needed because PublicTicketInput
-        // does not declare priorityId; value is still forwarded to the API at runtime)
-        ...({ priorityId: PRIORITY_MAP[data.priority] } as object),
+        // cast needed because PublicTicketInput does not declare priorityId; the
+        // value is still forwarded to the API at runtime.
+        ...({ priorityId } as object),
         ...(Object.keys(cfPayload).length ? { customFields: cfPayload } : {}),
         ...(attachmentIds.length ? { attachmentIds } : {}),
       } as Parameters<typeof createTicket.mutateAsync>[0]);

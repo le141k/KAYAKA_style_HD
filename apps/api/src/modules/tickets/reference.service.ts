@@ -62,6 +62,14 @@ export class ReferenceService {
     return this.prisma.ticketPriority.findMany({ orderBy: { displayOrder: 'asc' } });
   }
 
+  /** Public projection (id + title only) for the client portal priority picker. */
+  listPrioritiesPublic(): Promise<{ id: number; title: string }[]> {
+    return this.prisma.ticketPriority.findMany({
+      select: { id: true, title: true },
+      orderBy: { displayOrder: 'asc' },
+    });
+  }
+
   async createPriority(dto: CreatePriorityDto): Promise<TicketPriority> {
     return this.prisma.ticketPriority.create({ data: dto });
   }

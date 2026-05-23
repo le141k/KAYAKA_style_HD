@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { optionalBoolParam } from '../../common/zod-bool.util';
 
 export const CreateStaffGroupSchema = z.object({
   title: z.string().min(1).max(100),
@@ -48,6 +49,6 @@ export const ListStaffQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(100).default(20),
   groupId: z.coerce.number().int().positive().optional(),
   search: z.string().optional(),
-  enabled: z.coerce.boolean().optional(),
+  enabled: optionalBoolParam(),
 });
 export type ListStaffQueryDto = z.infer<typeof ListStaffQuerySchema>;

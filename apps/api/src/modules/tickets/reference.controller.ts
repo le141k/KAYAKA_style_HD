@@ -20,7 +20,7 @@ import {
   type CreatePriorityDto,
   type CreateTypeDto,
 } from './reference.service';
-import { RequirePermissions } from '../../auth/auth.decorators';
+import { RequirePermissions, Public } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 
@@ -70,6 +70,15 @@ export class ReferenceController {
   @ApiOperation({ summary: 'List ticket priorities' })
   listPriorities() {
     return this.refService.listPriorities();
+  }
+
+  // Public list (id + title) so the unauthenticated client portal can map a
+  // chosen priority slug → id dynamically (no hardcoded seed-order assumptions).
+  @Public()
+  @Get('ticket-priorities/public')
+  @ApiOperation({ summary: 'List ticket priorities (public, id + title)' })
+  listPrioritiesPublic() {
+    return this.refService.listPrioritiesPublic();
   }
 
   @Post('ticket-priorities')

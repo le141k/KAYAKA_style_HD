@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { optionalBoolParam } from '../../common/zod-bool.util';
 
 // ─────────────────── create ───────────────────
 
@@ -111,13 +112,13 @@ export const ListTicketsQuerySchema = z.object({
   typeId: z.coerce.number().int().positive().optional(),
   ownerStaffId: z.coerce.number().int().positive().optional(),
   /** When true, list only unassigned tickets */
-  unassigned: z.coerce.boolean().optional(),
+  unassigned: optionalBoolParam(),
   /** When true, list only SLA-breached tickets (unresolved + dueAt in the past). */
-  sla_breached: z.coerce.boolean().optional(),
+  sla_breached: optionalBoolParam(),
   search: z.string().optional(),
   /** Filter by requester user id */
   userId: z.coerce.number().int().positive().optional(),
-  isResolved: z.coerce.boolean().optional(),
+  isResolved: optionalBoolParam(),
   /** Filter by createdAt range (ISO timestamps) */
   createdAfter: z.coerce.date().optional(),
   createdBefore: z.coerce.date().optional(),

@@ -49,7 +49,17 @@ export function TicketRow({ ticket, href, selected, onSelect }: TicketRowProps) 
 
         {/* Subject */}
         <div className="min-w-0 flex-1">
-          <p className="truncate font-medium group-hover:text-primary">{ticket.subject}</p>
+          <div className="flex items-center gap-1.5">
+            <p className="truncate font-medium group-hover:text-primary">{ticket.subject}</p>
+            {ticket.tags?.slice(0, 3).map((tag) => (
+              <span
+                key={tag}
+                className="hidden flex-shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground sm:inline"
+              >
+                {tag}
+              </span>
+            ))}
+          </div>
           {ticket.department && (
             <p className="truncate text-xs text-muted-foreground">{ticket.department.name}</p>
           )}

@@ -6,6 +6,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { TicketsService } from './tickets.service';
+import { ListTicketsQuerySchema } from './dto';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { UsersService } from '../users/users.service';
 import type { SlaService } from '../sla/sla.service';
@@ -968,6 +969,24 @@ describe('TicketsService (extra coverage)', () => {
       expect(arg.where.dueAt).toHaveProperty('lt');
       // tags are included so the list can render them (were undefined before).
       expect(arg.include.tags).toEqual({ select: { name: true } });
+    });
+
+    it('sla_breached=false does NOT apply the breach filter', async () => {
+      (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+
+      // The schema parses 'false' → false (not the z.coerce.boolean footgun);
+      // listTickets must then leave the breach where-clause off.
+      const parsed = ListTicketsQuerySchema.parse({ sla_breached: 'false' });
+      expect(parsed.sla_breached).toBe(false);
+
+      await service.listTickets(parsed);
+
+      const arg = (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        where: Record<string, unknown>;
+      };
+      // No SLA narrowing: dueAt absent, and isResolved not forced to false by the breach path.
+      expect(arg.where.dueAt).toBeUndefined();
     });
   });
 });

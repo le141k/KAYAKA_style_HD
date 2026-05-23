@@ -28,14 +28,20 @@
 
 ---
 
-## P1 — functional bugs, fix first (all CONFIRMED open)
+## ✅ DONE in 5a059ac + 82ad9f8 (verified live by audit) — do NOT re-touch
 
-- **[P1][LIVE] BUG-001 — priority dropped on public submit.** `POST /tickets/public` with `priorityId:4` → ticket gets `priorityId:1`. `PublicCreateTicketSchema` has no `priorityId`; Zod strips it. **Fix:** add `priorityId?` to schema (`apps/api/src/modules/tickets/dto.ts:137-146`) + pass through controller; expose on `PublicTicketInput` (`use-tickets.ts:368-374`, `submit-form.tsx:102`).
-- **[P1][LIVE] BUG-002 — agents can't assign or apply macros.** Agent `GET /staff`→403 and `GET /admin/macros`→403; the assignee dropdown + macro picker (and the **bulk-assign** dropdown) are empty for the primary role. **Fix:** add an assignable-staff endpoint gated by `ticket.assign` and a staff-readable macros endpoint; repoint `useStaffOptions`/`useMacroOptions` (`use-tickets.ts:~513,443`).
-- **[P1][CODE] Macros are hollow (BUG-007/008/009).** `Macro.isShared` not in schema/DTO → silently lossy (`schema.prisma` Macro, `workflow/dto.ts:30-39`); macro dialog has **no replyText textarea and no action builder** (`workflows-content.tsx:609-649`) → UI macros do nothing; workflow `send_email` action is a **no-op** (`workflow.executor.ts:163-165`). Macros/automations are non-functional from the UI.
-- **[P1][LIVE] Bulk actions: silent partial failure, no transaction.** `[1,999999]` → `{updated:1}` with no failed-ids reported; loop swallows errors, no atomicity, N+1 (`tickets.service.ts:683-698`). **Fix:** `$transaction` or return `{updated, failed:[]}`; add UI loading/disable to prevent double-submit; add bulk-**unassign** option.
-- **[P1][LIVE] `sla_breached` list filter is client-side only** → wrong counter + broken pagination across pages (`use-tickets.ts:251-254`; no `slaBreached` in `ListTicketsQuerySchema`). Push to the server query.
-- **[P1][CODE] Ticket list omits tags** — `listTickets` has no `include:{tags}`, so every row's `tags` is `undefined` (`tickets.service.ts:441-459`).
+- BUG-001 priorityId now flows to public submit; BUG-002 `/staff/assignable` + `/admin/macros/options` (agent→200, full routes still 403); macros `isShared` column + set_status fallback + `send_email` wired; KB typography; client reopen-on-reply; **bulk** `$transaction` + `{updated,failed[]}` + unassign (live `{updated:2,failed:[99999]}`); **sla_breached** server-side (accurate totals); **listTickets include tags**; e2e 33/33 (clean window); lint 0; vitest **482/482**.
+
+## P1 — fix first (found during verification)
+
+- **[P1][LIVE] 🔴 CRITICAL — `PRIORITY_MAP` inverted on public submit.** DB priorities are id1=Low,2=Normal,3=High,4=Urgent, but `submit-form.tsx:31` maps `urgent→1, high→2, normal→3, low→4`. So a client choosing **«Критический» gets Low**, «Низкий» gets Urgent — **100% of public tickets get the wrong priority** (this silently negates the BUG-001 fix at the UI layer). **Fix:** map `urgent:4, high:3, normal:2, low:1` — or better, drop the static map and use the dynamic `priorityIdForSlug` lookup (staff side already does, `use-tickets.ts:217`). Add a test asserting urgent→Urgent.
+- **[P1][LIVE] `z.coerce.boolean()` footgun (flagged but NOT fixed).** `z.coerce.boolean("false")` → `true`. Confirmed live: `?sla_breached=false` returns 0 (filters as if true). Affects `sla_breached`,`unassigned`,`isResolved` (`tickets/dto.ts:114-120`), `publishedOnly` (`knowledgebase/dto.ts:25`), `enabled` (`staff/dto.ts:51`). Web UI only sends `true`/omits so users are unaffected today, but any API caller gets inverted semantics. **Fix:** copy the explicit `preprocess` pattern from `configuration.ts:17-22`.
+- **[P1][CODE] Scheduled reports are dead** — `createSchedule` never sets `nextRunAt` (NULL), and the processor filters `nextRunAt <= now` (NULL never matches) → no schedule ever fires (`reports.service.ts:173`, `report-schedule.processor.ts:49`). Manual run works. **Fix:** compute `nextRunAt` from cron on create + real cron-parse in `advanceNextRunAt`.
+
+## P1.5 — caveats from the 82ad9f8 fixes (close soon)
+
+- **[LIVE] Bulk bypasses SLA recalculation + events** (raw `tx.ticket.update`, intentional "no spam") → SLA `dueAt` not recomputed on bulk reopen; bulk-assign requires only `TICKET_EDIT` (single-assign needs `TICKET_ASSIGN`); web doesn't invalidate open ticket-detail queries after bulk. `tickets.service.ts:694-754`.
+- **[CODE] Tags fetched but not rendered** — `listTickets` now returns tags, but `TicketRow.tsx` never displays them → still invisible in the list. Render them.
 
 ## P2 — correctness / security gaps
 
