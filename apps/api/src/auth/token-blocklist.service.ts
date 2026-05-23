@@ -16,6 +16,9 @@ const KEY_PREFIX = 'th:revoked:'; // th:revoked:<jti> = "1" with TTL = remaining
 export class TokenBlocklistService implements OnModuleDestroy {
   private readonly logger = new Logger(TokenBlocklistService.name);
   private readonly redis: Redis;
+  /** Throttle the fail-open bypass alert so a Redis outage doesn't flood logs. */
+  private lastBypassAlertAt = 0;
+  private static readonly BYPASS_ALERT_INTERVAL_MS = 30_000;
 
   constructor(@Inject(APP_CONFIG) config: AppConfig) {
     this.redis = new Redis(config.REDIS_URL, {
@@ -42,14 +45,30 @@ export class TokenBlocklistService implements OnModuleDestroy {
     }
   }
 
-  /** True if the jti was revoked. Fail-open (false) when Redis is unavailable. */
+  /**
+   * True if the jti was revoked. Fail-open (false) when Redis is unavailable — but
+   * emit a throttled ERROR so the "Redis down → token revocation is bypassed"
+   * window is observable (alert/metric hook), not silent.
+   */
   async isBlocked(jti: string | undefined): Promise<boolean> {
     if (!jti) return false;
     try {
       return (await this.redis.exists(`${KEY_PREFIX}${jti}`)) === 1;
-    } catch {
+    } catch (err) {
+      this.alertRevocationBypass(err);
       return false;
     }
+  }
+
+  /** Log (at most once per interval) that revocation checks are being bypassed. */
+  private alertRevocationBypass(err: unknown): void {
+    const now = Date.now();
+    if (now - this.lastBypassAlertAt < TokenBlocklistService.BYPASS_ALERT_INTERVAL_MS) return;
+    this.lastBypassAlertAt = now;
+    this.logger.error(
+      `SECURITY: token revocation check failed — Redis unreachable, fail-open BYPASS active ` +
+        `(revoked access tokens are accepted until their ~15-min TTL expires): ${String(err)}`,
+    );
   }
 
   async onModuleDestroy(): Promise<void> {

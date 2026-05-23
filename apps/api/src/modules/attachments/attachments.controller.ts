@@ -1,4 +1,5 @@
 import {
+  Body,
   Controller,
   Get,
   Inject,
@@ -12,14 +13,21 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
+import { Throttle } from '@nestjs/throttler';
 import { Response } from 'express';
 import { memoryStorage } from 'multer';
+import { randomUUID } from 'crypto';
 import type { Request } from 'express';
 import { APP_CONFIG, AppConfig } from '../../config/configuration';
 import { Public, RequirePermissions } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { AttachmentsService } from './attachments.service';
 import { StorageService } from './storage.service';
+
+// Anon upload throttle — mirrors the public submit limit so an unauthenticated
+// caller cannot flood storage. Env-overridable (e2e/dev raise it for determinism).
+const PUBLIC_UPLOAD_LIMIT = Number(process.env['TELECOM_HD_PUBLIC_UPLOAD_LIMIT']) || 5;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** MIME types accepted by the upload endpoints. */
 const ALLOWED_MIMES = new Set([
@@ -105,11 +113,20 @@ export class AttachmentsController {
     };
   }
 
-  /** Public upload endpoint (no authentication): up to 5 files, orphan rows. */
+  /**
+   * Public upload endpoint (no authentication): up to 5 files, orphan rows.
+   * Throttled (anon storage-abuse/DoS). Returns a per-upload `claimToken` that the
+   * subsequent public ticket submit / reply must echo back — so a caller cannot
+   * adopt orphan attachments uploaded by someone else (IDOR).
+   */
   @Post('upload/public')
   @Public()
+  @Throttle({ default: { limit: PUBLIC_UPLOAD_LIMIT, ttl: 60000 } })
   @UseInterceptors(FilesInterceptor('files', 5, buildMulterOpts(25)))
-  async uploadPublic(@UploadedFiles() files: Express.Multer.File[]): Promise<{ attachmentIds: number[] }> {
+  async uploadPublic(
+    @UploadedFiles() files: Express.Multer.File[],
+    @Body('claimToken') bodyClaimToken?: string,
+  ): Promise<{ attachmentIds: number[]; claimToken: string }> {
     if (!files?.length) throw new BadRequestException('No files provided');
 
     const maxSizeMb = this.config.TELECOM_HD_UPLOAD_MAX_SIZE_MB;
@@ -119,6 +136,9 @@ export class AttachmentsController {
       }
     }
 
+    // The client may supply one token to bind several per-file uploads to a single
+    // submit. Accept only a well-formed UUID; otherwise mint our own.
+    const claimToken = UUID_RE.test(bodyClaimToken ?? '') ? (bodyClaimToken as string) : randomUUID();
     const attachments = await this.attachmentsService.uploadFiles(
       files.map((f) => ({
         originalname: f.originalname,
@@ -126,9 +146,10 @@ export class AttachmentsController {
         size: f.size,
         buffer: f.buffer,
       })),
+      { claimToken },
     );
 
-    return { attachmentIds: attachments.map((a) => a.id) };
+    return { attachmentIds: attachments.map((a) => a.id), claimToken };
   }
 
   /**

@@ -21,6 +21,11 @@ interface FileUploadZoneProps {
   uploadEndpoint?: string;
   /** Called when files are successfully uploaded; receives the DB attachment ids */
   onUploaded?: (ids: number[]) => void;
+  /**
+   * Per-session orphan-claim secret sent with each public upload. Bind orphan
+   * attachments to the submit that follows so they can't be adopted by others.
+   */
+  claimToken?: string;
   accept?: string;
   maxSizeMb?: number;
   maxFiles?: number;
@@ -31,6 +36,7 @@ export function FileUploadZone({
   onFiles,
   uploadEndpoint,
   onUploaded,
+  claimToken,
   accept = '*',
   maxSizeMb = 25,
   maxFiles = 10,
@@ -62,6 +68,8 @@ export function FileUploadZone({
 
       const formData = new FormData();
       formData.append('files', upload.file);
+      // Bind anonymous orphan uploads to this submit session (server scopes adoption).
+      if (claimToken) formData.append('claimToken', claimToken);
 
       // Auth travels via the HttpOnly cookie (credentials:'include'); no Bearer
       // header — the JWT is never exposed to JS. Do NOT set Content-Type manually:
@@ -100,7 +108,7 @@ export function FileUploadZone({
         );
       }
     },
-    [uploadEndpoint, onUploaded],
+    [uploadEndpoint, onUploaded, claimToken],
   );
 
   const processFiles = useCallback(

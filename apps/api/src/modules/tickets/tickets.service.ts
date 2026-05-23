@@ -35,9 +35,25 @@ export interface TicketDetail extends Ticket {
   tags: Array<{ name: string }>;
 }
 
+/**
+ * A client-safe post. Internal/PII fields (staff `email`, `ipAddress`, `staffId`,
+ * `messageId`, edit audit) are NEVER projected onto the public ticket view.
+ */
+export interface PublicTicketPost {
+  id: number;
+  ticketId: number;
+  authorType: ActorType;
+  userId: number | null;
+  fullName: string;
+  contents: string;
+  isHtml: boolean;
+  createdAt: Date;
+  attachments: { id: number; fileName: string; size: number; mimeType: string }[];
+}
+
 /** Public ticket view — posts only, no notes. */
 export interface PublicTicketDetail extends Ticket {
-  posts: TicketPost[];
+  posts: PublicTicketPost[];
   status: { id: number; title: string } | null;
   priority: { id: number; title: string } | null;
   department: { id: number; title: string } | null;
@@ -70,7 +86,10 @@ export class TicketsService {
 
   // ─────────────────────────── Create ───────────────────────────
 
-  async createTicket(dto: CreateTicketDto, creatorStaffId?: number): Promise<Ticket> {
+  async createTicket(
+    dto: CreateTicketDto & { attachmentClaimToken?: string },
+    creatorStaffId?: number,
+  ): Promise<Ticket> {
     // Validate custom fields against TICKET scope definitions
     if (dto.customFields && typeof dto.customFields === 'object') {
       await this.adminService.validateCustomFields('TICKET', dto.customFields as Record<string, unknown>);
@@ -180,7 +199,12 @@ export class TicketsService {
         orderBy: { id: 'asc' },
       });
       if (firstPost) {
-        await this.attachmentsService.linkToPost(dto.attachmentIds, firstPost.id, ticket.id);
+        await this.attachmentsService.linkToPost(
+          dto.attachmentIds,
+          firstPost.id,
+          ticket.id,
+          dto.attachmentClaimToken,
+        );
         await this.prisma.ticket.update({ where: { id: ticket.id }, data: { hasAttachments: true } });
       }
     }
@@ -286,9 +310,21 @@ export class TicketsService {
         owner: { select: { id: true, firstName: true, lastName: true } },
         // Narrow select — NEVER expose passwordHash or other sensitive user fields
         user: { select: PUBLIC_USER_SELECT },
-        // Only posts (USER/STAFF replies) — notes are intentionally excluded
+        // Only posts (USER/STAFF replies) — notes are intentionally excluded.
+        // Narrow select: NEVER expose staff email/ipAddress or internal audit fields.
         posts: {
           orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            ticketId: true,
+            authorType: true,
+            userId: true,
+            fullName: true,
+            contents: true,
+            isHtml: true,
+            createdAt: true,
+            attachments: { select: { id: true, fileName: true, size: true, mimeType: true } },
+          },
         },
         tags: { select: { name: true } },
       },
@@ -371,7 +407,12 @@ export class TicketsService {
     // Link attachment orphans to the new post
     const hasPublicAttachments = !!(dto.attachmentIds?.length && this.attachmentsService);
     if (hasPublicAttachments && this.attachmentsService) {
-      await this.attachmentsService.linkToPost(dto.attachmentIds!, post.id, ticketId);
+      await this.attachmentsService.linkToPost(
+        dto.attachmentIds!,
+        post.id,
+        ticketId,
+        dto.attachmentClaimToken,
+      );
     }
 
     // Reopen the ticket if it was resolved — a customer reply must re-surface it

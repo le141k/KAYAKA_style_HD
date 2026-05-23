@@ -57,6 +57,11 @@ export function SubmitTicketForm() {
   const [successMask, setSuccessMask] = useState<string | null>(null);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [attachmentIds, setAttachmentIds] = useState<number[]>([]);
+  // One orphan-claim secret per form session: the server scopes orphan adoption to
+  // it so uploaded files can only be attached to THIS submit (not stolen by others).
+  const [claimToken] = useState(() =>
+    typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : '',
+  );
 
   // TICKET-scope custom fields (public, read-only) + their collected values.
   const { fields: customFields } = useCustomFields('TICKET');
@@ -110,7 +115,7 @@ export function SubmitTicketForm() {
         // value is still forwarded to the API at runtime.
         ...({ priorityId } as object),
         ...(Object.keys(cfPayload).length ? { customFields: cfPayload } : {}),
-        ...(attachmentIds.length ? { attachmentIds } : {}),
+        ...(attachmentIds.length ? { attachmentIds, attachmentClaimToken: claimToken } : {}),
       } as Parameters<typeof createTicket.mutateAsync>[0]);
       // CL-3: persist the email so "Мои заявки" can filter by it
       if (typeof window !== 'undefined') {
@@ -250,6 +255,7 @@ export function SubmitTicketForm() {
         <Label>Вложения (необязательно)</Label>
         <FileUploadZone
           uploadEndpoint="/attachments/upload/public"
+          claimToken={claimToken}
           onUploaded={(ids) => setAttachmentIds((prev) => [...prev, ...ids])}
           accept="image/*,.pdf,.txt,.log,.pcap"
           maxSizeMb={25}

@@ -25,7 +25,7 @@ export class AttachmentsService {
    */
   async uploadFiles(
     files: UploadFileInput[],
-    ctx: { ticketId?: number; postId?: number } = {},
+    ctx: { ticketId?: number; postId?: number; claimToken?: string } = {},
   ): Promise<Attachment[]> {
     // TODO (P1): ClamAV scan
     const results: Attachment[] = [];
@@ -43,6 +43,7 @@ export class AttachmentsService {
           size: file.size,
           sha1,
           storageKey,
+          claimToken: ctx.claimToken ?? null,
         },
       });
 
@@ -56,18 +57,27 @@ export class AttachmentsService {
   /**
    * Link orphan attachment rows (postId IS NULL) to a specific post and ticket.
    * Called after the post is created, with the ids the client sent back.
+   *
+   * For ANONYMOUS uploads, pass the `claimToken` returned by the public upload:
+   * adoption is then scoped to orphans bearing that exact token, so a public
+   * submitter cannot adopt another submitter's orphan by guessing ids (IDOR).
+   * The token is cleared on adoption so it cannot be replayed. Authenticated
+   * staff callers omit the token (the route guard already scopes them).
    */
-  async linkToPost(ids: number[], postId: number, ticketId: number): Promise<void> {
+  async linkToPost(ids: number[], postId: number, ticketId: number, claimToken?: string): Promise<void> {
     if (!ids.length) return;
 
     await this.prisma.attachment.updateMany({
       where: {
         id: { in: ids },
         postId: null, // only adopt orphans
+        // Anonymous path: require the matching per-upload secret.
+        ...(claimToken ? { claimToken } : {}),
       },
       data: {
         postId,
         ticketId,
+        claimToken: null, // consume the token so it can't be replayed
       },
     });
   }

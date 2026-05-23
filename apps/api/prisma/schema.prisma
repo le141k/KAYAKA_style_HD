@@ -413,10 +413,15 @@ model Attachment {
   size       Int         @default(0)
   sha1       String      @default("")
   storageKey String                       // path/key in object store or disk
+  // Per-upload secret for anonymous orphan uploads. The public submit/reply must
+  // echo it back to adopt these orphans (prevents cross-submitter IDOR). Cleared
+  // once the rows are linked to a post.
+  claimToken String?
   createdAt  DateTime    @default(now())
 
   @@index([ticketId])
   @@index([postId])
+  @@index([claimToken])
 }
 
 model TicketWatcher {

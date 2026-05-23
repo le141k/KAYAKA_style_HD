@@ -17,6 +17,7 @@ function makeAttachment(overrides: Partial<Attachment> = {}): Attachment {
     size: 1024,
     sha1: 'abc123',
     storageKey: 'orphan/uuid-test.pdf',
+    claimToken: null,
     createdAt: new Date(),
     ...overrides,
   };
@@ -106,19 +107,47 @@ describe('AttachmentsService', () => {
 
       expect(storage.write).toHaveBeenCalledWith('tickets/42', 'file.txt', expect.any(Buffer));
     });
+
+    it('SEC-6: persists the claimToken on anonymous orphan uploads', async () => {
+      (prisma.attachment.create as ReturnType<typeof vi.fn>).mockResolvedValue(makeAttachment());
+
+      await service.uploadFiles(
+        [{ originalname: 'a.pdf', mimetype: 'application/pdf', size: 10, buffer: Buffer.from('x') }],
+        { claimToken: 'tok-xyz' },
+      );
+
+      expect(prisma.attachment.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ claimToken: 'tok-xyz' }) }),
+      );
+    });
   });
 
   // ─── linkToPost ────────────────────────────────────────────────────────────
 
   describe('linkToPost', () => {
-    it('updates orphan attachments with postId and ticketId', async () => {
+    it('updates orphan attachments with postId and ticketId (staff path: no token scope)', async () => {
       (prisma.attachment.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 2 });
 
       await service.linkToPost([1, 2], 99, 10);
 
       expect(prisma.attachment.updateMany).toHaveBeenCalledWith({
+        // No claimToken in the where → authenticated callers adopt by id+orphan only.
         where: { id: { in: [1, 2] }, postId: null },
-        data: { postId: 99, ticketId: 10 },
+        // Token is always cleared on adoption so it can't be replayed.
+        data: { postId: 99, ticketId: 10, claimToken: null },
+      });
+    });
+
+    it('SEC-6: scopes orphan adoption to the matching claimToken (anon path)', async () => {
+      (prisma.attachment.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+      await service.linkToPost([1, 2], 99, 10, 'tok-abc');
+
+      // The where MUST include the per-upload secret so a public submitter cannot
+      // adopt another submitter's orphan attachment by guessing ids (IDOR).
+      expect(prisma.attachment.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: [1, 2] }, postId: null, claimToken: 'tok-abc' },
+        data: { postId: 99, ticketId: 10, claimToken: null },
       });
     });
 

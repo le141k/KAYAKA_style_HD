@@ -152,6 +152,8 @@ export const PublicCreateTicketSchema = z.object({
   typeId: z.number().int().positive().optional(),
   customFields: z.record(z.unknown()).default({}),
   attachmentIds: z.array(z.number().int().positive()).optional(),
+  /** Per-upload secret from POST /attachments/upload/public — scopes orphan adoption. */
+  attachmentClaimToken: z.string().uuid().optional(),
 });
 export type PublicCreateTicketDto = z.infer<typeof PublicCreateTicketSchema>;
 
@@ -162,6 +164,8 @@ export const PublicReplySchema = z.object({
   /** The requester's email — used to attribute the post to the right user. */
   requesterEmail: z.string().email().optional(),
   attachmentIds: z.array(z.number().int().positive()).optional(),
+  /** Per-upload secret from POST /attachments/upload/public — scopes orphan adoption. */
+  attachmentClaimToken: z.string().uuid().optional(),
 });
 export type PublicReplyDto = z.infer<typeof PublicReplySchema>;
 

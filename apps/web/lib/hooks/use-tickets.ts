@@ -348,6 +348,9 @@ export interface PublicTicketInput {
   requesterEmail: string;
   requesterName?: string;
   departmentId?: number;
+  attachmentIds?: number[];
+  /** Per-upload secret echoed from POST /attachments/upload/public (orphan-claim scope). */
+  attachmentClaimToken?: string;
 }
 
 export function useSubmitPublicTicket() {

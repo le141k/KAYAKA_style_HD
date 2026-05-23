@@ -427,6 +427,35 @@ describe('TicketsService — public endpoints', () => {
       await expect(service.getPublicTicket(1, 'mallory@evil.com')).rejects.toThrow(NotFoundException);
     });
 
+    it('SEC-3b: posts use a narrow select that omits staff email / ipAddress', async () => {
+      const ticket = makeTicket();
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...ticket,
+        posts: [],
+        status: null,
+        priority: null,
+        department: null,
+        owner: null,
+        user: null,
+        tags: [],
+      });
+
+      await service.getPublicTicket(1, 'alice@example.com');
+
+      const callArg = (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
+        include?: { posts?: { select?: Record<string, unknown> } };
+      };
+      const postsSelect = callArg.include!.posts!.select!;
+      // Client-facing fields are allowed; internal/PII fields must NOT be projected.
+      expect(postsSelect).toBeDefined();
+      expect(postsSelect['contents']).toBe(true);
+      expect(postsSelect['fullName']).toBe(true);
+      expect(postsSelect['email']).toBeUndefined();
+      expect(postsSelect['ipAddress']).toBeUndefined();
+      expect(postsSelect['staffId']).toBeUndefined();
+      expect(postsSelect['messageId']).toBeUndefined();
+    });
+
     it('selects only non-sensitive user fields (never passwordHash)', async () => {
       const ticket = makeTicket();
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({

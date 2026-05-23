@@ -46,6 +46,15 @@ rewritten at commit 31add8e). After this, the product is honestly hand-to-a-real
 - [x] **BUILD-2** New `prod-deps` stage (`npm ci --omit=dev`); runner copies that node_modules + the build-stage generated Prisma client. **vitest/eslint/testcontainers gone from the runtime image; api boots, migrate+seed run, upload → 201.** Image 1.85 → 1.59 GB. (Residual tsc/playwright are hoisted transitive prod deps of the workspace; the test toolchain itself is removed.)
 - **Acceptance:** api boots under --omit=dev; upload works; `make verify` GREEN. ✅
 
+## ✅ Batch H5 — Security follow-up (DONE — found auditing committed H1)
+
+- [x] 🔴 **SEC-3b** `getPublicTicket` pulled `posts` with **no select** → staff `email` + `ipAddress` + `staffId` leaked to the client. Added a narrow `select` (id, ticketId, authorType, userId, fullName, contents, isHtml, createdAt, attachments{id,fileName,size,mimeType}) + a `PublicTicketPost` type. **Live: post keys = [attachments,authorType,contents,createdAt,fullName,id,isHtml,ticketId,userId]; email/ipAddress/staffId absent.**
+- [x] 🔴 **SEC-5** `POST /attachments/upload/public` now `@Throttle`d (`PUBLIC_UPLOAD_LIMIT`, default 5/60s). **Live: 3×201 → then 429.**
+- [x] 🟠 **SEC-1b** Client cannot download its own attachments today (portal renders no download links). → **Documented as Phase 2** (owner/email-scoped public download). No code now.
+- [x] 🟠 **SEC-6** `linkToPost` orphan-adoption IDOR closed: anonymous uploads bind to a per-upload `claimToken` (client-generated UUID, one per submit session, sent as a form field; server validates/mints). Adoption requires the matching token, then clears it (no replay). Staff path (authenticated) unchanged. **Live: matching token → attachment adopted; wrong token → adopted set EMPTY.** New nullable `Attachment.claimToken` column + migration.
+- [x] 🟠 **SEC-2b** jti blocklist stays fail-open but now emits a **throttled ERROR** ("Redis unreachable, fail-open BYPASS active") so the revocation-bypass window is observable (alert/metric hook); ≤1 log / 30s to avoid flooding.
+- **Acceptance:** all 4 security repros blocked live; api vitest +6 (controller throttle/claimToken, linkToPost token-scope, uploadFiles token, public-posts select); `make verify` GREEN 9/9; e2e 37/37. ✅
+
 ---
 
 ## ✅ Definition of Done — ALL GREEN
@@ -59,4 +68,4 @@ rewritten at commit 31add8e). After this, the product is honestly hand-to-a-real
 
 ## ⛔ OUT OF SCOPE (do NOT touch — post-pilot)
 
-SLA working-hours editor UI (schedule IS applied — confirmed; only the editor is missing = Phase 3). Multi-tenancy, full OTel/metrics, DB backups, load test, real-SMTP/bounce, CI/CD = Phase 2. i18n switcher persistence, CommandPalette eager fetch, Radix DialogDescription a11y, KB category draft count = deferred polish.
+SLA working-hours editor UI (schedule IS applied — confirmed; only the editor is missing = Phase 3). **Client-portal attachment download (SEC-1b)** — the client portal renders no download links today, so there is no live exposure; an owner/email-scoped public download (mirroring `GET /tickets/public/:id`) is **Phase 2**. Multi-tenancy, full OTel/metrics, DB backups, load test, real-SMTP/bounce, CI/CD = Phase 2. i18n switcher persistence, CommandPalette eager fetch, Radix DialogDescription a11y, KB category draft count = deferred polish.
