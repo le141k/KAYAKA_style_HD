@@ -134,6 +134,9 @@ model Staff {
   auditLogs       TicketAuditLog[]
   refreshTokens   RefreshToken[]
   watching        TicketWatcher[]
+  timeEntries     TimeEntry[]
+  followUps       FollowUp[]
+  savedViews      SavedView[]
   lastLoginAt     DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
@@ -343,6 +346,8 @@ model Ticket {
   linksTo         TicketLink[]   @relation("LinkTarget")
   alarisEvent     AlarisEvent?
   recipients      TicketRecipient[]
+  timeEntries     TimeEntry[]
+  followUps       FollowUp[]
 
   lastReplyAt     DateTime?
   lastActivityAt  DateTime       @default(now())
@@ -788,4 +793,52 @@ model ReportRun {
   createdAt   DateTime @default(now())
 
   @@index([reportId])
+}
+
+// ───────────────────────────── agent productivity (P3) ─────────────────────────────
+
+/** Time logged by a staff member against a ticket (minutes). */
+model TimeEntry {
+  id        Int      @id @default(autoincrement())
+  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId  Int
+  staff     Staff    @relation(fields: [staffId], references: [id])
+  staffId   Int
+  minutes   Int
+  note      String?
+  spentAt   DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  @@index([ticketId])
+  @@index([staffId])
+}
+
+/** A scheduled follow-up reminder on a ticket. */
+model FollowUp {
+  id          Int       @id @default(autoincrement())
+  ticket      Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId    Int
+  staff       Staff     @relation(fields: [staffId], references: [id])
+  staffId     Int
+  dueAt       DateTime
+  note        String?
+  completed   Boolean   @default(false)
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([ticketId])
+  @@index([dueAt])
+}
+
+/** A named, reusable set of ticket-list filters saved by a staff member. */
+model SavedView {
+  id        Int      @id @default(autoincrement())
+  staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  staffId   Int
+  name      String
+  filters   Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([staffId])
 }

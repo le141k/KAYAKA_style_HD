@@ -23,6 +23,9 @@ import { WorkflowModule } from './modules/workflow/workflow.module';
 import { AdminModule } from './modules/admin/admin.module';
 import { AttachmentsModule } from './modules/attachments/attachments.module';
 import { CustomFieldsModule } from './modules/custom-fields/custom-fields.module';
+import { TimeTrackingModule } from './modules/time-tracking/time-tracking.module';
+import { FollowUpsModule } from './modules/follow-ups/follow-ups.module';
+import { SavedViewsModule } from './modules/saved-views/saved-views.module';
 import { PrismaExceptionFilter } from './common/prisma-exception.filter';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { PermissionsGuard } from './auth/permissions.guard';
@@ -83,6 +86,9 @@ const redisUrl = new URL(config.REDIS_URL);
     AdminModule,
     AttachmentsModule,
     CustomFieldsModule,
+    TimeTrackingModule,
+    FollowUpsModule,
+    SavedViewsModule,
   ],
   providers: [
     // Provide AppConfig as a VALUE token so it can be constructor-injected via @Inject(APP_CONFIG)

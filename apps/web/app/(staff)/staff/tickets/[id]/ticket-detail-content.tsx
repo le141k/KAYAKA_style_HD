@@ -32,6 +32,8 @@ import { Separator } from '@/components/ui/separator';
 import { Combobox } from '@/components/ui/combobox';
 import { cn, formatDate, getInitials } from '@/lib/utils';
 import { RelativeTime } from '@/components/RelativeTime';
+import { TimeTrackingPanel } from '@/components/tickets/TimeTrackingPanel';
+import { FollowUpsPanel } from '@/components/tickets/FollowUpsPanel';
 import { toast } from '@/components/ui/use-toast';
 
 const STATUS_OPTIONS: { value: Ticket['status']; label: string }[] = [
@@ -551,6 +553,18 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                   aria-label="Новая метка"
                 />
               </form>
+            </section>
+
+            {/* Time tracking */}
+            <Separator />
+            <section>
+              <TimeTrackingPanel ticketId={ticketId} />
+            </section>
+
+            {/* Follow-ups */}
+            <Separator />
+            <section>
+              <FollowUpsPanel ticketId={ticketId} />
             </section>
           </div>
         </aside>

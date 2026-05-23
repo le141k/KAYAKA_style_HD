@@ -29,6 +29,7 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { TicketRow } from '@/components/premium/TicketRow';
 import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
+import { SavedViews } from '@/components/tickets/SavedViews';
 import {
   useTickets,
   useCreateTicket,
@@ -254,6 +255,24 @@ export function TicketsListContent() {
     });
   const clearSelection = () => setSelectedIds(new Set());
 
+  // ── Saved views ── snapshot the current list filters, and apply a saved one.
+  const currentFilters: Record<string, unknown> = {
+    status,
+    priority,
+    slaBreached,
+    departmentId,
+    assigneeId,
+    sort,
+  };
+  const applyView = (f: Record<string, unknown>) => {
+    if (typeof f.status === 'string') setStatus(f.status);
+    if (typeof f.priority === 'string') setPriority(f.priority);
+    if (typeof f.slaBreached === 'boolean') setSlaBreached(f.slaBreached);
+    if (typeof f.departmentId === 'string') setDepartmentId(f.departmentId);
+    if (typeof f.assigneeId === 'string') setAssigneeId(f.assigneeId);
+    if (typeof f.sort === 'string') setSort(f.sort);
+  };
+
   const runBulk = async (input: Parameters<typeof bulkAction.mutateAsync>[0], label: string) => {
     try {
       const res = await bulkAction.mutateAsync(input);
@@ -322,6 +341,8 @@ export function TicketsListContent() {
             ))}
           </SelectContent>
         </Select>
+
+        <SavedViews currentFilters={currentFilters} onApply={applyView} />
 
         {/* Date range filter */}
         <Popover open={calendarOpen} onOpenChange={setCalendarOpen}>
