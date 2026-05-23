@@ -182,6 +182,7 @@ async function main() {
 
     // Stat cards rendered
     const statCards = await page.locator('[class*="AnimatedStatCard"], [data-testid="stat-card"]').count();
+    console.log(`  Stat cards rendered: ${statCards}`);
     // Try by grid structure (5 cards expected)
     const links = await page.locator('a[href*="staff/tickets?status="]').count();
     console.log(`  Clickable stat-card links found: ${links}`);
@@ -391,13 +392,13 @@ async function main() {
             }
           });
 
-          await page.evaluate((box) => {
+          await page.evaluate(() => {
             const target = [...document.querySelectorAll('[aria-label^="Колонка"]')][1];
             if (target) {
               target.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true }));
               target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true }));
             }
-          }, targetBox);
+          });
           await sleep(1000);
 
           if (patchFired) {
@@ -415,9 +416,6 @@ async function main() {
     // ── 2h. Kanban card click opens ticket ─────────────────────────────
     if (cards >= 1) {
       const firstCard = page.locator('[data-testid="kanban-card"]').first();
-      // Navigate away listener
-      let navigated = false;
-      page.once('framenavigated', () => { navigated = true; });
       await firstCard.click();
       await sleep(1000);
       const url = page.url();

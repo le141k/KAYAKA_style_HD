@@ -405,7 +405,7 @@ export class TicketsService {
   // ─────────────────────────── List ───────────────────────────
 
   async listTickets(query: ListTicketsQueryDto): Promise<{ data: Ticket[]; total: number }> {
-    const { page, limit, sortBy, sortDir, unassigned, search, ...filters } = query;
+    const { page, limit, sortBy, sortDir, unassigned, search, sla_breached, ...filters } = query;
 
     const where: Record<string, unknown> = {};
 
@@ -418,6 +418,13 @@ export class TicketsService {
 
     if (filters.ownerStaffId !== undefined) where['ownerStaffId'] = filters.ownerStaffId;
     if (unassigned) where['ownerStaffId'] = null;
+
+    // SLA breach is computed server-side: unresolved tickets whose dueAt is in the
+    // past. (Previously filtered client-side, which broke counts across pages.)
+    if (sla_breached) {
+      where['isResolved'] = false;
+      where['dueAt'] = { lt: new Date() };
+    }
 
     if (filters.createdAfter || filters.createdBefore) {
       where['createdAt'] = {
@@ -451,6 +458,7 @@ export class TicketsService {
           department: true,
           owner: { select: { id: true, firstName: true, lastName: true, email: true } },
           user: { select: PUBLIC_USER_SELECT },
+          tags: { select: { name: true } },
         },
       }),
       this.prisma.ticket.count({ where }),
@@ -680,21 +688,70 @@ export class TicketsService {
    * effects and events fire exactly as for a single update. Returns the count
    * of tickets updated; ids that fail (e.g. already gone) are skipped.
    */
-  async bulkAction(dto: BulkTicketActionDto, staffId: number): Promise<{ updated: number }> {
-    let updated = 0;
-    for (const id of dto.ids) {
-      try {
-        if (dto.action === 'status' && dto.statusId != null) {
-          await this.changeStatus(id, { statusId: dto.statusId }, staffId);
-        } else if (dto.action === 'assignee') {
-          await this.assign(id, { ownerStaffId: dto.ownerStaffId ?? null }, staffId);
-        }
-        updated += 1;
-      } catch {
-        // Skip individual failures so one bad id doesn't abort the whole batch.
-      }
+  async bulkAction(
+    dto: BulkTicketActionDto,
+    staffId: number,
+  ): Promise<{ updated: number; failed: number[] }> {
+    // Pre-validate: ids that don't exist (or were merged away) are reported in
+    // `failed[]` and never touched. Bulk ops apply a direct field update + audit
+    // atomically (no per-ticket notification/event spam — that's by design for a
+    // batch); the resolved-status side effect is preserved inline.
+    const existing = await this.prisma.ticket.findMany({
+      where: { id: { in: dto.ids }, mergedIntoId: null },
+      select: { id: true, isResolved: true },
+    });
+    const existingIds = new Set(existing.map((t) => t.id));
+    const failed = dto.ids.filter((id) => !existingIds.has(id));
+    if (existing.length === 0) return { updated: 0, failed };
+
+    let status: { markAsResolved: boolean } | null = null;
+    if (dto.action === 'status') {
+      status = await this.prisma.ticketStatus.findUnique({
+        where: { id: dto.statusId! },
+        select: { markAsResolved: true },
+      });
+      if (!status) throw new NotFoundException(`Status ${dto.statusId} not found`);
     }
-    return { updated };
+
+    const now = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      for (const t of existing) {
+        const data: Record<string, unknown> = { lastActivityAt: now };
+        let action: string;
+        let newValue: string | null;
+
+        if (dto.action === 'status') {
+          data['statusId'] = dto.statusId;
+          if (status!.markAsResolved) {
+            Object.assign(data, { isResolved: true, resolvedAt: now, dueAt: null, resolutionDueAt: null });
+          } else if (t.isResolved) {
+            // Reopen on bulk status change away from a resolved state.
+            Object.assign(data, { isResolved: false, resolvedAt: null, reopenedAt: now, wasReopened: true });
+          }
+          action = 'STATUS';
+          newValue = String(dto.statusId);
+        } else {
+          const ownerStaffId = dto.action === 'unassign' ? null : (dto.ownerStaffId ?? null);
+          data['ownerStaffId'] = ownerStaffId;
+          action = 'ASSIGN';
+          newValue = ownerStaffId?.toString() ?? null;
+        }
+
+        await tx.ticket.update({ where: { id: t.id }, data });
+        await tx.ticketAuditLog.create({
+          data: {
+            ticketId: t.id,
+            staffId,
+            actorType: 'STAFF',
+            action,
+            field: action === 'STATUS' ? 'statusId' : 'ownerStaffId',
+            newValue,
+          },
+        });
+      }
+    });
+
+    return { updated: existing.length, failed };
   }
 
   async assign(ticketId: number, dto: AssignTicketDto, staffId: number): Promise<Ticket> {

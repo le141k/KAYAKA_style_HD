@@ -276,7 +276,10 @@ export function TicketsListContent() {
   const runBulk = async (input: Parameters<typeof bulkAction.mutateAsync>[0], label: string) => {
     try {
       const res = await bulkAction.mutateAsync(input);
-      toast({ title: `${label}: обновлено ${res.updated} из ${selectedIds.size}` });
+      toast({
+        title: `${label}: обновлено ${res.updated} из ${selectedIds.size}`,
+        description: res.failed.length ? `Не найдено: ${res.failed.length}` : undefined,
+      });
       clearSelection();
     } catch {
       toast({ title: 'Ошибка', description: 'Массовое действие не выполнено', variant: 'destructive' });
@@ -522,6 +525,14 @@ export function TicketsListContent() {
               ))}
             </SelectContent>
           </Select>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8"
+            onClick={() => runBulk({ ids: [...selectedIds], action: 'unassign' }, 'Снято назначение')}
+          >
+            Снять назначение
+          </Button>
           <Button variant="ghost" size="sm" className="h-8" onClick={clearSelection}>
             Снять выделение
           </Button>

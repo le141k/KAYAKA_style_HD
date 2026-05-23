@@ -64,13 +64,18 @@ export type ChangeStatusDto = z.infer<typeof ChangeStatusSchema>;
 export const BulkTicketActionSchema = z
   .object({
     ids: z.array(z.number().int().positive()).min(1).max(200),
-    action: z.enum(['status', 'assignee']),
+    action: z.enum(['status', 'assignee', 'unassign']),
     statusId: z.number().int().positive().optional(),
     ownerStaffId: z.number().int().positive().nullable().optional(),
   })
-  .refine((d) => (d.action === 'status' ? d.statusId != null : d.ownerStaffId !== undefined), {
-    message: 'status action requires statusId; assignee action requires ownerStaffId',
-  });
+  .refine(
+    (d) => {
+      if (d.action === 'status') return d.statusId != null;
+      if (d.action === 'assignee') return d.ownerStaffId !== undefined;
+      return true; // unassign needs no extra field
+    },
+    { message: 'status action requires statusId; assignee action requires ownerStaffId' },
+  );
 export type BulkTicketActionDto = z.infer<typeof BulkTicketActionSchema>;
 
 export const ChangePrioritySchema = z.object({ priorityId: z.number().int().positive() });
@@ -107,6 +112,8 @@ export const ListTicketsQuerySchema = z.object({
   ownerStaffId: z.coerce.number().int().positive().optional(),
   /** When true, list only unassigned tickets */
   unassigned: z.coerce.boolean().optional(),
+  /** When true, list only SLA-breached tickets (unresolved + dueAt in the past). */
+  sla_breached: z.coerce.boolean().optional(),
   search: z.string().optional(),
   /** Filter by requester user id */
   userId: z.coerce.number().int().positive().optional(),

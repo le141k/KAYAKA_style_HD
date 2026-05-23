@@ -234,6 +234,8 @@ export function useTickets(params: TicketListParams = {}) {
         if (params.date_to) qs.set('createdBefore', params.date_to);
         if (params.sort_by) qs.set('sortBy', params.sort_by);
         if (params.sort_dir) qs.set('sortDir', params.sort_dir);
+        // SLA breach is now filtered server-side (correct totals across pages).
+        if (params.sla_breached) qs.set('sla_breached', 'true');
         // Map slug filters → ids and push to the server (correct totals + paging).
         if (params.status) {
           const id = await statusIdForSlug(params.status);
@@ -244,16 +246,8 @@ export function useTickets(params: TicketListParams = {}) {
           if (id) qs.set('priorityId', String(id));
         }
         const res = await api.get<{ data: ApiTicket[]; total: number }>(`/tickets?${qs}`);
-        let data = res.data.map(mapTicket);
-        let total = res.total;
-        // SLA-breach filter: the list API has no server param for this, so narrow
-        // the loaded page client-side (tickets whose due date is already in the past).
-        if (params.sla_breached) {
-          const now = Date.now();
-          data = data.filter((t) => t.sla_due_at && new Date(t.sla_due_at).getTime() < now);
-          total = data.length;
-        }
-        return { data, total, page: params.page ?? 1, per_page: params.per_page ?? 25 };
+        const data = res.data.map(mapTicket);
+        return { data, total: res.total, page: params.page ?? 1, per_page: params.per_page ?? 25 };
       } catch {
         let data = [...MOCK_TICKETS];
         if (params.status) data = data.filter((t) => t.status === params.status);
@@ -339,22 +333,27 @@ export function useCreateTicket() {
 
 export type BulkInput =
   | { ids: number[]; action: 'status'; status: string }
-  | { ids: number[]; action: 'assignee'; ownerStaffId: number | null };
+  | { ids: number[]; action: 'assignee'; ownerStaffId: number | null }
+  | { ids: number[]; action: 'unassign' };
 
-/** Apply one action (status / assignee) to many tickets at once. */
+export interface BulkResult {
+  updated: number;
+  failed: number[];
+}
+
+/** Apply one action (status / assignee / unassign) to many tickets at once. */
 export function useBulkTicketAction() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async (input: BulkInput) => {
+    mutationFn: async (input: BulkInput): Promise<BulkResult> => {
       if (input.action === 'status') {
         const statusId = await statusIdForSlug(input.status);
-        return api.post<{ updated: number }>('/tickets/bulk', {
-          ids: input.ids,
-          action: 'status',
-          statusId,
-        });
+        return api.post<BulkResult>('/tickets/bulk', { ids: input.ids, action: 'status', statusId });
       }
-      return api.post<{ updated: number }>('/tickets/bulk', {
+      if (input.action === 'unassign') {
+        return api.post<BulkResult>('/tickets/bulk', { ids: input.ids, action: 'unassign' });
+      }
+      return api.post<BulkResult>('/tickets/bulk', {
         ids: input.ids,
         action: 'assignee',
         ownerStaffId: input.ownerStaffId,

@@ -873,28 +873,101 @@ describe('TicketsService (extra coverage)', () => {
   });
 
   describe('bulkAction', () => {
-    it('applies a status change to every id (reuses changeStatus)', async () => {
-      const spy = vi.spyOn(service, 'changeStatus').mockResolvedValue({} as any);
-      const res = await service.bulkAction({ ids: [1, 2, 3], action: 'status', statusId: 4 }, 7);
-      expect(res.updated).toBe(3);
-      expect(spy).toHaveBeenCalledTimes(3);
-      expect(spy).toHaveBeenCalledWith(1, { statusId: 4 }, 7);
+    const fm = () => prisma.ticket.findMany as ReturnType<typeof vi.fn>;
+
+    it('applies a status change atomically to every existing id', async () => {
+      fm().mockResolvedValue([
+        { id: 1, isResolved: false },
+        { id: 2, isResolved: false },
+      ]);
+      (prisma.ticketStatus.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        markAsResolved: false,
+      });
+
+      const res = await service.bulkAction({ ids: [1, 2], action: 'status', statusId: 4 }, 7);
+
+      expect(res).toEqual({ updated: 2, failed: [] });
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 1 }, data: expect.objectContaining({ statusId: 4 }) }),
+      );
+      expect(prisma.ticketAuditLog.create).toHaveBeenCalledTimes(2);
     });
 
-    it('applies an assignment to every id (reuses assign)', async () => {
-      const spy = vi.spyOn(service, 'assign').mockResolvedValue({} as any);
-      const res = await service.bulkAction({ ids: [10, 11], action: 'assignee', ownerStaffId: 5 }, 7);
-      expect(res.updated).toBe(2);
-      expect(spy).toHaveBeenCalledWith(10, { ownerStaffId: 5 }, 7);
+    it('sets isResolved when the target status marks resolved', async () => {
+      fm().mockResolvedValue([{ id: 1, isResolved: false }]);
+      (prisma.ticketStatus.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        markAsResolved: true,
+      });
+
+      await service.bulkAction({ ids: [1], action: 'status', statusId: 9 }, 7);
+
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ isResolved: true, dueAt: null }) }),
+      );
     });
 
-    it('skips ids that fail and counts only successes', async () => {
-      vi.spyOn(service, 'changeStatus')
-        .mockResolvedValueOnce({} as any)
-        .mockRejectedValueOnce(new Error('gone'))
-        .mockResolvedValueOnce({} as any);
-      const res = await service.bulkAction({ ids: [1, 2, 3], action: 'status', statusId: 4 }, 7);
-      expect(res.updated).toBe(2);
+    it('assigns an owner to every id', async () => {
+      fm().mockResolvedValue([{ id: 10, isResolved: false }]);
+      const res = await service.bulkAction({ ids: [10], action: 'assignee', ownerStaffId: 5 }, 7);
+      expect(res.updated).toBe(1);
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ ownerStaffId: 5 }) }),
+      );
+    });
+
+    it('unassigns (ownerStaffId → null) on the unassign action', async () => {
+      fm().mockResolvedValue([{ id: 10, isResolved: false }]);
+      const res = await service.bulkAction({ ids: [10], action: 'unassign' }, 7);
+      expect(res.updated).toBe(1);
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ ownerStaffId: null }) }),
+      );
+    });
+
+    it('reports non-existent ids in failed[] and never touches them', async () => {
+      // Only id 1 exists; 2 and 99 do not.
+      fm().mockResolvedValue([{ id: 1, isResolved: false }]);
+      (prisma.ticketStatus.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        markAsResolved: false,
+      });
+
+      const res = await service.bulkAction({ ids: [1, 2, 99], action: 'status', statusId: 4 }, 7);
+
+      expect(res.updated).toBe(1);
+      expect(res.failed).toEqual([2, 99]);
+      expect(prisma.ticket.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns all-failed without a transaction when no id exists', async () => {
+      fm().mockResolvedValue([]);
+      const res = await service.bulkAction({ ids: [7, 8], action: 'unassign' }, 7);
+      expect(res).toEqual({ updated: 0, failed: [7, 8] });
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listTickets — sla_breached + tags', () => {
+    it('filters SLA-breached tickets server-side (unresolved + dueAt in past)', async () => {
+      (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+
+      await service.listTickets({
+        page: 1,
+        limit: 20,
+        sortBy: 'lastActivityAt',
+        sortDir: 'desc',
+        sla_breached: true,
+      } as any);
+
+      const arg = (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        where: { isResolved?: boolean; dueAt?: { lt: Date } };
+        include: Record<string, unknown>;
+      };
+      expect(arg.where.isResolved).toBe(false);
+      expect(arg.where.dueAt).toHaveProperty('lt');
+      // tags are included so the list can render them (were undefined before).
+      expect(arg.include.tags).toEqual({ select: { name: true } });
     });
   });
 });
