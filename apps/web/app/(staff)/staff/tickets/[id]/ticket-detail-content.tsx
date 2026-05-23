@@ -7,7 +7,13 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { motion } from 'framer-motion';
-import { useTicket, useReply, useUpdateTicket, useStaffOptions } from '@/lib/hooks/use-tickets';
+import {
+  useTicket,
+  useReply,
+  useUpdateTicket,
+  useStaffOptions,
+  useTicketTags,
+} from '@/lib/hooks/use-tickets';
 import type { Ticket } from '@/lib/types';
 import { StatusBadge } from '@/components/premium/StatusBadge';
 import { PriorityChip } from '@/components/premium/PriorityChip';
@@ -47,6 +53,8 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const replyMutation = useReply(ticketId);
   const updateTicket = useUpdateTicket(ticketId);
   const { data: staffOptions = [] } = useStaffOptions();
+  const tags = useTicketTags(ticketId);
+  const [newTag, setNewTag] = useState('');
 
   const [replyTab, setReplyTab] = useState<'reply' | 'note'>('reply');
   // Files are collected for UX; the reply endpoint does not yet accept uploads.
@@ -389,26 +397,51 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
             </section>
 
             {/* Tags */}
-            {ticket.tags && ticket.tags.length > 0 && (
-              <>
-                <Separator />
-                <section>
-                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    Метки
-                  </h3>
-                  <div className="flex flex-wrap gap-1.5">
-                    {ticket.tags.map((tag) => (
-                      <span
-                        key={tag}
-                        className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-                      >
-                        {tag}
-                      </span>
-                    ))}
-                  </div>
-                </section>
-              </>
-            )}
+            <Separator />
+            <section>
+              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Метки
+              </h3>
+              <div className="mb-2 flex flex-wrap gap-1.5">
+                {(ticket.tags ?? []).map((tag) => (
+                  <span
+                    key={tag}
+                    className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                  >
+                    {tag}
+                    <button
+                      type="button"
+                      aria-label={`Удалить метку ${tag}`}
+                      className="text-muted-foreground/60 hover:text-destructive"
+                      onClick={() => tags.remove.mutate(tag)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+                {(ticket.tags ?? []).length === 0 && (
+                  <span className="text-xs text-muted-foreground">Нет меток</span>
+                )}
+              </div>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const name = newTag.trim();
+                  if (name) {
+                    tags.add.mutate(name);
+                    setNewTag('');
+                  }
+                }}
+              >
+                <input
+                  value={newTag}
+                  onChange={(e) => setNewTag(e.target.value)}
+                  placeholder="Добавить метку…"
+                  className="h-7 w-full rounded-md border border-input bg-transparent px-2 text-xs"
+                  aria-label="Новая метка"
+                />
+              </form>
+            </section>
           </div>
         </aside>
       </div>

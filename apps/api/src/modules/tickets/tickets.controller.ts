@@ -44,6 +44,8 @@ import {
   type WatcherDto,
   type ListTicketsQueryDto,
   type PublicCreateTicketDto,
+  PublicReplySchema,
+  type PublicReplyDto,
 } from './dto';
 
 @ApiTags('tickets')
@@ -81,6 +83,27 @@ export class TicketsController {
       throw new BadRequestException('Query parameter "email" is required');
     }
     return this.ticketsService.listMyTickets(email);
+  }
+
+  // ─────────────────── Client: public ticket detail ───────────────────
+
+  @Public()
+  @Get('public/:id')
+  @ApiOperation({ summary: 'Get a single ticket (no auth) with public posts only — no internal notes' })
+  getPublic(@Param('id', ParseIntPipe) id: number) {
+    return this.ticketsService.getPublicTicket(id);
+  }
+
+  // ─────────────────── Client: public reply ───────────────────
+
+  @Public()
+  @Post('public/:id/reply')
+  @ApiOperation({ summary: 'Add a user reply to a ticket from the client portal (no auth required)' })
+  publicReply(
+    @Param('id', ParseIntPipe) id: number,
+    @Body(new ZodValidationPipe(PublicReplySchema)) dto: PublicReplyDto,
+  ) {
+    return this.ticketsService.publicReply(id, dto);
   }
 
   // ─────────────────── Staff routes ───────────────────

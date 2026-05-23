@@ -35,11 +35,12 @@
 - ☑ Ticket detail: статус/приоритет/ассайн(ownerStaffId)/закрыть + notes + авторы + dedup [TD-1,2,3,4,5,8,9,10,11] (◐ остаётся TD-6 отдел, TD-7 теги, TD-12 вложения, TD-13 макрос, TD-14 merge, TD-16 dup-id)
 - ☑ Tickets list: server-side фильтры + счётчик + период [TL-1,2,3]
 - ☑ Dashboard: реальные SLA/avg [DK-4], убраны фейк-тренды [DK-5], CommandPalette enabled:open [DK-7], closed-колонка [DK-8]
-- ☐ Client: client_email запись + публичные detail/reply эндпоинты + dept dropdown [CL-1..5]
+- ☑ Client: client_email + публичные detail/reply эндпоинты + dept dropdown + priority + error-toast [CL-1..6]
 - ☑ Workflows/macros: билдеры criteria/actions, edit макроса, категории, isShared [WF-2,3,4,6]
 - ☑ SLA UI: расписания/праздники/эскалации [SLA-3,4,5] + ApiEscalationRule [SLA-6]
 - ☑ KB: превью/счётчик/HTML/драфты [KB-1,2,3,4 + RBAC-1]; ☐ Staff isEnabled toggle [ST-4]
-- ☐ Security: throttler login/public; KB-черновики; /tickets/my scope; HttpOnly cookie [RBAC-1,2; AU-1,2,4]
+- ☑ Security: throttler login (AU-1/2), KB-черновики (RBAC-1 ✓ блок3); ☐ /tickets/my scope (RBAC-2), HttpOnly cookie (AU-4)
+- ☑ Staff isEnabled toggle [ST-4]; ☑ TD-7 теги add/remove
 
 ## Обнаружено в ходе фиксов
 

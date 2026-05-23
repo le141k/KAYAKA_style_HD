@@ -18,6 +18,7 @@ import type {
   ListTicketsQueryDto,
   TagDto,
   WatcherDto,
+  PublicReplyDto,
 } from './dto';
 import type { ActorType, CreationMode, Ticket, TicketPost, TicketNote } from '@prisma/client';
 
@@ -26,6 +27,17 @@ export interface TicketDetail extends Ticket {
   posts: TicketPost[];
   notes: TicketNote[];
   watchers: Array<{ staffId: number }>;
+  tags: Array<{ name: string }>;
+}
+
+/** Public ticket view — posts only, no notes. */
+export interface PublicTicketDetail extends Ticket {
+  posts: TicketPost[];
+  status: { id: number; title: string } | null;
+  priority: { id: number; title: string } | null;
+  department: { id: number; title: string } | null;
+  owner: { id: number; firstName: string; lastName: string; email: string } | null;
+  user: { id: number; fullName: string; emails: { email: string; isPrimary: boolean }[] } | null;
   tags: Array<{ name: string }>;
 }
 
@@ -209,6 +221,79 @@ export class TicketsService {
     ]);
 
     return { data, total };
+  }
+
+  // ─────────────────────────── Public ticket detail (client portal) ──────────
+
+  /**
+   * Returns a single ticket with its posts only — internal notes are
+   * NEVER included.  Shape mirrors getTicket() but omits notes/watchers/auditLogs.
+   * Used by the @Public GET /tickets/public/:id endpoint.
+   */
+  async getPublicTicket(id: number): Promise<PublicTicketDetail> {
+    const ticket = await this.prisma.ticket.findUnique({
+      where: { id },
+      include: {
+        status: { select: { id: true, title: true } },
+        priority: { select: { id: true, title: true } },
+        department: { select: { id: true, title: true } },
+        owner: { select: { id: true, firstName: true, lastName: true, email: true } },
+        user: { include: { emails: true } },
+        // Only posts (USER/STAFF replies) — notes are intentionally excluded
+        posts: {
+          orderBy: { createdAt: 'asc' },
+        },
+        tags: { select: { name: true } },
+      },
+    });
+
+    if (!ticket) throw new NotFoundException(`Ticket ${id} not found`);
+    return ticket as unknown as PublicTicketDetail;
+  }
+
+  // ─────────────────────────── Public reply (client portal) ────────────────
+
+  /**
+   * Creates a USER post on behalf of the requester.
+   * Does not require authentication — identity is taken from the ticket's
+   * own requesterName / requesterEmail fields (or the optional dto fields).
+   * Internal notes are never involved.
+   */
+  async publicReply(ticketId: number, dto: PublicReplyDto): Promise<TicketPost> {
+    const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
+    if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
+
+    const now = new Date();
+
+    const post = await this.prisma.ticketPost.create({
+      data: {
+        ticketId,
+        authorType: 'USER',
+        staffId: null,
+        userId: ticket.userId,
+        fullName: ticket.requesterName ?? undefined,
+        email: dto.requesterEmail ?? ticket.requesterEmail ?? undefined,
+        subject: ticket.subject,
+        contents: dto.contents,
+        isHtml: false,
+        creationMode: 'WEB',
+        ipAddress: '0.0.0.0',
+      },
+    });
+
+    await this.prisma.ticket.update({
+      where: { id: ticketId },
+      data: {
+        totalReplies: { increment: 1 },
+        lastReplyAt: now,
+        lastActivityAt: now,
+      },
+    });
+
+    await this.writeAudit(ticketId, 'REPLY', undefined, 'USER', {});
+    this.emitDomainEvent('ticket.replied', ticketId);
+
+    return post;
   }
 
   // ─────────────────────────── List ───────────────────────────

@@ -314,6 +314,40 @@ describe('StaffService', () => {
       expect(prisma.departmentStaff.createMany).toHaveBeenCalled();
     });
 
+    it('passes isEnabled through to the update payload', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        staffGroup: MOCK_GROUP,
+      });
+      (prisma.staff.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        isEnabled: true,
+      });
+
+      await service.update(1, { isEnabled: true } as any);
+
+      expect(prisma.staff.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ isEnabled: true }),
+        }),
+      );
+    });
+
+    it('re-enables a previously disabled staff member via update', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        isEnabled: false,
+        staffGroup: MOCK_GROUP,
+      });
+      (prisma.staff.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        isEnabled: true,
+      });
+
+      const result = await service.update(1, { isEnabled: true } as any);
+      expect(result.isEnabled).toBe(true);
+    });
+
     it('throws NotFoundException when staff not found', async () => {
       (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.update(999, { firstName: 'X' } as any)).rejects.toThrow(NotFoundException);

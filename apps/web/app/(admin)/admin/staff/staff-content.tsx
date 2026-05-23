@@ -30,6 +30,7 @@ const staffSchema = z.object({
   // Group is mandatory: the API requires a positive staffGroupId on create.
   staffGroupId: z.coerce.number({ invalid_type_error: 'Выберите группу' }).int().positive('Выберите группу'),
   password: z.string().optional(),
+  isEnabled: z.boolean().optional(),
 });
 type StaffFormValues = z.infer<typeof staffSchema>;
 
@@ -79,6 +80,7 @@ export function StaffContent() {
       designation: member.designation,
       staffGroupId: member.staffGroupId ?? undefined,
       password: '',
+      isEnabled: member.isEnabled,
     });
     setDialogOpen(true);
   }
@@ -95,7 +97,10 @@ export function StaffContent() {
           form.setError('password', { message: 'Пароль обязателен при создании' });
           return;
         }
-        await createStaff.mutateAsync(payload);
+        // isEnabled is not part of the create schema — strip it on create
+        const { isEnabled: _ie, ...createPayload } = payload;
+        void _ie;
+        await createStaff.mutateAsync(createPayload);
         toast({ title: 'Сотрудник создан' });
       }
       setDialogOpen(false);
@@ -249,6 +254,19 @@ export function StaffContent() {
                 <p className="text-xs text-destructive">{form.formState.errors.password.message}</p>
               )}
             </div>
+            {editing && (
+              <div className="flex items-center gap-3">
+                <input
+                  id="isEnabled"
+                  type="checkbox"
+                  className="h-4 w-4 rounded border-input accent-primary"
+                  {...form.register('isEnabled')}
+                />
+                <label htmlFor="isEnabled" className="text-sm font-medium cursor-pointer">
+                  Аккаунт активен
+                </label>
+              </div>
+            )}
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setDialogOpen(false)}>
                 Отмена

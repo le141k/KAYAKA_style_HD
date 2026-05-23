@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
-import { APP_FILTER } from '@nestjs/core';
+import { APP_FILTER, APP_GUARD } from '@nestjs/core';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { LoggerModule } from 'nestjs-pino';
 import { BullModule } from '@nestjs/bullmq';
 import { EventEmitterModule } from '@nestjs/event-emitter';
@@ -36,6 +37,10 @@ const redisUrl = new URL(config.REDIS_URL);
  */
 @Module({
   imports: [
+    // Global rate-limiting (300 req / 60 s per IP — headroom for a data-heavy SPA
+    // that fires several React Query calls per page); login has a stricter override.
+    ThrottlerModule.forRoot([{ ttl: 60000, limit: 300 }]),
+
     // Structured JSON logging via Pino
     LoggerModule.forRoot({
       pinoHttp: {
@@ -83,6 +88,11 @@ const redisUrl = new URL(config.REDIS_URL);
     {
       provide: APP_FILTER,
       useClass: PrismaExceptionFilter,
+    },
+    // Enforce ThrottlerModule limits globally (coexists with JWT/Permissions guards)
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
     },
   ],
   exports: [APP_CONFIG],

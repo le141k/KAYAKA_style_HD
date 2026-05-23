@@ -372,6 +372,24 @@ export function useChangeTicketStatus() {
   });
 }
 
+// Add / remove a tag on a ticket (TICKET_EDIT). Used by the ticket detail panel.
+export function useTicketTags(ticketId: number) {
+  const qc = useQueryClient();
+  const invalidate = () => {
+    void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });
+    void qc.invalidateQueries({ queryKey: ticketKeys.lists() });
+  };
+  const add = useMutation({
+    mutationFn: (name: string) => api.post(`/tickets/${ticketId}/tags`, { name }),
+    onSuccess: invalidate,
+  });
+  const remove = useMutation({
+    mutationFn: (name: string) => api.delete(`/tickets/${ticketId}/tags/${encodeURIComponent(name)}`),
+    onSuccess: invalidate,
+  });
+  return { add, remove };
+}
+
 // Real staff list for the assignee picker (replaces hardcoded MOCK_USERS).
 interface ApiStaffOption {
   id: number;

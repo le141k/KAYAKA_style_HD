@@ -37,6 +37,7 @@ export const UpdateStaffSchema = z.object({
   mobileNumber: z.string().optional(),
   timezone: z.string().optional(),
   departmentIds: z.array(z.number().int().positive()).optional(),
+  isEnabled: z.boolean().optional(),
 });
 export type UpdateStaffDto = z.infer<typeof UpdateStaffSchema>;
 

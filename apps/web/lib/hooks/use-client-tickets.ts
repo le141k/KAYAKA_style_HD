@@ -218,8 +218,13 @@ export function useClientReply(ticketId: number) {
         return await api.post(`/tickets/${ticketId}/reply`, { contents: data.contents });
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
-          // Fall back to the public reply endpoint
-          return api.post(`/tickets/public/${ticketId}/reply`, { contents: data.contents });
+          // Fall back to the public reply endpoint, including the stored email so
+          // the post is attributed to the right requester.
+          const requesterEmail = getRequesterEmail() || undefined;
+          return api.post(`/tickets/public/${ticketId}/reply`, {
+            contents: data.contents,
+            ...(requesterEmail ? { requesterEmail } : {}),
+          });
         }
         throw err;
       }

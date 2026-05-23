@@ -122,3 +122,12 @@ export const PublicCreateTicketSchema = z.object({
   customFields: z.record(z.unknown()).default({}),
 });
 export type PublicCreateTicketDto = z.infer<typeof PublicCreateTicketSchema>;
+
+// ─────────────────── public reply ───────────────────
+
+export const PublicReplySchema = z.object({
+  contents: z.string().min(1),
+  /** The requester's email — used to attribute the post to the right user. */
+  requesterEmail: z.string().email().optional(),
+});
+export type PublicReplyDto = z.infer<typeof PublicReplySchema>;
