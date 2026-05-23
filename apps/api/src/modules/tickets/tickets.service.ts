@@ -275,9 +275,15 @@ export class TicketsService {
         user: { include: { emails: true } },
         posts: {
           orderBy: { createdAt: 'asc' },
-          include: { attachments: true },
+          include: {
+            attachments: true,
+            staff: { select: { firstName: true, lastName: true, email: true } },
+          },
         },
-        notes: { orderBy: { createdAt: 'asc' } },
+        notes: {
+          orderBy: { createdAt: 'asc' },
+          include: { staff: { select: { firstName: true, lastName: true, email: true } } },
+        },
         attachments: true,
         watchers: { select: { staffId: true } },
         tags: { select: { name: true } },
@@ -299,7 +305,13 @@ export class TicketsService {
         department: true,
         owner: { select: { id: true, firstName: true, lastName: true, email: true } },
         user: { include: { emails: true } },
-        posts: { orderBy: { createdAt: 'asc' }, include: { attachments: true } },
+        posts: {
+          orderBy: { createdAt: 'asc' },
+          include: {
+            attachments: true,
+            staff: { select: { firstName: true, lastName: true, email: true } },
+          },
+        },
         notes: { orderBy: { createdAt: 'asc' } },
         attachments: true,
         watchers: { select: { staffId: true } },
@@ -326,11 +338,28 @@ export class TicketsService {
     const isStaffReply = !!staffId;
     const firstResponse = isStaffReply && ticket.firstResponseAt === null;
 
+    // Capture the author's display name/email on the post so the thread shows
+    // who replied (previously left blank → rendered as "—").
+    let authorName: string | undefined;
+    let authorEmail: string | undefined;
+    if (isStaffReply && staffId) {
+      const staff = await this.prisma.staff.findUnique({ where: { id: staffId } });
+      if (staff) {
+        authorName = `${staff.firstName} ${staff.lastName}`.trim() || staff.email;
+        authorEmail = staff.email;
+      }
+    } else {
+      authorName = ticket.requesterName ?? undefined;
+      authorEmail = ticket.requesterEmail ?? undefined;
+    }
+
     const post = await this.prisma.ticketPost.create({
       data: {
         ticketId,
         authorType: isStaffReply ? 'STAFF' : 'USER',
         staffId,
+        fullName: authorName,
+        email: authorEmail,
         subject: ticket.subject,
         contents: dto.contents,
         isHtml: dto.isHtml,

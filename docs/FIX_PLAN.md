@@ -32,7 +32,7 @@
 
 ## P1 (кластерами)
 
-- ☐ Ticket detail: статус/приоритет/отдел/теги/закрыть + ассайн(ownerStaffId) + notes + авторы [TD-1..10]
+- ☑ Ticket detail: статус/приоритет/ассайн(ownerStaffId)/закрыть + notes + авторы + dedup [TD-1,2,3,4,5,8,9,10,11] (◐ остаётся TD-6 отдел, TD-7 теги, TD-12 вложения, TD-13 макрос, TD-14 merge, TD-16 dup-id)
 - ☐ Tickets list: server-side фильтры + счётчик + период [TL-1..3]
 - ☐ Dashboard: реальные SLA/avg/тренды [DK-4,5]; CommandPalette enabled:open [DK-7]; closed-колонка [DK-8]
 - ☐ Client: client_email запись + публичные detail/reply эндпоинты + dept dropdown [CL-1..5]

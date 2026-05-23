@@ -16,6 +16,11 @@ interface ApiStaffRef {
   lastName: string;
   email: string;
 }
+interface ApiStaffRel {
+  firstName: string;
+  lastName: string;
+  email: string;
+}
 interface ApiPost {
   id: number;
   ticketId: number;
@@ -26,6 +31,15 @@ interface ApiPost {
   email?: string;
   contents: string;
   createdAt: string;
+  staff?: ApiStaffRel | null;
+}
+interface ApiNote {
+  id: number;
+  ticketId: number;
+  staffId?: number | null;
+  contents: string;
+  createdAt: string;
+  staff?: ApiStaffRel | null;
 }
 interface ApiTicket {
   id: number;
@@ -51,7 +65,13 @@ interface ApiTicket {
   owner?: ApiStaffRef | null;
   user?: { id: number; fullName: string; emails?: { email: string; isPrimary: boolean }[] } | null;
   posts?: ApiPost[];
+  notes?: ApiNote[];
   tags?: { name: string }[];
+}
+
+function staffName(s?: ApiStaffRel | null): string | undefined {
+  if (!s) return undefined;
+  return `${s.firstName} ${s.lastName}`.trim() || s.email;
 }
 
 // ─── Mappers: API → frontend view models ────────────────────────────────────
@@ -73,13 +93,31 @@ function mapPostToReply(p: ApiPost): Reply {
     ticket_id: p.ticketId,
     author: {
       id: p.staffId ?? p.userId ?? 0,
-      name: p.fullName || p.email || '—',
-      email: p.email ?? '',
+      name: p.fullName || staffName(p.staff) || p.email || '—',
+      email: p.email ?? p.staff?.email ?? '',
       role: p.authorType === 'STAFF' ? 'agent' : 'client',
     } as User,
     body: p.contents,
     is_internal: false,
     created_at: p.createdAt,
+  };
+}
+
+// Internal notes live in a separate table; surface them in the thread flagged
+// as internal (staff-only).
+function mapNoteToReply(n: ApiNote): Reply {
+  return {
+    id: 1_000_000_000 + n.id, // offset to avoid id collision with posts
+    ticket_id: n.ticketId,
+    author: {
+      id: n.staffId ?? 0,
+      name: staffName(n.staff) || '—',
+      email: n.staff?.email ?? '',
+      role: 'agent',
+    } as User,
+    body: n.contents,
+    is_internal: true,
+    created_at: n.createdAt,
   };
 }
 
@@ -117,7 +155,9 @@ function mapTicket(t: ApiTicket): Ticket {
     updated_at: t.updatedAt,
     reply_count: t.totalReplies ?? 0,
     tags: t.tags?.map((tag) => tag.name),
-    replies: t.posts?.map(mapPostToReply),
+    replies: [...(t.posts?.map(mapPostToReply) ?? []), ...(t.notes?.map(mapNoteToReply) ?? [])].sort(
+      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+    ),
   } as Ticket;
 }
 
@@ -283,13 +323,41 @@ export function useUpdateTicket(ticketId: number) {
         if (match) await api.patch(`/tickets/${ticketId}/priority`, { priorityId: match.id });
       }
       if (data.assigneeId !== undefined) {
-        await api.patch(`/tickets/${ticketId}/assign`, { staffId: data.assigneeId });
+        // API schema is { ownerStaffId } — { staffId } was silently rejected (400).
+        await api.patch(`/tickets/${ticketId}/assign`, { ownerStaffId: data.assigneeId });
       }
     },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });
       void qc.invalidateQueries({ queryKey: ticketKeys.lists() });
     },
+  });
+}
+
+// Real staff list for the assignee picker (replaces hardcoded MOCK_USERS).
+interface ApiStaffOption {
+  id: number;
+  firstName: string;
+  lastName: string;
+  email: string;
+}
+export interface AssigneeOption {
+  value: string;
+  label: string;
+  description: string;
+}
+export function useStaffOptions() {
+  return useQuery({
+    queryKey: ['staff', 'options'],
+    queryFn: async (): Promise<AssigneeOption[]> => {
+      const res = await api.get<{ data: ApiStaffOption[] }>('/staff?limit=100');
+      return res.data.map((s) => ({
+        value: String(s.id),
+        label: `${s.firstName} ${s.lastName}`.trim() || s.email,
+        description: s.email,
+      }));
+    },
+    staleTime: 5 * 60_000,
   });
 }
 

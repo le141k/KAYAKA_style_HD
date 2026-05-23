@@ -7,7 +7,8 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { motion } from 'framer-motion';
-import { useTicket, useReplies, useReply } from '@/lib/hooks/use-tickets';
+import { useTicket, useReply, useUpdateTicket, useStaffOptions } from '@/lib/hooks/use-tickets';
+import type { Ticket } from '@/lib/types';
 import { StatusBadge } from '@/components/premium/StatusBadge';
 import { PriorityChip } from '@/components/premium/PriorityChip';
 import { SlaPill } from '@/components/premium/SlaPill';
@@ -21,14 +22,20 @@ import { Separator } from '@/components/ui/separator';
 import { Combobox } from '@/components/ui/combobox';
 import { cn, formatDate, formatRelative, getInitials } from '@/lib/utils';
 import { toast } from '@/components/ui/use-toast';
-import { MOCK_USERS } from '@/lib/mock-data';
 
-// Build assignee options from mock staff users
-const ASSIGNEE_OPTIONS = MOCK_USERS.filter((u) => u.role === 'agent' || u.role === 'admin').map((u) => ({
-  value: String(u.id),
-  label: u.name,
-  description: u.email,
-}));
+const STATUS_OPTIONS: { value: Ticket['status']; label: string }[] = [
+  { value: 'open', label: 'Открыта' },
+  { value: 'pending', label: 'Ожидает' },
+  { value: 'in_progress', label: 'В работе' },
+  { value: 'resolved', label: 'Решена' },
+  { value: 'closed', label: 'Закрыта' },
+];
+const PRIORITY_OPTIONS: { value: Ticket['priority']; label: string }[] = [
+  { value: 'urgent', label: 'Критический' },
+  { value: 'high', label: 'Высокий' },
+  { value: 'normal', label: 'Обычный' },
+  { value: 'low', label: 'Низкий' },
+];
 
 const replySchema = z.object({
   body: z.string().min(1, 'Введите текст ответа'),
@@ -37,13 +44,46 @@ type ReplyForm = z.infer<typeof replySchema>;
 
 export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const { data: ticket, isLoading: ticketLoading } = useTicket(ticketId);
-  const { data: replies, isLoading: repliesLoading } = useReplies(ticketId);
   const replyMutation = useReply(ticketId);
+  const updateTicket = useUpdateTicket(ticketId);
+  const { data: staffOptions = [] } = useStaffOptions();
 
   const [replyTab, setReplyTab] = useState<'reply' | 'note'>('reply');
   // Files are collected for UX; the reply endpoint does not yet accept uploads.
   const [, setAttachedFiles] = useState<File[]>([]);
-  const [assigneeId, setAssigneeId] = useState<string>(ticket?.assignee ? String(ticket.assignee.id) : '');
+  const [assigneeId, setAssigneeId] = useState<string>('');
+
+  // Sync the assignee picker once the ticket loads (it starts undefined).
+  useEffect(() => {
+    if (ticket?.assignee) setAssigneeId(String(ticket.assignee.id));
+  }, [ticket?.assignee]);
+
+  const changeStatus = async (status: Ticket['status']) => {
+    try {
+      await updateTicket.mutateAsync({ status });
+      toast({ title: `Статус: ${STATUS_OPTIONS.find((s) => s.value === status)?.label ?? status}` });
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось изменить статус', variant: 'destructive' });
+    }
+  };
+  const changePriority = async (priority: Ticket['priority']) => {
+    try {
+      await updateTicket.mutateAsync({ priority });
+      toast({ title: `Приоритет: ${PRIORITY_OPTIONS.find((p) => p.value === priority)?.label ?? priority}` });
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось изменить приоритет', variant: 'destructive' });
+    }
+  };
+  const changeAssignee = async (v: string) => {
+    setAssigneeId(v);
+    try {
+      await updateTicket.mutateAsync({ assigneeId: v ? Number(v) : null });
+      const agent = staffOptions.find((o) => o.value === v);
+      toast({ title: agent ? `Назначено: ${agent.label}` : 'Исполнитель снят' });
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось назначить исполнителя', variant: 'destructive' });
+    }
+  };
 
   const {
     register,
@@ -93,7 +133,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
     );
   }
 
-  const allReplies = replies ?? ticket.replies ?? [];
+  const allReplies = ticket.replies ?? [];
 
   return (
     <div className="flex h-full flex-col">
@@ -137,44 +177,40 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
             </motion.div>
 
             {/* Replies */}
-            {repliesLoading ? (
-              <div className="text-sm text-muted-foreground">Загрузка ответов...</div>
-            ) : (
-              allReplies.map((reply, i) => (
-                <motion.div
-                  key={reply.id}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: i * 0.05 }}
-                  className={cn(
-                    'rounded-xl border p-5',
-                    reply.is_internal
-                      ? 'border-status-pending/30 bg-status-pending/5'
-                      : 'border-border bg-card',
-                  )}
-                >
-                  <div className="mb-3 flex items-center gap-3">
-                    <Avatar className="h-7 w-7">
-                      <AvatarImage src={reply.author.avatar_url} />
-                      <AvatarFallback className="text-xs">{getInitials(reply.author.name)}</AvatarFallback>
-                    </Avatar>
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2">
-                        <p className="text-sm font-semibold">{reply.author.name}</p>
-                        {reply.is_internal && (
-                          <span className="inline-flex items-center gap-1 rounded-full bg-status-pending/10 px-2 py-0.5 text-[10px] font-semibold text-status-pending">
-                            <Lock className="h-2.5 w-2.5" />
-                            Внутренняя
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-xs text-muted-foreground">{formatRelative(reply.created_at)}</p>
+            {allReplies.map((reply, i) => (
+              <motion.div
+                key={reply.id}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: i * 0.05 }}
+                className={cn(
+                  'rounded-xl border p-5',
+                  reply.is_internal
+                    ? 'border-status-pending/30 bg-status-pending/5'
+                    : 'border-border bg-card',
+                )}
+              >
+                <div className="mb-3 flex items-center gap-3">
+                  <Avatar className="h-7 w-7">
+                    <AvatarImage src={reply.author.avatar_url} />
+                    <AvatarFallback className="text-xs">{getInitials(reply.author.name)}</AvatarFallback>
+                  </Avatar>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-semibold">{reply.author.name}</p>
+                      {reply.is_internal && (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-status-pending/10 px-2 py-0.5 text-[10px] font-semibold text-status-pending">
+                          <Lock className="h-2.5 w-2.5" />
+                          Внутренняя
+                        </span>
+                      )}
                     </div>
+                    <p className="text-xs text-muted-foreground">{formatRelative(reply.created_at)}</p>
                   </div>
-                  <p className="text-sm leading-relaxed whitespace-pre-line">{reply.body}</p>
-                </motion.div>
-              ))
-            )}
+                </div>
+                <p className="text-sm leading-relaxed whitespace-pre-line">{reply.body}</p>
+              </motion.div>
+            ))}
           </div>
 
           {/* Reply composer */}
@@ -232,16 +268,28 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                 Свойства
               </h3>
               <dl className="space-y-2.5 text-sm">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2">
                   <dt className="text-muted-foreground">Статус</dt>
-                  <dd>
-                    <StatusBadge status={ticket.status} size="sm" />
+                  <dd className="flex-1 max-w-[150px]">
+                    <Combobox
+                      options={STATUS_OPTIONS}
+                      value={ticket.status}
+                      onValueChange={(v) => void changeStatus(v as Ticket['status'])}
+                      placeholder="Статус"
+                      triggerWidth="w-full"
+                    />
                   </dd>
                 </div>
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2">
                   <dt className="text-muted-foreground">Приоритет</dt>
-                  <dd>
-                    <PriorityChip priority={ticket.priority} />
+                  <dd className="flex-1 max-w-[150px]">
+                    <Combobox
+                      options={PRIORITY_OPTIONS}
+                      value={ticket.priority}
+                      onValueChange={(v) => void changePriority(v as Ticket['priority'])}
+                      placeholder="Приоритет"
+                      triggerWidth="w-full"
+                    />
                   </dd>
                 </div>
                 {ticket.department && (
@@ -283,20 +331,42 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                 Исполнитель
               </h3>
               <Combobox
-                options={ASSIGNEE_OPTIONS}
+                options={staffOptions}
                 value={assigneeId}
-                onValueChange={(v) => {
-                  setAssigneeId(v);
-                  const agent = MOCK_USERS.find((u) => String(u.id) === v);
-                  toast({
-                    title: agent ? `Назначено: ${agent.name}` : 'Исполнитель снят',
-                  });
-                }}
+                onValueChange={(v) => void changeAssignee(v)}
                 placeholder="Назначить исполнителя"
                 searchPlaceholder="Поиск агента..."
                 emptyMessage="Агент не найден"
                 triggerWidth="w-full"
               />
+            </section>
+
+            <Separator />
+
+            {/* Quick actions */}
+            <section className="space-y-2">
+              {ticket.status !== 'resolved' && ticket.status !== 'closed' && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full"
+                  disabled={updateTicket.isPending}
+                  onClick={() => void changeStatus('resolved')}
+                >
+                  Решена
+                </Button>
+              )}
+              {ticket.status !== 'closed' && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full"
+                  disabled={updateTicket.isPending}
+                  onClick={() => void changeStatus('closed')}
+                >
+                  Закрыть
+                </Button>
+              )}
             </section>
 
             <Separator />

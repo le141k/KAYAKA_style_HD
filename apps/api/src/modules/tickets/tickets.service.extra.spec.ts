@@ -69,6 +69,9 @@ function makePrismaMock() {
     user: {
       findUnique: vi.fn().mockResolvedValue({ organizationId: null }),
     },
+    staff: {
+      findUnique: vi.fn().mockResolvedValue({ id: 1, firstName: 'A', lastName: 'B', email: 'a@b.c' }),
+    },
     ticketPost: {
       create: vi.fn(),
       updateMany: vi.fn(),
