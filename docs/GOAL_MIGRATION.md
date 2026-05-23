@@ -8,22 +8,23 @@ email path correct. Built from a 5-agent analysis of the dump (`../kayako_db_exp
 
 23 Telecom is an **SMS/voice routing broker/operator** — the helpdesk operator, the hub in the middle.
 **All email flows TO 23 Telecom** (queues `noc@` = Customer Issue, `rates@` = Rate Notification,
-`rs@` = Vendor Issue, all `@23telecom.co.uk` on Gmail/IMAP). A ticket is one issue that 23T staff
-resolve by **MATCHING a customer's request with a supplier (carrier) and communicating with BOTH sides
-inside the same ticket**:
+`rs@` = Vendor Issue, all `@23telecom.co.uk` on Gmail/IMAP). The workflow is **two LINKED tickets**, not one:
 
-- **Customer** reports a problem (e.g. SMS not delivering to a country/operator, or a rate request).
-- 23T staff **match it to a supplier/carrier** (Sinch, Lleida, Broadnet, …) that has a route.
-- Staff email the **vendor** to fix/adjust the route (macros in category **"to vendor"**), then email the
-  **customer** to retest (macros in category **"to customer"** — e.g. _"our provider has made route
-  adjustments, kindly retest and share your results"_).
-- So every real ticket has a **client side AND a supplier side**; posts are addressed to one or the other
-  (`swticketposts.email`/`emailto`, `isthirdparty=1` = the vendor/supplier post), and the **macros are
-  deliberately split customer-vs-vendor** for this dual communication. Ticket **type** = `Customer Issue`
-  / `Vendor Issue` / `Rate Notification`.
-- Orgs split three ways: **23 Telecom = INTERNAL**, customers = **CLIENT**, carriers = **SUPPLIER**.
-  > Implication: the matched **client↔supplier pair is the core record**, not an afterthought. Migrated and
-  > seeded tickets MUST show both parties + the two-sided email thread, not just a single requester.
+1. **Auto-ingest:** a **customer emails `noc@23telecom.co.uk`** → the IMAP poller auto-pulls it → a
+   **CLIENT ticket is created automatically** (creationMode = EMAIL, type = Customer Issue).
+2. **NOC works the client ticket:** investigates, replies to the customer ("we're on it" / retest) using
+   the **"to customer"** macros.
+3. **In parallel, NOC contacts the matched supplier/carrier** (Sinch, Lleida, Broadnet, …) → this spawns a
+   **NEW SUPPLIER ticket, LINKED to the client ticket** (`TicketLink`), where staff use the **"to vendor"**
+   macros (fix/adjust the route).
+4. Vendor replies on the supplier ticket → NOC relays the result back on the client ticket → customer
+   retests → resolved. The **link** keeps the customer-side and vendor-side conversations tied together.
+
+- Orgs split three ways: **23 Telecom = INTERNAL**, customers = **CLIENT**, carriers = **SUPPLIER**
+  (confirmed: 23 Telecom=internal; Lleida/Broadnet/Sinch=suppliers; the rest=clients).
+  > Implication: the unit of work is a **linked pair of tickets** (client ticket ↔ supplier ticket), each with
+  > its own one-sided thread, joined by a `TicketLink`. NOT a single ticket with mixed posts. Our schema HAS
+  > a `TicketLink` model but **no API/UI yet** — the linking feature must be built (see M0/M2).
 
 ## ⚠️ Data reality (read first)
 
@@ -43,7 +44,8 @@ inside the same ticket**:
 
 ## ☐ Batch M0 — Schema + importer scaffolding
 
-- [ ] Prisma additions + migration: `Organization.orgType` enum `CLIENT|SUPPLIER|INTERNAL` (default CLIENT); **`Ticket.clientOrgId Int?` + `Ticket.supplierOrgId Int?` (FKs → Organization)** to make the matched client↔supplier pair a first-class, queryable record (the core of the 23T model — see Domain model). `Macro.subject String @default("")`; `Macro.isHtml Boolean @default(false)`. (TicketRecipient CC/BCC, EmailQueue, EmailParserRule already exist — no change.) Add a nullable `kayakoId Int? @unique` to Organization, User, Ticket, Macro (for idempotent re-import + FK resolution). _(Fallback if you must avoid schema change: encode supplier as a `TicketRecipient` CC + `isThirdParty` posts — but the explicit FK pair is strongly preferred.)_
+- [ ] Prisma additions + migration: `Organization.orgType` enum `CLIENT|SUPPLIER|INTERNAL` (default CLIENT); `Macro.subject String @default("")`; `Macro.isHtml Boolean @default(false)`. Add nullable `kayakoId Int? @unique` to Organization, User, Ticket, Macro (idempotent re-import + FK resolution). (TicketRecipient CC/BCC, EmailQueue, EmailParserRule, **`TicketLink`** already exist as models — no schema change.)
+- [ ] **Build the ticket-linking FEATURE** — `TicketLink` model exists (source/target/linkType) but has **NO API and NO UI**. Add: `POST /tickets/:id/links` (link to another ticket, `linkType` e.g. `supplier`/`client`/`related`), `GET /tickets/:id/links`, `DELETE …/links/:id`; a "Связанные тикеты / Linked tickets" panel in the ticket-detail UI (show the linked client/supplier ticket + open it). This is the backbone of the 23T client↔supplier model. (RBAC: `TICKET_EDIT`; tests.)
 - [ ] `apps/api/scripts/import-kayako.ts` (tsx, mirrors seed pattern): a MySQL-INSERT parser (table + columns + rows), in-memory id maps, `prisma.$transaction` inserts in order: Departments→StaffGroup→Staff→Organization→User→UserEmail→Status/Priority/Type→EmailQueue→Macro… Convert Kayako `dateline` (unix) → `DateTime`. Run: `tsx scripts/import-kayako.ts <dump.sql>` against dev DB after `npm run seed`.
 - [ ] Detect full-dump vs samples; log counts imported vs `tables_inventory.csv` expectations.
 - **Acceptance:** migration applies; importer runs on `samples.sql` without error; `make verify` green.
@@ -65,18 +67,20 @@ Fix our mail flow (gaps found vs Kayako), each with a test + MailHog live-check:
 - [ ] **POST_PARSE rules** — `ParserRuleType.POST_PARSE` exists but `inbound.service.ts:applyParserRules()` only queries PRE_PARSE. Evaluate POST_PARSE after ticket create/append.
 - [ ] **Catch-all routing** — implement `swcatchallrules` (regex on To: → queue) before parser rules in `pollQueue()`.
 - [ ] **Migrate email config:** `swemailqueues`→EmailQueue (4: noc@/rates@/rs@; decrypt password→passwordEnc, map type, departmentId); `swparserrules`+criteria+actions(10/11/10)→EmailParserRule (JSON criteria/actions; ruletype1→PRE_PARSE, matchtype3→ALL, the 3 enabled bounce-ignore rules are critical); `swsignatures`/`swqueuesignatures`; re-author key `swtemplates` (autoresponder, ticket_user_reply) from Smarty `{$x}`→`{{x}}` into EmailTemplate.
-- [ ] **Directed reply (customer vs vendor)** — core to the 23T flow: staff must be able to send a ticket reply to the **customer** OR to the matched **vendor/supplier** (not only the requester). Ensure the reply composer can target the supplier (CC/`supplierOrgId` address), mark that post `isThirdParty`, and that the "to customer"/"to vendor" macros land in the right place. (tickets.service.ts reply path + web ticket-detail composer)
+- [ ] **Auto-ingest (client → ticket)** — verify end-to-end that a mail arriving at a queue (`noc@`) is auto-pulled by the IMAP poller and **auto-creates a CLIENT ticket** (creationMode=EMAIL, correct type/queue). `inbound.service.ts` exists — confirm it works against a test IMAP/MailHog-equivalent and the noc@/rates@/rs@ queues route to the right type.
+- [ ] **Spawn linked supplier ticket** — the core NOC action: from a client ticket, "Написать поставщику / Contact supplier" creates a **NEW supplier ticket** (requester = the matched carrier, type = Vendor Issue, prefilled) **auto-linked** to the client ticket via `TicketLink` (linkType=`supplier`). Staff then use the **"to vendor"** macros there; the **"to customer"** macros stay on the client ticket. (new endpoint + ticket-detail button)
 - [ ] (optional) ticket forward (`swticketforwards`), spam filter — defer if time-boxed.
 - **Acceptance:** inbound IMAP (MailHog) → ticket; reply by mask threads; staff reply carries In-Reply-To + signature; autoresponder only when queue opts in; quoted history stripped; parser/queue rows imported. Tests + `make verify` green.
 
 ## ☐ Batch M3 — Emails into all 8 statuses with client↔supplier (Task 3)
 
 - [ ] Confirm the **8 statuses** (5 known: Initial, In Progress, Closed[markResolved], Pending Vendor, Reply Received; 3 only in the full dump) → seed/map to TicketStatus.
-- [ ] For EACH of the 8 statuses, create **5–15 tickets** (from the full dump if present, else synthesize) that model the **real 23T broker flow** — every ticket has BOTH a matched client and supplier:
-  - **`clientOrgId`** = a CLIENT org + the customer is the requester (`Ticket.userId`/`requesterEmail`); **`supplierOrgId`** = a matched SUPPLIER/carrier org (Sinch, Lleida, Broadnet, …). Also CC the supplier (`TicketRecipient` role CC) so outbound mirrors Kayako.
-  - **Two-sided thread** (5–15 `TicketPost`s): customer post(s) (USER) → 23T staff post(s) → **vendor post(s) `isThirdParty=true`** (the carrier) → staff relays back to customer. Use realistic SMS-routing content (delivery issue → route adjusted → retest), `typeId` = Customer Issue / Vendor Issue / Rate Notification, increasing dates.
-  - **Status-specific shape:** Initial = customer just wrote in (1–2 posts, no supplier yet); In Progress = staff matched + emailed the vendor; Pending Vendor = last post is the vendor request, awaiting their reply; Reply Received = vendor `isThirdParty` reply just arrived; Closed = full resolved thread (vendor fixed → customer retested → confirmed).
-- **Acceptance:** every status has 5–15 tickets; each shows a **matched CLIENT + SUPPLIER** (`clientOrgId`+`supplierOrgId`, CC, ≥1 `isThirdParty` vendor post) AND visible two-sided communication in the staff UI. `make verify` green.
+- [ ] For EACH of the 8 statuses, create **5–15 CLIENT tickets**, and for each one a **LINKED SUPPLIER ticket** (the real 23T model = a linked pair, see Domain model):
+  - **Client ticket:** requester = a customer (CLIENT org, e.g. via `noc@`, type Customer Issue), thread = customer ↔ 23T posts only (no vendor posts here). Status = the target status.
+  - **Supplier ticket:** requester/recipient = the matched carrier (SUPPLIER org: Sinch/Lleida/Broadnet…), type Vendor Issue, thread = 23T ↔ vendor posts (`isThirdParty` for the carrier). Created via the M2 "spawn linked supplier ticket" action.
+  - **Link them** with a `TicketLink` (linkType=`supplier`/`client`). Realistic SMS-routing content (delivery issue → ask vendor to fix route → vendor adjusts → customer retests). Increasing dates.
+  - **Status-specific shape (on the CLIENT ticket):** Initial = customer just wrote in, no supplier ticket yet; In Progress = supplier ticket spawned + linked; Pending Vendor = supplier ticket awaiting vendor reply; Reply Received = vendor replied on the supplier ticket; Closed = both resolved (vendor fixed → customer confirmed).
+- **Acceptance:** every status has 5–15 client tickets; each is **linked to a supplier ticket** (visible in the "Linked tickets" panel, openable), client side shows customer↔23T, supplier side shows 23T↔vendor (`isThirdParty`); both reachable in the staff UI. `make verify` green.
 
 ## ☐ Batch M4 — Reply macros (Task 4)
 
@@ -87,10 +91,12 @@ Fix our mail flow (gaps found vs Kayako), each with a test + MailHog live-check:
 
 ## ✅ Definition of Done — STOP when all green
 
-- [ ] Orgs/users/emails imported + classified client/supplier (idempotent re-run).
+- [ ] Orgs/users/emails imported + classified client/supplier/internal (idempotent re-run).
+- [ ] **Ticket-linking feature built** (API + UI) — link/unlink/list; "Linked tickets" panel shows the client↔supplier counterpart.
+- [ ] **Auto-ingest verified** (mail → noc@ → auto client ticket) + **"spawn linked supplier ticket"** action works.
 - [ ] Email-path gaps fixed (threading headers, per-queue autoresponder, signature, quote-strip, POST_PARSE, catch-all) + queues/parser-rules imported; verified live via MailHog.
-- [ ] 5–15 tickets in EACH of the 8 statuses, each with a **matched client + supplier** (`clientOrgId`+`supplierOrgId`) and a **two-sided thread** (customer ↔ 23T ↔ vendor `isThirdParty`).
-- [ ] All reply macros + categories imported and applicable.
+- [ ] 5–15 **client tickets** in EACH of the 8 statuses, **each linked to a supplier ticket** (client side = customer↔23T, supplier side = 23T↔vendor `isThirdParty`).
+- [ ] All reply macros + the "to customer"/"to vendor" categories imported and applicable.
 - [ ] `make verify-full` green (gate + e2e); dev loop intact.
 
 ## ⛔ OUT OF SCOPE / decisions for the human

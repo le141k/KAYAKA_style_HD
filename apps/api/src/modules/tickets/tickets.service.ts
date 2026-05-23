@@ -1226,32 +1226,38 @@ export class TicketsService {
               if (did) ticketUpdate['departmentId'] = did;
               break;
             }
-            case 'add_tag':
-              if (typeof action['tag'] === 'string' && action['tag']) {
+            case 'add_tag': {
+              // Accept both the typed key (`tag`) and the UI's generic `value`.
+              const tag = (action['tag'] ?? action['value']) as string | undefined;
+              if (typeof tag === 'string' && tag) {
                 await this.prisma.ticket.update({
                   where: { id: ticketId },
                   data: {
                     tags: {
                       connectOrCreate: {
-                        where: { name: action['tag'] as string },
-                        create: { name: action['tag'] as string },
+                        where: { name: tag },
+                        create: { name: tag },
                       },
                     },
                   },
                 });
               }
               break;
-            case 'add_note':
-              if (typeof action['note'] === 'string' && action['note']) {
+            }
+            case 'add_note': {
+              // Accept both the typed key (`note`) and the UI's generic `value`.
+              const note = (action['note'] ?? action['value']) as string | undefined;
+              if (typeof note === 'string' && note) {
                 await this.prisma.ticketNote.create({
                   data: {
                     ticketId,
                     staffId,
-                    contents: `[Macro: ${macro.title}] ${action['note']}`,
+                    contents: `[Macro: ${macro.title}] ${note}`,
                   },
                 });
               }
               break;
+            }
           }
         } catch (err) {
           this.logger.error(

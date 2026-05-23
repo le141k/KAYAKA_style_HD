@@ -62,10 +62,11 @@ rewritten at commit 31add8e). After this, the product is honestly hand-to-a-real
 - [x] 🟡 **SEC-7** `StorageService.createReadStream`/`delete` now resolve the storageKey and assert it stays inside the upload dir (defense-in-depth path-traversal guard; storageKeys are DB-sourced). +4 unit tests.
 - **Acceptance:** `make verify` GREEN 9/9; e2e 37/37. ✅
 
-## ⏳ Batch H7 — Admin workflow/macro builders (real feature gaps)
+## ✅ Batch H7 — Admin workflow/macro builders (DONE — real feature gaps)
 
-- [ ] 🟠 **ADM-1** Macro create/edit dialog had no actions builder (`macroSchema = {title,isShared,categoryId}`) → a UI-made macro did nothing. Add an actions field-array (reuse `ACTION_TYPES` + per-type value input).
-- [ ] 🟠 **ADM-2** Workflow rule criterion _field_ was a free-text `<input>` → admin could silently save a non-matching rule. Replace with a dropdown of real ticket fields.
+- [x] 🟠 **ADM-1** Macro dialog now has an **actions builder** (field-array). `macroSchema` gained `actions`; create/edit serialize them to `{type,value}` (no longer `[]`/preserve-only). Uses a macro-aligned `MACRO_ACTION_TYPES` (only types `applyMacro` executes). Backend: `applyMacro` `add_tag`/`add_note` now accept the UI's generic `value` (not just typed `tag`/`note` keys). **Live: macro `{add_tag, value:'h7tag'}` created via API → applied → ticket tagged `h7tag`.** +2 unit tests.
+- [x] 🟠 **ADM-2** Workflow criterion _field_ is now a **dropdown** of real ticket columns (`CRITERION_FIELDS`: subject/statusId/priorityId/departmentId/typeId/ownerStaffId/requesterEmail/creationMode/flagType/isResolved/isEscalated) — admin can no longer silently save a rule referencing a non-existent field.
+- **Acceptance:** UI-built macro fires live; criterion field constrained to real columns; api vitest 56/56 in the macro suite; `make verify` GREEN 9/9; e2e 37/37. ✅
 
 ---
 

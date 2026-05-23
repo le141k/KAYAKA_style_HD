@@ -755,6 +755,69 @@ describe('TicketsService (extra coverage)', () => {
       );
     });
 
+    it('ADM-1: add_tag fires from the UI {type,value} shape (value → tag name)', async () => {
+      const ticket = makeTicket();
+      const macro = {
+        id: 31,
+        title: 'UI Tag Macro',
+        replyText: '',
+        // The admin builder serializes actions as {type, value} (no typed `tag` key).
+        actions: [{ type: 'add_tag', value: 'vip' }],
+        categoryId: null,
+        createdAt: new Date(),
+      };
+
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.macro.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(macro);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticket.findUniqueOrThrow as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+
+      await service.applyMacro(1, { macroId: 31 }, 5);
+
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            tags: expect.objectContaining({
+              connectOrCreate: expect.objectContaining({
+                where: { name: 'vip' },
+                create: { name: 'vip' },
+              }),
+            }),
+          }),
+        }),
+      );
+    });
+
+    it('ADM-1: add_note fires from the UI {type,value} shape (value → note text)', async () => {
+      const ticket = makeTicket();
+      const macro = {
+        id: 32,
+        title: 'UI Note Macro',
+        replyText: '',
+        actions: [{ type: 'add_note', value: 'check billing' }],
+        categoryId: null,
+        createdAt: new Date(),
+      };
+
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.macro.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(macro);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.ticketNote.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticket.findUniqueOrThrow as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+
+      await service.applyMacro(1, { macroId: 32 }, 5);
+
+      expect(prisma.ticketNote.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            contents: expect.stringContaining('check billing'),
+          }),
+        }),
+      );
+    });
+
     it('writes audit log entry with MACRO_APPLIED action', async () => {
       const ticket = makeTicket();
       const macro = {

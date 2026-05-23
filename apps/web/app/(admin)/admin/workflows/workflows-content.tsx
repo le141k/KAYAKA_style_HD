@@ -55,6 +55,7 @@ const macroSchema = z.object({
   title: z.string().min(1, 'Обязательное поле'),
   isShared: z.boolean().optional(),
   categoryId: z.coerce.number().nullable().optional(),
+  actions: z.array(actionSchema),
 });
 type MacroFormValues = z.infer<typeof macroSchema>;
 
@@ -84,6 +85,34 @@ const CRITERION_OPS = [
   { value: 'not_contains', label: 'не содержит' },
   { value: 'starts_with', label: 'начинается с' },
   { value: 'ends_with', label: 'заканчивается на' },
+];
+
+// Real ticket columns the executor matches against (`ticket[field]`). A dropdown
+// instead of free text so an admin can't silently save a rule that never matches.
+const CRITERION_FIELDS = [
+  { value: 'subject', label: 'Тема' },
+  { value: 'statusId', label: 'Статус (ID)' },
+  { value: 'priorityId', label: 'Приоритет (ID)' },
+  { value: 'departmentId', label: 'Отдел (ID)' },
+  { value: 'typeId', label: 'Тип (ID)' },
+  { value: 'ownerStaffId', label: 'Исполнитель (ID)' },
+  { value: 'requesterEmail', label: 'Email заявителя' },
+  { value: 'creationMode', label: 'Канал (WEB/EMAIL/API/STAFF/ALARIS)' },
+  { value: 'flagType', label: 'Флаг' },
+  { value: 'isResolved', label: 'Решена (true/false)' },
+  { value: 'isEscalated', label: 'Эскалирована (true/false)' },
+];
+
+// Macro action vocabulary — only the types `applyMacro` actually executes. The
+// generic `value` carries the target (status/priority/owner/department ID, tag
+// name, or note text); applyMacro reads `value` for every one of these.
+const MACRO_ACTION_TYPES = [
+  { value: 'set_status', label: 'Установить статус (ID)' },
+  { value: 'set_priority', label: 'Установить приоритет (ID)' },
+  { value: 'assign', label: 'Назначить исполнителя (ID, пусто = снять)' },
+  { value: 'change_department', label: 'Сменить отдел (ID)' },
+  { value: 'add_tag', label: 'Добавить тег (имя)' },
+  { value: 'add_note', label: 'Добавить заметку (текст)' },
 ];
 
 export function WorkflowsContent() {
@@ -127,8 +156,14 @@ export function WorkflowsContent() {
 
   const macroForm = useForm<MacroFormValues>({
     resolver: zodResolver(macroSchema),
-    defaultValues: { title: '', isShared: true, categoryId: null },
+    defaultValues: { title: '', isShared: true, categoryId: null, actions: [] },
   });
+
+  const {
+    fields: macroActionsFields,
+    append: appendMacroAction,
+    remove: removeMacroAction,
+  } = useFieldArray({ control: macroForm.control, name: 'actions' });
 
   const macroCategoryForm = useForm<MacroCategoryFormValues>({
     resolver: zodResolver(macroCategorySchema),
@@ -193,31 +228,42 @@ export function WorkflowsContent() {
 
   function openCreateMacro() {
     setEditingMacro(null);
-    macroForm.reset({ title: '', isShared: true, categoryId: null });
+    macroForm.reset({ title: '', isShared: true, categoryId: null, actions: [] });
     setMacroDialog(true);
   }
 
   function openEditMacro(macro: AdminMacro) {
     setEditingMacro(macro);
-    macroForm.reset({ title: macro.title, isShared: macro.isShared, categoryId: macro.categoryId });
+    // Pre-populate the actions builder from the stored macro (mirror openEditWf).
+    const actions = (macro.actions as { type?: string; value?: string; [k: string]: unknown }[]).map((a) => ({
+      type: a.type ?? '',
+      value:
+        (a.value as string | undefined) ??
+        Object.entries(a)
+          .filter(([k]) => k !== 'type')
+          .map(([, v]) => String(v ?? ''))
+          .join(''),
+    }));
+    macroForm.reset({
+      title: macro.title,
+      isShared: macro.isShared,
+      categoryId: macro.categoryId,
+      actions,
+    });
     setMacroDialog(true);
   }
 
   async function onMacroSubmit(values: MacroFormValues) {
     // Ensure isShared is explicitly boolean (checkbox may be undefined when unchecked)
-    const payload = { ...values, isShared: values.isShared ?? false };
+    // and serialize the actions the admin built into the API's {type,value} shape.
+    const actions = values.actions.map((a) => ({ type: a.type, value: a.value }));
+    const payload = { ...values, isShared: values.isShared ?? false, actions };
     try {
       if (editingMacro) {
-        // Preserve existing actions; only update metadata fields
-        const updated = await updateMacro.mutateAsync({
-          id: editingMacro.id,
-          data: { ...payload, actions: editingMacro.actions },
-        });
-        // Optimistic: if backend strips isShared, keep our value
-        void updated;
+        await updateMacro.mutateAsync({ id: editingMacro.id, data: payload });
         toast({ title: 'Макрос обновлён' });
       } else {
-        await createMacro.mutateAsync({ ...payload, actions: [] });
+        await createMacro.mutateAsync(payload);
         toast({ title: 'Макрос создан' });
       }
       setMacroDialog(false);
@@ -510,11 +556,16 @@ export function WorkflowsContent() {
               )}
               {criteriaFields.map((field, idx) => (
                 <div key={field.id} className="flex gap-2 items-start">
-                  <Input
+                  <select
                     {...wfForm.register(`criteria.${idx}.field`)}
-                    placeholder="Поле (напр. subject)"
-                    className="flex-1"
-                  />
+                    className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+                  >
+                    {CRITERION_FIELDS.map((f) => (
+                      <option key={f.value} value={f.value}>
+                        {f.label}
+                      </option>
+                    ))}
+                  </select>
                   <select
                     {...wfForm.register(`criteria.${idx}.op`)}
                     className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm"
@@ -636,6 +687,56 @@ export function WorkflowsContent() {
                 Общий (виден всем агентам)
               </label>
             </div>
+
+            {/* Macro actions builder — without these a macro applies nothing. */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium">Действия</label>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => appendMacroAction({ type: 'set_status', value: '' })}
+                >
+                  <Plus className="mr-1 h-3.5 w-3.5" />
+                  Добавить действие
+                </Button>
+              </div>
+              {macroActionsFields.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  Нет действий — макрос ничего не изменит (можно использовать только для текста ответа)
+                </p>
+              )}
+              {macroActionsFields.map((field, idx) => (
+                <div key={field.id} className="flex gap-2 items-start">
+                  <select
+                    {...macroForm.register(`actions.${idx}.type`)}
+                    className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+                  >
+                    {MACRO_ACTION_TYPES.map((t) => (
+                      <option key={t.value} value={t.value}>
+                        {t.label}
+                      </option>
+                    ))}
+                  </select>
+                  <Input
+                    {...macroForm.register(`actions.${idx}.value`)}
+                    placeholder="Значение"
+                    className="flex-1"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-9 w-9 text-destructive hover:text-destructive shrink-0"
+                    onClick={() => removeMacroAction(idx)}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setMacroDialog(false)}>
                 Отмена
