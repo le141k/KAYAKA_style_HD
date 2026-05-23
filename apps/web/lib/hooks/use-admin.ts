@@ -125,8 +125,10 @@ export interface ApiMacro {
 export interface ApiCustomFieldGroup {
   id: number;
   title: string;
+  scope: 'TICKET' | 'USER' | 'STAFF' | 'ORGANIZATION';
   displayOrder: number;
-  isEditable: boolean;
+  // The list endpoint embeds fields inline; there is no per-group GET route.
+  fields?: ApiCustomField[];
 }
 
 export interface ApiCustomField {
@@ -237,8 +239,8 @@ export interface AdminMacro {
 export interface AdminCustomFieldGroup {
   id: number;
   title: string;
+  scope: 'TICKET' | 'USER' | 'STAFF' | 'ORGANIZATION';
   displayOrder: number;
-  isEditable: boolean;
   fields: AdminCustomField[];
 }
 
@@ -343,8 +345,8 @@ function mapFieldGroup(g: ApiCustomFieldGroup, fields: ApiCustomField[]): AdminC
   return {
     id: g.id,
     title: g.title,
+    scope: g.scope,
     displayOrder: g.displayOrder,
-    isEditable: g.isEditable,
     fields: fields.map((f) => ({
       id: f.id,
       groupId: f.groupId,
@@ -391,10 +393,17 @@ export interface DepartmentInput {
   parentId?: number | null;
 }
 
+// API schema treats parentId as optional-omitted, not nullable: sending JSON
+// `null` (or 0 from an empty <select>) fails validation. Drop it when empty.
+function cleanDepartment(data: DepartmentInput): { title: string; parentId?: number } {
+  const parentId = data.parentId;
+  return parentId == null || parentId === 0 ? { title: data.title } : { title: data.title, parentId };
+}
+
 export function useCreateDepartment() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: DepartmentInput) => api.post<ApiDepartment>('/departments', data),
+    mutationFn: (data: DepartmentInput) => api.post<ApiDepartment>('/departments', cleanDepartment(data)),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.departments }),
   });
 }
@@ -403,7 +412,7 @@ export function useUpdateDepartment() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, data }: { id: number; data: DepartmentInput }) =>
-      api.patch<ApiDepartment>(`/departments/${id}`, data),
+      api.patch<ApiDepartment>(`/departments/${id}`, cleanDepartment(data)),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.departments }),
   });
 }
@@ -523,10 +532,16 @@ export interface SlaPlanInput {
   scheduleId?: number | null;
 }
 
+// An empty schedule <select> yields 0 via z.coerce.number(); the API wants a
+// positive id or explicit null ("no schedule").
+function cleanSlaPlan(data: SlaPlanInput): SlaPlanInput {
+  return { ...data, scheduleId: data.scheduleId ? data.scheduleId : null };
+}
+
 export function useCreateSlaPlan() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: SlaPlanInput) => api.post<ApiSlaPlan>('/admin/sla/plans', data),
+    mutationFn: (data: SlaPlanInput) => api.post<ApiSlaPlan>('/admin/sla/plans', cleanSlaPlan(data)),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.slaPlans }),
   });
 }
@@ -535,7 +550,7 @@ export function useUpdateSlaPlan() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, data }: { id: number; data: SlaPlanInput }) =>
-      api.patch<ApiSlaPlan>(`/admin/sla/plans/${id}`, data),
+      api.put<ApiSlaPlan>(`/admin/sla/plans/${id}`, cleanSlaPlan(data)),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.slaPlans }),
   });
 }
@@ -610,7 +625,8 @@ export function useAdminStaff() {
   return useQuery({
     queryKey: adminKeys.staff,
     queryFn: async () => {
-      const res = await api.get<{ data: ApiStaffMember[]; total: number }>('/staff?limit=200');
+      // API caps limit at 100 — requesting 200 returns a 400 and the table never loads.
+      const res = await api.get<{ data: ApiStaffMember[]; total: number }>('/staff?limit=100');
       return { data: res.data.map(mapStaff), total: res.total };
     },
   });
@@ -626,10 +642,20 @@ export interface StaffInput {
   password?: string;
 }
 
+// API requires `username` and rejects staffGroupId 0/null. The form doesn't
+// expose a username, so derive it from the email local-part, and drop an empty
+// group selection.
+function cleanStaff<T extends Partial<StaffInput>>(data: T): T {
+  const out: Partial<StaffInput> = { ...data };
+  if (!out.username && out.email) out.username = out.email.split('@')[0];
+  if (out.staffGroupId == null || out.staffGroupId === 0) delete out.staffGroupId;
+  return out as T;
+}
+
 export function useCreateStaff() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: StaffInput) => api.post<ApiStaffMember>('/staff', data),
+    mutationFn: (data: StaffInput) => api.post<ApiStaffMember>('/staff', cleanStaff(data)),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staff }),
   });
 }
@@ -638,7 +664,7 @@ export function useUpdateStaff() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, data }: { id: number; data: Partial<StaffInput> }) =>
-      api.patch<ApiStaffMember>(`/staff/${id}`, data),
+      api.patch<ApiStaffMember>(`/staff/${id}`, cleanStaff(data)),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staff }),
   });
 }
@@ -706,7 +732,7 @@ export function useUpdateWorkflow() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, data }: { id: number; data: WorkflowInput }) =>
-      api.patch<ApiWorkflow>(`/admin/workflows/${id}`, data),
+      api.put<ApiWorkflow>(`/admin/workflows/${id}`, data),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.workflows }),
   });
 }
@@ -784,7 +810,7 @@ export function useUpdateMacro() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, data }: { id: number; data: MacroInput }) =>
-      api.patch<ApiMacro>(`/admin/macros/${id}`, data),
+      api.put<ApiMacro>(`/admin/macros/${id}`, data),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.macros() }),
   });
 }
@@ -803,31 +829,25 @@ export function useAdminCustomFieldGroups() {
   return useQuery({
     queryKey: adminKeys.customFieldGroups,
     queryFn: async () => {
+      // The list response embeds fields inline — there is no per-group GET route
+      // (the old per-group fetch always 404'd, so groups showed "0 полей").
       const groups = await api.get<ApiCustomFieldGroup[]>('/admin/custom-field-groups');
-      const withFields = await Promise.all(
-        groups.map(async (g) => {
-          try {
-            const fields = await api.get<ApiCustomField[]>(`/admin/custom-field-groups/${g.id}/fields`);
-            return mapFieldGroup(g, fields);
-          } catch {
-            return mapFieldGroup(g, []);
-          }
-        }),
-      );
-      return withFields;
+      return groups.map((g) => mapFieldGroup(g, g.fields ?? []));
     },
   });
 }
 
 export interface CustomFieldGroupInput {
   title: string;
+  scope?: 'TICKET' | 'USER' | 'STAFF' | 'ORGANIZATION';
 }
 
 export function useCreateCustomFieldGroup() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (data: CustomFieldGroupInput) =>
-      api.post<ApiCustomFieldGroup>('/admin/custom-field-groups', data),
+      // API requires `scope`; default to TICKET when the form doesn't specify one.
+      api.post<ApiCustomFieldGroup>('/admin/custom-field-groups', { scope: 'TICKET', ...data }),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.customFieldGroups }),
   });
 }
@@ -840,17 +860,50 @@ export function useDeleteCustomFieldGroup() {
   });
 }
 
+// API field types are UPPERCASE; the form supplies a human label + lowercase id.
+const FIELD_TYPE_MAP: Record<string, string> = {
+  text: 'TEXT',
+  textarea: 'TEXTAREA',
+  password: 'PASSWORD',
+  checkbox: 'CHECKBOX',
+  radio: 'RADIO',
+  select: 'SELECT',
+  multiselect: 'MULTISELECT',
+  date: 'DATE',
+  file: 'FILE',
+  custom: 'CUSTOM',
+};
+
 export interface CustomFieldInput {
   title: string;
   type: string;
+  fieldKey?: string;
   isRequired?: boolean;
+  options?: string[];
+}
+
+// Derive a valid fieldKey (lowercase alphanumeric/underscore) from the title.
+function slugifyFieldKey(title: string): string {
+  return (
+    title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 100) || `field_${Date.now()}`
+  );
 }
 
 export function useCreateCustomField(groupId: number) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (data: CustomFieldInput) =>
-      api.post<ApiCustomField>(`/admin/custom-field-groups/${groupId}/fields`, data),
+      api.post<ApiCustomField>(`/admin/custom-field-groups/${groupId}/fields`, {
+        title: data.title,
+        fieldKey: data.fieldKey || slugifyFieldKey(data.title),
+        type: FIELD_TYPE_MAP[data.type.toLowerCase()] ?? data.type.toUpperCase(),
+        isRequired: data.isRequired ?? false,
+        options: data.options ?? [],
+      }),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.customFieldGroups }),
   });
 }

@@ -27,7 +27,8 @@ const staffSchema = z.object({
   lastName: z.string().min(1, 'Обязательное поле'),
   username: z.string().optional(),
   designation: z.string().optional(),
-  staffGroupId: z.coerce.number().nullable().optional(),
+  // Group is mandatory: the API requires a positive staffGroupId on create.
+  staffGroupId: z.coerce.number({ invalid_type_error: 'Выберите группу' }).int().positive('Выберите группу'),
   password: z.string().optional(),
 });
 type StaffFormValues = z.infer<typeof staffSchema>;
@@ -48,7 +49,7 @@ export function StaffContent() {
       firstName: '',
       lastName: '',
       designation: '',
-      staffGroupId: null,
+      staffGroupId: undefined,
       password: '',
     },
   });
@@ -57,7 +58,14 @@ export function StaffContent() {
 
   function openCreate() {
     setEditing(null);
-    form.reset({ email: '', firstName: '', lastName: '', designation: '', staffGroupId: null, password: '' });
+    form.reset({
+      email: '',
+      firstName: '',
+      lastName: '',
+      designation: '',
+      staffGroupId: undefined,
+      password: '',
+    });
     setDialogOpen(true);
   }
 
@@ -69,7 +77,7 @@ export function StaffContent() {
       lastName: member.lastName,
       username: member.username,
       designation: member.designation,
-      staffGroupId: member.staffGroupId,
+      staffGroupId: member.staffGroupId ?? undefined,
       password: '',
     });
     setDialogOpen(true);
@@ -185,7 +193,7 @@ export function StaffContent() {
           <DialogHeader>
             <DialogTitle>{editing ? 'Редактировать сотрудника' : 'Новый сотрудник'}</DialogTitle>
           </DialogHeader>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4" noValidate>
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-1.5">
                 <label className="text-sm font-medium">Имя</label>
@@ -220,13 +228,16 @@ export function StaffContent() {
                   className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm"
                   {...form.register('staffGroupId')}
                 >
-                  <option value="">— Без группы —</option>
+                  <option value="">— Выберите группу —</option>
                   {groups.map((g) => (
                     <option key={g.id} value={g.id}>
                       {g.title}
                     </option>
                   ))}
                 </select>
+                {form.formState.errors.staffGroupId && (
+                  <p className="text-xs text-destructive">{form.formState.errors.staffGroupId.message}</p>
+                )}
               </div>
             )}
             <div className="space-y-1.5">

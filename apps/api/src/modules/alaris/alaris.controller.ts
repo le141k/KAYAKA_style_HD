@@ -1,5 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import {
+  BadRequestException,
   Body,
   Controller,
   ForbiddenException,
@@ -47,7 +48,7 @@ export class AlarisController {
     }
 
     if (!payload.externalId || !payload.message) {
-      throw new Error('Missing required fields: externalId, message');
+      throw new BadRequestException('Missing required fields: externalId, message');
     }
 
     return this.alarisService.ingest(payload);

@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { APP_FILTER } from '@nestjs/core';
 import { LoggerModule } from 'nestjs-pino';
 import { BullModule } from '@nestjs/bullmq';
 import { EventEmitterModule } from '@nestjs/event-emitter';
@@ -19,6 +20,7 @@ import { TroubleshooterModule } from './modules/troubleshooter/troubleshooter.mo
 import { ReportsModule } from './modules/reports/reports.module';
 import { WorkflowModule } from './modules/workflow/workflow.module';
 import { AdminModule } from './modules/admin/admin.module';
+import { PrismaExceptionFilter } from './common/prisma-exception.filter';
 
 const config = loadConfig();
 const redisUrl = new URL(config.REDIS_URL);
@@ -76,6 +78,11 @@ const redisUrl = new URL(config.REDIS_URL);
     {
       provide: APP_CONFIG,
       useValue: config,
+    },
+    // Map Prisma known-request errors (P2025/P2003/P2002) to 404/400/409 instead of 500
+    {
+      provide: APP_FILTER,
+      useClass: PrismaExceptionFilter,
     },
   ],
   exports: [APP_CONFIG],

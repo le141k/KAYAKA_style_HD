@@ -2,12 +2,17 @@
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
-function getToken(): string | null {
+export function getToken(): string | null {
   if (typeof window === 'undefined') return null;
   // Prefer cookie, fall back to localStorage
   const cookieMatch = document.cookie.split('; ').find((row) => row.startsWith('auth_token='));
   if (cookieMatch) return cookieMatch.split('=')[1] ?? null;
   return localStorage.getItem('auth_token');
+}
+
+/** True when an auth token is present (used to gate authed-only queries). */
+export function hasToken(): boolean {
+  return getToken() != null;
 }
 
 function storeTokens(accessToken: string): void {

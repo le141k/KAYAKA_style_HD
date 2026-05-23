@@ -1,22 +1,21 @@
-"use client";
+'use client';
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
-import { useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
-import { z } from "zod";
-import { motion } from "framer-motion";
-import { Eye, EyeOff, Wifi, Lock, Mail, ArrowRight, Loader2 } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { useLogin } from "@/lib/hooks/use-auth";
-import { useI18n } from "@/lib/i18n";
+import { useState } from 'react';
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
+import { motion } from 'framer-motion';
+import { Eye, EyeOff, Wifi, Lock, Mail, ArrowRight, Loader2 } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { useLogin } from '@/lib/hooks/use-auth';
+import { useI18n } from '@/lib/i18n';
 
 const loginSchema = z.object({
-  email: z.string().email("Введите корректный email"),
-  password: z.string().min(6, "Минимум 6 символов"),
+  email: z.string().email('Введите корректный email'),
+  password: z.string().min(6, 'Минимум 6 символов'),
 });
 type LoginForm = z.infer<typeof loginSchema>;
 
@@ -31,7 +30,7 @@ function BrandLogo({ className }: { className?: string }) {
       viewBox="0 0 64 64"
       fill="none"
       xmlns="http://www.w3.org/2000/svg"
-      className={cn("h-12 w-12", className)}
+      className={cn('h-12 w-12', className)}
       aria-hidden="true"
     >
       {/* Outer arc */}
@@ -87,9 +86,8 @@ function BrandLogo({ className }: { className?: string }) {
   );
 }
 
-export function LoginScreen({ redirectTo = "/staff/dashboard" }: LoginScreenProps) {
+export function LoginScreen({ redirectTo = '/staff/dashboard' }: LoginScreenProps) {
   const { t } = useI18n();
-  const router = useRouter();
   const [showPassword, setShowPassword] = useState(false);
   const loginMutation = useLogin();
 
@@ -105,9 +103,11 @@ export function LoginScreen({ redirectTo = "/staff/dashboard" }: LoginScreenProp
   const onSubmit = async (data: LoginForm) => {
     try {
       await loginMutation.mutateAsync(data);
-      router.push(redirectTo);
+      // Hard navigation: a soft router.push can be pre-empted by the (client)
+      // layout's RSC prefetch of /tickets, landing staff on the client portal.
+      window.location.assign(redirectTo);
     } catch {
-      setError("root", { message: t.auth.loginError });
+      setError('root', { message: t.auth.loginError });
     }
   };
 
@@ -135,8 +135,7 @@ export function LoginScreen({ redirectTo = "/staff/dashboard" }: LoginScreenProp
               без хаоса
             </h2>
             <p className="mt-3 text-base text-white/75">
-              Единая платформа для агентов, клиентов и NOC-команды с
-              мониторингом SLA в реальном времени.
+              Единая платформа для агентов, клиентов и NOC-команды с мониторингом SLA в реальном времени.
             </p>
           </motion.div>
 
@@ -148,10 +147,10 @@ export function LoginScreen({ redirectTo = "/staff/dashboard" }: LoginScreenProp
             className="space-y-3"
           >
             {[
-              "Канбан-доска с drag & drop",
-              "SLA-таймеры и автоэскалация",
-              "База знаний и клиентский портал",
-              "Командная строка ⌘K",
+              'Канбан-доска с drag & drop',
+              'SLA-таймеры и автоэскалация',
+              'База знаний и клиентский портал',
+              'Командная строка ⌘K',
             ].map((f) => (
               <li key={f} className="flex items-center gap-2.5 text-sm text-white/90">
                 <span className="flex h-5 w-5 items-center justify-center rounded-full bg-white/20">
@@ -182,9 +181,7 @@ export function LoginScreen({ redirectTo = "/staff/dashboard" }: LoginScreenProp
 
           <div>
             <h1 className="text-2xl font-bold">{t.auth.loginTitle}</h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              {t.auth.loginSubtitle}
-            </p>
+            <p className="mt-1 text-sm text-muted-foreground">{t.auth.loginSubtitle}</p>
           </div>
 
           <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
@@ -197,10 +194,10 @@ export function LoginScreen({ redirectTo = "/staff/dashboard" }: LoginScreenProp
                   type="email"
                   autoComplete="email"
                   placeholder="agent@23telecom.ru"
-                  className={cn("pl-9", errors.email && "border-destructive")}
-                  {...register("email")}
+                  className={cn('pl-9', errors.email && 'border-destructive')}
+                  {...register('email')}
                   aria-invalid={!!errors.email}
-                  aria-describedby={errors.email ? "email-error" : undefined}
+                  aria-describedby={errors.email ? 'email-error' : undefined}
                 />
               </div>
               {errors.email && (
@@ -216,25 +213,21 @@ export function LoginScreen({ redirectTo = "/staff/dashboard" }: LoginScreenProp
                 <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   id="password"
-                  type={showPassword ? "text" : "password"}
+                  type={showPassword ? 'text' : 'password'}
                   autoComplete="current-password"
                   placeholder="••••••••"
-                  className={cn("pl-9 pr-9", errors.password && "border-destructive")}
-                  {...register("password")}
+                  className={cn('pl-9 pr-9', errors.password && 'border-destructive')}
+                  {...register('password')}
                   aria-invalid={!!errors.password}
-                  aria-describedby={errors.password ? "pw-error" : undefined}
+                  aria-describedby={errors.password ? 'pw-error' : undefined}
                 />
                 <button
                   type="button"
                   onClick={() => setShowPassword((v) => !v)}
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                  aria-label={showPassword ? "Скрыть пароль" : "Показать пароль"}
+                  aria-label={showPassword ? 'Скрыть пароль' : 'Показать пароль'}
                 >
-                  {showPassword ? (
-                    <EyeOff className="h-4 w-4" />
-                  ) : (
-                    <Eye className="h-4 w-4" />
-                  )}
+                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                 </button>
               </div>
               {errors.password && (
@@ -255,11 +248,7 @@ export function LoginScreen({ redirectTo = "/staff/dashboard" }: LoginScreenProp
               </motion.p>
             )}
 
-            <Button
-              type="submit"
-              className="w-full"
-              disabled={loginMutation.isPending}
-            >
+            <Button type="submit" className="w-full" disabled={loginMutation.isPending}>
               {loginMutation.isPending ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />

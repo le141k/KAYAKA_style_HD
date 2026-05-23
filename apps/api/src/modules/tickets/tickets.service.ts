@@ -150,14 +150,20 @@ export class TicketsService {
     // Emit domain event
     this.emitDomainEvent('ticket.created', updated.id);
 
-    // Send autoresponder email to requester (non-blocking)
-    if (dto.requesterEmail) {
+    // Send autoresponder email to requester (non-blocking).
+    // Skip for system-generated tickets (e.g. Alaris) — their requesterEmail is a
+    // non-deliverable internal address and should not receive an autoresponder.
+    const isSystemTicket = dto.creationMode === 'ALARIS';
+    if (dto.requesterEmail && !isSystemTicket) {
+      const requesterName = dto.requesterName || dto.requesterEmail;
       this.mailService
         .sendTemplate(dto.requesterEmail, 'autoresponder', 'en', {
           mask,
           subject: dto.subject,
           contents: dto.contents,
-          requesterName: dto.requesterName || dto.requesterEmail,
+          // Templates reference {{name}}; keep requesterName too for forward-compat.
+          name: requesterName,
+          requesterName,
         })
         .catch((err: unknown) => this.logger.error(`Autoresponder email failed for ${mask}: ${String(err)}`));
     }
@@ -350,12 +356,15 @@ export class TicketsService {
 
     // Send outbound email to requester when a staff member replies (non-blocking)
     if (isStaffReply && ticket.requesterEmail) {
+      const requesterName = ticket.requesterName || ticket.requesterEmail;
       this.mailService
         .sendTemplate(ticket.requesterEmail, 'ticket_user_reply', 'en', {
           mask: ticket.mask,
           subject: ticket.subject,
           contents: dto.contents,
-          requesterName: ticket.requesterName || ticket.requesterEmail,
+          // Templates reference {{name}}; keep requesterName too for forward-compat.
+          name: requesterName,
+          requesterName,
         })
         .catch((err: unknown) =>
           this.logger.error(`Reply email failed for ticket ${ticket.mask}: ${String(err)}`),
@@ -371,6 +380,7 @@ export class TicketsService {
   // ─────────────────────────── Note ───────────────────────────
 
   async addNote(ticketId: number, contents: string, staffId?: number): Promise<TicketNote> {
+    await this.findOrThrow(ticketId);
     const note = await this.prisma.ticketNote.create({
       data: { ticketId, staffId, contents },
     });
