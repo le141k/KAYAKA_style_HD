@@ -23,6 +23,7 @@ import {
   CreateTicketSchema,
   ReplyTicketSchema,
   AssignTicketSchema,
+  BulkTicketActionSchema,
   ChangeStatusSchema,
   ChangePrioritySchema,
   ChangeTypeSchema,
@@ -50,6 +51,7 @@ import {
   type PublicReplyDto,
   type ApplyMacroDto,
   type ChangeDepartmentDto,
+  type BulkTicketActionDto,
 } from './dto';
 
 @ApiTags('tickets')
@@ -145,6 +147,16 @@ export class TicketsController {
   @ApiOperation({ summary: 'Create a ticket (staff)' })
   create(@Body() dto: CreateTicketDto, @CurrentStaff() staff: AuthStaff) {
     return this.ticketsService.createTicket(dto, staff.staffId);
+  }
+
+  @Post('bulk')
+  @RequirePermissions(PERMISSIONS.TICKET_EDIT)
+  @ApiOperation({ summary: 'Apply a status change or (re)assignment to many tickets' })
+  bulk(
+    @Body(new ZodValidationPipe(BulkTicketActionSchema)) dto: BulkTicketActionDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.ticketsService.bulkAction(dto, staff.staffId);
   }
 
   @Post(':id/reply')

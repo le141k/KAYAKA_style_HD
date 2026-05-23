@@ -133,10 +133,30 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
     register,
     handleSubmit,
     reset,
+    watch,
+    setValue,
     formState: { errors },
   } = useForm<ReplyForm>({
     resolver: zodResolver(replySchema),
   });
+
+  // ── Reply draft auto-save ──
+  // Persist the in-progress reply per ticket so navigating away (or an accidental
+  // reload) doesn't lose it. Cleared on successful send.
+  const draftKey = `th_reply_draft_${ticketId}`;
+  const [draftRestored, setDraftRestored] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined' || draftRestored) return;
+    const saved = localStorage.getItem(draftKey);
+    if (saved) setValue('body', saved);
+    setDraftRestored(true);
+  }, [draftKey, draftRestored, setValue]);
+  const draftBody = watch('body');
+  useEffect(() => {
+    if (typeof window === 'undefined' || !draftRestored) return;
+    if (draftBody && draftBody.trim() !== '') localStorage.setItem(draftKey, draftBody);
+    else localStorage.removeItem(draftKey);
+  }, [draftBody, draftKey, draftRestored]);
 
   // r hotkey → focus reply
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
@@ -160,6 +180,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
     });
     reset();
     setAttachmentIds([]);
+    if (typeof window !== 'undefined') localStorage.removeItem(draftKey);
     toast({
       title: replyTab === 'note' ? 'Заметка добавлена' : 'Ответ отправлен',
     });
@@ -293,7 +314,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                 </TabsContent>
                 <TabsContent value="note">
                   <Textarea
-                    id="reply-textarea"
+                    id="note-textarea"
                     placeholder="Внутренняя заметка (видна только агентам)..."
                     className="min-h-[100px] resize-none border-status-pending/40 bg-status-pending/5"
                     {...register('body')}
@@ -301,6 +322,9 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                   />
                 </TabsContent>
                 {errors.body && <p className="mt-1 text-xs text-destructive">{errors.body.message}</p>}
+                {draftBody && draftBody.trim() !== '' && (
+                  <p className="mt-1 text-xs text-muted-foreground">Черновик сохраняется автоматически</p>
+                )}
 
                 <div className="mt-3 space-y-3">
                   <FileUploadZone

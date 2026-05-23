@@ -871,4 +871,30 @@ describe('TicketsService (extra coverage)', () => {
       expect(prisma.$transaction).toHaveBeenCalled();
     });
   });
+
+  describe('bulkAction', () => {
+    it('applies a status change to every id (reuses changeStatus)', async () => {
+      const spy = vi.spyOn(service, 'changeStatus').mockResolvedValue({} as any);
+      const res = await service.bulkAction({ ids: [1, 2, 3], action: 'status', statusId: 4 }, 7);
+      expect(res.updated).toBe(3);
+      expect(spy).toHaveBeenCalledTimes(3);
+      expect(spy).toHaveBeenCalledWith(1, { statusId: 4 }, 7);
+    });
+
+    it('applies an assignment to every id (reuses assign)', async () => {
+      const spy = vi.spyOn(service, 'assign').mockResolvedValue({} as any);
+      const res = await service.bulkAction({ ids: [10, 11], action: 'assignee', ownerStaffId: 5 }, 7);
+      expect(res.updated).toBe(2);
+      expect(spy).toHaveBeenCalledWith(10, { ownerStaffId: 5 }, 7);
+    });
+
+    it('skips ids that fail and counts only successes', async () => {
+      vi.spyOn(service, 'changeStatus')
+        .mockResolvedValueOnce({} as any)
+        .mockRejectedValueOnce(new Error('gone'))
+        .mockResolvedValueOnce({} as any);
+      const res = await service.bulkAction({ ids: [1, 2, 3], action: 'status', statusId: 4 }, 7);
+      expect(res.updated).toBe(2);
+    });
+  });
 });

@@ -337,6 +337,33 @@ export function useCreateTicket() {
   });
 }
 
+export type BulkInput =
+  | { ids: number[]; action: 'status'; status: string }
+  | { ids: number[]; action: 'assignee'; ownerStaffId: number | null };
+
+/** Apply one action (status / assignee) to many tickets at once. */
+export function useBulkTicketAction() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: BulkInput) => {
+      if (input.action === 'status') {
+        const statusId = await statusIdForSlug(input.status);
+        return api.post<{ updated: number }>('/tickets/bulk', {
+          ids: input.ids,
+          action: 'status',
+          statusId,
+        });
+      }
+      return api.post<{ updated: number }>('/tickets/bulk', {
+        ids: input.ids,
+        action: 'assignee',
+        ownerStaffId: input.ownerStaffId,
+      });
+    },
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ticketKeys.lists() }),
+  });
+}
+
 // Public (unauthenticated) submission from the client portal → POST /tickets/public.
 export interface PublicTicketInput {
   subject: string;

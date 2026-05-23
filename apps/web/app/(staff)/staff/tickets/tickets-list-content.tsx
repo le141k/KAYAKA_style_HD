@@ -29,7 +29,13 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { TicketRow } from '@/components/premium/TicketRow';
 import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
-import { useTickets, useCreateTicket, useDepartmentOptions, useStaffOptions } from '@/lib/hooks/use-tickets';
+import {
+  useTickets,
+  useCreateTicket,
+  useDepartmentOptions,
+  useStaffOptions,
+  useBulkTicketAction,
+} from '@/lib/hooks/use-tickets';
 import { useCustomFields } from '@/lib/hooks/use-custom-fields';
 import {
   CustomFieldsSection,
@@ -101,6 +107,8 @@ export function TicketsListContent() {
   const [createOpen, setCreateOpen] = useState(() => searchParams.get('create') === '1');
 
   const createMutation = useCreateTicket();
+  const bulkAction = useBulkTicketAction();
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const { data: departmentOptions = [] } = useDepartmentOptions();
   const { data: staffOptions = [] } = useStaffOptions();
   // TICKET-scope custom fields rendered in the create dialog.
@@ -225,6 +233,36 @@ export function TicketsListContent() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
+
+  // ── Bulk selection ──
+  const toggleSelected = (id: number) =>
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const allOnPageSelected = tickets.length > 0 && tickets.every((t) => selectedIds.has(t.id));
+  const toggleSelectAll = () =>
+    setSelectedIds((prev) => {
+      if (tickets.every((t) => prev.has(t.id))) {
+        const next = new Set(prev);
+        tickets.forEach((t) => next.delete(t.id));
+        return next;
+      }
+      return new Set([...prev, ...tickets.map((t) => t.id)]);
+    });
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const runBulk = async (input: Parameters<typeof bulkAction.mutateAsync>[0], label: string) => {
+    try {
+      const res = await bulkAction.mutateAsync(input);
+      toast({ title: `${label}: обновлено ${res.updated} из ${selectedIds.size}` });
+      clearSelection();
+    } catch {
+      toast({ title: 'Ошибка', description: 'Массовое действие не выполнено', variant: 'destructive' });
+    }
+  };
 
   return (
     <div className="flex h-full flex-col">
@@ -426,6 +464,49 @@ export function TicketsListContent() {
         {isLoading ? 'Загрузка...' : `${total} заявок · j/k для навигации · Enter для открытия`}
       </div>
 
+      {/* Bulk action bar */}
+      {selectedIds.size > 0 && (
+        <div className="flex flex-wrap items-center gap-3 border-b border-border bg-primary/5 px-6 py-2.5 text-sm">
+          <span className="font-medium">Выбрано: {selectedIds.size}</span>
+          <Select
+            onValueChange={(v) => runBulk({ ids: [...selectedIds], action: 'status', status: v }, 'Статус')}
+          >
+            <SelectTrigger className="h-8 w-44 text-sm" aria-label="Массовая смена статуса">
+              <SelectValue placeholder="Сменить статус…" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="open">Открытые</SelectItem>
+              <SelectItem value="pending">Ожидают</SelectItem>
+              <SelectItem value="in_progress">В работе</SelectItem>
+              <SelectItem value="resolved">Решённые</SelectItem>
+              <SelectItem value="closed">Закрытые</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select
+            onValueChange={(v) =>
+              runBulk(
+                { ids: [...selectedIds], action: 'assignee', ownerStaffId: v ? Number(v) : null },
+                'Исполнитель',
+              )
+            }
+          >
+            <SelectTrigger className="h-8 w-48 text-sm" aria-label="Массовое назначение">
+              <SelectValue placeholder="Назначить исполнителя…" />
+            </SelectTrigger>
+            <SelectContent>
+              {staffOptions.map((s) => (
+                <SelectItem key={s.value} value={s.value}>
+                  {s.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button variant="ghost" size="sm" className="h-8" onClick={clearSelection}>
+            Снять выделение
+          </Button>
+        </div>
+      )}
+
       {/* List */}
       <div className="flex-1 overflow-y-auto p-6">
         {isLoading ? (
@@ -437,14 +518,34 @@ export function TicketsListContent() {
           </div>
         ) : (
           <div className="space-y-2" role="list" aria-label="Список заявок">
-            {tickets.map((ticket, i) => (
-              <TicketRow
-                key={ticket.id}
-                ticket={ticket}
-                href={`/staff/tickets/${ticket.id}`}
-                selected={i === focusedIdx}
-                onSelect={() => setFocusedIdx(i)}
+            <div className="flex items-center gap-3 px-1 pb-1 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                aria-label="Выбрать все на странице"
+                checked={allOnPageSelected}
+                onChange={toggleSelectAll}
+                className="h-4 w-4 cursor-pointer rounded border-border"
               />
+              <span>{selectedIds.size > 0 ? `Выбрано: ${selectedIds.size}` : 'Выбрать все'}</span>
+            </div>
+            {tickets.map((ticket, i) => (
+              <div key={ticket.id} className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  aria-label={`Выбрать ${ticket.mask}`}
+                  checked={selectedIds.has(ticket.id)}
+                  onChange={() => toggleSelected(ticket.id)}
+                  className="h-4 w-4 flex-shrink-0 cursor-pointer rounded border-border"
+                />
+                <div className="min-w-0 flex-1">
+                  <TicketRow
+                    ticket={ticket}
+                    href={`/staff/tickets/${ticket.id}`}
+                    selected={i === focusedIdx}
+                    onSelect={() => setFocusedIdx(i)}
+                  />
+                </div>
+              </div>
             ))}
           </div>
         )}

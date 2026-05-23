@@ -59,6 +59,20 @@ export type AssignTicketDto = z.infer<typeof AssignTicketSchema>;
 export const ChangeStatusSchema = z.object({ statusId: z.number().int().positive() });
 export type ChangeStatusDto = z.infer<typeof ChangeStatusSchema>;
 
+// ─────────────────── bulk actions ───────────────────
+
+export const BulkTicketActionSchema = z
+  .object({
+    ids: z.array(z.number().int().positive()).min(1).max(200),
+    action: z.enum(['status', 'assignee']),
+    statusId: z.number().int().positive().optional(),
+    ownerStaffId: z.number().int().positive().nullable().optional(),
+  })
+  .refine((d) => (d.action === 'status' ? d.statusId != null : d.ownerStaffId !== undefined), {
+    message: 'status action requires statusId; assignee action requires ownerStaffId',
+  });
+export type BulkTicketActionDto = z.infer<typeof BulkTicketActionSchema>;
+
 export const ChangePrioritySchema = z.object({ priorityId: z.number().int().positive() });
 export type ChangePriorityDto = z.infer<typeof ChangePrioritySchema>;
 

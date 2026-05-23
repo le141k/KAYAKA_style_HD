@@ -12,6 +12,7 @@ import type {
   CreateTicketDto,
   ReplyTicketDto,
   AssignTicketDto,
+  BulkTicketActionDto,
   ChangeStatusDto,
   ChangePriorityDto,
   ChangeTypeDto,
@@ -672,6 +673,29 @@ export class TicketsService {
   }
 
   // ─────────────────────────── Assign ───────────────────────────
+
+  /**
+   * Apply one action (status change or (re)assignment) to many tickets at once.
+   * Reuses the per-ticket changeStatus/assign paths so audit logs, SLA side
+   * effects and events fire exactly as for a single update. Returns the count
+   * of tickets updated; ids that fail (e.g. already gone) are skipped.
+   */
+  async bulkAction(dto: BulkTicketActionDto, staffId: number): Promise<{ updated: number }> {
+    let updated = 0;
+    for (const id of dto.ids) {
+      try {
+        if (dto.action === 'status' && dto.statusId != null) {
+          await this.changeStatus(id, { statusId: dto.statusId }, staffId);
+        } else if (dto.action === 'assignee') {
+          await this.assign(id, { ownerStaffId: dto.ownerStaffId ?? null }, staffId);
+        }
+        updated += 1;
+      } catch {
+        // Skip individual failures so one bad id doesn't abort the whole batch.
+      }
+    }
+    return { updated };
+  }
 
   async assign(ticketId: number, dto: AssignTicketDto, staffId: number): Promise<Ticket> {
     const ticket = await this.findOrThrow(ticketId);
