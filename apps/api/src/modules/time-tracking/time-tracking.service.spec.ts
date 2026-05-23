@@ -114,6 +114,15 @@ describe('TimeTrackingService', () => {
     expect(prisma.timeEntry.delete).not.toHaveBeenCalled();
   });
 
+  it("admin/manager (canManageOthers) can delete another staff member's entry", async () => {
+    (prisma.timeEntry.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_ENTRY);
+    (prisma.timeEntry.delete as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_ENTRY);
+
+    await service.remove(1, MOCK_ENTRY.staffId + 1, true);
+
+    expect(prisma.timeEntry.delete).toHaveBeenCalledWith({ where: { id: 1 } });
+  });
+
   it('throws NotFoundException when deleting a missing entry', async () => {
     (prisma.timeEntry.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 

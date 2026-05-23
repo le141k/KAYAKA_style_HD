@@ -4,11 +4,12 @@ import { useRouter } from 'next/navigation';
 import { KanbanBoard } from '@/components/premium/KanbanBoard';
 import { KanbanSkeleton } from '@/components/premium/SkeletonLoaders';
 import { useTickets, useChangeTicketStatus } from '@/lib/hooks/use-tickets';
+import { QueryError } from '@/components/QueryError';
 import { toast } from '@/components/ui/use-toast';
 
 export function KanbanPageContent() {
   const router = useRouter();
-  const { data, isLoading } = useTickets({ per_page: 50 });
+  const { data, isLoading, isError, refetch } = useTickets({ per_page: 50 });
   const changeStatus = useChangeTicketStatus();
   const tickets = data?.data ?? [];
 
@@ -21,6 +22,8 @@ export function KanbanPageContent() {
       <div className="flex-1 overflow-auto p-6">
         {isLoading ? (
           <KanbanSkeleton />
+        ) : isError ? (
+          <QueryError message="Не удалось загрузить канбан-доску." onRetry={() => void refetch()} />
         ) : (
           <KanbanBoard
             tickets={tickets}

@@ -129,7 +129,9 @@ export function mapTicket(t: ApiTicket): Ticket {
     updated_at: t.updatedAt,
     reply_count: t.totalReplies ?? 0,
     tags: t.tags?.map((tag) => tag.name),
-    replies: t.posts?.map(mapPostToReply),
+    // posts[0] is the original message (rendered separately as the body); replies
+    // are the rest — slice(1) so the first message isn't shown twice (mirror staff).
+    replies: t.posts?.slice(1).map(mapPostToReply),
   } as Ticket;
 }
 
@@ -158,22 +160,15 @@ export function useClientTickets() {
     queryFn: async (): Promise<PaginatedResponse<Ticket>> => {
       const email = getRequesterEmail();
       if (!email) {
+        // Legit "no email yet" case — an empty list, not an error.
         return { data: [], total: 0, page: 1, per_page: 25 };
       }
-      try {
-        const res = await api.get<{ data: ApiTicket[]; total: number }>(
-          `/tickets/my?email=${encodeURIComponent(email)}`,
-        );
-        return {
-          data: res.data.map(mapTicket),
-          total: res.total,
-          page: 1,
-          per_page: 25,
-        };
-      } catch {
-        // Graceful degradation: return empty list rather than crashing
-        return { data: [], total: 0, page: 1, per_page: 25 };
-      }
+      // No catch: a real API failure must reject so the page shows an error
+      // (not a fake "you have no tickets" empty state).
+      const res = await api.get<{ data: ApiTicket[]; total: number }>(
+        `/tickets/my?email=${encodeURIComponent(email)}`,
+      );
+      return { data: res.data.map(mapTicket), total: res.total, page: 1, per_page: 25 };
     },
     staleTime: 30_000,
   });

@@ -7,6 +7,7 @@ import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
 import { useClientTickets } from '@/lib/hooks/use-client-tickets';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { QueryError } from '@/components/QueryError';
 
 /**
  * Renders the client "Мои заявки" list.
@@ -16,7 +17,7 @@ import { Input } from '@/components/ui/input';
  * email to look up their tickets — without requiring a staff login.
  */
 export function ClientTicketsContent() {
-  const { data, isLoading, refetch } = useClientTickets();
+  const { data, isLoading, isError, refetch } = useClientTickets();
   const tickets = data?.data ?? [];
 
   // Local state for the email-lookup affordance
@@ -36,6 +37,8 @@ export function ClientTicketsContent() {
   };
 
   if (isLoading) return <TicketListSkeleton count={5} />;
+  if (isError)
+    return <QueryError message="Не удалось загрузить ваши обращения." onRetry={() => void refetch()} />;
 
   // Show email-lookup form when no email is stored yet
   if (showLookup) {

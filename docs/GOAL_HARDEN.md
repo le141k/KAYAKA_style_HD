@@ -25,13 +25,13 @@ rewritten at commit 31add8e). After this, the product is honestly hand-to-a-real
 - [x] **SEC-4** `@Throttle` on `GET /tickets/my` + `GET /tickets/public/:id` (env-driven `PUBLIC_READ_LIMIT`, default 30; dev=100 for e2e).
 - **Acceptance:** all repros blocked live; api vitest 507/507 (+ guard revocation, blocklist, public-owner specs); `make verify` GREEN 9/9. ✅
 
-## ☐ Batch H2 — Safety / correctness
+## ✅ Batch H2 — Safety / correctness (DONE)
 
-- [ ] **UI-1** Client "Мои заявки" shows API errors as empty list (`use-client-tickets.ts:163` catch→[]). **Fix:** propagate error → render `<QueryError onRetry>` (keep the legit staff→public route fallback, but a real failure must surface).
-- [ ] **UI-2** Kanban shows API errors as empty columns (`kanban-content.tsx:11` ignores `isError`). **Fix:** render an error state with retry.
-- [ ] **BUG-1** Client ticket thread duplicates the first message. **Fix:** `posts.slice(1)` in the client mapper (mirror the staff side).
-- [ ] **OWN-1** Ownership guard has no admin bypass — admin gets 403 on others' time-entries/follow-ups. **Fix:** allow `isAdmin` (or a manage permission) to bypass the staffId-ownership check on time/follow-up patch/delete.
-- **Acceptance:** client/kanban surface real errors; thread shows each post once; admin can manage any time/follow-up; `make verify` green.
+- [x] **UI-1** `useClientTickets` no longer swallows errors (kept only the empty-email short-circuit); `client-tickets-content` renders `<QueryError onRetry>` on isError.
+- [x] **UI-2** `kanban-content` reads `isError`/`refetch` → `<QueryError>` branch (no more empty columns on failure).
+- [x] **BUG-1** client mapper `posts.slice(1)` — original message no longer duplicated.
+- [x] **OWN-1** time-entry/follow-up delete+patch accept a `canManageOthers` flag (`isAdmin || STAFF_MANAGE`) computed in the controllers. **Live: admin DELETE agent's /time → 204, /follow-ups → 200** (was 403).
+- **Acceptance:** client/kanban surface real errors; thread shows each post once; admin manages any time/follow-up; api vitest 509/509; `make verify` GREEN. ✅
 
 ## ☐ Batch H3 — Polish / i18n
 

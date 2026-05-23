@@ -43,8 +43,9 @@ export class TimeTrackingController {
   @RequirePermissions(PERMISSIONS.TICKET_EDIT)
   @Delete('time/:id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Delete a time entry (owner only)' })
+  @ApiOperation({ summary: 'Delete a time entry (owner, or admin/STAFF_MANAGE)' })
   deleteTime(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
-    return this.timeTracking.remove(id, staff.staffId);
+    const canManageOthers = staff.isAdmin || staff.permissions.includes(PERMISSIONS.STAFF_MANAGE);
+    return this.timeTracking.remove(id, staff.staffId, canManageOthers);
   }
 }

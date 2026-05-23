@@ -120,6 +120,14 @@ describe('FollowUpsService', () => {
       expect(prisma.followUp.delete).not.toHaveBeenCalled();
     });
 
+    it("admin/manager (canManageOthers) can delete another staff member's follow-up", async () => {
+      prisma.followUp.findUnique.mockResolvedValue({ id: 5, staffId: 42 });
+      prisma.followUp.delete.mockResolvedValue({ id: 5 });
+      const result = await service.remove(5, 99, true);
+      expect(result).toEqual({ deleted: true });
+      expect(prisma.followUp.delete).toHaveBeenCalledWith({ where: { id: 5 } });
+    });
+
     it('throws NotFoundException when the follow-up is missing', async () => {
       prisma.followUp.findUnique.mockResolvedValue(null);
       await expect(service.remove(999, 42)).rejects.toBeInstanceOf(NotFoundException);

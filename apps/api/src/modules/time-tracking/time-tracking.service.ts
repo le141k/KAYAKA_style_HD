@@ -33,11 +33,14 @@ export class TimeTrackingService {
     return { entries, totalMinutes };
   }
 
-  /** Delete a single time entry. 404 if missing, 403 if not the owner. */
-  async remove(id: number, staffId: number) {
+  /**
+   * Delete a single time entry. 404 if missing, 403 if not the owner — unless the
+   * caller can manage others (admin / STAFF_MANAGE), so managers can correct the team.
+   */
+  async remove(id: number, staffId: number, canManageOthers = false) {
     const entry = await this.prisma.timeEntry.findUnique({ where: { id } });
     if (!entry) throw new NotFoundException(`TimeEntry ${id} not found`);
-    if (entry.staffId !== staffId) {
+    if (entry.staffId !== staffId && !canManageOthers) {
       throw new ForbiddenException('You can only delete your own time entries');
     }
     await this.prisma.timeEntry.delete({ where: { id } });
