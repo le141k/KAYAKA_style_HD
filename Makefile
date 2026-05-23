@@ -1,5 +1,5 @@
 # 23 Telecom Help Desk — common developer tasks.
-.PHONY: install infra migrate seed dev build test e2e smoke up down logs reset
+.PHONY: install infra migrate seed dev build test e2e smoke up down logs reset verify
 
 install: ; npm install
 infra: ; docker compose up -d postgres redis mailhog
@@ -10,6 +10,7 @@ build: ; npm run build
 test: ; npm run test
 e2e: ; npm run test:e2e
 smoke: ; bash scripts/smoke.sh
+verify: ; bash scripts/verify.sh   # the GATE: tsc+vitest+build+lint+smoke, one PASS/FAIL
 up: ; docker compose up --build -d
 down: ; docker compose down
 logs: ; docker compose logs -f --tail=100

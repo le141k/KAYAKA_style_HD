@@ -470,7 +470,9 @@ export function useMacroOptions() {
   return useQuery({
     queryKey: ['macros', 'options'],
     queryFn: async (): Promise<MacroOption[]> => {
-      const res = await api.get<{ id: number; title: string }[]>('/admin/macros');
+      // Agent-accessible picker endpoint (TICKET_EDIT); the full /admin/macros
+      // list requires ADMIN_WORKFLOW which agents lack (would 403 → empty picker).
+      const res = await api.get<{ id: number; title: string }[]>('/admin/macros/options');
       return res.map((m) => ({ value: String(m.id), label: m.title }));
     },
     staleTime: 5 * 60_000,
@@ -541,8 +543,10 @@ export function useStaffOptions() {
   return useQuery({
     queryKey: ['staff', 'options'],
     queryFn: async (): Promise<AssigneeOption[]> => {
-      const res = await api.get<{ data: ApiStaffOption[] }>('/staff?limit=100');
-      return res.data.map((s) => ({
+      // Agent-accessible directory (TICKET_ASSIGN); the full /staff list requires
+      // STAFF_MANAGE which agents lack (would 403 → empty assignee picker).
+      const res = await api.get<ApiStaffOption[]>('/staff/assignable');
+      return res.map((s) => ({
         value: String(s.id),
         label: `${s.firstName} ${s.lastName}`.trim() || s.email,
         description: s.email,

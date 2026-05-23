@@ -545,6 +545,8 @@ model Macro {
   replyText  String         @default("")
   // bulk actions applied with the macro
   actions    Json           @default("[]")
+  // shared = visible to all agents; false = owner-only (UI toggle)
+  isShared   Boolean        @default(true)
   createdAt  DateTime       @default(now())
 }
 

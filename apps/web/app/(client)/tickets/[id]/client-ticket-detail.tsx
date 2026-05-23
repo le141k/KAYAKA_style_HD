@@ -43,9 +43,20 @@ export function ClientTicketDetail({ ticketId }: { ticketId: number }) {
   const publicReplies = allReplies.filter((r) => !r.is_internal);
 
   const onSubmit = async (data: ReplyForm) => {
-    await replyMutation.mutateAsync({ contents: data.contents });
-    reset();
-    toast({ title: 'Сообщение отправлено' });
+    try {
+      await replyMutation.mutateAsync({ contents: data.contents });
+      reset();
+      toast({
+        title: 'Сообщение отправлено',
+        description: ticket.status === 'resolved' ? 'Обращение снова открыто для рассмотрения.' : undefined,
+      });
+    } catch {
+      toast({
+        title: 'Ошибка',
+        description: 'Не удалось отправить сообщение. Попробуйте ещё раз.',
+        variant: 'destructive',
+      });
+    }
   };
 
   return (
@@ -105,10 +116,15 @@ export function ClientTicketDetail({ ticketId }: { ticketId: number }) {
         ))}
       </div>
 
-      {/* Reply form (only if not resolved/closed) */}
-      {ticket.status !== 'resolved' && ticket.status !== 'closed' && (
+      {/* Reply form — hidden only when fully closed. A reply to a *resolved*
+          ticket reopens it (server publicReply reopen path), so keep it allowed. */}
+      {ticket.status !== 'closed' && (
         <div className="rounded-xl border border-border bg-card p-5">
-          <h3 className="mb-3 text-sm font-semibold">Добавить сообщение</h3>
+          <h3 className="mb-3 text-sm font-semibold">
+            {ticket.status === 'resolved'
+              ? 'Ответить (обращение будет открыто заново)'
+              : 'Добавить сообщение'}
+          </h3>
           <form onSubmit={handleSubmit(onSubmit)} className="space-y-3">
             <Textarea
               placeholder="Введите дополнительную информацию или вопрос..."

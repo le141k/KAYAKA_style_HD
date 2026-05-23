@@ -1,8 +1,4 @@
-import {
-  ConflictException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { hashPassword } from '../../auth/password.util';
 import type {
@@ -60,6 +56,15 @@ export class StaffService {
   }
 
   // ─────────────────── Staff Members ───────────────────
+
+  /** Minimal staff directory for assignee pickers (no sensitive fields). */
+  listAssignable() {
+    return this.prisma.staff.findMany({
+      where: { isEnabled: true },
+      select: { id: true, firstName: true, lastName: true, email: true },
+      orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
+    });
+  }
 
   async list(query: ListStaffQueryDto): Promise<{ data: SafeStaff[]; total: number }> {
     const { page, limit, groupId, search, enabled } = query;

@@ -76,6 +76,15 @@ export class StaffController {
     return this.staffService.list(query);
   }
 
+  // Lightweight directory for assignee pickers — available to anyone who can
+  // assign tickets (agents lack STAFF_MANAGE, so the full list 403s for them).
+  @Get('assignable')
+  @RequirePermissions(PERMISSIONS.TICKET_ASSIGN)
+  @ApiOperation({ summary: 'List assignable staff (id + name) for pickers' })
+  assignable() {
+    return this.staffService.listAssignable();
+  }
+
   @Get(':id')
   @RequirePermissions(PERMISSIONS.STAFF_MANAGE)
   @ApiOperation({ summary: 'Get a staff member by ID' })

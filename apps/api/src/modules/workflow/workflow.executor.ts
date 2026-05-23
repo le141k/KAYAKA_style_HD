@@ -1,6 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
+import { MailService } from '../mail/mail.service';
 import type { Workflow, Ticket } from '@prisma/client';
 
 /** The shape of a domain event emitted by TicketsService */
@@ -34,7 +35,10 @@ interface WorkflowAction {
 export class WorkflowExecutor {
   private readonly logger = new Logger(WorkflowExecutor.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional() private readonly mail?: MailService,
+  ) {}
 
   @OnEvent('ticket.created')
   async onTicketCreated(payload: TicketEvent): Promise<void> {
@@ -160,10 +164,22 @@ export class WorkflowExecutor {
               });
             }
             break;
-          case 'send_email':
-            // No mail wiring in the executor yet — logged for the next pass (see NEXT_GOAL.md).
-            this.logger.warn(`Workflow ${workflow.id}: send_email action not yet implemented`);
+          case 'send_email': {
+            const to = ticket.requesterEmail;
+            if (!this.mail || !to) {
+              this.logger.warn(
+                `Workflow ${workflow.id}: send_email skipped (no mail service or requester email)`,
+              );
+              break;
+            }
+            const body = str(action.note) || str(action.value) || `Обновление по обращению ${ticket.mask}.`;
+            await this.mail.send({
+              to,
+              subject: `[${ticket.mask}] ${ticket.subject}`,
+              text: body,
+            });
             break;
+          }
           default:
             this.logger.warn(`Workflow ${workflow.id}: unknown action type "${action.type}"`);
         }

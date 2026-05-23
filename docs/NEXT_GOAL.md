@@ -1,128 +1,65 @@
 # NEXT-GOAL WORKLIST — 23 Telecom Help Desk
 
-> ✅ IMPLEMENTED this session (live-verify pending rebuild): **Attachments** (storage/upload/download + inbound email attachments + frontend FileUploadZone real upload + per-post download chips) and **Reports/KQL engine** (safe declarative model + compiler + ReportRun + schedule processor + 10 seed reports + CSV). ALL THREE big parity features now IMPLEMENTED: attachments, reports-KQL, AND email-parity (CC/BCC + parser-rules + IMAP AES-256-GCM encryption + staff notifications). Remaining = P2/P3 long tail only (see below).
-
-> Authoritative, prioritized worklist for the next `/goal` pass. Built from the post-fix
-> re-audit (1 coordinator + 14 agents): functional parity vs original Kayako + full
-> module bug sweep + deep-dive specs for the big parity features. Every item has a fix
-> location. Deep-dive specs live in `docs/specs/{attachments,reports-kql,email-parity,code-review}.md`.
+> **Rewritten 2026-05-23 from an independent live audit at HEAD `5fd04ea`** (coordinator + 15 agents,
+> driven against the running Docker stack on a fresh seed + direct API probes). Supersedes all prior
+> content. Tags: **[LIVE]** = reproduced against the running stack · **[API]** = confirmed via API call ·
+> **[CODE]** = located in source (file:line), not run live.
 >
-> Discipline (same as last pass): fix in priority order → unit/integration tests → tsc/lint
-> /vitest green → `docker compose build --no-cache web api` + `up -d --force-recreate` →
-> Playwright real-login verify → commit/push. Demo: admin@23telecom.example / demo1234.
-> Rate-limit aware (login 5/60s, global 300/60s) when scripting.
+> Discipline for the next `/goal`: fix in priority order → unit/integration test → `tsc`/`vitest` green →
+> `docker compose down -v && up -d` (or `build --no-cache` if code changed) → re-verify the item live →
+> commit/push. Demo: `admin@23telecom.example` / `demo1234`, `agent@23telecom.example` / `demo1234`.
+> Login throttle 5/60s, global 300/60s.
+
+## Build & test health (verified at 5fd04ea)
+
+- ✅ `vitest` **478/478**, `nest build` 0, `next build` 0 (19 pages), api+web `tsc` 0. **[LIVE]**
+- ❌ root `npm run lint` fails — **3 unused-var errors in `scripts/audit-dashboard-kanban.mjs`** (QA helper, not app code). Trivial: delete/clean that script or `eslintignore` it. **[LIVE]**
+
+## ✅ Verified DONE this cycle — do NOT re-touch
+
+- **SEC-1** no `passwordHash` leak anywhere (SAFE_USER_SELECT / SAFE_STAFF_SELECT / PUBLIC_USER_SELECT used across tickets/users/staff/orgs/notifications; live responses clean). **[API]**
+- **SEC-2** cookie-only auth (HttpOnly `th_access`/`th_refresh`, JS sees only `th_authed`; no JWT in localStorage). **[LIVE]**
+- **React #418** hydration fixed & committed (`RelativeTime.tsx`, `SlaPill.tsx` mounted-gate). **[CODE]**
+- **Admin create** departments/staff/custom-field-groups/SLA-plans/workflows/statuses all → **201**. **[LIVE]**
+- **Client portal** submit / my-tickets (client_email) / public detail / public reply / reopen-on-reply. **[LIVE/API]**
+- **Security backstops** global JwtAuthGuard+PermissionsGuard+ThrottlerGuard + PrismaExceptionFilter; IDOR→404, isAdmin escalation blocked, bad-id→404, bad-FK→400 (not 500). **[API]**
+- **New P3 modules wired** time-tracking / follow-ups / saved-views registered, in Swagger (104 paths/168 ops), behind guards; happy paths create→201; saved-views correctly scoped per-staff. **[LIVE]**
+- **BUG-026** custom-field type label localized. **CF NUMBER** type. **[CODE]**
 
 ---
 
-## P0 — must fix first
+## P1 — functional bugs, fix first (all CONFIRMED open)
 
-> ✅ The 4 last-pass regressions below were FIXED & live-verified (commit pending): first-post dedup (use-tickets slice(1)), staff-create departmentId selector + priority map, workflow UI-vocab alias in executor (verified firing → tag added), applyMacro change_status routed via changeStatus. Kept for history.
+- **[P1][LIVE] BUG-001 — priority dropped on public submit.** `POST /tickets/public` with `priorityId:4` → ticket gets `priorityId:1`. `PublicCreateTicketSchema` has no `priorityId`; Zod strips it. **Fix:** add `priorityId?` to schema (`apps/api/src/modules/tickets/dto.ts:137-146`) + pass through controller; expose on `PublicTicketInput` (`use-tickets.ts:368-374`, `submit-form.tsx:102`).
+- **[P1][LIVE] BUG-002 — agents can't assign or apply macros.** Agent `GET /staff`→403 and `GET /admin/macros`→403; the assignee dropdown + macro picker (and the **bulk-assign** dropdown) are empty for the primary role. **Fix:** add an assignable-staff endpoint gated by `ticket.assign` and a staff-readable macros endpoint; repoint `useStaffOptions`/`useMacroOptions` (`use-tickets.ts:~513,443`).
+- **[P1][CODE] Macros are hollow (BUG-007/008/009).** `Macro.isShared` not in schema/DTO → silently lossy (`schema.prisma` Macro, `workflow/dto.ts:30-39`); macro dialog has **no replyText textarea and no action builder** (`workflows-content.tsx:609-649`) → UI macros do nothing; workflow `send_email` action is a **no-op** (`workflow.executor.ts:163-165`). Macros/automations are non-functional from the UI.
+- **[P1][LIVE] Bulk actions: silent partial failure, no transaction.** `[1,999999]` → `{updated:1}` with no failed-ids reported; loop swallows errors, no atomicity, N+1 (`tickets.service.ts:683-698`). **Fix:** `$transaction` or return `{updated, failed:[]}`; add UI loading/disable to prevent double-submit; add bulk-**unassign** option.
+- **[P1][LIVE] `sla_breached` list filter is client-side only** → wrong counter + broken pagination across pages (`use-tickets.ts:251-254`; no `slaBreached` in `ListTicketsQuerySchema`). Push to the server query.
+- **[P1][CODE] Ticket list omits tags** — `listTickets` has no `include:{tags}`, so every row's `tags` is `undefined` (`tickets.service.ts:441-459`).
 
-### Regressions introduced by the last fix pass (quick, high-value)
+## P2 — correctness / security gaps
 
-- **TD: first post duplicated in thread** — `ticket.body = posts[0].contents` AND `replies` includes posts[0]. Fix `mapTicket` → `t.posts?.slice(1).map(mapPostToReply)`. `apps/web/lib/hooks/use-tickets.ts:158`.
-- **Staff create ticket dialog always 400** — no `departmentId` field; API requires it. Add a department `<Select>` (GET /api/departments) + send `departmentId` (+ map priority→priorityId). `tickets-list-content.tsx:28-35,276-330`, `use-tickets.ts:282`.
-- **Workflow builder vocab mismatch → workflows silently never fire**: UI criteria ops `{is,is_not,starts_with,ends_with}` vs executor `{eq,neq,contains,gt,lt}`; UI actions `{assign_group,assign_staff,set_status,set_priority,remove_tag,send_email}` vs executor `{change_department,change_owner,change_status,change_priority,add_tag,add_note}`. Align vocab + add remove_tag/send_email handlers. `workflows-content.tsx:70-87`, `workflow.executor.ts:14,80-148`.
-- **applyMacro `change_status` bypasses changeStatus()** → isResolved/resolvedAt/SLA not updated. Route through `this.changeStatus()`. `tickets.service.ts:~882,929`.
+- **[P2][LIVE] No ownership check on time-entries & follow-ups.** Admin deleted an agent's time entry (204) and completed an agent's follow-up (200); endpoints only require `TICKET_EDIT`, no `staffId` match (`time-tracking.controller.ts:43`, `follow-ups.service.ts:33-55`). Decide policy; add ownership (or document as intended). SavedView scoping IS correctly enforced (admin can't see/delete agent's view → 404).
+- **[P2][CODE] Reply drafts share one field across reply/note tabs** — both `TabsContent` bind `register('body')` (`ticket-detail-content.tsx:312,322`); note clobbers reply draft. Also `draftRestored` not reset on ticket switch without unmount. (Duplicate `id="reply-textarea"` IS fixed → `note-textarea`.)
+- **[P2][CODE] Client reply: form hidden on resolved/closed** (`client-ticket-detail.tsx:109`) so the (working) reopen-on-reply backend path is unreachable from the portal; and `mutateAsync` is unguarded (`:46`) → unhandled rejection on error.
+- **[P2][CODE] PROD hardening incomplete.** `helmet`/security headers **absent** (`main.ts`); prod compose still invokes the seed binary (guard is a soft skip, not hard-abort) and publishes API :4000; no `.env.prod.example`. Secret-gate, prod compose, secure cookies ARE in place.
+- **[P2][CODE] Mock fallbacks hide API errors** — `useDashboardStats`/`useTickets`/`useKB*`/`useClientTickets` `catch`→return mock/empty, so 500/403 look like real/empty data with no error UI.
+- **[P2][CODE] Notification bell is a permanent empty mock** (`NotificationBell.tsx:20`); no `/notifications` endpoint (BUG-004).
+- **[P2][CODE] BUG-003 sub-department creation impossible via UI** — no parent selector in the dept dialog (`departments-content.tsx:163-179`).
+- **[P2][CODE] Schema gaps:** `FollowUp.staffId` missing index; `TimeEntry`/`FollowUp` staff FK `onDelete: Restrict` (blocks staff deletion); `SavedView` no `@@unique([staffId,name])`, no filters size cap, no edit endpoint.
 
-### Security (see `docs/specs/code-review.md` + security re-audit)
+## P3 — polish / cosmetic
 
-- **AU-4 HttpOnly cookie** (token in localStorage + non-HttpOnly cookie = XSS). Move to server `Set-Cookie HttpOnly;Secure;SameSite` + `credentials:include`; drop JS token mgmt. COUPLE with **Next.js `middleware.ts`** (server route guard for /staff,/admin). `auth.controller`, `api.ts`, `use-auth.ts`, new `apps/web/middleware.ts`.
-- **IDOR/leak on public ticket**: `GET /tickets/public/:id` + `POST .../reply` have no ownership check (enumerable by int id) and `user:{include:{emails}}` leaks passwordHash. Require+verify requesterEmail (or per-ticket token); narrow user select; consider mask-based id. `tickets.service.ts:235,242,264`.
-- **isAdmin privilege escalation** via `PATCH /staff/groups/:id` (UpdateStaffGroupSchema=Create.partial). Strip isAdmin/permissions from update or admin-only gate. `staff/dto.ts:10`, `staff.service.ts`.
-- **APP_GUARD JWT backstop**: add global `JwtAuthGuard`+`PermissionsGuard` so an undecorated route isn't wide open. `app.module.ts`.
-- **No rate-limit/ownership on `GET /tickets/my`** (RBAC-2): per-email throttle + field masking now; OTP/magic-link proper.
-- **Alaris secret** weak: `z.string().min(32)` + random; alaris missing-fields `timingSafeEqual` byteLength + reject empty.
-
-### Backend 500/data-integrity (code-review.md)
-
-- ticket-create **mask race** (`TT-PENDING` two-write) → single $transaction. `tickets.service.ts:103,723`.
-- **merge()** doesn't re-parent notes/attachments/watchers → orphaned. Include in $transaction.
-- **IMAP duplicate autoresponder** (createTicket + inbound both send) → remove inbound `sendTemplate`. `inbound.service.ts:241`.
-- **IMAP `fetch('1:*')`** every poll → dup tickets. UID watermark in Setting / `{seen:false}`. `inbound.service.ts:124`.
-
-### Parity P0 features (full specs in docs/specs/)
-
-- **Attachments** upload/download/storage end-to-end + inbound email attachments → `docs/specs/attachments.md`.
-- **Email parser rules** (`ignore` action prevents bounce-loop junk tickets) + **IMAP password AES-256-GCM** + **CC/BCC** → `docs/specs/email-parity.md`.
-
----
-
-## P1 — important
-
-- **Reports/KQL engine** (safe declarative model + compiler + schedules + 10 reports + UI) → `docs/specs/reports-kql.md`.
-- **Staff/watcher notifications** (notify-on-assign, notify-watchers-on-user-reply) + workflow `send_email` action → email-parity.md §D.
-- **TICKET custom fields never rendered** on staff create / client submit (required field blocks API invisibly). Fetch TICKET-scope groups + render dynamic inputs + send customFields.
-- **macro isShared** has no DB column (phantom). Add column+dto+service. macro **replyText** has no UI textarea (macros can't auto-reply).
-- **publicReply/reply on resolved ticket doesn't reopen** → customer reply invisible. Reset to pending on USER reply.
-- **Ticket-detail missing UI** for department change + apply-macro (APIs exist). Add Combobox + macro picker.
-- **resolved_today** = all-time not today (reports.module.ts:88, add startOfDay filter); **stat-card links** don't seed list filters from URL (`searchParams`); **sla_breached=1** param ignored.
-- **Tickets list**: pagination UI (61 tickets, 25 shown), per-page, department/assignee filters, dead "Фильтры" button, sortable columns.
-- **KB**: category-name inverted regression (`a.categoryId ? '' : 'Общее'`); voting/related/TOC missing. **Public departments endpoint** so submit dropdown shows for unauth clients.
-- **SLA/troubleshooter list endpoints** 200[] for missing parent → 404. `sla.service.ts:383,454`, `troubleshooter.module.ts:20`.
-- **dashboard avg** uses unbounded findMany → `$queryRaw AVG`. reports run() re-validate definition. argon2 refresh O(N)→jti lookup.
-- **Saved ticket views**, **follow-ups**, **report schedule execution UI**, **email-queue + template web UI** (APIs exist, no pages).
-- **React hydration #418** (formatRelative Date.now) on SSR pages → suppressHydrationWarning or post-hydrate switch.
+- KB article body unstyled (`@tailwindcss/typography` not installed; `prose` no-op) — BUG-010.
+- i18n switch is a no-op / not persisted (`providers.tsx:30`); nav labels hardcoded RU.
+- Kanban: `onDragLeave` flicker, no optimistic rollback, 50-card cap, skeleton 4-vs-5 cols (BUG-021).
+- `kanban.spec.ts` doesn't log in + uses stale `role="list"` selectors → 4 e2e failures (board itself works). Fix specs.
+- CommandPalette fires `GET /tickets?limit=5` on every open even with empty query.
+- KB category count includes drafts (`knowledgebase.service.ts:33`); `isPublished` leaked on `/kb/categories`.
+- my-tickets React-Query key frozen at mount (`use-client-tickets.ts:157`).
+- Admin `catch{}` swallows API 400/409 detail (generic toasts); Radix dialogs missing `DialogDescription` (a11y).
+- Long-tail parity: CF options editor, POP3, jti revocation blocklist, SLA schedule working-hours editor (dialog is title-only), saved-view date-range persistence.
 
 ---
 
-## P2 / P3
-
-> ✅ CLEARED this pass (live-verified): CF **NUMBER** type (was 422); **reply drafts**;
-> **time-tracking**; **bulk-actions** (status/assignee); **saved ticket-list views**;
-> **follow-ups**; duplicate `id="reply-textarea"` fixed; React #418 hydration. Plus
-> round-2 SEC-1/SEC-2/PROD-1..5 (see above).
-
-Remaining (genuinely optional polish, no live blocker):
-
-- CF type label raw uppercase; CF field-edit + group-scope + staff-group CRUD UI; select-type options editor.
-- Watchers add/remove require TICKET_VIEW→TICKET_EDIT (done last pass); watcher/ticket delete silent 204; flag endpoint; ticket-link CRUD; search post bodies; user/org notes; POP3; KQL expansion.
-- Kanban: 50-cap pagination, onDragLeave flicker, skeleton 4-vs-5; client reply no try/catch; non-numeric ticket id NaN→notFound; useSearchParams Suspense boundary; sla_breach template vars; auto-close wrong template; SlaProcessor/MailProcessor debug→info logging; pagination 3 shapes standardize; @ApiResponse schemas; JWT revocation lag (Redis jti blocklist); dead NewsModule/Troubleshooter wiring; attachment fake-progress deceives user.
-
----
-
-## Confirmed working (do NOT re-touch)
-
-All last-pass fixes verified live: login throttle→429, login→/staff/dashboard, guards, 401-refresh, KB drafts hidden, ticket status/priority/assignee/close/tags/notes/authors, kanban DnD persist, dashboard real metrics, server-side filters, /auth/me real name, apply-macro/dept-change/email-queue endpoints, mail "Hello <name>", Alaris no-autoresponder/400/403/dedup, SLA+auto-close jobs, custom-field validation, admin CRUD (dept/status/priority/staff/workflow/macro/CF create+edit), client portal submit/my-tickets/public-detail/reply. Test suite: api vitest 325/325, web build clean.
-
----
-
-## Addendum — needs live verification next pass
-
-- **SLA admin UI** (new schedules / holidays / escalation-rules CRUD from this pass) — re-audit agent did not return in time; exercise create/edit/delete on each via the UI and confirm correct seconds/camelCase payloads + nested routes (`/admin/sla/schedules/:id/holidays`, `/admin/sla/plans/:id/escalation-rules`).
-- Department parent-selector in admin form (parentId now accepted) — confirm sub-department creation via UI.
-
----
-
-## Round 2 — newly reported (2026-05-23, user audit)
-
-> Fix order: SEC-1 (P0) → SEC-2 → PROD-1..5. Discipline unchanged (test → tsc/lint/vitest
-> green → rebuild no-cache → live-verify → commit).
-
-### SEC-1 (P0) — passwordHash leak on STAFF ticket endpoints
-
-Public endpoints were narrowed last pass, but the **staff** reads were missed.
-`GET /tickets/:id` / `getTicketByMask` (tickets.service.ts:~472) still do
-`user: { include: { emails: true } }` and return the raw Prisma object → the portal
-user's `passwordHash` lands in the JSON. Fix: explicit non-sensitive `select` for `user`
-(id, fullName, emails{email,isPrimary}) on every staff ticket read; never `include` the
-raw user. Test that passwordHash is absent.
-
-### SEC-2 (P1) — HttpOnly cookie added but XSS not closed
-
-Tokens still duplicated in `localStorage` (api.ts:~33) "for compatibility" → XSS can still
-exfiltrate the JWT. Move the browser app to **cookie-only**: drop localStorage token
-storage + Bearer header from the web client (guard already accepts the HttpOnly cookie);
-`hasToken()` reads the non-sensitive `th_authed` marker, not the JWT. Keep SameSite=Lax.
-
-### PROD-1..5 (P1) — configuration is dev/demo, not production-safe
-
-1. **NODE_ENV=development in container** → cookie `secure=false`, dev logging. Provide a
-   prod profile with NODE_ENV=production.
-2. **Seed runs every start** → demo admin recreated on restart. Gate behind an env flag
-   (TELECOM_HD_SEED) / skip in production.
-3. **NEXT_PUBLIC_API_URL hardcoded to localhost:4000** → broken off the dev machine.
-4. **No TLS/reverse-proxy, restart policies, secret management**; mail = MailHog.
-5. **Weak secret validation** (configuration.ts:~10): only `min(32)` — placeholder
-   `...-change-me-...` secrets pass; Alaris webhook has a known default. In production,
-   reject default/placeholder secrets (JWT, Alaris, field-encryption) at boot.
+_Companion reports: `BUG_REPORT.md` (full repro/severity/evidence) · `e2e_23rd_test_goal.md` (per-area scenarios)._

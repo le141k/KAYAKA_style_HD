@@ -260,6 +260,7 @@ describe('WorkflowService', () => {
         title: 'Close ticket',
         replyText: 'Closing.',
         actions: [],
+        isShared: true,
         categoryId: 1,
       });
       expect(result.id).toBe(1);

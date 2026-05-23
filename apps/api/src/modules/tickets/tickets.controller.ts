@@ -14,6 +14,7 @@ import {
   UsePipes,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { TicketsService } from './tickets.service';
 import { RequirePermissions, CurrentStaff, Public } from '../../auth/auth.decorators';
 import type { AuthStaff } from '../../auth/auth.decorators';
@@ -63,10 +64,11 @@ export class TicketsController {
 
   @Public()
   @Post('public')
+  // Per-endpoint throttle (tighter than the global 300/60s) to curb portal spam/DoS.
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
   @UsePipes(new ZodValidationPipe(PublicCreateTicketSchema))
   @ApiOperation({ summary: 'Submit a ticket from the client portal (no auth required)' })
   async publicCreate(@Body() dto: PublicCreateTicketDto) {
-    // TODO: rate-limit by IP
     return this.ticketsService.createTicket({
       ...dto,
       contents: dto.contents,
@@ -110,6 +112,7 @@ export class TicketsController {
 
   @Public()
   @Post('public/:id/reply')
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @ApiOperation({ summary: 'Add a user reply to a ticket from the client portal (no auth required)' })
   publicReply(
     @Param('id', ParseIntPipe) id: number,

@@ -139,6 +139,15 @@ export class MacroController {
     return this.workflowService.listMacros(categoryId !== undefined ? parseInt(categoryId, 10) : undefined);
   }
 
+  // Lightweight macro list (id + title) for the ticket apply-macro picker —
+  // available to anyone who can edit tickets (agents lack ADMIN_WORKFLOW).
+  @Get('options')
+  @RequirePermissions(PERMISSIONS.TICKET_EDIT)
+  @ApiOperation({ summary: 'List macros (id + title) for the apply-macro picker' })
+  options() {
+    return this.workflowService.listMacroOptions();
+  }
+
   @Get(':id')
   @RequirePermissions(PERMISSIONS.ADMIN_WORKFLOW)
   @ApiOperation({ summary: 'Get a macro by ID' })

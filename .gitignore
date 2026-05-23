@@ -34,3 +34,4 @@ npm-debug.log*
 .idea/
 .vscode/*
 !.vscode/extensions.json
+apps/web/e2e/.auth/

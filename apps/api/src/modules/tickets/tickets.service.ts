@@ -1091,23 +1091,37 @@ export class TicketsService {
 
       for (const action of actions) {
         const type = action['type'] as string | undefined;
+        // The workflow/macro UI stores the target as a string `value` (e.g.
+        // {type:'set_status', value:'3'}); older/event-driven shapes use a typed
+        // key (statusId). Accept both so UI-built macros actually fire.
+        const numField = (key: string): number | undefined => {
+          const raw = action[key] ?? action['value'];
+          const n = typeof raw === 'string' ? Number(raw) : (raw as number | undefined);
+          return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : undefined;
+        };
         try {
           switch (type) {
             case 'set_status':
-            case 'change_status':
-              if (action['statusId']) ticketUpdate['statusId'] = action['statusId'];
+            case 'change_status': {
+              const sid = numField('statusId');
+              if (sid) ticketUpdate['statusId'] = sid;
               break;
+            }
             case 'set_priority':
-            case 'change_priority':
-              if (action['priorityId']) ticketUpdate['priorityId'] = action['priorityId'];
+            case 'change_priority': {
+              const pid = numField('priorityId');
+              if (pid) ticketUpdate['priorityId'] = pid;
               break;
+            }
             case 'assign':
             case 'change_owner':
-              ticketUpdate['ownerStaffId'] = action['ownerStaffId'] ?? null;
+              ticketUpdate['ownerStaffId'] = action['ownerStaffId'] ?? numField('ownerStaffId') ?? null;
               break;
-            case 'change_department':
-              if (action['departmentId']) ticketUpdate['departmentId'] = action['departmentId'];
+            case 'change_department': {
+              const did = numField('departmentId');
+              if (did) ticketUpdate['departmentId'] = did;
               break;
+            }
             case 'add_tag':
               if (typeof action['tag'] === 'string' && action['tag']) {
                 await this.prisma.ticket.update({

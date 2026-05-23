@@ -31,6 +31,7 @@ export const CreateMacroSchema = z.object({
   title: z.string().min(1).max(200),
   replyText: z.string().default(''),
   actions: z.array(z.unknown()).default([]),
+  isShared: z.boolean().default(true),
   categoryId: z.number().int().positive().nullable().optional(),
 });
 export type CreateMacroDto = z.infer<typeof CreateMacroSchema>;

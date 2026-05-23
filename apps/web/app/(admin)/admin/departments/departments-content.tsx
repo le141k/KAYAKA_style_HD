@@ -168,6 +168,27 @@ export function DepartmentsContent() {
                 <p className="text-xs text-destructive">{form.formState.errors.title.message}</p>
               )}
             </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium" htmlFor="dept-parent">
+                Родительский отдел
+              </label>
+              <select
+                id="dept-parent"
+                className="h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
+                value={form.watch('parentId') ?? ''}
+                onChange={(e) => form.setValue('parentId', e.target.value ? Number(e.target.value) : null)}
+              >
+                <option value="">— Без родителя (верхний уровень) —</option>
+                {flat
+                  .filter(({ dept }) => dept.id !== editing?.id)
+                  .map(({ dept, depth }) => (
+                    <option key={dept.id} value={dept.id}>
+                      {' '.repeat(depth * 2)}
+                      {dept.title}
+                    </option>
+                  ))}
+              </select>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setDialogOpen(false)}>
                 Отмена

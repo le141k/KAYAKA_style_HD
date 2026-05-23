@@ -94,6 +94,14 @@ export class WorkflowService {
     });
   }
 
+  /** Minimal macro list (id + title) for the ticket apply-macro picker. */
+  listMacroOptions() {
+    return this.prisma.macro.findMany({
+      select: { id: true, title: true },
+      orderBy: { title: 'asc' },
+    });
+  }
+
   async getMacro(id: number): Promise<Macro> {
     const m = await this.prisma.macro.findUnique({ where: { id } });
     if (!m) throw new NotFoundException(`Macro ${id} not found`);
@@ -106,6 +114,7 @@ export class WorkflowService {
         title: dto.title,
         replyText: dto.replyText,
         actions: dto.actions as object,
+        isShared: dto.isShared ?? true,
         categoryId: dto.categoryId ?? null,
       },
     });
@@ -119,6 +128,7 @@ export class WorkflowService {
         ...(dto.title !== undefined && { title: dto.title }),
         ...(dto.replyText !== undefined && { replyText: dto.replyText }),
         ...(dto.actions !== undefined && { actions: dto.actions as object }),
+        ...(dto.isShared !== undefined && { isShared: dto.isShared }),
         ...(dto.categoryId !== undefined && { categoryId: dto.categoryId }),
       },
     });

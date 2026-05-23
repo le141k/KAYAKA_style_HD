@@ -140,6 +140,7 @@ export const PublicCreateTicketSchema = z.object({
   requesterEmail: z.string().email(),
   requesterName: z.string().min(1).max(200),
   departmentId: z.number().int().positive().optional(),
+  priorityId: z.number().int().positive().optional(),
   typeId: z.number().int().positive().optional(),
   customFields: z.record(z.unknown()).default({}),
   attachmentIds: z.array(z.number().int().positive()).optional(),
