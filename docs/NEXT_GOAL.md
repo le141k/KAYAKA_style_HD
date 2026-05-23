@@ -32,11 +32,17 @@
 
 - BUG-001 priorityId now flows to public submit; BUG-002 `/staff/assignable` + `/admin/macros/options` (agent→200, full routes still 403); macros `isShared` column + set_status fallback + `send_email` wired; KB typography; client reopen-on-reply; **bulk** `$transaction` + `{updated,failed[]}` + unassign (live `{updated:2,failed:[99999]}`); **sla_breached** server-side (accurate totals); **listTickets include tags**; e2e 33/33 (clean window); lint 0; vitest **482/482**.
 
+## ✅ DONE in 6373c5f (verified live by audit) — do NOT re-touch
+
+- **PRIORITY_MAP inversion FIXED** — submit-form resolves slug→id dynamically via new `@Public() GET /ticket-priorities/public`; gold-standard live: form pick «Критический» → sends `priorityId:4` (Urgent). **z.coerce.boolean footgun FIXED** — new `common/zod-bool.util.ts` (explicit preprocess) on `sla_breached`/`unassigned`/`isResolved`/`publishedOnly`/`enabled`; live `?sla_breached=false`→total 5 (no longer filters). **Tags rendered** in `TicketRow` (≤3 chips). vitest **489/489**, builds 0, lint 0.
+
 ## P1 — fix first (found during verification)
 
-- **[P1][LIVE] 🔴 CRITICAL — `PRIORITY_MAP` inverted on public submit.** DB priorities are id1=Low,2=Normal,3=High,4=Urgent, but `submit-form.tsx:31` maps `urgent→1, high→2, normal→3, low→4`. So a client choosing **«Критический» gets Low**, «Низкий» gets Urgent — **100% of public tickets get the wrong priority** (this silently negates the BUG-001 fix at the UI layer). **Fix:** map `urgent:4, high:3, normal:2, low:1` — or better, drop the static map and use the dynamic `priorityIdForSlug` lookup (staff side already does, `use-tickets.ts:217`). Add a test asserting urgent→Urgent.
-- **[P1][LIVE] `z.coerce.boolean()` footgun (flagged but NOT fixed).** `z.coerce.boolean("false")` → `true`. Confirmed live: `?sla_breached=false` returns 0 (filters as if true). Affects `sla_breached`,`unassigned`,`isResolved` (`tickets/dto.ts:114-120`), `publishedOnly` (`knowledgebase/dto.ts:25`), `enabled` (`staff/dto.ts:51`). Web UI only sends `true`/omits so users are unaffected today, but any API caller gets inverted semantics. **Fix:** copy the explicit `preprocess` pattern from `configuration.ts:17-22`.
-- **[P1][CODE] Scheduled reports are dead** — `createSchedule` never sets `nextRunAt` (NULL), and the processor filters `nextRunAt <= now` (NULL never matches) → no schedule ever fires (`reports.service.ts:173`, `report-schedule.processor.ts:49`). Manual run works. **Fix:** compute `nextRunAt` from cron on create + real cron-parse in `advanceNextRunAt`.
+- **[P1][CODE] Scheduled reports are dead** — `createSchedule` never sets `nextRunAt` (NULL), and the processor filters `nextRunAt <= now` (NULL never matches) → no schedule ever fires (`reports.service.ts:173`, `report-schedule.processor.ts:49`). Manual run works. **Fix:** compute `nextRunAt` from cron on create + real cron-parse in `advanceNextRunAt`. _(Not a pilot blocker — manual run works; sequence after Batch 4.)_
+
+## 🔑 NEXT (agreed): Batch 4 — deploy hardening (the pilot "ready" gate)
+
+- helmet/security headers (`main.ts`); separate **prod profile** (`docker-compose.prod.yml`: NODE_ENV=production, secure cookies, restart, API port not published); **hard** seed-guard (refuse demo `demo1234` in production, not silent skip); `.env.prod.example`; deploy README. **Must NOT break the dev compose / `make verify` loop** (keep demo seed in dev).
 
 ## P1.5 — caveats from the 82ad9f8 fixes (close soon)
 

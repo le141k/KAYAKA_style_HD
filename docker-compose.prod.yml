@@ -56,10 +56,10 @@ services:
       NODE_ENV: production
       DATABASE_URL: postgresql://${TELECOM_HD_DB_USER}:${TELECOM_HD_DB_PASSWORD}@postgres:5432/${TELECOM_HD_DB_NAME}?schema=public
       REDIS_URL: redis://redis:6379
+    # API is NOT published to the host — the reverse proxy reaches it over the
+    # internal docker network. Only `expose` (container-to-container).
     expose:
       - "4000"
-    ports:
-      - "4000:4000"   # remove if the reverse proxy is on the same docker network
     volumes:
       - uploads:/app/uploads
     depends_on:
@@ -67,9 +67,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Apply migrations, then start. Seed is intentionally NOT run (it self-skips in
-    # production unless TELECOM_HD_SEED=1).
-    command: ["sh", "-c", "npx prisma migrate deploy && node dist/seed/seed.js && node dist/main.js"]
+    # Apply migrations, then start. Seed is intentionally NOT run in prod (seed.ts
+    # also hard-refuses to create the demo admin under NODE_ENV=production).
+    command: ["sh", "-c", "npx prisma migrate deploy && node dist/main.js"]
 
   web:
     build:
@@ -82,10 +82,9 @@ services:
     environment:
       NODE_ENV: production
       TELECOM_HD_API_URL: http://api:4000
+    # Behind the reverse proxy too — not published to the host.
     expose:
       - "3000"
-    ports:
-      - "3000:3000"   # remove if the reverse proxy is on the same docker network
     depends_on:
       - api
 

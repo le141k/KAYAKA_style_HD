@@ -86,6 +86,49 @@ npm run test:e2e           # Playwright E2E
 > **locally** via the npm scripts above (Docker must be running for integration/e2e). Run them
 > before committing; the Husky `pre-commit` hook runs lint-staged.
 
+## Production deploy
+
+The dev `docker-compose.yml` (demo seed + demo creds over http) is for local work.
+For production use the **separate** `docker-compose.prod.yml`:
+
+```bash
+cp .env.prod.example .env.prod      # then replace EVERY placeholder secret
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+```
+
+What the prod profile enforces:
+
+- `NODE_ENV=production` → secure (`Secure`) cookies, info-level logs, **helmet** security
+  headers on every API response.
+- **The API refuses to boot with placeholder/default secrets** (`assertProductionSecrets`):
+  `change-me`, `dev-secret`, `…0000`, `example` JWT/Alaris values are rejected — so a careless
+  `cp .env.prod.example .env.prod` without edits fails fast instead of running insecure.
+- **No demo seed.** The prod command runs `migrate deploy` then `main` only, and `seed.ts`
+  hard-refuses (non-zero exit) to create the demo `admin@23telecom.example / demo1234` under
+  `NODE_ENV=production` unless `TELECOM_HD_SEED=1` is explicitly set.
+- **No published ports** — `api` (4000) and `web` (3000) are only `expose`d on the internal
+  docker network; terminate TLS and route at a reverse proxy.
+
+### Reverse proxy + TLS
+
+Front both services with nginx/Traefik/Caddy on the same docker network and terminate HTTPS
+there. Example nginx vhost:
+
+```nginx
+server {
+  listen 443 ssl;
+  server_name help.example.com;
+  ssl_certificate     /etc/letsencrypt/live/help.example.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/help.example.com/privkey.pem;
+
+  location /api/ { proxy_pass http://api:4000;  proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+  location /     { proxy_pass http://web:3000;  proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+}
+```
+
+`NEXT_PUBLIC_API_URL` is baked into the web image at build time — set it to the public origin
+(e.g. `https://help.example.com`) in `.env.prod` before `up --build`.
+
 ## Alaris integration (stub)
 
 A **placeholder** module wires `POST /api/alaris/webhook` (shared-secret guarded) to

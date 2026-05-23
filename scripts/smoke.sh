@@ -4,7 +4,8 @@
 set -euo pipefail
 
 API="${API_URL:-http://localhost:4000}"
-SECRET="${TELECOM_HD_ALARIS_WEBHOOK_SECRET:-alaris-dev-secret}"
+# Default must match the dev .env / config default, else the webhook check 403s.
+SECRET="${TELECOM_HD_ALARIS_WEBHOOK_SECRET:-alaris-dev-secret-change-me-0000}"
 pass() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31m✗\033[0m %s\n' "$1"; exit 1; }
 

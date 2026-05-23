@@ -30,6 +30,7 @@
     "argon2": "^0.41.1",
     "bullmq": "^5.34.5",
     "eventemitter2": "^6.4.9",
+    "helmet": "^8.2.0",
     "imapflow": "^1.0.171",
     "mailparser": "^3.7.2",
     "nestjs-pino": "^4.2.0",

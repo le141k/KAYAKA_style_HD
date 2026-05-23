@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import helmet from 'helmet';
 import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import { loadConfig } from './config/configuration';
@@ -11,6 +12,23 @@ async function bootstrap(): Promise<void> {
 
   // Use Pino as the application-level logger (replaces NestJS default)
   app.useLogger(app.get(Logger));
+
+  // Security headers (applies in dev + prod). The API is JSON-only behind a
+  // reverse proxy in prod, so the strict default CSP is fine; we relax it just
+  // enough for the self-hosted Swagger UI at /api/docs.
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          'default-src': ["'self'"],
+          'script-src': ["'self'", "'unsafe-inline'"],
+          'style-src': ["'self'", "'unsafe-inline'"],
+          'img-src': ["'self'", 'data:'],
+        },
+      },
+      crossOriginEmbedderPolicy: false,
+    }),
+  );
 
   // Global API prefix (all routes become /api/*)
   app.setGlobalPrefix('api');

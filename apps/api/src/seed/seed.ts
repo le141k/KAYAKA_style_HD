@@ -35,12 +35,16 @@ async function findOrCreateWhere<T extends { id: number }>(
 }
 
 async function main(): Promise<void> {
-  // The seed creates a demo admin (admin@23telecom.example / demo1234). Never do
-  // that automatically in production — it would recreate a known-password account
-  // on every restart. Opt in explicitly with TELECOM_HD_SEED=1.
+  // The seed creates a demo admin (admin@23telecom.example / demo1234). In
+  // production we REFUSE outright (loud, non-zero exit — not a silent skip) so a
+  // known-password account can never be created on a real deployment. An operator
+  // who really wants demo data must opt in explicitly with TELECOM_HD_SEED=1.
   if (process.env.NODE_ENV === 'production' && process.env.TELECOM_HD_SEED !== '1') {
-    console.log('⏭️  Seed skipped (NODE_ENV=production and TELECOM_HD_SEED!=1).');
-    return;
+    console.error(
+      '⛔ Refusing to seed in production: this would create the demo admin ' +
+        '(admin@23telecom.example / demo1234). Set TELECOM_HD_SEED=1 to override (NOT recommended).',
+    );
+    process.exit(1);
   }
 
   console.log('🌱 Seeding 23 Telecom Help Desk…');
