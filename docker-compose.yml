@@ -41,6 +41,10 @@ services:
     environment:
       DATABASE_URL: postgresql://${TELECOM_HD_DB_USER:-telecom_hd}:${TELECOM_HD_DB_PASSWORD:-telecom_hd_dev}@postgres:5432/${TELECOM_HD_DB_NAME:-telecom_hd}?schema=public
       REDIS_URL: redis://redis:6379
+      # Dev/e2e only: relax the public-portal throttle so repeated e2e submits are
+      # deterministic. Prod (.env.prod) leaves these unset → strict 5/10 per 60s.
+      TELECOM_HD_PUBLIC_SUBMIT_LIMIT: "100"
+      TELECOM_HD_PUBLIC_REPLY_LIMIT: "100"
     ports:
       - "4000:4000"
     volumes:

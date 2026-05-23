@@ -39,12 +39,23 @@ File:line detail for each item is in `docs/NEXT_GOAL.md`.
 - [x] `createSchedule` seeds `nextRunAt` from the cron (UTC); `updateSchedule` recomputes it when the cron changes; `advanceNextRunAt` now uses real `cron-parser` (added as a direct dep) instead of the fixed +1h hack. Cron is validated on write (`ScheduleCreateSchema` refine → 400 on garbage). New `cron.util` + spec; createSchedule test asserts non-NULL nextRunAt.
 - **Acceptance:** live — created schedule `nextRunAt` is non-NULL (`2026-…T18:25:00Z`); invalid cron → 400; the processor's due-scan (`nextRunAt <= now`) now matches real schedules. `make verify` GREEN. ✅
 
-## ☐ Batch D — Test lock-in (DO LAST so the gate is strongest)
+## ✅ Batch D — Test lock-in (DONE)
 
-- [ ] Make e2e deterministic vs the public throttle (raise/exempt the limit under test, or serialize submit tests).
-- [ ] Add e2e: agent full workflow (assign via `/staff/assignable`, apply macro, reply, status), bulk action, public submit-with-priority (urgent→Urgent).
-- [ ] Add a `verify-full` make target that also runs `npm run test:e2e`; wire it into the gate.
-- **Acceptance:** `make verify-full` green and repeatable.
+- [x] Public throttle is env-driven (`TELECOM_HD_PUBLIC_SUBMIT_LIMIT`/`_REPLY_LIMIT`), bumped to 100 in the dev compose so repeated e2e submits are deterministic; prod (.env.prod) keeps the strict 5/10 defaults.
+- [x] New `agent-flows.spec.ts` (chromium-auth project): agent loop (reply + internal note via UI; status/priority/assign-via-`/staff/assignable`/create+apply macro end-to-end through the authed stack); bulk status change via the list UI; public submit choosing "Критический" → asserts the created ticket is Urgent.
+- [x] `make verify-full` = `verify.sh` + `npm run test:e2e`.
+- **Acceptance:** `make verify-full` GREEN (gate 9/9 + e2e 37/37); e2e stable across 3 consecutive runs. ✅
+
+---
+
+## ✅ Definition of Ready — ALL GREEN
+
+- [x] `make verify` green (tsc · vitest · build · lint · smoke) — 9/9.
+- [x] Full e2e green AND stable — 37/37, 3× consecutive (throttle no longer flaky).
+- [x] Agent loop covered: list → open → reply → internal note (UI) → status/priority → assign → macro (end-to-end via the authed stack in `agent-flows.spec.ts`) + time/follow-up endpoints (Batch B specs).
+- [x] Client self-service: submit with the **correct** priority (urgent→Urgent e2e) → my-tickets → reply → reopen (reply-to-resolved reopen wired earlier).
+- [x] No silent failure-masking; no fake data; notification bell removed (Batch B).
+- [x] Prod profile exists & builds: NODE_ENV=production, helmet, secret-gate rejects placeholders, no demo seed, reverse-proxy, documented; dev loop still green (Batch A).
 
 ---
 

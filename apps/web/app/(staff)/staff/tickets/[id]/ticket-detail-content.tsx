@@ -346,7 +346,12 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                     className="text-sm"
                   />
                   <div className="flex justify-end">
-                    <Button type="submit" disabled={replyMutation.isPending} className="gap-2">
+                    <Button
+                      type="submit"
+                      disabled={replyMutation.isPending}
+                      className="gap-2"
+                      data-testid="reply-submit"
+                    >
                       {replyMutation.isPending ? (
                         <Loader2 className="h-4 w-4 animate-spin" />
                       ) : (

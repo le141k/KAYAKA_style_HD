@@ -15,22 +15,22 @@ export default defineConfig({
   projects: [
     // Logs in once → shared storage state (avoids the 5/60s login throttle).
     { name: 'setup', testMatch: /auth\.setup\.ts/ },
-    // Unauthenticated specs (login page, public portal, KB). Kanban is excluded —
-    // it needs auth and runs in the authenticated project below.
+    // Unauthenticated specs (login page, public portal, KB). Authenticated specs
+    // (kanban, agent-flows) are excluded — they run in the project below.
     {
       name: 'chromium',
       use: { ...devices['Desktop Chrome'] },
-      testIgnore: /kanban\.spec\.ts/,
+      testIgnore: /(kanban|agent-flows)\.spec\.ts/,
     },
     {
       name: 'mobile-chrome',
       use: { ...devices['Pixel 5'] },
-      testIgnore: /kanban\.spec\.ts/,
+      testIgnore: /(kanban|agent-flows)\.spec\.ts/,
     },
-    // Authenticated desktop — kanban (a desktop-oriented board).
+    // Authenticated desktop — staff workflows (storageState from auth.setup).
     {
       name: 'chromium-auth',
-      testMatch: /kanban\.spec\.ts/,
+      testMatch: /(kanban|agent-flows)\.spec\.ts/,
       use: { ...devices['Desktop Chrome'], storageState: 'e2e/.auth/staff.json' },
       dependencies: ['setup'],
     },

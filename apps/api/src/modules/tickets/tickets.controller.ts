@@ -56,6 +56,11 @@ import {
   type BulkTicketActionDto,
 } from './dto';
 
+// Per-endpoint throttle limits for the unauthenticated portal. Env-overridable so
+// e2e/dev can raise them for determinism; prod leaves them at the strict defaults.
+const PUBLIC_SUBMIT_LIMIT = Number(process.env['TELECOM_HD_PUBLIC_SUBMIT_LIMIT']) || 5;
+const PUBLIC_REPLY_LIMIT = Number(process.env['TELECOM_HD_PUBLIC_REPLY_LIMIT']) || 10;
+
 @ApiTags('tickets')
 @Controller('tickets')
 export class TicketsController {
@@ -66,7 +71,7 @@ export class TicketsController {
   @Public()
   @Post('public')
   // Per-endpoint throttle (tighter than the global 300/60s) to curb portal spam/DoS.
-  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @Throttle({ default: { limit: PUBLIC_SUBMIT_LIMIT, ttl: 60000 } })
   @UsePipes(new ZodValidationPipe(PublicCreateTicketSchema))
   @ApiOperation({ summary: 'Submit a ticket from the client portal (no auth required)' })
   async publicCreate(@Body() dto: PublicCreateTicketDto) {
@@ -113,7 +118,7 @@ export class TicketsController {
 
   @Public()
   @Post('public/:id/reply')
-  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @Throttle({ default: { limit: PUBLIC_REPLY_LIMIT, ttl: 60000 } })
   @ApiOperation({ summary: 'Add a user reply to a ticket from the client portal (no auth required)' })
   publicReply(
     @Param('id', ParseIntPipe) id: number,
