@@ -11,18 +11,19 @@ import {
   useDeleteTimeEntry,
   type TimeEntry,
 } from '@/lib/hooks/use-time-tracking';
+import { useI18n } from '@/lib/i18n';
 
-/** Render minutes as a compact "Hh Mm" / "Mm" string. */
-function formatMinutes(total: number): string {
-  if (total <= 0) return '0m';
+/** Render minutes as a compact "Hh Mm" / "Mm" string using localized units. */
+function formatMinutes(total: number, hUnit: string, mUnit: string): string {
+  if (total <= 0) return `0${mUnit}`;
   const h = Math.floor(total / 60);
   const m = total % 60;
-  return [h > 0 ? `${h}h` : '', m > 0 ? `${m}m` : ''].filter(Boolean).join(' ') || '0m';
+  return [h > 0 ? `${h}${hUnit}` : '', m > 0 ? `${m}${mUnit}` : ''].filter(Boolean).join(' ') || `0${mUnit}`;
 }
 
 function staffName(e: TimeEntry): string {
-  if (!e.staff) return 'Staff';
-  return `${e.staff.firstName} ${e.staff.lastName}`.trim() || 'Staff';
+  if (!e.staff) return '';
+  return `${e.staff.firstName} ${e.staff.lastName}`.trim();
 }
 
 /**
@@ -30,9 +31,12 @@ function staffName(e: TimeEntry): string {
  * time, a small log form (minutes + optional note), and the entry list.
  */
 export function TimeTrackingPanel({ ticketId }: { ticketId: number }) {
+  const { t } = useI18n();
+  const tt = t.timeTracking;
   const { data, isLoading } = useTimeEntries(ticketId);
   const logTime = useLogTime(ticketId);
   const deleteEntry = useDeleteTimeEntry(ticketId);
+  const fmt = (n: number) => formatMinutes(n, tt.hours, tt.mins);
 
   const [minutes, setMinutes] = useState('');
   const [note, setNote] = useState('');
@@ -60,44 +64,44 @@ export function TimeTrackingPanel({ ticketId }: { ticketId: number }) {
       <div className="flex items-center justify-between">
         <h3 className="flex items-center gap-1.5 text-sm font-medium">
           <Clock className="size-4" />
-          Time tracked
+          {tt.title}
         </h3>
-        <span className="text-sm font-semibold tabular-nums">{formatMinutes(totalMinutes)}</span>
+        <span className="text-sm font-semibold tabular-nums">{fmt(totalMinutes)}</span>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-2">
         <div className="space-y-1">
           <Label htmlFor="time-minutes" className="text-xs">
-            Minutes
+            {tt.minutes}
           </Label>
           <Input
             id="time-minutes"
             type="number"
             min={1}
             inputMode="numeric"
-            placeholder="30"
+            placeholder={tt.minutesPlaceholder}
             value={minutes}
             onChange={(e) => setMinutes(e.target.value)}
             className="h-8"
           />
         </div>
         <Input
-          aria-label="Note"
-          placeholder="Note (optional)"
+          aria-label={tt.notePlaceholder}
+          placeholder={tt.notePlaceholder}
           value={note}
           onChange={(e) => setNote(e.target.value)}
           className="h-8"
         />
         <Button type="submit" size="sm" className="w-full" disabled={logTime.isPending || !minutes}>
-          {logTime.isPending ? 'Logging…' : 'Log time'}
+          {logTime.isPending ? tt.logging : tt.logTime}
         </Button>
       </form>
 
       <div className="space-y-1.5">
         {isLoading ? (
-          <p className="text-xs text-muted-foreground">Loading…</p>
+          <p className="text-xs text-muted-foreground">{tt.loading}</p>
         ) : entries.length === 0 ? (
-          <p className="text-xs text-muted-foreground">No time logged yet.</p>
+          <p className="text-xs text-muted-foreground">{tt.empty}</p>
         ) : (
           entries.map((entry) => (
             <div
@@ -106,8 +110,10 @@ export function TimeTrackingPanel({ ticketId }: { ticketId: number }) {
             >
               <div className="min-w-0">
                 <div className="flex items-center gap-1.5">
-                  <span className="font-medium tabular-nums">{formatMinutes(entry.minutes)}</span>
-                  <span className="text-muted-foreground">· {staffName(entry)}</span>
+                  <span className="font-medium tabular-nums">{fmt(entry.minutes)}</span>
+                  {staffName(entry) ? (
+                    <span className="text-muted-foreground">· {staffName(entry)}</span>
+                  ) : null}
                 </div>
                 {entry.note ? <p className="truncate text-muted-foreground">{entry.note}</p> : null}
               </div>
@@ -116,7 +122,7 @@ export function TimeTrackingPanel({ ticketId }: { ticketId: number }) {
                 variant="ghost"
                 size="icon"
                 className="size-6 shrink-0 text-muted-foreground hover:text-destructive"
-                aria-label="Delete entry"
+                aria-label={tt.deleteEntry}
                 disabled={deleteEntry.isPending}
                 onClick={() => deleteEntry.mutate(entry.id)}
               >

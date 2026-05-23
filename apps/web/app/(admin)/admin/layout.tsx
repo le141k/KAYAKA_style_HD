@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, usePathname } from 'next/navigation';
 import Link from 'next/link';
 import { Loader2 } from 'lucide-react';
 import { ThemeToggle } from '@/components/premium/ThemeToggle';
@@ -20,6 +20,7 @@ const ADMIN_TABS = [
 
 export default function AdminLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
+  const pathname = usePathname();
   const { data: user, isLoading, isError } = useMe();
 
   // `useMe` is disabled during SSR (hasToken() false) but enabled on the
@@ -79,15 +80,20 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
           className="flex overflow-x-auto border-t border-border px-6"
           aria-label="Разделы администрирования"
         >
-          {ADMIN_TABS.map((tab) => (
-            <Link
-              key={tab.href}
-              href={tab.href}
-              className="flex-shrink-0 border-b-2 border-transparent px-3 py-2.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/50 hover:text-foreground data-[active=true]:border-primary data-[active=true]:text-primary"
-            >
-              {tab.label}
-            </Link>
-          ))}
+          {ADMIN_TABS.map((tab) => {
+            const active = pathname === tab.href || pathname.startsWith(`${tab.href}/`);
+            return (
+              <Link
+                key={tab.href}
+                href={tab.href}
+                data-active={active}
+                aria-current={active ? 'page' : undefined}
+                className="flex-shrink-0 border-b-2 border-transparent px-3 py-2.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/50 hover:text-foreground data-[active=true]:border-primary data-[active=true]:text-primary"
+              >
+                {tab.label}
+              </Link>
+            );
+          })}
         </nav>
       </header>
 

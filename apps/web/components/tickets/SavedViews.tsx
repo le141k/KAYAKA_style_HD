@@ -13,6 +13,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useSavedViews, useCreateSavedView, useDeleteSavedView } from '@/lib/hooks/use-saved-views';
+import { useI18n } from '@/lib/i18n';
 
 /**
  * Compact toolbar control for the ticket list: pick a saved set of filters,
@@ -25,6 +26,8 @@ export function SavedViews({
   currentFilters: Record<string, unknown>;
   onApply: (filters: Record<string, unknown>) => void;
 }) {
+  const { t } = useI18n();
+  const sv = t.savedViews;
   const { data: views = [], isLoading } = useSavedViews();
   const createView = useCreateSavedView();
   const deleteView = useDeleteSavedView();
@@ -58,17 +61,17 @@ export function SavedViews({
       <DropdownMenuTrigger asChild>
         <Button variant="outline" size="sm">
           <Bookmark className="mr-1.5 h-4 w-4" />
-          Saved views
+          {sv.title}
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-64">
-        <DropdownMenuLabel>Saved views</DropdownMenuLabel>
+        <DropdownMenuLabel>{sv.title}</DropdownMenuLabel>
         <DropdownMenuSeparator />
 
         {isLoading ? (
-          <DropdownMenuItem disabled>Loading…</DropdownMenuItem>
+          <DropdownMenuItem disabled>{sv.loading}</DropdownMenuItem>
         ) : views.length === 0 ? (
-          <DropdownMenuItem disabled>No saved views yet</DropdownMenuItem>
+          <DropdownMenuItem disabled>{sv.empty}</DropdownMenuItem>
         ) : (
           views.map((view) => (
             <DropdownMenuItem
@@ -79,7 +82,7 @@ export function SavedViews({
               <span className="truncate">{view.name}</span>
               <button
                 type="button"
-                aria-label={`Delete ${view.name}`}
+                aria-label={`${sv.deleteView}: ${view.name}`}
                 className="shrink-0 rounded p-1 text-muted-foreground hover:text-destructive"
                 onClick={(e) => {
                   // Keep the menu open and don't apply the view when deleting.
@@ -108,11 +111,11 @@ export function SavedViews({
                   handleSave();
                 }
               }}
-              placeholder="View name"
+              placeholder={sv.namePlaceholder}
               className="h-8"
             />
             <Button size="sm" onClick={handleSave} disabled={!name.trim() || createView.isPending}>
-              Save
+              {sv.save}
             </Button>
           </div>
         ) : (
@@ -124,7 +127,7 @@ export function SavedViews({
             }}
           >
             <Plus className="mr-1.5 h-4 w-4" />
-            Save current filters
+            {sv.saveCurrent}
           </DropdownMenuItem>
         )}
       </DropdownMenuContent>

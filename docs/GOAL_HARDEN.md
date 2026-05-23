@@ -33,12 +33,12 @@ rewritten at commit 31add8e). After this, the product is honestly hand-to-a-real
 - [x] **OWN-1** time-entry/follow-up delete+patch accept a `canManageOthers` flag (`isAdmin || STAFF_MANAGE`) computed in the controllers. **Live: admin DELETE agent's /time → 204, /follow-ups → 200** (was 403).
 - **Acceptance:** client/kanban surface real errors; thread shows each post once; admin manages any time/follow-up; api vitest 509/509; `make verify` GREEN. ✅
 
-## ☐ Batch H3 — Polish / i18n
+## ✅ Batch H3 — Polish / i18n (DONE)
 
-- [ ] **I18N-1** Time-tracking / Follow-ups / Saved-views panels are hardcoded English. **Fix:** route labels through i18n (ru/en/uk).
-- [ ] **UI-3** Admin nav has no active-tab highlight. **Fix:** wire `usePathname` → set `data-active`/aria-current on the current tab.
-- [ ] **UI-4** Kanban silently caps at 50 tickets. **Fix:** show a "showing first 50" banner (or paginate). No silent data hiding.
-- **Acceptance:** RU UI has no stray English on those panels; active admin tab is visible; kanban warns when capped; `make verify` green.
+- [x] **I18N-1** Added `timeTracking`/`followUps`/`savedViews` sections to ru/en/uk dicts (ru = type source → en/uk completeness compile-enforced); all three panels wired through `useI18n`. **Live: panels render Russian, no stray English.**
+- [x] **UI-3** Admin nav active tab via `usePathname` → `data-active`/`aria-current`. **Live: open tab "Отделы" highlighted.**
+- [x] **UI-4** Kanban reads `total`; banner "Показаны первые 50 из N" when `total > 50` (latent now at 8 tickets).
+- **Acceptance:** RU panels localized; active tab visible; kanban warns when capped; `make verify` GREEN. ✅
 
 ## ☐ Batch H4 — Build hygiene
 

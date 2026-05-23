@@ -14,6 +14,7 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { cn } from '@/lib/utils';
+import { useI18n } from '@/lib/i18n';
 
 function isOverdue(f: FollowUp): boolean {
   return !f.completed && new Date(f.dueAt).getTime() < Date.now();
@@ -25,6 +26,8 @@ function staffName(f: FollowUp): string {
 }
 
 export function FollowUpsPanel({ ticketId }: { ticketId: number }) {
+  const { t } = useI18n();
+  const fu = t.followUps;
   const { data: followUps, isLoading } = useFollowUps(ticketId);
   const createFollowUp = useCreateFollowUp(ticketId);
   const toggleFollowUp = useToggleFollowUp(ticketId);
@@ -50,13 +53,13 @@ export function FollowUpsPanel({ ticketId }: { ticketId: number }) {
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm font-semibold">Follow-ups</CardTitle>
+        <CardTitle className="text-sm font-semibold">{fu.title}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
         <form onSubmit={handleSubmit} className="space-y-2">
           <div className="space-y-1">
             <Label htmlFor="follow-up-due" className="text-xs">
-              Due date
+              {fu.dueDate}
             </Label>
             <Input
               id="follow-up-due"
@@ -68,25 +71,25 @@ export function FollowUpsPanel({ ticketId }: { ticketId: number }) {
           </div>
           <div className="space-y-1">
             <Label htmlFor="follow-up-note" className="text-xs">
-              Note (optional)
+              {fu.notePlaceholder}
             </Label>
             <Textarea
               id="follow-up-note"
               value={note}
               onChange={(e) => setNote(e.target.value)}
-              placeholder="What needs following up?"
+              placeholder={fu.notePlaceholder}
               rows={2}
             />
           </div>
           <Button type="submit" size="sm" disabled={!dueAt || createFollowUp.isPending}>
-            {createFollowUp.isPending ? 'Scheduling…' : 'Schedule follow-up'}
+            {createFollowUp.isPending ? fu.scheduling : fu.schedule}
           </Button>
         </form>
 
         <div className="space-y-2">
-          {isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
+          {isLoading && <p className="text-xs text-muted-foreground">{fu.loading}</p>}
           {!isLoading && (followUps?.length ?? 0) === 0 && (
-            <p className="text-xs text-muted-foreground">No follow-ups scheduled.</p>
+            <p className="text-xs text-muted-foreground">{fu.empty}</p>
           )}
           {followUps?.map((f) => {
             const overdue = isOverdue(f);
@@ -104,7 +107,7 @@ export function FollowUpsPanel({ ticketId }: { ticketId: number }) {
                   checked={f.completed}
                   disabled={toggleFollowUp.isPending}
                   onChange={(e) => toggleFollowUp.mutate({ id: f.id, completed: e.target.checked })}
-                  aria-label="Mark follow-up complete"
+                  aria-label={fu.markComplete}
                 />
                 <div className="min-w-0 flex-1">
                   <div
@@ -115,14 +118,18 @@ export function FollowUpsPanel({ ticketId }: { ticketId: number }) {
                     )}
                   >
                     {new Date(f.dueAt).toLocaleString()}
-                    {overdue && <span className="ml-2 text-xs font-semibold">Overdue</span>}
+                    {overdue && <span className="ml-2 text-xs font-semibold">{fu.overdue}</span>}
                   </div>
                   {f.note && (
                     <div className={cn('text-xs text-muted-foreground', f.completed && 'line-through')}>
                       {f.note}
                     </div>
                   )}
-                  {staffName(f) && <div className="text-xs text-muted-foreground">by {staffName(f)}</div>}
+                  {staffName(f) && (
+                    <div className="text-xs text-muted-foreground">
+                      {fu.by} {staffName(f)}
+                    </div>
+                  )}
                 </div>
                 <Button
                   type="button"
@@ -131,9 +138,9 @@ export function FollowUpsPanel({ ticketId }: { ticketId: number }) {
                   className="shrink-0 text-muted-foreground hover:text-destructive"
                   disabled={deleteFollowUp.isPending}
                   onClick={() => deleteFollowUp.mutate(f.id)}
-                  aria-label="Delete follow-up"
+                  aria-label={fu.deleteFollowUp}
                 >
-                  Delete
+                  {fu.deleteFollowUp}
                 </Button>
               </div>
             );
