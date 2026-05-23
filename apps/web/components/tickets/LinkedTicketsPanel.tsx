@@ -17,9 +17,12 @@ import { useI18n } from '@/lib/i18n';
 export function LinkedTicketsPanel({ ticketId }: { ticketId: number }) {
   const { t } = useI18n();
   const l = t.linkedTickets;
-  const { list, add, remove } = useTicketLinks(ticketId);
+  const { list, add, remove, spawnSupplier } = useTicketLinks(ticketId);
   const [targetId, setTargetId] = useState('');
   const [linkType, setLinkType] = useState<'supplier' | 'client' | 'related'>('supplier');
+  const [spawnOpen, setSpawnOpen] = useState(false);
+  const [supEmail, setSupEmail] = useState('');
+  const [supMsg, setSupMsg] = useState('');
 
   const typeLabel = (lt: string) => (lt === 'supplier' ? l.supplier : lt === 'client' ? l.client : l.related);
 
@@ -31,6 +34,21 @@ export function LinkedTicketsPanel({ ticketId }: { ticketId: number }) {
       {
         onSuccess: () => setTargetId(''),
         onError: () => toast({ title: l.linkError, variant: 'destructive' }),
+      },
+    );
+  }
+
+  function handleSpawn() {
+    if (!supEmail.trim() || !supMsg.trim()) return;
+    spawnSupplier.mutate(
+      { supplierEmail: supEmail.trim(), contents: supMsg.trim() },
+      {
+        onSuccess: () => {
+          setSupEmail('');
+          setSupMsg('');
+          setSpawnOpen(false);
+        },
+        onError: () => toast({ title: l.spawnError, variant: 'destructive' }),
       },
     );
   }
@@ -102,6 +120,42 @@ export function LinkedTicketsPanel({ ticketId }: { ticketId: number }) {
           {l.add}
         </Button>
       </div>
+
+      {/* The NOC "Contact supplier" action — spawns a linked Vendor-Issue ticket. */}
+      {!spawnOpen ? (
+        <Button size="sm" variant="secondary" className="w-full" onClick={() => setSpawnOpen(true)}>
+          {l.spawnSupplier}
+        </Button>
+      ) : (
+        <div className="space-y-1.5 rounded-md border border-border p-2">
+          <Input
+            value={supEmail}
+            onChange={(e) => setSupEmail(e.target.value)}
+            placeholder={l.supplierEmail}
+            type="email"
+            className="h-8"
+          />
+          <textarea
+            value={supMsg}
+            onChange={(e) => setSupMsg(e.target.value)}
+            placeholder={l.message}
+            rows={3}
+            className="w-full rounded-md border border-input bg-transparent px-2 py-1 text-sm"
+          />
+          <div className="flex gap-1.5">
+            <Button
+              size="sm"
+              onClick={handleSpawn}
+              disabled={!supEmail.trim() || !supMsg.trim() || spawnSupplier.isPending}
+            >
+              {l.spawnSubmit}
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setSpawnOpen(false)}>
+              <X className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

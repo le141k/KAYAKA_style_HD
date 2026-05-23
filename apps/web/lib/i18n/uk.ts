@@ -159,5 +159,10 @@ export const uk: Dictionary = {
     addPlaceholder: '№ тикета (id)',
     add: 'Звʼязати',
     linkError: 'Не вдалося звʼязати тикети',
+    spawnSupplier: 'Написати постачальнику',
+    supplierEmail: 'Email постачальника',
+    message: 'Повідомлення постачальнику',
+    spawnSubmit: 'Створити тикет постачальника',
+    spawnError: 'Не вдалося створити тикет постачальника',
   },
 };

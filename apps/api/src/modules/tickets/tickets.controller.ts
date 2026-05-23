@@ -34,6 +34,7 @@ import {
   TagSchema,
   WatcherSchema,
   LinkTicketSchema,
+  SpawnSupplierSchema,
   ListTicketsQuerySchema,
   PublicCreateTicketSchema,
   ApplyMacroSchema,
@@ -49,6 +50,7 @@ import {
   type TagDto,
   type WatcherDto,
   type LinkTicketDto,
+  type SpawnSupplierDto,
   type ListTicketsQueryDto,
   type PublicCreateTicketDto,
   PublicReplySchema,
@@ -342,6 +344,17 @@ export class TicketsController {
   @ApiOperation({ summary: 'Remove a link between two tickets' })
   removeLink(@Param('id', ParseIntPipe) id: number, @Param('linkId', ParseIntPipe) linkId: number) {
     return this.ticketsService.removeLink(id, linkId);
+  }
+
+  @Post(':id/spawn-supplier')
+  @RequirePermissions(PERMISSIONS.TICKET_CREATE)
+  @ApiOperation({ summary: 'Spawn a linked supplier (Vendor Issue) ticket from a client ticket' })
+  spawnSupplier(
+    @Param('id', ParseIntPipe) id: number,
+    @Body(new ZodValidationPipe(SpawnSupplierSchema)) dto: SpawnSupplierDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.ticketsService.spawnSupplierTicket(id, dto, staff.staffId);
   }
 
   // ─────────────────── Tags ───────────────────

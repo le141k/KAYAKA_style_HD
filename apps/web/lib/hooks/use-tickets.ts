@@ -498,7 +498,13 @@ export function useTicketLinks(ticketId: number) {
     mutationFn: (linkId: number) => api.delete(`/tickets/${ticketId}/links/${linkId}`),
     onSuccess: invalidate,
   });
-  return { list, add, remove };
+  // The NOC "Contact supplier" action: spawns a Vendor-Issue ticket linked back here.
+  const spawnSupplier = useMutation({
+    mutationFn: (input: { supplierEmail: string; supplierName?: string; contents: string }) =>
+      api.post<{ ticket: { id: number; mask: string } }>(`/tickets/${ticketId}/spawn-supplier`, input),
+    onSuccess: invalidate,
+  });
+  return { list, add, remove, spawnSupplier };
 }
 
 export function useTicketTags(ticketId: number) {

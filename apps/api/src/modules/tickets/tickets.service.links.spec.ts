@@ -114,6 +114,51 @@ describe('TicketsService — ticket links', () => {
     });
   });
 
+  describe('spawnSupplierTicket', () => {
+    it('creates a Vendor-Issue ticket for the carrier and links it as supplier', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 10,
+        subject: 'SMS not delivered to ES',
+        departmentId: 2,
+      });
+      (prisma as unknown as { ticketType: { findFirst: ReturnType<typeof vi.fn> } }).ticketType = {
+        findFirst: vi.fn().mockResolvedValue({ id: 7 }),
+      };
+
+      const createSpy = vi
+        .spyOn(service, 'createTicket')
+        .mockResolvedValue({ id: 20, subject: '[Supplier] SMS not delivered to ES' } as never);
+      const linkSpy = vi
+        .spyOn(service, 'addLink')
+        .mockResolvedValue({ linkId: 99, linkType: 'supplier', targetId: 20 });
+
+      const res = await service.spawnSupplierTicket(
+        10,
+        { supplierEmail: 'noc@sinch.com', supplierName: 'Sinch', contents: 'Please fix the ES route' },
+        5,
+      );
+
+      // Vendor Issue type resolved, requester = carrier, department inherited.
+      expect(createSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requesterEmail: 'noc@sinch.com',
+          requesterName: 'Sinch',
+          typeId: 7,
+          departmentId: 2,
+          creationMode: 'STAFF',
+        }),
+        5,
+      );
+      // Auto-linked back to the client ticket as a supplier link.
+      expect(linkSpy).toHaveBeenCalledWith(10, { targetId: 20, linkType: 'supplier' });
+      expect(res).toEqual({
+        ticket: { id: 20, subject: '[Supplier] SMS not delivered to ES' },
+        linkId: 99,
+        clientTicketId: 10,
+      });
+    });
+  });
+
   describe('removeLink', () => {
     it('deletes a link that involves the ticket', async () => {
       (prisma.ticketLink.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({

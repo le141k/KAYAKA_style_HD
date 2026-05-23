@@ -159,5 +159,10 @@ export const en: Dictionary = {
     addPlaceholder: 'Ticket # (id)',
     add: 'Link',
     linkError: 'Failed to link tickets',
+    spawnSupplier: 'Contact supplier',
+    supplierEmail: 'Supplier email',
+    message: 'Message to supplier',
+    spawnSubmit: 'Create supplier ticket',
+    spawnError: 'Failed to create supplier ticket',
   },
 };

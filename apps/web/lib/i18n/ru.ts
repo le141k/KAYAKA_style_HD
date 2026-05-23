@@ -158,6 +158,11 @@ export const ru = {
     addPlaceholder: '№ тикета (id)',
     add: 'Связать',
     linkError: 'Не удалось связать тикеты',
+    spawnSupplier: 'Написать поставщику',
+    supplierEmail: 'Email поставщика',
+    message: 'Сообщение поставщику',
+    spawnSubmit: 'Создать тикет поставщика',
+    spawnError: 'Не удалось создать тикет поставщика',
   },
 };
 

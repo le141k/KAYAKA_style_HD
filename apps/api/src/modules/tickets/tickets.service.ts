@@ -22,6 +22,7 @@ import type {
   TagDto,
   WatcherDto,
   LinkTicketDto,
+  SpawnSupplierDto,
   PublicReplyDto,
   ApplyMacroDto,
   ChangeDepartmentDto,
@@ -1199,6 +1200,46 @@ export class TicketsService {
       throw new NotFoundException(`Link ${linkId} not found on ticket ${ticketId}`);
     }
     await this.prisma.ticketLink.delete({ where: { id: linkId } });
+  }
+
+  /**
+   * The core 23T NOC action: from a CLIENT ticket, open a NEW SUPPLIER ticket
+   * (type "Vendor Issue" if it exists, requester = the matched carrier) and
+   * auto-link it back to the client ticket (`linkType=supplier`). Staff then work
+   * the supplier ticket with the "to vendor" macros while the client ticket keeps
+   * the "to customer" thread. Returns the spawned supplier ticket.
+   */
+  async spawnSupplierTicket(
+    clientTicketId: number,
+    dto: SpawnSupplierDto,
+    staffId: number,
+  ): Promise<{ ticket: Ticket; linkId: number; clientTicketId: number }> {
+    const client = await this.findOrThrow(clientTicketId);
+    // Prefer a "Vendor Issue" type; fall back to leaving it unset.
+    const vendorType = await this.prisma.ticketType.findFirst({
+      where: { title: { in: ['Vendor Issue', 'Vendor', 'Supplier Issue'] } },
+      select: { id: true },
+    });
+
+    const supplier = await this.createTicket(
+      {
+        subject: dto.subject ?? `[Supplier] ${client.subject}`,
+        contents: dto.contents,
+        isHtml: false,
+        departmentId: client.departmentId,
+        ...(vendorType ? { typeId: vendorType.id } : {}),
+        requesterEmail: dto.supplierEmail,
+        requesterName: dto.supplierName ?? '',
+        creationMode: 'STAFF',
+        ipAddress: '0.0.0.0',
+        customFields: {},
+        tags: [],
+      },
+      staffId,
+    );
+
+    const link = await this.addLink(clientTicketId, { targetId: supplier.id, linkType: 'supplier' });
+    return { ticket: supplier, linkId: link.linkId, clientTicketId };
   }
 
   // ─────────────────────────── Tags ───────────────────────────

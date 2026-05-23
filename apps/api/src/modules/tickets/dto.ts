@@ -111,6 +111,16 @@ export const LinkTicketSchema = z.object({
 });
 export type LinkTicketDto = z.infer<typeof LinkTicketSchema>;
 
+// The core NOC action: from a client ticket, open a NEW supplier ticket (Vendor
+// Issue, requester = the matched carrier) auto-linked back to the client ticket.
+export const SpawnSupplierSchema = z.object({
+  supplierEmail: z.string().email(),
+  supplierName: z.string().max(200).optional(),
+  subject: z.string().min(1).max(500).optional(),
+  contents: z.string().min(1),
+});
+export type SpawnSupplierDto = z.infer<typeof SpawnSupplierSchema>;
+
 // ─────────────────── list query ───────────────────
 
 export const ListTicketsQuerySchema = z.object({
