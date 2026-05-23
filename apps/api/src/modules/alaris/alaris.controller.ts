@@ -39,10 +39,14 @@ export class AlarisController {
     @Body() payload: AlarisWebhookPayload,
   ) {
     const expected = this.config.TELECOM_HD_ALARIS_WEBHOOK_SECRET;
-    const secretOk =
-      !!secret &&
-      secret.length === expected.length &&
-      timingSafeEqual(Buffer.from(secret), Buffer.from(expected));
+    // Constant-time comparison. Reject empty/missing secrets up front, and guard
+    // on byteLength because timingSafeEqual throws if the buffers differ in length.
+    let secretOk = false;
+    if (secret) {
+      const provided = Buffer.from(secret, 'utf8');
+      const expectedBuf = Buffer.from(expected, 'utf8');
+      secretOk = provided.byteLength === expectedBuf.byteLength && timingSafeEqual(provided, expectedBuf);
+    }
     if (!secretOk) {
       throw new ForbiddenException('Invalid Alaris webhook secret');
     }

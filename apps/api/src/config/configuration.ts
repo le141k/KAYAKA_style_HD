@@ -22,7 +22,10 @@ const schema = z.object({
     .default(false),
   TELECOM_HD_MAIL_FROM: z.string().default('23 Telecom Help Desk <support@23telecom.example>'),
   TELECOM_HD_LOG_LEVEL: z.string().default('info'),
-  TELECOM_HD_ALARIS_WEBHOOK_SECRET: z.string().default('alaris-dev-secret'),
+  // Shared-secret for the Alaris webhook. Must be at least 32 chars so it carries
+  // enough entropy to resist guessing; the default below is a 32-char dev value.
+  // Generate a strong one: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+  TELECOM_HD_ALARIS_WEBHOOK_SECRET: z.string().min(32).default('alaris-dev-secret-change-me-0000'),
   TELECOM_HD_UPLOAD_DIR: z.string().default('/app/uploads'),
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: z.coerce.number().default(25),
   // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)

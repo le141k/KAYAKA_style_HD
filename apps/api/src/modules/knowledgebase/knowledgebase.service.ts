@@ -84,13 +84,19 @@ export class KnowledgebaseService {
   }
 
   async getArticle(id: number) {
-    const article = await this.prisma.kbArticle.findUnique({ where: { id } });
+    const article = await this.prisma.kbArticle.findUnique({
+      where: { id },
+      include: { category: { select: { title: true } } },
+    });
     if (!article) throw new NotFoundException('Article not found');
     return article;
   }
 
   async getArticleBySlug(slug: string) {
-    const article = await this.prisma.kbArticle.findUnique({ where: { slug } });
+    const article = await this.prisma.kbArticle.findUnique({
+      where: { slug },
+      include: { category: { select: { title: true } } },
+    });
     if (!article || !article.isPublished) throw new NotFoundException('Article not found');
     await this.prisma.kbArticle.update({ where: { id: article.id }, data: { views: { increment: 1 } } });
     return article;

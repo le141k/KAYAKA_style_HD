@@ -93,9 +93,15 @@ export class TicketsController {
 
   @Public()
   @Get('public/:id')
-  @ApiOperation({ summary: 'Get a single ticket (no auth) with public posts only — no internal notes' })
-  getPublic(@Param('id', ParseIntPipe) id: number) {
-    return this.ticketsService.getPublicTicket(id);
+  @ApiOperation({
+    summary:
+      'Get a single ticket (no auth) with public posts only — no internal notes. Requires ?email= matching the ticket requester.',
+  })
+  getPublic(@Param('id', ParseIntPipe) id: number, @Query('email') email: string | undefined) {
+    if (!email) {
+      throw new BadRequestException('Query parameter "email" is required');
+    }
+    return this.ticketsService.getPublicTicket(id, email);
   }
 
   // ─────────────────── Client: public reply ───────────────────

@@ -39,9 +39,10 @@ function mapArticle(a: ApiArticle): KBArticle {
   // body holds the HTML when available (for article detail rendering), or a plaintext
   // snippet (≤120 chars) when only contentsText is available (list card preview).
   const body = a.contents ?? (a.contentsText ? a.contentsText.slice(0, 120) : '');
-  // Category name: real title when present, "Общее" when uncategorised (KB-4 fix —
-  // the previous logic was inverted and blanked categorised articles).
-  const categoryName = a.category?.title ?? (a.categoryId ? '' : 'Общее');
+  // Category name: real title when present, "Общее" as the default otherwise (KB-4 fix —
+  // the previous logic was inverted: `a.categoryId ? '' : 'Общее'` blanked categorised
+  // articles whenever the embedded category title wasn't expanded by the endpoint).
+  const categoryName = a.category?.title ?? 'Общее';
   return {
     id: a.id,
     slug: a.slug,

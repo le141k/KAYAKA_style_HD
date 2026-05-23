@@ -13,6 +13,10 @@ import {
   useUpdateTicket,
   useStaffOptions,
   useTicketTags,
+  useDepartmentOptions,
+  useChangeTicketDepartment,
+  useApplyMacro,
+  useMacroOptions,
 } from '@/lib/hooks/use-tickets';
 import type { Ticket, Attachment } from '@/lib/types';
 import { StatusBadge } from '@/components/premium/StatusBadge';
@@ -53,17 +57,49 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const replyMutation = useReply(ticketId);
   const updateTicket = useUpdateTicket(ticketId);
   const { data: staffOptions = [] } = useStaffOptions();
+  const { data: departmentOptions = [] } = useDepartmentOptions();
+  const { data: macroOptions = [] } = useMacroOptions();
+  const changeDepartment = useChangeTicketDepartment(ticketId);
+  const applyMacro = useApplyMacro(ticketId);
   const tags = useTicketTags(ticketId);
   const [newTag, setNewTag] = useState('');
 
   const [replyTab, setReplyTab] = useState<'reply' | 'note'>('reply');
   const [attachmentIds, setAttachmentIds] = useState<number[]>([]);
   const [assigneeId, setAssigneeId] = useState<string>('');
+  const [departmentId, setDepartmentId] = useState<string>('');
 
   // Sync the assignee picker once the ticket loads (it starts undefined).
   useEffect(() => {
     if (ticket?.assignee) setAssigneeId(String(ticket.assignee.id));
   }, [ticket?.assignee]);
+  // Sync the department picker once the ticket loads.
+  useEffect(() => {
+    if (ticket?.department) setDepartmentId(String(ticket.department.id));
+  }, [ticket?.department]);
+
+  const handleChangeDepartment = async (v: string) => {
+    if (!v) return;
+    setDepartmentId(v);
+    try {
+      await changeDepartment.mutateAsync(Number(v));
+      const dept = departmentOptions.find((o) => o.value === v);
+      toast({ title: dept ? `Отдел: ${dept.label}` : 'Отдел изменён' });
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось изменить отдел', variant: 'destructive' });
+    }
+  };
+
+  const handleApplyMacro = async (v: string) => {
+    if (!v) return;
+    try {
+      await applyMacro.mutateAsync(Number(v));
+      const macro = macroOptions.find((o) => o.value === v);
+      toast({ title: macro ? `Макрос применён: ${macro.label}` : 'Макрос применён' });
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось применить макрос', variant: 'destructive' });
+    }
+  };
 
   const changeStatus = async (status: Ticket['status']) => {
     try {
@@ -321,12 +357,21 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                     />
                   </dd>
                 </div>
-                {ticket.department && (
-                  <div className="flex items-center justify-between">
-                    <dt className="text-muted-foreground">Отдел</dt>
-                    <dd className="font-medium">{ticket.department.name}</dd>
-                  </div>
-                )}
+                <div className="flex items-center justify-between gap-2">
+                  <dt className="text-muted-foreground">Отдел</dt>
+                  <dd className="flex-1 max-w-[150px]">
+                    <Combobox
+                      options={departmentOptions}
+                      value={departmentId}
+                      onValueChange={(v) => void handleChangeDepartment(v)}
+                      placeholder="Отдел"
+                      searchPlaceholder="Поиск отдела..."
+                      emptyMessage="Отдел не найден"
+                      disabled={changeDepartment.isPending}
+                      triggerWidth="w-full"
+                    />
+                  </dd>
+                </div>
                 <div className="flex items-center justify-between">
                   <dt className="text-muted-foreground">SLA</dt>
                   <dd>
@@ -366,6 +411,25 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                 placeholder="Назначить исполнителя"
                 searchPlaceholder="Поиск агента..."
                 emptyMessage="Агент не найден"
+                triggerWidth="w-full"
+              />
+            </section>
+
+            <Separator />
+
+            {/* Macros */}
+            <section>
+              <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Макрос
+              </h3>
+              <Combobox
+                options={macroOptions}
+                value=""
+                onValueChange={(v) => void handleApplyMacro(v)}
+                placeholder="Применить макрос"
+                searchPlaceholder="Поиск макроса..."
+                emptyMessage="Макросы не найдены"
+                disabled={applyMacro.isPending}
                 triggerWidth="w-full"
               />
             </section>

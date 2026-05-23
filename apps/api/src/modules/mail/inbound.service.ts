@@ -49,7 +49,8 @@ const MASK_RE = /TT-\d{6,}/i;
  *  5. Sends a reply email notification on staff reply.
  *
  * TODO: replace polling with IMAP IDLE for push-based notification.
- * TODO: persist per-queue UID watermark in the Setting table to avoid re-processing.
+ * A per-queue UID watermark is persisted in the Setting table so a restart does
+ * not re-process (and re-ticket) the entire mailbox.
  */
 @Injectable()
 export class InboundMailService implements OnModuleInit, OnModuleDestroy {
@@ -158,13 +159,68 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
 
     const lock = await client.getMailboxLock('INBOX');
     try {
-      // Fetch unseen messages
-      for await (const msg of client.fetch('1:*', { envelope: true, source: true })) {
+      // Only fetch messages newer than the last UID we processed for this queue.
+      // The watermark is persisted in Setting so a restart does not re-create
+      // tickets from the entire mailbox (the old `fetch('1:*')` behaviour).
+      const lastUid = await this.getLastSeenUid(queueId);
+      let maxUid = lastUid;
+
+      // `<uid>:*` with uid:true selects all messages with UID >= lastUid+1.
+      // (IMAP `*` resolves to the highest UID, so the range always includes at
+      // least the newest message; we guard against re-processing via the > check.)
+      const range = `${lastUid + 1}:*`;
+      for await (const msg of client.fetch(range, { uid: true, envelope: true, source: true })) {
+        // The `<n>:*` range can echo the last message when the mailbox has not
+        // advanced — skip anything we have already seen.
+        if (msg.uid <= lastUid) continue;
         await this.processMessage(msg, queue.departmentId ?? undefined);
+        if (msg.uid > maxUid) maxUid = msg.uid;
+      }
+
+      if (maxUid > lastUid) {
+        await this.setLastSeenUid(queueId, maxUid);
       }
     } finally {
       lock.release();
     }
+  }
+
+  /** Setting section/key under which per-queue IMAP UID watermarks are stored. */
+  private static readonly UID_SETTING_SECTION = 'imap';
+  private uidSettingKey(queueId: number): string {
+    return `lastSeenUid:${queueId}`;
+  }
+
+  /** Read the last-processed IMAP UID for a queue (0 if none recorded yet). */
+  private async getLastSeenUid(queueId: number): Promise<number> {
+    const row = await this.prisma.setting.findUnique({
+      where: {
+        section_key: {
+          section: InboundMailService.UID_SETTING_SECTION,
+          key: this.uidSettingKey(queueId),
+        },
+      },
+    });
+    const value = row?.value;
+    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+  }
+
+  /** Persist the last-processed IMAP UID for a queue. */
+  private async setLastSeenUid(queueId: number, uid: number): Promise<void> {
+    await this.prisma.setting.upsert({
+      where: {
+        section_key: {
+          section: InboundMailService.UID_SETTING_SECTION,
+          key: this.uidSettingKey(queueId),
+        },
+      },
+      create: {
+        section: InboundMailService.UID_SETTING_SECTION,
+        key: this.uidSettingKey(queueId),
+        value: uid,
+      },
+      update: { value: uid },
+    });
   }
 
   /**
@@ -316,12 +372,9 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       await this.storeMessageIdOnLatestPost(newTicket.id, incomingMessageId);
     }
 
-    // Send autoresponder
-    await this.mailService.sendTemplate(fromEmail, 'autoresponder', 'en', {
-      mask: newTicket.mask,
-      subject: newTicket.subject,
-      name: fromName,
-    });
+    // NOTE: the autoresponder is sent by TicketsService.createTicket() (it fires for
+    // every requesterEmail on creation). Sending it again here produced a duplicate
+    // autoresponder for every inbound email — removed intentionally.
 
     this.logger.log(`IMAP: new ticket ${newTicket.mask} from ${fromEmail} — "${subject}"`);
   }

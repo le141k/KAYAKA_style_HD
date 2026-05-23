@@ -45,6 +45,13 @@ export interface PublicTicketDetail extends Ticket {
   tags: Array<{ name: string }>;
 }
 
+/** Non-sensitive user fields exposed on public ticket views (never passwordHash). */
+const PUBLIC_USER_SELECT = {
+  id: true,
+  fullName: true,
+  emails: { select: { email: true, isPrimary: true } },
+} as const;
+
 @Injectable()
 export class TicketsService {
   private readonly logger = new Logger(TicketsService.name);
@@ -103,60 +110,67 @@ export class TicketsService {
       resolutionDueAt = dueDates.resolutionDueAt;
     }
 
-    // Create ticket without mask first (need id for mask)
-    const ticket = await this.prisma.ticket.create({
-      data: {
-        mask: 'TT-PENDING', // temporary; updated immediately below
-        subject: dto.subject,
-        departmentId: dto.departmentId,
-        statusId,
-        priorityId,
-        typeId: dto.typeId,
-        userId,
-        requesterEmail: dto.requesterEmail,
-        requesterName: dto.requesterName,
-        ownerStaffId: dto.ownerStaffId,
-        slaPlanId,
-        dueAt,
-        resolutionDueAt,
-        creationMode: dto.creationMode as CreationMode,
-        creator: creatorActor,
-        ipAddress: dto.ipAddress,
-        customFields: dto.customFields as object,
-        // First post
-        posts: {
-          create: {
-            authorType: creatorActor,
-            staffId: creatorStaffId,
-            userId,
-            fullName: dto.requesterName,
-            email: dto.requesterEmail,
-            subject: dto.subject,
-            contents: dto.contents,
-            isHtml: dto.isHtml,
-            creationMode: dto.creationMode as CreationMode,
-            ipAddress: dto.ipAddress,
+    // Create ticket + assign its mask atomically. The mask is derived from the
+    // auto-increment id, so we create first (temp mask) then update within a
+    // single $transaction to avoid a window where a TT-PENDING mask is visible.
+    const [, updated] = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.ticket.create({
+        data: {
+          mask: 'TT-PENDING', // temporary; replaced within this same transaction
+          subject: dto.subject,
+          departmentId: dto.departmentId,
+          statusId,
+          priorityId,
+          typeId: dto.typeId,
+          userId,
+          requesterEmail: dto.requesterEmail,
+          requesterName: dto.requesterName,
+          ownerStaffId: dto.ownerStaffId,
+          slaPlanId,
+          dueAt,
+          resolutionDueAt,
+          creationMode: dto.creationMode as CreationMode,
+          creator: creatorActor,
+          ipAddress: dto.ipAddress,
+          customFields: dto.customFields as object,
+          // First post
+          posts: {
+            create: {
+              authorType: creatorActor,
+              staffId: creatorStaffId,
+              userId,
+              fullName: dto.requesterName,
+              email: dto.requesterEmail,
+              subject: dto.subject,
+              contents: dto.contents,
+              isHtml: dto.isHtml,
+              creationMode: dto.creationMode as CreationMode,
+              ipAddress: dto.ipAddress,
+            },
           },
+          // Tags
+          tags: dto.tags.length
+            ? {
+                connectOrCreate: dto.tags.map((name) => ({
+                  where: { name },
+                  create: { name },
+                })),
+              }
+            : undefined,
+          totalReplies: 1,
         },
-        // Tags
-        tags: dto.tags.length
-          ? {
-              connectOrCreate: dto.tags.map((name) => ({
-                where: { name },
-                create: { name },
-              })),
-            }
-          : undefined,
-        totalReplies: 1,
-      },
+      });
+
+      const updatedTicket = await tx.ticket.update({
+        where: { id: created.id },
+        data: { mask: formatTicketMask(created.id) },
+      });
+
+      return [created, updatedTicket] as const;
     });
 
-    // Update mask now that we have the real ID
-    const mask = formatTicketMask(ticket.id);
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticket.id },
-      data: { mask },
-    });
+    const ticket = updated;
+    const mask = updated.mask;
 
     // Link attachment orphans to the first post (if any attachmentIds were supplied)
     if (dto.attachmentIds?.length && this.attachmentsService) {
@@ -260,7 +274,7 @@ export class TicketsService {
    * NEVER included.  Shape mirrors getTicket() but omits notes/watchers/auditLogs.
    * Used by the @Public GET /tickets/public/:id endpoint.
    */
-  async getPublicTicket(id: number): Promise<PublicTicketDetail> {
+  async getPublicTicket(id: number, requesterEmail?: string): Promise<PublicTicketDetail> {
     const ticket = await this.prisma.ticket.findUnique({
       where: { id },
       include: {
@@ -268,7 +282,8 @@ export class TicketsService {
         priority: { select: { id: true, title: true } },
         department: { select: { id: true, title: true } },
         owner: { select: { id: true, firstName: true, lastName: true, email: true } },
-        user: { include: { emails: true } },
+        // Narrow select — NEVER expose passwordHash or other sensitive user fields
+        user: { select: PUBLIC_USER_SELECT },
         // Only posts (USER/STAFF replies) — notes are intentionally excluded
         posts: {
           orderBy: { createdAt: 'asc' },
@@ -278,7 +293,40 @@ export class TicketsService {
     });
 
     if (!ticket) throw new NotFoundException(`Ticket ${id} not found`);
+
+    // Ownership check: a public ticket is enumerable by integer id, so the caller
+    // must prove they own it by supplying the matching requester email.
+    this.assertRequesterOwnsTicket(ticket, requesterEmail);
+
     return ticket as unknown as PublicTicketDetail;
+  }
+
+  /**
+   * Verify the supplied email matches the ticket's requester (direct
+   * requesterEmail OR any of the linked user's emails). Throws NotFoundException
+   * (not Forbidden) so callers cannot distinguish "wrong email" from
+   * "no such ticket" and enumerate valid ids.
+   */
+  private assertRequesterOwnsTicket(
+    ticket: {
+      id: number;
+      requesterEmail: string | null;
+      user?: { emails?: { email: string }[] } | null;
+    },
+    requesterEmail?: string,
+  ): void {
+    if (!requesterEmail) {
+      throw new NotFoundException(`Ticket ${ticket.id} not found`);
+    }
+    const supplied = requesterEmail.trim().toLowerCase();
+    const owned = new Set<string>();
+    if (ticket.requesterEmail) owned.add(ticket.requesterEmail.toLowerCase());
+    for (const e of ticket.user?.emails ?? []) {
+      if (e.email) owned.add(e.email.toLowerCase());
+    }
+    if (!owned.has(supplied)) {
+      throw new NotFoundException(`Ticket ${ticket.id} not found`);
+    }
   }
 
   // ─────────────────────────── Public reply (client portal) ────────────────
@@ -290,8 +338,15 @@ export class TicketsService {
    * Internal notes are never involved.
    */
   async publicReply(ticketId: number, dto: PublicReplyDto): Promise<TicketPost> {
-    const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
+    const ticket = await this.prisma.ticket.findUnique({
+      where: { id: ticketId },
+      include: { user: { select: { emails: { select: { email: true } } } } },
+    });
     if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
+
+    // Ownership check: the requester must supply a matching email so a random
+    // integer id cannot be used to post on someone else's ticket.
+    this.assertRequesterOwnsTicket(ticket, dto.requesterEmail);
 
     const now = new Date();
 
@@ -317,6 +372,18 @@ export class TicketsService {
       await this.attachmentsService.linkToPost(dto.attachmentIds!, post.id, ticketId);
     }
 
+    // Reopen the ticket if it was resolved — a customer reply must re-surface it
+    // to staff. Reset to the default status and clear resolved markers.
+    const reopenData = ticket.isResolved
+      ? {
+          statusId: await this.defaultStatusId(),
+          isResolved: false,
+          resolvedAt: null,
+          reopenedAt: now,
+          wasReopened: true,
+        }
+      : {};
+
     await this.prisma.ticket.update({
       where: { id: ticketId },
       data: {
@@ -324,6 +391,7 @@ export class TicketsService {
         lastReplyAt: now,
         lastActivityAt: now,
         ...(hasPublicAttachments && { hasAttachments: true }),
+        ...reopenData,
       },
     });
 
@@ -506,6 +574,19 @@ export class TicketsService {
       await this.attachmentsService.linkToPost(dto.attachmentIds!, post.id, ticketId);
     }
 
+    // Reopen the ticket when a USER (customer) replies to a resolved/closed
+    // ticket so it re-surfaces to staff. Staff replies must NOT reopen.
+    const reopenData =
+      !isStaffReply && ticket.isResolved
+        ? {
+            statusId: await this.defaultStatusId(),
+            isResolved: false,
+            resolvedAt: null,
+            reopenedAt: now,
+            wasReopened: true,
+          }
+        : {};
+
     await this.prisma.ticket.update({
       where: { id: ticketId },
       data: {
@@ -516,6 +597,7 @@ export class TicketsService {
         ...(firstResponse && { firstResponseAt: now }),
         // Set hasAttachments if new attachments were linked
         ...(hasNewAttachments && { hasAttachments: true }),
+        ...reopenData,
       },
     });
 
@@ -726,26 +808,55 @@ export class TicketsService {
       throw new BadRequestException(`Ticket ${source.mask} is already merged`);
     }
 
-    await this.prisma.$transaction([
+    await this.prisma.$transaction(async (tx) => {
+      const now = new Date();
+
       // Move all posts from source to target
-      this.prisma.ticketPost.updateMany({
+      await tx.ticketPost.updateMany({
         where: { ticketId: sourceTicketId },
         data: { ticketId: target.id },
-      }),
+      });
+
+      // Re-parent notes and attachments so they are not orphaned on the merged-away ticket
+      await tx.ticketNote.updateMany({
+        where: { ticketId: sourceTicketId },
+        data: { ticketId: target.id },
+      });
+      await tx.attachment.updateMany({
+        where: { ticketId: sourceTicketId },
+        data: { ticketId: target.id },
+      });
+
+      // Re-parent watchers. The watcher PK is (ticketId, staffId), so a watcher
+      // already present on the target would collide — move only the non-colliding
+      // rows and drop the rest.
+      const targetWatchers = await tx.ticketWatcher.findMany({
+        where: { ticketId: target.id },
+        select: { staffId: true },
+      });
+      const targetStaffIds = targetWatchers.map((w) => w.staffId);
+      await tx.ticketWatcher.updateMany({
+        where: { ticketId: sourceTicketId, staffId: { notIn: targetStaffIds } },
+        data: { ticketId: target.id },
+      });
+      // Remaining source watchers are duplicates of target watchers — discard them.
+      await tx.ticketWatcher.deleteMany({ where: { ticketId: sourceTicketId } });
+
       // Mark source as merged
-      this.prisma.ticket.update({
+      await tx.ticket.update({
         where: { id: sourceTicketId },
-        data: { mergedIntoId: target.id, lastActivityAt: new Date() },
-      }),
+        data: { mergedIntoId: target.id, lastActivityAt: now },
+      });
+
       // Bump target reply count
-      this.prisma.ticket.update({
+      await tx.ticket.update({
         where: { id: target.id },
         data: {
           totalReplies: { increment: source.totalReplies },
-          lastActivityAt: new Date(),
+          lastActivityAt: now,
         },
-      }),
-    ]);
+      });
+    });
 
     // Audit on both
     await this.writeAudit(sourceTicketId, 'MERGE', staffId, 'STAFF', {

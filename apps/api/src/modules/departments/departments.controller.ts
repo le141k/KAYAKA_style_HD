@@ -13,7 +13,7 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { DepartmentsService } from './departments.service';
-import { RequirePermissions } from '../../auth/auth.decorators';
+import { Public, RequirePermissions } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
@@ -40,6 +40,14 @@ export class DepartmentsController {
   @ApiOperation({ summary: 'Return department tree (nested children)' })
   listTree() {
     return this.departmentsService.listTree();
+  }
+
+  // NOTE: must be declared before `@Get(':id')` so 'public' isn't captured as an id param.
+  @Get('public')
+  @Public()
+  @ApiOperation({ summary: 'Public department list (id + title only) for the client submit form' })
+  listPublic() {
+    return this.departmentsService.listPublic();
   }
 
   @Get(':id')

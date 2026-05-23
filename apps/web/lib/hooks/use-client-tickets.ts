@@ -192,7 +192,11 @@ export function useClientTicket(id: number) {
         return mapTicket(await api.get<ApiTicket>(`/tickets/${id}`));
       } catch {
         try {
-          return mapTicket(await api.get<ApiTicket>(`/tickets/public/${id}`));
+          // Public route now requires the requester email for ownership
+          // verification (prevents IDOR enumeration by integer id).
+          const email = getRequesterEmail();
+          const qs = email ? `?email=${encodeURIComponent(email)}` : '';
+          return mapTicket(await api.get<ApiTicket>(`/tickets/public/${id}${qs}`));
         } catch {
           return null;
         }

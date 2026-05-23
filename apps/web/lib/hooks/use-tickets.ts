@@ -199,6 +199,11 @@ export interface TicketListParams {
   q?: string;
   date_from?: string;
   date_to?: string;
+  /** Only tickets whose SLA due date is in the past (filtered client-side per page). */
+  sla_breached?: boolean;
+  /** Server-side sort field. */
+  sort_by?: 'createdAt' | 'lastActivityAt' | 'lastReplyAt';
+  sort_dir?: 'asc' | 'desc';
   /** Skip the query entirely (e.g. command palette while closed). */
   enabled?: boolean;
 }
@@ -227,6 +232,8 @@ export function useTickets(params: TicketListParams = {}) {
         if (params.assignee_id) qs.set('ownerStaffId', String(params.assignee_id));
         if (params.date_from) qs.set('createdAfter', params.date_from);
         if (params.date_to) qs.set('createdBefore', params.date_to);
+        if (params.sort_by) qs.set('sortBy', params.sort_by);
+        if (params.sort_dir) qs.set('sortDir', params.sort_dir);
         // Map slug filters → ids and push to the server (correct totals + paging).
         if (params.status) {
           const id = await statusIdForSlug(params.status);
@@ -237,11 +244,24 @@ export function useTickets(params: TicketListParams = {}) {
           if (id) qs.set('priorityId', String(id));
         }
         const res = await api.get<{ data: ApiTicket[]; total: number }>(`/tickets?${qs}`);
-        const data = res.data.map(mapTicket);
-        return { data, total: res.total, page: params.page ?? 1, per_page: params.per_page ?? 25 };
+        let data = res.data.map(mapTicket);
+        let total = res.total;
+        // SLA-breach filter: the list API has no server param for this, so narrow
+        // the loaded page client-side (tickets whose due date is already in the past).
+        if (params.sla_breached) {
+          const now = Date.now();
+          data = data.filter((t) => t.sla_due_at && new Date(t.sla_due_at).getTime() < now);
+          total = data.length;
+        }
+        return { data, total, page: params.page ?? 1, per_page: params.per_page ?? 25 };
       } catch {
         let data = [...MOCK_TICKETS];
         if (params.status) data = data.filter((t) => t.status === params.status);
+        if (params.priority) data = data.filter((t) => t.priority === params.priority);
+        if (params.sla_breached) {
+          const now = Date.now();
+          data = data.filter((t) => t.sla_due_at && new Date(t.sla_due_at).getTime() < now);
+        }
         if (params.q) {
           const q = params.q.toLowerCase();
           data = data.filter((t) => t.subject.toLowerCase().includes(q) || t.mask.toLowerCase().includes(q));
@@ -291,6 +311,7 @@ export interface CreateTicketInput {
   requesterName?: string;
   priority?: string;
   department_id?: number;
+  customFields?: Record<string, unknown>;
 }
 
 export function useCreateTicket() {
@@ -307,6 +328,9 @@ export function useCreateTicket() {
         requesterName: data.requesterName ?? data.requesterEmail,
         departmentId: data.department_id,
         ...(priorityId ? { priorityId } : {}),
+        ...(data.customFields && Object.keys(data.customFields).length
+          ? { customFields: data.customFields }
+          : {}),
       });
     },
     onSuccess: () => void qc.invalidateQueries({ queryKey: ticketKeys.lists() }),
@@ -382,6 +406,47 @@ export function useUpdateTicket(ticketId: number) {
       void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });
       void qc.invalidateQueries({ queryKey: ticketKeys.lists() });
     },
+  });
+}
+
+// Change a ticket's department (PATCH /tickets/:id/department, body { departmentId }).
+export function useChangeTicketDepartment(ticketId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (departmentId: number) => api.patch(`/tickets/${ticketId}/department`, { departmentId }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });
+      void qc.invalidateQueries({ queryKey: ticketKeys.lists() });
+    },
+  });
+}
+
+// Apply a macro to a ticket (POST /tickets/:id/apply-macro, body { macroId }).
+export function useApplyMacro(ticketId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (macroId: number) => api.post(`/tickets/${ticketId}/apply-macro`, { macroId }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ticketKeys.replies(ticketId) });
+      void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });
+      void qc.invalidateQueries({ queryKey: ticketKeys.lists() });
+    },
+  });
+}
+
+// Macro picker options (id + title) from the admin macros endpoint.
+export interface MacroOption {
+  value: string;
+  label: string;
+}
+export function useMacroOptions() {
+  return useQuery({
+    queryKey: ['macros', 'options'],
+    queryFn: async (): Promise<MacroOption[]> => {
+      const res = await api.get<{ id: number; title: string }[]>('/admin/macros');
+      return res.map((m) => ({ value: String(m.id), label: m.title }));
+    },
+    staleTime: 5 * 60_000,
   });
 }
 

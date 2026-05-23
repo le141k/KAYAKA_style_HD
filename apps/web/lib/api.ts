@@ -2,29 +2,43 @@
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
+// Cookie name set non-HttpOnly by the legacy client; the auth source of truth is
+// now the server-set HttpOnly cookie (invisible to JS). This local marker cookie
+// only exists so the Next.js middleware can do a coarse server-side route guard
+// without the token value leaking to JS XSS in a usable way.
+const PRESENCE_COOKIE = 'th_authed';
+
 export function getToken(): string | null {
   if (typeof window === 'undefined') return null;
-  // Prefer cookie, fall back to localStorage
-  const cookieMatch = document.cookie.split('; ').find((row) => row.startsWith('auth_token='));
-  if (cookieMatch) return cookieMatch.split('=')[1] ?? null;
+  // Bearer fallback for the legacy localStorage flow. When absent, requests still
+  // authenticate via the HttpOnly cookie sent automatically with credentials:'include'.
   return localStorage.getItem('auth_token');
 }
 
-/** True when an auth token is present (used to gate authed-only queries). */
+/**
+ * True when the user appears authenticated. Checks the localStorage token (legacy
+ * Bearer flow) OR the th_authed presence marker cookie (cookie flow). We can't read
+ * the HttpOnly cookie from JS, so we rely on the presence marker set at login.
+ */
 export function hasToken(): boolean {
-  return getToken() != null;
+  if (typeof window === 'undefined') return false;
+  if (localStorage.getItem('auth_token') != null) return true;
+  return document.cookie.split('; ').some((row) => row.startsWith(`${PRESENCE_COOKIE}=`));
 }
 
 function storeTokens(accessToken: string): void {
   if (typeof window === 'undefined') return;
+  // Keep the localStorage copy so the Bearer fallback keeps working seamlessly.
+  // The authoritative access token also arrives as an HttpOnly cookie from the server.
   localStorage.setItem('auth_token', accessToken);
-  document.cookie = `auth_token=${accessToken}; path=/; max-age=${7 * 86400}; SameSite=Strict`;
 }
 
 function clearTokens(): void {
   if (typeof window === 'undefined') return;
   localStorage.removeItem('auth_token');
   localStorage.removeItem('refresh_token');
+  document.cookie = `${PRESENCE_COOKIE}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+  // Clean up the legacy non-HttpOnly token cookie if it lingers from an old session.
   document.cookie = 'auth_token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
 }
 
@@ -36,11 +50,13 @@ async function tryRefresh(): Promise<boolean> {
   _refreshing = (async () => {
     try {
       const refreshToken = typeof window !== 'undefined' ? localStorage.getItem('refresh_token') : null;
-      if (!refreshToken) return false;
+      // No body refresh token means we rely on the HttpOnly th_refresh cookie sent
+      // via credentials:'include'. Only bail if BOTH are unavailable.
       const res = await fetch(`${API_URL}/auth/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refreshToken }),
+        credentials: 'include',
+        body: JSON.stringify(refreshToken ? { refreshToken } : {}),
       });
       if (!res.ok) {
         clearTokens();
@@ -78,7 +94,9 @@ async function request<T>(path: string, options: RequestInit = {}, _retry = fals
   };
   if (token) headers['Authorization'] = `Bearer ${token}`;
 
-  const res = await fetch(`${API_URL}${path}`, { ...options, headers });
+  // credentials:'include' sends the HttpOnly auth cookie alongside (or instead of)
+  // the Bearer header — the API guard accepts either.
+  const res = await fetch(`${API_URL}${path}`, { ...options, headers, credentials: 'include' });
 
   if (res.status === 401 && !_retry) {
     const refreshed = await tryRefresh();

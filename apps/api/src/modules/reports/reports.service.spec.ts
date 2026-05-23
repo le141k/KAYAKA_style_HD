@@ -20,6 +20,8 @@ function makePrismaMock() {
       count: vi.fn().mockResolvedValue(0),
       findMany: vi.fn().mockResolvedValue([]),
     },
+    // avg first-response is computed DB-side via $queryRaw (no unbounded findMany)
+    $queryRaw: vi.fn().mockResolvedValue([{ avg_minutes: null }]),
     // These are new Prisma models added by our migration; cast as any
     reportRun: {
       create: vi.fn().mockResolvedValue({ id: 1 }),
@@ -175,9 +177,7 @@ describe('ReportsService', () => {
         .mockResolvedValueOnce(100) // total
         .mockResolvedValueOnce(40) // resolved
         .mockResolvedValueOnce(5); // slaBreached
-      (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { createdAt: new Date('2026-01-01T00:00:00Z'), firstResponseAt: new Date('2026-01-01T00:30:00Z') },
-      ]);
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([{ avg_minutes: 30 }]);
 
       const result = await service.dashboard();
 
@@ -205,7 +205,7 @@ describe('ReportsService', () => {
     it('returns 0 avgFirstResponseMinutes when no responded tickets', async () => {
       (prisma.ticket.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
-      (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([{ avg_minutes: null }]);
 
       const result = await service.dashboard();
       expect(result.avgFirstResponseMinutes).toBe(0);

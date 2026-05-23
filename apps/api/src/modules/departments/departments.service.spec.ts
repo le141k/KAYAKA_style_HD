@@ -59,6 +59,24 @@ describe('DepartmentsService', () => {
     });
   });
 
+  // ─── listPublic ──────────────────────────────────────────────────────────────
+
+  describe('listPublic', () => {
+    it('returns only PUBLIC departments with id + title selected', async () => {
+      (prisma.department.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 1, title: 'Technical Support' },
+      ]);
+      const result = await service.listPublic();
+      expect(result).toEqual([{ id: 1, title: 'Technical Support' }]);
+      expect(prisma.department.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { type: 'PUBLIC' },
+          select: { id: true, title: true },
+        }),
+      );
+    });
+  });
+
   // ─── get ─────────────────────────────────────────────────────────────────────
 
   describe('get', () => {

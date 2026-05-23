@@ -40,6 +40,10 @@ function makePrismaMock() {
     },
     ticketPost: { findFirst: vi.fn(), update: vi.fn() },
     department: { findFirst: vi.fn().mockResolvedValue({ id: 1 }) },
+    setting: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      upsert: vi.fn().mockResolvedValue({}),
+    },
   } as unknown as PrismaService;
 }
 
@@ -249,6 +253,68 @@ describe('InboundMailService — parser rule helpers', () => {
       );
       const result = await service.applyParserRules(parsedBase, 1);
       expect(result).toEqual({ skip: false, tags: [] });
+    });
+  });
+
+  // ─── pollQueue UID watermark ─────────────────────────────────────────────────
+
+  describe('pollQueue — UID watermark', () => {
+    /** A minimal fake ImapFlow that yields the given messages from fetch(). */
+    function makeFakeClient(messages: Array<{ uid: number }>) {
+      return {
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        // eslint-disable-next-line @typescript-eslint/require-await
+        fetch: vi.fn(function* () {
+          for (const m of messages) yield m;
+        }),
+      };
+    }
+
+    it('reads the last-seen UID from Setting and fetches only newer messages', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        departmentId: null,
+      });
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ value: 100 });
+      const client = makeFakeClient([]);
+
+      // Stub processMessage so we only assert fetch/watermark behaviour
+      const processSpy = vi
+        .spyOn(service as unknown as { processMessage: () => Promise<void> }, 'processMessage')
+        .mockResolvedValue(undefined);
+
+      await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        client,
+      );
+
+      // Range must start just after the watermark
+      expect(client.fetch).toHaveBeenCalledWith('101:*', expect.objectContaining({ uid: true }));
+      processSpy.mockRestore();
+    });
+
+    it('persists the new max UID and skips already-seen messages', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        departmentId: null,
+      });
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ value: 100 });
+      // 100 = already seen (skipped), 101 + 102 = new
+      const client = makeFakeClient([{ uid: 100 }, { uid: 101 }, { uid: 102 }]);
+
+      const processSpy = vi
+        .spyOn(service as unknown as { processMessage: () => Promise<void> }, 'processMessage')
+        .mockResolvedValue(undefined);
+
+      await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        client,
+      );
+
+      // uid 100 skipped; 101 and 102 processed
+      expect(processSpy).toHaveBeenCalledTimes(2);
+      expect(prisma.setting.upsert).toHaveBeenCalledWith(expect.objectContaining({ update: { value: 102 } }));
+      processSpy.mockRestore();
     });
   });
 });

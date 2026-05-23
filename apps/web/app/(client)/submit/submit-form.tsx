@@ -13,6 +13,12 @@ import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { FileUploadZone } from '@/components/premium/FileUploadZone';
 import { useSubmitPublicTicket } from '@/lib/hooks/use-tickets';
+import { useCustomFields } from '@/lib/hooks/use-custom-fields';
+import {
+  CustomFieldsSection,
+  buildCustomFieldsPayload,
+  type CustomFieldValue,
+} from '@/components/custom-fields/CustomFieldsSection';
 import { generateTicketMask } from '@/lib/utils';
 import { toast } from '@/components/ui/use-toast';
 import { api } from '@/lib/api';
@@ -45,16 +51,21 @@ export function SubmitTicketForm() {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [attachmentIds, setAttachmentIds] = useState<number[]>([]);
 
-  // Fetch departments on mount; gracefully degrade if the endpoint is auth-gated.
+  // TICKET-scope custom fields (public, read-only) + their collected values.
+  const { fields: customFields } = useCustomFields('TICKET');
+  const [cfValues, setCfValues] = useState<Record<string, CustomFieldValue>>({});
+  const [cfErrors, setCfErrors] = useState<Record<string, string>>({});
+
+  // Fetch the PUBLIC departments list on mount (unauthenticated-friendly).
   useEffect(() => {
     api
-      .get<Department[] | { data: Department[] }>('/departments')
+      .get<Department[] | { data: Department[] }>('/departments/public')
       .then((res) => {
         const list = Array.isArray(res) ? res : ((res as { data: Department[] }).data ?? []);
         setDepartments(list);
       })
       .catch(() => {
-        // Endpoint requires auth — leave list empty so the select is hidden
+        // Endpoint unavailable — leave list empty so the select is hidden
         setDepartments([]);
       });
   }, []);
@@ -71,6 +82,14 @@ export function SubmitTicketForm() {
   });
 
   const onSubmit = async (data: SubmitForm) => {
+    // Validate + collect custom fields before hitting the API (required CFs would
+    // otherwise be rejected server-side with no field-level feedback).
+    const { values: cfPayload, missing } = buildCustomFieldsPayload(customFields, cfValues);
+    if (missing.length) {
+      setCfErrors(Object.fromEntries(missing.map((f) => [f.fieldKey, 'Обязательное поле'])));
+      return;
+    }
+    setCfErrors({});
     try {
       const ticket = await createTicket.mutateAsync({
         subject: data.subject,
@@ -81,6 +100,7 @@ export function SubmitTicketForm() {
         // CL-6: wire priority slug → numeric priorityId (cast needed because PublicTicketInput
         // does not declare priorityId; value is still forwarded to the API at runtime)
         ...({ priorityId: PRIORITY_MAP[data.priority] } as object),
+        ...(Object.keys(cfPayload).length ? { customFields: cfPayload } : {}),
         ...(attachmentIds.length ? { attachmentIds } : {}),
       } as Parameters<typeof createTicket.mutateAsync>[0]);
       // CL-3: persist the email so "Мои заявки" can filter by it
@@ -89,6 +109,7 @@ export function SubmitTicketForm() {
       }
       setSuccessMask(ticket?.mask ?? generateTicketMask(Date.now() % 99999));
       reset();
+      setCfValues({});
     } catch (err: unknown) {
       // CL-1: surface the error instead of swallowing it
       const message =
@@ -206,6 +227,15 @@ export function SubmitTicketForm() {
         />
         {errors.body && <p className="text-xs text-destructive">{errors.body.message}</p>}
       </div>
+
+      {customFields.length > 0 && (
+        <CustomFieldsSection
+          fields={customFields}
+          values={cfValues}
+          onChange={(key, value) => setCfValues((prev) => ({ ...prev, [key]: value }))}
+          errors={cfErrors}
+        />
+      )}
 
       <div className="space-y-1.5">
         <Label>Вложения (необязательно)</Label>

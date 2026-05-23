@@ -57,7 +57,7 @@ function makeTicket(overrides: Partial<Ticket> = {}): Ticket {
 }
 
 function makePrismaMock() {
-  return {
+  const mock = {
     ticket: {
       create: vi.fn(),
       update: vi.fn(),
@@ -79,6 +79,10 @@ function makePrismaMock() {
     },
     ticketNote: {
       create: vi.fn(),
+      updateMany: vi.fn(),
+    },
+    attachment: {
+      updateMany: vi.fn(),
     },
     ticketStatus: {
       findFirst: vi.fn(),
@@ -93,6 +97,8 @@ function makePrismaMock() {
     ticketWatcher: {
       upsert: vi.fn(),
       deleteMany: vi.fn(),
+      findMany: vi.fn().mockResolvedValue([]),
+      updateMany: vi.fn(),
     },
     ticketTag: {
       findUnique: vi.fn(),
@@ -107,8 +113,13 @@ function makePrismaMock() {
       findMany: vi.fn().mockResolvedValue([]),
       createMany: vi.fn().mockResolvedValue({}),
     },
-    $transaction: vi.fn(),
-  } as unknown as PrismaService;
+    $transaction: vi.fn((arg: unknown) =>
+      typeof arg === 'function'
+        ? (arg as (tx: unknown) => unknown)(mock)
+        : Promise.all(arg as Promise<unknown>[]),
+    ),
+  };
+  return mock as unknown as PrismaService;
 }
 
 function makeUsersMock(): UsersService {
@@ -381,6 +392,72 @@ describe('TicketsService (extra coverage)', () => {
       await expect(service.reply(999, { contents: 'Test', isNote: false } as any, 1)).rejects.toThrow(
         NotFoundException,
       );
+    });
+
+    it('reopens a resolved ticket when a USER (non-staff) replies', async () => {
+      const ticket = makeTicket({ isResolved: true });
+      const post = { id: 11, ticketId: 1, contents: 'Customer follow-up' };
+
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue(post);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 7 });
+
+      // No staffId → USER reply
+      await service.reply(
+        1,
+        {
+          contents: 'Customer follow-up',
+          isHtml: false,
+          isEmailed: false,
+          isThirdParty: false,
+          creationMode: 'WEB',
+          ipAddress: '0.0.0.0',
+          isNote: false,
+        } as any,
+        undefined,
+      );
+
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            statusId: 7,
+            isResolved: false,
+            resolvedAt: null,
+            wasReopened: true,
+          }),
+        }),
+      );
+    });
+
+    it('does NOT reopen a resolved ticket when STAFF replies', async () => {
+      const ticket = makeTicket({ isResolved: true });
+      const post = { id: 12, ticketId: 1, contents: 'Staff note reply' };
+
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue(post);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 7 });
+
+      await service.reply(
+        1,
+        {
+          contents: 'Staff note reply',
+          isHtml: false,
+          isEmailed: false,
+          isThirdParty: false,
+          creationMode: 'STAFF',
+          ipAddress: '0.0.0.0',
+          isNote: false,
+        } as any,
+        5,
+      );
+
+      const updateCall = (prisma.ticket.update as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+      expect(updateCall.data).not.toHaveProperty('isResolved');
+      expect(updateCall.data).not.toHaveProperty('statusId');
     });
 
     it('does not set firstResponseAt if already set', async () => {

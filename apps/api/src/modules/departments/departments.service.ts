@@ -23,6 +23,19 @@ export class DepartmentsService {
     return this.prisma.department.findMany({ orderBy: [{ displayOrder: 'asc' }, { title: 'asc' }] });
   }
 
+  /**
+   * Public-facing department list for the unauthenticated client submit form.
+   * Returns only PUBLIC-type departments and only the id + title (no sensitive
+   * fields like staff assignments, email queues, type/app routing internals).
+   */
+  async listPublic(): Promise<{ id: number; title: string }[]> {
+    return this.prisma.department.findMany({
+      where: { type: 'PUBLIC' },
+      orderBy: [{ displayOrder: 'asc' }, { title: 'asc' }],
+      select: { id: true, title: true },
+    });
+  }
+
   async get(id: number): Promise<Department & { children: Department[] }> {
     const dept = await this.prisma.department.findUnique({
       where: { id },

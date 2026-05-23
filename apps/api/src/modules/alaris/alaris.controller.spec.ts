@@ -26,9 +26,14 @@ describe('AlarisController.webhook', () => {
     ({ controller: ctrl, ingest } = makeController());
   });
 
-  it('rejects a wrong/missing secret with 403', async () => {
+  it('rejects a wrong/missing/empty secret with 403', async () => {
     await expect(ctrl.webhook('nope', validPayload)).rejects.toBeInstanceOf(ForbiddenException);
     await expect(ctrl.webhook(undefined, validPayload)).rejects.toBeInstanceOf(ForbiddenException);
+    // Empty string must be rejected (length 0 ≠ expected, and falsy guard).
+    await expect(ctrl.webhook('', validPayload)).rejects.toBeInstanceOf(ForbiddenException);
+    // A same-length-but-different secret must also fail (constant-time compare).
+    const sameLenWrong = 'x'.repeat(SECRET.length);
+    await expect(ctrl.webhook(sameLenWrong, validPayload)).rejects.toBeInstanceOf(ForbiddenException);
     expect(ingest).not.toHaveBeenCalled();
   });
 

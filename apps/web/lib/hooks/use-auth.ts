@@ -54,10 +54,14 @@ export function useLogin() {
     mutationFn: (data: LoginInput) => api.post<LoginResponse>('/auth/login', data),
     onSuccess: (res) => {
       if (typeof window !== 'undefined') {
+        // Keep localStorage tokens for the Bearer fallback (backward compatible).
+        // The authoritative access + refresh tokens are ALSO set as HttpOnly cookies
+        // by the server on this same response, so JS never needs the raw token.
         localStorage.setItem('auth_token', res.accessToken);
         localStorage.setItem('refresh_token', res.refreshToken);
-        // also set cookie for SSR / middleware
-        document.cookie = `auth_token=${res.accessToken}; path=/; max-age=${7 * 86400}; SameSite=Strict`;
+        // Non-sensitive presence marker so the Next.js middleware can guard /staff
+        // and /admin server-side without exposing the token to JS.
+        document.cookie = `th_authed=1; path=/; max-age=${7 * 86400}; SameSite=Lax`;
       }
       // Map the returned staff principal to the same display User shape as useMe()
       const user: User = principalToUser({
@@ -78,9 +82,14 @@ export function useLogout() {
   const qc = useQueryClient();
   return {
     logout: () => {
+      // Tell the server to revoke refresh tokens and clear the HttpOnly cookies.
+      // Fire-and-forget: we redirect regardless of the result.
+      void api.post('/auth/logout', {}).catch(() => undefined);
       if (typeof window !== 'undefined') {
         localStorage.removeItem('auth_token');
         localStorage.removeItem('refresh_token');
+        document.cookie = 'th_authed=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+        // Clear the legacy non-HttpOnly token cookie too, in case it lingers.
         document.cookie = 'auth_token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
       }
       qc.clear();

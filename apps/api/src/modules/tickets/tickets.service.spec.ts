@@ -69,7 +69,7 @@ function makeTicket(overrides: Partial<Ticket> = {}): Ticket {
 }
 
 function makePrismaMock() {
-  return {
+  const mock = {
     ticket: {
       create: vi.fn(),
       update: vi.fn(),
@@ -87,6 +87,10 @@ function makePrismaMock() {
     },
     ticketNote: {
       create: vi.fn(),
+      updateMany: vi.fn(),
+    },
+    attachment: {
+      updateMany: vi.fn(),
     },
     ticketStatus: {
       findFirst: vi.fn(),
@@ -101,6 +105,8 @@ function makePrismaMock() {
     ticketWatcher: {
       upsert: vi.fn(),
       deleteMany: vi.fn(),
+      findMany: vi.fn().mockResolvedValue([]),
+      updateMany: vi.fn(),
     },
     ticketTag: {
       findUnique: vi.fn(),
@@ -109,8 +115,15 @@ function makePrismaMock() {
       findMany: vi.fn().mockResolvedValue([]),
       createMany: vi.fn().mockResolvedValue({}),
     },
-    $transaction: vi.fn(),
-  } as unknown as PrismaService;
+    // Default: interactive ($transaction(cb)) form runs the callback against this
+    // same mock; array form resolves the array of promises.
+    $transaction: vi.fn((arg: unknown) =>
+      typeof arg === 'function'
+        ? (arg as (tx: unknown) => unknown)(mock)
+        : Promise.all(arg as Promise<unknown>[]),
+    ),
+  };
+  return mock as unknown as PrismaService;
 }
 
 function makeUsersMock(): UsersService {
@@ -183,6 +196,37 @@ describe('TicketsService', () => {
       expect(prisma.ticket.update).toHaveBeenCalledWith(
         expect.objectContaining({ data: { mask: 'TT-000042' } }),
       );
+    });
+
+    it('creates the ticket and assigns its mask inside a single $transaction (no race)', async () => {
+      const mockTicket = makeTicket({ id: 42, mask: 'TT-PENDING' });
+
+      (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
+      (prisma.ticketPriority.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 2 });
+      (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue(mockTicket);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...mockTicket,
+        mask: 'TT-000042',
+      });
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      await service.createTicket({
+        subject: 'Race',
+        contents: 'Body',
+        isHtml: false,
+        departmentId: 1,
+        requesterEmail: 'test@example.com',
+        requesterName: 'Test',
+        creationMode: 'WEB',
+        ipAddress: '0.0.0.0',
+        tags: [],
+        customFields: {},
+      });
+
+      // Both the create (TT-PENDING) and the mask update must run via $transaction
+      expect(prisma.$transaction).toHaveBeenCalled();
+      const txArg = (prisma.$transaction as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+      expect(typeof txArg).toBe('function');
     });
 
     it('throws if no default status is configured', async () => {

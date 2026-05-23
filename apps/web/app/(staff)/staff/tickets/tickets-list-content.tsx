@@ -5,7 +5,17 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Search, SlidersHorizontal, LayoutGrid, CalendarDays, X, Plus } from 'lucide-react';
+import {
+  Search,
+  SlidersHorizontal,
+  LayoutGrid,
+  CalendarDays,
+  X,
+  Plus,
+  ChevronLeft,
+  ChevronRight,
+  ArrowUpDown,
+} from 'lucide-react';
 import { format } from 'date-fns';
 import { ru } from 'date-fns/locale';
 import type { DateRange } from 'react-day-picker';
@@ -19,7 +29,14 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { TicketRow } from '@/components/premium/TicketRow';
 import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
-import { useTickets, useCreateTicket, useDepartmentOptions } from '@/lib/hooks/use-tickets';
+import { useTickets, useCreateTicket, useDepartmentOptions, useStaffOptions } from '@/lib/hooks/use-tickets';
+import { useCustomFields } from '@/lib/hooks/use-custom-fields';
+import {
+  CustomFieldsSection,
+  buildCustomFieldsPayload,
+  type CustomFieldValue,
+} from '@/components/custom-fields/CustomFieldsSection';
+import type { Ticket } from '@/lib/types';
 import { useToast } from '@/components/ui/use-toast';
 import { useI18n } from '@/lib/i18n';
 import Link from 'next/link';
@@ -36,14 +53,46 @@ const createTicketSchema = z.object({
 });
 type CreateTicketFormData = z.infer<typeof createTicketSchema>;
 
+const SORT_OPTIONS: { value: string; label: string }[] = [
+  { value: 'lastActivityAt:desc', label: 'Активность ↓' },
+  { value: 'lastActivityAt:asc', label: 'Активность ↑' },
+  { value: 'createdAt:desc', label: 'Создана: новые' },
+  { value: 'createdAt:asc', label: 'Создана: старые' },
+  { value: 'status:asc', label: 'Статус' },
+  { value: 'priority:asc', label: 'Приоритет' },
+];
+// Client-side ordering for fields the list API can't sort on (status/priority).
+const STATUS_ORDER: Record<Ticket['status'], number> = {
+  open: 0,
+  pending: 1,
+  in_progress: 2,
+  resolved: 3,
+  closed: 4,
+};
+const PRIORITY_ORDER: Record<Ticket['priority'], number> = {
+  urgent: 0,
+  high: 1,
+  normal: 2,
+  low: 3,
+};
+const PER_PAGE_OPTIONS = [25, 50, 100];
+
 export function TicketsListContent() {
   const { t } = useI18n();
   const router = useRouter();
   const searchParams = useSearchParams();
   const { toast } = useToast();
   const [search, setSearch] = useState('');
-  const [status, setStatus] = useState('all');
-  const [priority, setPriority] = useState('all');
+  // Seed status / priority / sla-breach filters from the URL (dashboard stat-card links).
+  const [status, setStatus] = useState(() => searchParams.get('status') ?? 'all');
+  const [priority, setPriority] = useState(() => searchParams.get('priority') ?? 'all');
+  const [slaBreached, setSlaBreached] = useState(() => searchParams.get('sla_breached') === '1');
+  const [departmentId, setDepartmentId] = useState(() => searchParams.get('department_id') ?? 'all');
+  const [assigneeId, setAssigneeId] = useState(() => searchParams.get('assignee_id') ?? 'all');
+  const [sort, setSort] = useState('lastActivityAt:desc');
+  const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = useState(25);
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [dateRange, setDateRange] = useState<DateRange | undefined>(undefined);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [debouncedSearch, setDebouncedSearch] = useState('');
@@ -53,6 +102,18 @@ export function TicketsListContent() {
 
   const createMutation = useCreateTicket();
   const { data: departmentOptions = [] } = useDepartmentOptions();
+  const { data: staffOptions = [] } = useStaffOptions();
+  // TICKET-scope custom fields rendered in the create dialog.
+  const { fields: customFields } = useCustomFields('TICKET');
+  const [cfValues, setCfValues] = useState<Record<string, CustomFieldValue>>({});
+  const [cfErrors, setCfErrors] = useState<Record<string, string>>({});
+
+  // Split the combined sort token into a server field and a client-only field.
+  const [sortField, sortDir] = sort.split(':') as [string, 'asc' | 'desc'];
+  const serverSort =
+    sortField === 'createdAt' || sortField === 'lastActivityAt' || sortField === 'lastReplyAt'
+      ? (sortField as 'createdAt' | 'lastActivityAt' | 'lastReplyAt')
+      : undefined;
   const {
     register,
     handleSubmit,
@@ -65,6 +126,8 @@ export function TicketsListContent() {
 
   const openCreate = () => {
     reset({ priority: 'normal' });
+    setCfValues({});
+    setCfErrors({});
     setCreateOpen(true);
   };
 
@@ -78,8 +141,14 @@ export function TicketsListContent() {
   };
 
   const onSubmitCreate = async (data: CreateTicketFormData) => {
+    const { values: cfPayload, missing } = buildCustomFieldsPayload(customFields, cfValues);
+    if (missing.length) {
+      setCfErrors(Object.fromEntries(missing.map((f) => [f.fieldKey, 'Обязательное поле'])));
+      return;
+    }
+    setCfErrors({});
     try {
-      await createMutation.mutateAsync(data);
+      await createMutation.mutateAsync({ ...data, customFields: cfPayload });
       toast({ title: 'Заявка создана', description: `Тема: ${data.subject}` });
       closeCreate();
     } catch {
@@ -92,15 +161,44 @@ export function TicketsListContent() {
     return () => clearTimeout(timer);
   }, [search]);
 
+  // Reset to page 1 whenever a filter / search / sort / page-size changes.
+  useEffect(() => {
+    setPage(1);
+  }, [debouncedSearch, status, priority, slaBreached, departmentId, assigneeId, sort, perPage, dateRange]);
+
   const { data, isLoading } = useTickets({
+    page,
+    per_page: perPage,
     q: debouncedSearch || undefined,
     status: status === 'all' ? undefined : status,
     priority: priority === 'all' ? undefined : priority,
+    department_id: departmentId === 'all' ? undefined : Number(departmentId),
+    assignee_id: assigneeId === 'all' ? undefined : Number(assigneeId),
+    sla_breached: slaBreached || undefined,
+    sort_by: serverSort,
+    sort_dir: serverSort ? sortDir : undefined,
     date_from: dateRange?.from ? dateRange.from.toISOString() : undefined,
     date_to: dateRange?.to ? new Date(dateRange.to.getTime() + 86_399_000).toISOString() : undefined,
   });
 
-  const tickets = useMemo(() => data?.data ?? [], [data]);
+  // Status / priority aren't server-sortable → sort the loaded page client-side.
+  const tickets = useMemo(() => {
+    const rows = data?.data ?? [];
+    if (sortField === 'status' || sortField === 'priority') {
+      const order = sortField === 'status' ? STATUS_ORDER : PRIORITY_ORDER;
+      return [...rows].sort(
+        (a, b) =>
+          (order[a[sortField] as keyof typeof order] ?? 99) -
+          (order[b[sortField] as keyof typeof order] ?? 99),
+      );
+    }
+    return rows;
+  }, [data, sortField]);
+
+  const total = data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / perPage));
+  const activeFilterCount =
+    (departmentId !== 'all' ? 1 : 0) + (assigneeId !== 'all' ? 1 : 0) + (slaBreached ? 1 : 0);
 
   // j/k keyboard nav
   const [focusedIdx, setFocusedIdx] = useState(-1);
@@ -172,6 +270,21 @@ export function TicketsListContent() {
           </SelectContent>
         </Select>
 
+        {/* Sort */}
+        <Select value={sort} onValueChange={setSort}>
+          <SelectTrigger className="h-8 w-44 text-sm" aria-label="Сортировка">
+            <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground" />
+            <SelectValue placeholder="Сортировка" />
+          </SelectTrigger>
+          <SelectContent>
+            {SORT_OPTIONS.map((o) => (
+              <SelectItem key={o.value} value={o.value}>
+                {o.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
         {/* Date range filter */}
         <Popover open={calendarOpen} onOpenChange={setCalendarOpen}>
           <PopoverTrigger asChild>
@@ -229,16 +342,88 @@ export function TicketsListContent() {
               Канбан
             </Link>
           </Button>
-          <Button variant="outline" size="icon" className="h-8 w-8">
-            <SlidersHorizontal className="h-3.5 w-3.5" />
-            <span className="sr-only">Фильтры</span>
-          </Button>
+          <Popover open={filtersOpen} onOpenChange={setFiltersOpen}>
+            <PopoverTrigger asChild>
+              <Button variant="outline" size="sm" className="relative h-8 gap-1.5 text-sm font-normal">
+                <SlidersHorizontal className="h-3.5 w-3.5" />
+                Фильтры
+                {activeFilterCount > 0 && (
+                  <span className="ml-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold text-primary-foreground">
+                    {activeFilterCount}
+                  </span>
+                )}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="w-72 space-y-4" align="end">
+              <div className="space-y-1.5">
+                <Label className="text-xs">Отдел</Label>
+                <Select value={departmentId} onValueChange={setDepartmentId}>
+                  <SelectTrigger className="h-8 text-sm">
+                    <SelectValue placeholder="Все отделы" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Все отделы</SelectItem>
+                    {departmentOptions.map((d) => (
+                      <SelectItem key={d.value} value={d.value}>
+                        {d.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label className="text-xs">Исполнитель</Label>
+                <Select value={assigneeId} onValueChange={setAssigneeId}>
+                  <SelectTrigger className="h-8 text-sm">
+                    <SelectValue placeholder="Все исполнители" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Все исполнители</SelectItem>
+                    {staffOptions.map((s) => (
+                      <SelectItem key={s.value} value={s.value}>
+                        {s.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={slaBreached}
+                  onChange={(e) => setSlaBreached(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border-input"
+                />
+                Просроченный SLA
+              </label>
+
+              {activeFilterCount > 0 && (
+                <div className="flex justify-end border-t border-border pt-2">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 gap-1 text-xs text-muted-foreground"
+                    onClick={() => {
+                      setDepartmentId('all');
+                      setAssigneeId('all');
+                      setSlaBreached(false);
+                    }}
+                  >
+                    <X className="h-3 w-3" />
+                    Сбросить фильтры
+                  </Button>
+                </div>
+              )}
+            </PopoverContent>
+          </Popover>
         </div>
       </div>
 
       {/* Results info */}
       <div className="px-6 py-2 text-xs text-muted-foreground border-b border-border">
-        {isLoading ? 'Загрузка...' : `${data?.total ?? 0} заявок · j/k для навигации · Enter для открытия`}
+        {isLoading ? 'Загрузка...' : `${total} заявок · j/k для навигации · Enter для открытия`}
       </div>
 
       {/* List */}
@@ -264,6 +449,55 @@ export function TicketsListContent() {
           </div>
         )}
       </div>
+
+      {/* Pagination */}
+      {!isLoading && total > 0 && (
+        <div className="flex items-center justify-between gap-3 border-t border-border bg-card px-6 py-2.5 text-sm">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span>Показывать по</span>
+            <Select value={String(perPage)} onValueChange={(v) => setPerPage(Number(v))}>
+              <SelectTrigger className="h-7 w-16 text-xs" aria-label="Заявок на странице">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {PER_PAGE_OPTIONS.map((n) => (
+                  <SelectItem key={n} value={String(n)}>
+                    {n}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-muted-foreground">
+              Стр. {page} из {totalPages}
+            </span>
+            <div className="flex gap-1">
+              <Button
+                variant="outline"
+                size="icon"
+                className="h-7 w-7"
+                disabled={page <= 1}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                aria-label="Предыдущая страница"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+              </Button>
+              <Button
+                variant="outline"
+                size="icon"
+                className="h-7 w-7"
+                disabled={page >= totalPages}
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                aria-label="Следующая страница"
+              >
+                <ChevronRight className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Create Ticket Dialog */}
       <Dialog
@@ -339,6 +573,15 @@ export function TicketsListContent() {
                 <option value="urgent">Критический</option>
               </select>
             </div>
+
+            {customFields.length > 0 && (
+              <CustomFieldsSection
+                fields={customFields}
+                values={cfValues}
+                onChange={(key, value) => setCfValues((prev) => ({ ...prev, [key]: value }))}
+                errors={cfErrors}
+              />
+            )}
 
             <DialogFooter className="pt-2">
               <Button type="button" variant="outline" onClick={closeCreate}>

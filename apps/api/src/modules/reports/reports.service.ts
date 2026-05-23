@@ -124,7 +124,8 @@ export class ReportsService {
   /** Convenience dashboard summary used by the staff home screen. */
   async dashboard() {
     const now = new Date();
-    const [byStatus, byPriority, total, resolved, slaBreached, firstResponded] = await Promise.all([
+    const startOfDay = new Date(new Date().setHours(0, 0, 0, 0));
+    const [byStatus, byPriority, total, resolved, slaBreached, avgRows] = await Promise.all([
       this.prisma.ticket.groupBy({
         by: ['statusId'],
         _count: { _all: true },
@@ -138,26 +139,21 @@ export class ReportsService {
       this.prisma.ticket.count({
         where: {
           isResolved: true,
-          resolvedAt: { gte: new Date(new Date().setHours(0, 0, 0, 0)) },
+          resolvedAt: { gte: startOfDay },
         },
       }),
       // SLA breached: past due and not yet resolved
       this.prisma.ticket.count({ where: { isResolved: false, dueAt: { lt: now } } }),
-      // For avg first-response time, pull (createdAt, firstResponseAt) of responded tickets
-      this.prisma.ticket.findMany({
-        where: { firstResponseAt: { not: null } },
-        select: { createdAt: true, firstResponseAt: true },
-      }),
+      // Avg first-response time computed DB-side (no unbounded findMany).
+      // AVG over (firstResponseAt - createdAt) in minutes for responded tickets.
+      this.prisma.$queryRaw<{ avg_minutes: number | null }[]>`
+        SELECT AVG(EXTRACT(EPOCH FROM ("firstResponseAt" - "createdAt")) / 60) AS avg_minutes
+        FROM "Ticket"
+        WHERE "firstResponseAt" IS NOT NULL
+      `,
     ]);
-    const avgFirstResponseMinutes =
-      firstResponded.length === 0
-        ? 0
-        : Math.round(
-            firstResponded.reduce(
-              (acc, t) => acc + (t.firstResponseAt!.getTime() - t.createdAt.getTime()) / 60_000,
-              0,
-            ) / firstResponded.length,
-          );
+    const rawAvg = avgRows?.[0]?.avg_minutes;
+    const avgFirstResponseMinutes = rawAvg === null || rawAvg === undefined ? 0 : Math.round(Number(rawAvg));
 
     const byStatusMapped = byStatus.map((r) => ({ key: r.statusId, count: r._count._all }));
     const byPriorityMapped = byPriority.map((r) => ({ key: r.priorityId, count: r._count._all }));

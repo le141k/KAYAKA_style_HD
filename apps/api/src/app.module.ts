@@ -22,7 +22,10 @@ import { ReportsModule } from './modules/reports/reports.module';
 import { WorkflowModule } from './modules/workflow/workflow.module';
 import { AdminModule } from './modules/admin/admin.module';
 import { AttachmentsModule } from './modules/attachments/attachments.module';
+import { CustomFieldsModule } from './modules/custom-fields/custom-fields.module';
 import { PrismaExceptionFilter } from './common/prisma-exception.filter';
+import { JwtAuthGuard } from './auth/jwt-auth.guard';
+import { PermissionsGuard } from './auth/permissions.guard';
 
 const config = loadConfig();
 const redisUrl = new URL(config.REDIS_URL);
@@ -79,6 +82,7 @@ const redisUrl = new URL(config.REDIS_URL);
     WorkflowModule,
     AdminModule,
     AttachmentsModule,
+    CustomFieldsModule,
   ],
   providers: [
     // Provide AppConfig as a VALUE token so it can be constructor-injected via @Inject(APP_CONFIG)
@@ -95,6 +99,23 @@ const redisUrl = new URL(config.REDIS_URL);
     {
       provide: APP_GUARD,
       useClass: ThrottlerGuard,
+    },
+    // Global JWT backstop: every route requires a valid access token UNLESS it is
+    // decorated with @Public(). This closes the "undecorated route is wide open"
+    // gap — routes that forgot @RequirePermissions() are no longer anonymous.
+    // The guard honours IS_PUBLIC metadata, so login / refresh / kb-public /
+    // departments-public / alaris-webhook (all @Public) continue to work tokenless.
+    // It runs BEFORE PermissionsGuard so req.user is populated first.
+    {
+      provide: APP_GUARD,
+      useClass: JwtAuthGuard,
+    },
+    // Global permissions backstop: enforces @RequirePermissions() metadata. Routes
+    // with no PERMISSIONS metadata fall through (return true), so an authenticated
+    // route without explicit permissions still works as before.
+    {
+      provide: APP_GUARD,
+      useClass: PermissionsGuard,
     },
   ],
   exports: [APP_CONFIG],
