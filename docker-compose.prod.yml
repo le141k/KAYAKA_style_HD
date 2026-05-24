@@ -57,7 +57,9 @@ services:
     env_file: .env.prod
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://${TELECOM_HD_DB_USER}:${TELECOM_HD_DB_PASSWORD}@postgres:5432/${TELECOM_HD_DB_NAME}?schema=public
+      # connection_limit/pool_timeout tune the Prisma pool so API handlers + the
+      # BullMQ workers sharing this client don't exhaust/contend under load.
+      DATABASE_URL: postgresql://${TELECOM_HD_DB_USER}:${TELECOM_HD_DB_PASSWORD}@postgres:5432/${TELECOM_HD_DB_NAME}?schema=public&connection_limit=${TELECOM_HD_DB_POOL:-20}&pool_timeout=20
       REDIS_URL: redis://:${TELECOM_HD_REDIS_PASSWORD}@redis:6379
     # API is NOT published to the host — the reverse proxy reaches it over the
     # internal docker network. Only `expose` (container-to-container).

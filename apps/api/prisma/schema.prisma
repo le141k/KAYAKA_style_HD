@@ -384,6 +384,20 @@ model Ticket {
   @@index([userId])
   @@index([lastActivityAt])
   @@index([createdAt])
+  // Load: frequently filtered/sorted columns (list filters, SLA breach scan, reports)
+  @@index([priorityId])
+  @@index([typeId])
+  @@index([isResolved])
+  @@index([mergedIntoId])
+  @@index([dueAt])
+  @@index([resolutionDueAt])
+  // Composite for the 60s SLA breach scan (isResolved=false, isEscalated=false, mergedIntoId=null)
+  @@index([isResolved, isEscalated, mergedIntoId])
+  // Trigram GIN indexes so the list `search` (ILIKE '%term%') uses an index
+  // instead of a sequential scan. Requires the pg_trgm extension (prior migration).
+  @@index([subject(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([requesterEmail(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([requesterName(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model TicketPost {

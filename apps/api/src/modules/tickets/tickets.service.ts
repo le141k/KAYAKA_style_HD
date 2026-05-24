@@ -330,6 +330,9 @@ export class TicketsService {
         // columns (ipAddress, customFields, messageId, creationMode) to anyone
         // who supplies an email address.
         select: PUBLIC_TICKET_LIST_SELECT,
+        // Bound the result so a heavy requester (or abuse) can't pull an unbounded
+        // set on this public endpoint; `total` still reflects the true count.
+        take: 200,
       }),
       this.prisma.ticket.count({ where }),
     ]);

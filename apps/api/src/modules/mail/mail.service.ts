@@ -1,4 +1,6 @@
-import { Injectable, Logger, Inject } from '@nestjs/common';
+import { Injectable, Logger, Inject, Optional } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import type { Queue } from 'bullmq';
 import * as nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -32,19 +34,52 @@ export class MailService {
   constructor(
     @Inject(APP_CONFIG) private readonly config: AppConfig,
     private readonly prisma: PrismaService,
+    // Optional so unit tests (and any non-DI construction) work without a queue —
+    // when absent, send() delivers inline instead of enqueuing.
+    @Optional() @InjectQueue('mail') private readonly mailQueue?: Queue,
   ) {
     this.transporter = nodemailer.createTransport({
       host: config.TELECOM_HD_SMTP_HOST,
       port: config.TELECOM_HD_SMTP_PORT,
       secure: config.TELECOM_HD_SMTP_SECURE,
+      // Authenticated relay in prod; MailHog/dev needs none. Only set auth when
+      // both credentials are provided (otherwise nodemailer would force AUTH).
+      ...(config.TELECOM_HD_SMTP_USER && config.TELECOM_HD_SMTP_PASSWORD
+        ? { auth: { user: config.TELECOM_HD_SMTP_USER, pass: config.TELECOM_HD_SMTP_PASSWORD } }
+        : {}),
     });
   }
 
   /**
-   * Send an outbound email.
-   * Logs a warning and swallows the error to avoid crashing the ticket flow.
+   * Enqueue an outbound email onto the 'mail' BullMQ queue so SMTP latency never
+   * blocks the HTTP request / processor loop. Falls back to inline delivery when
+   * no queue is wired (unit tests). Retries with backoff are configured on the job.
    */
   async send(opts: SendMailOptions): Promise<void> {
+    if (!this.mailQueue) {
+      await this.deliver(opts);
+      return;
+    }
+    try {
+      await this.mailQueue.add('send', opts, {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2000 },
+        removeOnComplete: true,
+        removeOnFail: 100,
+      });
+    } catch (err) {
+      // If enqueue fails (Redis down), don't lose the mail — deliver inline.
+      this.logger.error(`Mail enqueue failed, delivering inline: ${String(err)}`);
+      await this.deliver(opts);
+    }
+  }
+
+  /**
+   * Actually deliver an email via SMTP. Called by the MailProcessor (off the
+   * critical path) or inline as a fallback. Logs and swallows errors so a send
+   * failure never crashes the ticket flow.
+   */
+  async deliver(opts: SendMailOptions): Promise<void> {
     try {
       const toStr = Array.isArray(opts.to) ? opts.to.join(', ') : opts.to;
       const ccStr = opts.cc ? (Array.isArray(opts.cc) ? opts.cc.join(', ') : opts.cc) : undefined;
