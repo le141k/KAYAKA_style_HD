@@ -40,8 +40,11 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # Require a password — even on the internal network, an unauthenticated Redis
+    # lets any compromised container read/write the BullMQ queues and token state.
+    command: ["redis-server", "--requirepass", "${TELECOM_HD_REDIS_PASSWORD:?set in .env.prod}"]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${TELECOM_HD_REDIS_PASSWORD}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -55,7 +58,7 @@ services:
     environment:
       NODE_ENV: production
       DATABASE_URL: postgresql://${TELECOM_HD_DB_USER}:${TELECOM_HD_DB_PASSWORD}@postgres:5432/${TELECOM_HD_DB_NAME}?schema=public
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${TELECOM_HD_REDIS_PASSWORD}@redis:6379
     # API is NOT published to the host — the reverse proxy reaches it over the
     # internal docker network. Only `expose` (container-to-container).
     expose:

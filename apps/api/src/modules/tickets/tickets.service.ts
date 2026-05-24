@@ -27,6 +27,7 @@ import type {
   ApplyMacroDto,
   ChangeDepartmentDto,
 } from './dto';
+import { Prisma } from '@prisma/client';
 import type { ActorType, CreationMode, Ticket, TicketPost, TicketNote } from '@prisma/client';
 
 /** Rich ticket view returned by getTicket. */
@@ -36,6 +37,36 @@ export interface TicketDetail extends Ticket {
   watchers: Array<{ staffId: number }>;
   tags: Array<{ name: string }>;
 }
+
+/**
+ * Client-safe ticket fields for the @Public "my tickets" list. Deliberately
+ * omits infra/PII columns (ipAddress, customFields, messageId, creationMode,
+ * slaPlanId, internal SLA timestamps) — those must never reach an unauthenticated
+ * caller who only supplies an email address.
+ */
+export const PUBLIC_TICKET_LIST_SELECT = {
+  id: true,
+  mask: true,
+  subject: true,
+  requesterName: true,
+  requesterEmail: true,
+  statusId: true,
+  priorityId: true,
+  typeId: true,
+  departmentId: true,
+  dueAt: true,
+  totalReplies: true,
+  isResolved: true,
+  lastActivityAt: true,
+  createdAt: true,
+  updatedAt: true,
+  status: { select: { id: true, title: true } },
+  priority: { select: { id: true, title: true } },
+  type: { select: { id: true, title: true } },
+  department: { select: { id: true, title: true } },
+} satisfies Prisma.TicketSelect;
+
+export type PublicTicketListItem = Prisma.TicketGetPayload<{ select: typeof PUBLIC_TICKET_LIST_SELECT }>;
 
 /**
  * A client-safe post. Internal/PII fields (staff `email`, `ipAddress`, `staffId`,
@@ -272,7 +303,7 @@ export class TicketsService {
    * Matches requesterEmail directly OR any UserEmail linked to a User row.
    * Used by the client-facing "my tickets" page (@Public endpoint).
    */
-  async listMyTickets(requesterEmail: string): Promise<{ data: Ticket[]; total: number }> {
+  async listMyTickets(requesterEmail: string): Promise<{ data: PublicTicketListItem[]; total: number }> {
     // Build OR clause: direct requesterEmail OR through the user's emails
     const where = {
       mergedIntoId: null,
@@ -292,12 +323,10 @@ export class TicketsService {
       this.prisma.ticket.findMany({
         where,
         orderBy: { createdAt: 'desc' },
-        include: {
-          status: true,
-          priority: true,
-          type: true,
-          department: true,
-        },
+        // Narrow select — this is a @Public endpoint, so NEVER leak infra/PII
+        // columns (ipAddress, customFields, messageId, creationMode) to anyone
+        // who supplies an email address.
+        select: PUBLIC_TICKET_LIST_SELECT,
       }),
       this.prisma.ticket.count({ where }),
     ]);
