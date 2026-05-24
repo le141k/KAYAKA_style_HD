@@ -1,0 +1,34 @@
+# Tailnet overlay — publishes the portal on :1488 over plain HTTP (Tailscale-only).
+# Use INSTEAD of docker-compose.proxy.yml (which does public TLS on 80/443):
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.tailnet.yml \
+#     --env-file .env.prod up -d --build
+#
+# api/web stay internal (expose-only); only this proxy binds a host port — and
+# nftables (infra/nftables/helpdesk.nft) restricts :1488 to the tailnet/LAN.
+# NOTE: set NEXT_PUBLIC_API_URL=http://10.0.0.20:1488 (the tailnet origin) in
+# .env.prod BEFORE building — it is baked into the browser bundle.
+
+services:
+  proxy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    # Bind on the host so the tailnet/LAN can reach it; nftables gates the source.
+    ports:
+      - "1488:1488"
+    volumes:
+      - ./infra/caddy/Caddyfile.tailnet:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  caddy_data:
+  caddy_config:

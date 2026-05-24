@@ -1,0 +1,42 @@
+# Tailnet deployment — plain HTTP reverse proxy on :1488 (NO TLS; Tailscale already
+# encrypts the transport, and the portal is reachable ONLY over the tailnet/LAN).
+# Routes /api/* → api:4000 (NestJS keeps its global /api prefix — do NOT strip it),
+# everything else → web:3000.
+#
+# Used by docker-compose.tailnet.yml. Reachable as http://<tailnet-ip>:1488 and
+# http://10.0.0.20:1488 once nftables allows the port from the tailnet/LAN only.
+
+{
+	# No automatic HTTPS — this listener is plain HTTP on a private tailnet.
+	auto_https off
+	admin off
+}
+
+:1488 {
+	encode gzip
+
+	# Cap request bodies to the app's upload limit.
+	request_body {
+		max_size 25MB
+	}
+
+	# API — preserve the /api prefix (handle, not handle_path).
+	handle /api/* {
+		reverse_proxy api:4000 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# Everything else → the Next.js web app.
+	handle {
+		reverse_proxy web:3000 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+}

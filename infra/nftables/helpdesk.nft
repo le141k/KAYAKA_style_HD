@@ -1,0 +1,65 @@
+#!/usr/sbin/nft -f
+# 23 Telecom Help Desk — host firewall (Tailscale-only exposure).
+#
+# Goal: the host accepts inbound ONLY from the tailnet (100.64.0.0/10) and the
+# LAN/subnet-route (10.0.0.0/24); nothing from the public internet. The portal
+# (:1488) and SSH (:22) are reachable only over those.
+#
+# ⚠️ APPLY CAREFULLY — this sets input policy to DROP and CAN LOCK YOU OUT of SSH.
+#   Always apply behind a rollback timer, e.g.:
+#     sudo sh -c 'nft -f /path/helpdesk.nft && sleep 120 && nft flush ruleset' &
+#   then, in ANOTHER session, confirm SSH still works and KILL the rollback timer.
+#   Persist only after confirming: sudo cp helpdesk.nft /etc/nftables.conf && systemctl enable --now nftables
+#
+# ⚠️ DOCKER CAVEAT — Docker publishes container ports via DNAT into the FORWARD
+#   path (DOCKER-USER chain), NOT the host INPUT chain. The INPUT rules below
+#   protect HOST services (SSH, host-bound :1488). To also gate a DOCKER-PUBLISHED
+#   :1488 by source, add the DOCKER-USER rules at the bottom (iptables-nft).
+#   On this VM the only inbound interface is the private LAN (reached via the
+#   Tailscale subnet-route) — there is no public NIC — so even the host-input
+#   policy already prevents internet exposure; the DOCKER-USER rules are
+#   defense-in-depth.
+
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		# Loopback + established/related.
+		iif "lo" accept
+		ct state established,related accept
+		ct state invalid drop
+
+		# ICMP / ICMPv6 (ping, PMTU).
+		ip protocol icmp accept
+		ip6 nexthdr ipv6-icmp accept
+
+		# Tailscale's own interface (WireGuard traffic terminates here).
+		iifname "tailscale0" accept
+
+		# SSH + portal — ONLY from the tailnet and the LAN/subnet-route.
+		ip saddr 100.64.0.0/10 tcp dport { 22, 1488 } accept
+		ip saddr 10.0.0.0/24  tcp dport { 22, 1488 } accept
+
+		# (Everything else is dropped by policy — no 0.0.0.0/0 access.)
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		ct state established,related accept
+		# Docker manages its own forward rules in its chains; this policy does not
+		# remove them (separate table). If containers lose connectivity after apply,
+		# Docker likely needs its rules reloaded: `systemctl restart docker`.
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+	}
+}
+
+# ── OPTIONAL: restrict the DOCKER-PUBLISHED :1488 by source (defense-in-depth) ──
+# Run these AFTER docker is up (DOCKER-USER must exist). They use iptables-nft:
+#
+#   sudo iptables -I DOCKER-USER -p tcp --dport 1488 -s 100.64.0.0/10 -j RETURN
+#   sudo iptables -I DOCKER-USER -p tcp --dport 1488 -s 10.0.0.0/24  -j RETURN
+#   sudo iptables -A DOCKER-USER -p tcp --dport 1488 -j DROP
+#   # persist with iptables-persistent (netfilter-persistent save)
