@@ -47,6 +47,8 @@ const SAFE_USER = {
 function makeAdminMock(): AdminService {
   return {
     validateCustomFields: vi.fn().mockResolvedValue(undefined),
+    encryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
+    decryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
   } as unknown as AdminService;
 }
 

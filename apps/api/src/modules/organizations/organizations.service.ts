@@ -39,37 +39,45 @@ export class OrganizationsService {
   async get(id: number): Promise<Organization> {
     const org = await this.prisma.organization.findUnique({ where: { id } });
     if (!org) throw new NotFoundException(`Organization ${id} not found`);
+    org.customFields = (await this.adminService.decryptCustomFields(
+      'ORGANIZATION',
+      org.customFields as Record<string, unknown>,
+    )) as object;
     return org;
   }
 
   async create(dto: CreateOrganizationDto): Promise<Organization> {
-    // Validate custom fields against ORGANIZATION scope definitions
-    if (dto.customFields && typeof dto.customFields === 'object') {
-      await this.adminService.validateCustomFields(
-        'ORGANIZATION',
-        dto.customFields as Record<string, unknown>,
-      );
+    // Validate + encrypt custom fields against ORGANIZATION scope definitions
+    let cf = dto.customFields as Record<string, unknown> | undefined;
+    if (cf && typeof cf === 'object') {
+      await this.adminService.validateCustomFields('ORGANIZATION', cf);
+      cf = await this.adminService.encryptCustomFields('ORGANIZATION', cf);
     }
 
     return this.prisma.organization.create({
-      data: dto as Parameters<typeof this.prisma.organization.create>[0]['data'],
+      data: {
+        ...dto,
+        ...(cf !== undefined ? { customFields: cf as object } : {}),
+      } as Parameters<typeof this.prisma.organization.create>[0]['data'],
     });
   }
 
   async update(id: number, dto: UpdateOrganizationDto): Promise<Organization> {
     await this.get(id);
 
-    // Validate custom fields against ORGANIZATION scope definitions (if provided)
-    if (dto.customFields && typeof dto.customFields === 'object') {
-      await this.adminService.validateCustomFields(
-        'ORGANIZATION',
-        dto.customFields as Record<string, unknown>,
-      );
+    // Validate + encrypt custom fields against ORGANIZATION scope definitions (if provided)
+    let cf = dto.customFields as Record<string, unknown> | undefined;
+    if (cf && typeof cf === 'object') {
+      await this.adminService.validateCustomFields('ORGANIZATION', cf);
+      cf = await this.adminService.encryptCustomFields('ORGANIZATION', cf);
     }
 
     return this.prisma.organization.update({
       where: { id },
-      data: dto as Parameters<typeof this.prisma.organization.update>[0]['data'],
+      data: {
+        ...dto,
+        ...(cf !== undefined ? { customFields: cf as object } : {}),
+      } as Parameters<typeof this.prisma.organization.update>[0]['data'],
     });
   }
 

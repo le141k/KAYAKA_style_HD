@@ -123,9 +123,12 @@ export class TicketsService {
     dto: CreateTicketDto & { attachmentClaimToken?: string },
     creatorStaffId?: number,
   ): Promise<Ticket> {
-    // Validate custom fields against TICKET scope definitions
-    if (dto.customFields && typeof dto.customFields === 'object') {
-      await this.adminService.validateCustomFields('TICKET', dto.customFields as Record<string, unknown>);
+    // Validate custom fields against TICKET scope definitions, then encrypt any
+    // fields flagged isEncrypted before they are persisted to the JSONB column.
+    let customFields = dto.customFields as Record<string, unknown> | undefined;
+    if (customFields && typeof customFields === 'object') {
+      await this.adminService.validateCustomFields('TICKET', customFields);
+      customFields = await this.adminService.encryptCustomFields('TICKET', customFields);
     }
 
     // Resolve or create the requester user
@@ -185,7 +188,7 @@ export class TicketsService {
           creationMode: dto.creationMode as CreationMode,
           creator: creatorActor,
           ipAddress: dto.ipAddress,
-          customFields: dto.customFields as object,
+          customFields: (customFields ?? {}) as object,
           // First post
           posts: {
             create: {
@@ -378,7 +381,13 @@ export class TicketsService {
     // must prove they own it by supplying the matching requester email.
     this.assertRequesterOwnsTicket(ticket, requesterEmail);
 
-    return ticket as unknown as PublicTicketDetail;
+    // Redact infra/PII scalar columns before returning to the @Public caller.
+    // (findUnique with top-level `include` returns ALL ticket scalars.)
+    const safe = { ...ticket } as Record<string, unknown>;
+    for (const k of ['ipAddress', 'customFields', 'messageId', 'creationMode', 'creator', 'flagType']) {
+      delete safe[k];
+    }
+    return safe as unknown as PublicTicketDetail;
   }
 
   /**
@@ -590,6 +599,10 @@ export class TicketsService {
     });
 
     if (!ticket) throw new NotFoundException(`Ticket ${id} not found`);
+    ticket.customFields = (await this.adminService.decryptCustomFields(
+      'TICKET',
+      ticket.customFields as Record<string, unknown>,
+    )) as object;
     return ticket as unknown as TicketDetail;
   }
 
@@ -619,6 +632,10 @@ export class TicketsService {
     });
 
     if (!ticket) throw new NotFoundException(`Ticket ${mask} not found`);
+    ticket.customFields = (await this.adminService.decryptCustomFields(
+      'TICKET',
+      ticket.customFields as Record<string, unknown>,
+    )) as object;
     return ticket as unknown as TicketDetail;
   }
 

@@ -71,6 +71,10 @@ export class UsersService {
       select: SAFE_USER_SELECT,
     });
     if (!user) throw new NotFoundException(`User ${id} not found`);
+    user.customFields = (await this.adminService.decryptCustomFields(
+      'USER',
+      user.customFields as Record<string, unknown>,
+    )) as object;
     return user;
   }
 
@@ -106,9 +110,11 @@ export class UsersService {
   }
 
   async create(dto: CreateUserDto): Promise<SafeUser> {
-    // Validate custom fields against USER scope definitions
-    if (dto.customFields && typeof dto.customFields === 'object') {
-      await this.adminService.validateCustomFields('USER', dto.customFields as Record<string, unknown>);
+    // Validate + encrypt custom fields against USER scope definitions
+    let cf = dto.customFields as Record<string, unknown> | undefined;
+    if (cf && typeof cf === 'object') {
+      await this.adminService.validateCustomFields('USER', cf);
+      cf = await this.adminService.encryptCustomFields('USER', cf);
     }
 
     // Ensure primary email isn't already taken
@@ -126,6 +132,7 @@ export class UsersService {
     return this.prisma.user.create({
       data: {
         ...rest,
+        ...(cf !== undefined ? { customFields: cf as object } : {}),
         emails: { create: allEmails },
       } as Parameters<typeof this.prisma.user.create>[0]['data'],
       select: SAFE_USER_SELECT,
@@ -135,14 +142,19 @@ export class UsersService {
   async update(id: number, dto: UpdateUserDto): Promise<SafeUser> {
     await this.get(id);
 
-    // Validate custom fields against USER scope definitions (if provided)
-    if (dto.customFields && typeof dto.customFields === 'object') {
-      await this.adminService.validateCustomFields('USER', dto.customFields as Record<string, unknown>);
+    // Validate + encrypt custom fields against USER scope definitions (if provided)
+    let cf = dto.customFields as Record<string, unknown> | undefined;
+    if (cf && typeof cf === 'object') {
+      await this.adminService.validateCustomFields('USER', cf);
+      cf = await this.adminService.encryptCustomFields('USER', cf);
     }
 
     return this.prisma.user.update({
       where: { id },
-      data: dto as Parameters<typeof this.prisma.user.update>[0]['data'],
+      data: {
+        ...dto,
+        ...(cf !== undefined ? { customFields: cf as object } : {}),
+      } as Parameters<typeof this.prisma.user.update>[0]['data'],
       select: SAFE_USER_SELECT,
     });
   }

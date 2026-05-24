@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
+import { encryptField, decryptField } from '../../common/field-encrypt.util';
 import type {
   CreateCustomFieldGroupDto,
   UpdateCustomFieldGroupDto,
@@ -91,6 +92,51 @@ export class AdminService {
           throw new BadRequestException(`Custom field "${f.fieldKey}" has invalid type (expected ${f.type})`);
       }
     }
+  }
+
+  /**
+   * Return a copy of `values` with every field flagged `isEncrypted` encrypted
+   * at rest (AES-256-GCM). Call at write time, AFTER validateCustomFields().
+   * No-op for values whose field is not encrypted or that are non-string.
+   */
+  async encryptCustomFields(
+    scope: CustomFieldScope,
+    values: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (!values || typeof values !== 'object') return values;
+    const encryptedFields = await this.prisma.customField.findMany({
+      where: { group: { scope }, isEncrypted: true },
+      select: { fieldKey: true },
+    });
+    if (encryptedFields.length === 0) return values;
+    const out = { ...values };
+    for (const { fieldKey } of encryptedFields) {
+      const v = out[fieldKey];
+      if (typeof v === 'string' && v !== '') out[fieldKey] = encryptField(v);
+    }
+    return out;
+  }
+
+  /**
+   * Inverse of encryptCustomFields — decrypt `isEncrypted` values for an
+   * authorized staff read. Plaintext/legacy values pass through unchanged.
+   */
+  async decryptCustomFields(
+    scope: CustomFieldScope,
+    values: Record<string, unknown> | null | undefined,
+  ): Promise<Record<string, unknown> | null | undefined> {
+    if (!values || typeof values !== 'object') return values;
+    const encryptedFields = await this.prisma.customField.findMany({
+      where: { group: { scope }, isEncrypted: true },
+      select: { fieldKey: true },
+    });
+    if (encryptedFields.length === 0) return values;
+    const out = { ...values };
+    for (const { fieldKey } of encryptedFields) {
+      const v = out[fieldKey];
+      if (typeof v === 'string' && v !== '') out[fieldKey] = decryptField(v);
+    }
+    return out;
   }
 
   private checkType(type: string, value: unknown): boolean {

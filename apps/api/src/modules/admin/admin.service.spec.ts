@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import type { PrismaService } from '../../prisma/prisma.service';
@@ -360,6 +360,44 @@ describe('AdminService', () => {
     it('throws NotFoundException when template not found', async () => {
       (prisma.emailTemplate.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.deleteTemplate(99)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  // ─── encrypt / decrypt custom fields ──────────────────────────────────────────
+
+  describe('encryptCustomFields / decryptCustomFields', () => {
+    const KEY = 'a'.repeat(64); // 64 hex chars → 256-bit key
+    let prevKey: string | undefined;
+
+    beforeEach(() => {
+      prevKey = process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
+      process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'] = KEY;
+    });
+    afterEach(() => {
+      if (prevKey === undefined) delete process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
+      else process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'] = prevKey;
+    });
+
+    it('encrypts only fields flagged isEncrypted and round-trips on decrypt', async () => {
+      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ fieldKey: 'secret' }]);
+
+      const values = { secret: 'p@ss', plain: 'visible' };
+      const encrypted = await service.encryptCustomFields('TICKET', values);
+
+      // Encrypted field is no longer plaintext; non-encrypted field is untouched.
+      expect(typeof encrypted['secret']).toBe('string');
+      expect(encrypted['secret']).not.toBe('p@ss');
+      expect(encrypted['secret']).toMatch(/^v1:/);
+      expect(encrypted['plain']).toBe('visible');
+
+      const decrypted = await service.decryptCustomFields('TICKET', encrypted);
+      expect(decrypted).toEqual(values);
+    });
+
+    it('is a no-op when no fields are encrypted', async () => {
+      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const values = { a: '1' };
+      expect(await service.encryptCustomFields('TICKET', values)).toEqual(values);
     });
   });
 });
