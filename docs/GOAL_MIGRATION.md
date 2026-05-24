@@ -96,7 +96,7 @@ Fix our mail flow (gaps found vs Kayako), each with a test + MailHog live-check:
 - [x] Email-path gaps fixed (threading headers, per-queue autoresponder, signature, quote-strip) + queues/parser-rules imported; threading + signature verified live via MailHog. _(POST_PARSE / catch-all deferred — see M2.)_
 - [x] 5–15 **client tickets** in EACH of the 8 statuses, **each linked to a supplier ticket** (client side = customer↔23T, supplier side = 23T↔vendor `isThirdParty`). _(Run `tsx scripts/seed-demo-pairs.ts` after seed.)_
 - [x] All reply macros + the "to customer"/"to vendor" categories imported and applicable (sampled subset; a migrated macro applied live).
-- [ ] `make verify-full` green (gate + e2e); dev loop intact. _(Per-batch `make verify` GREEN throughout; final verify-full pending.)_
+- [x] `make verify-full` green (gate + e2e); dev loop intact. **Final run on a clean reseed: gate 9/9 + vitest 547 + e2e 37/37.**
 
 ## ⛔ OUT OF SCOPE / decisions for the human
 
