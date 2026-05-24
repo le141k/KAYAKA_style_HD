@@ -83,14 +83,14 @@ export class AuthService {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
-    // Find and validate the stored token by jti (uuid in the token)
-    const stored = await this.prisma.refreshToken.findMany({
+    // Active (non-revoked) stored tokens — the normal rotation path.
+    const active = await this.prisma.refreshToken.findMany({
       where: { staffId: payload.sub, revokedAt: null },
     });
 
     // Find matching token by verifying argon2 hash
-    let matchedToken: (typeof stored)[number] | undefined;
-    for (const t of stored) {
+    let matchedToken: (typeof active)[number] | undefined;
+    for (const t of active) {
       if (new Date() > t.expiresAt) continue;
       const matches = await verifyPassword(t.tokenHash, rawRefreshToken);
       if (matches) {
@@ -100,6 +100,24 @@ export class AuthService {
     }
 
     if (!matchedToken) {
+      // Reuse detection: if the presented token matches one we already REVOKED
+      // (and that hasn't expired), this is a replay of a rotated/stolen token.
+      // Treat it as a compromise and revoke the entire token family for this staff.
+      const revoked = await this.prisma.refreshToken.findMany({
+        where: { staffId: payload.sub, NOT: { revokedAt: null }, expiresAt: { gt: new Date() } },
+      });
+      for (const t of revoked) {
+        if (await verifyPassword(t.tokenHash, rawRefreshToken)) {
+          await this.prisma.refreshToken.updateMany({
+            where: { staffId: payload.sub, revokedAt: null },
+            data: { revokedAt: new Date() },
+          });
+          this.logger.error(
+            `SECURITY: refresh-token reuse detected for staff ${payload.sub} — all active sessions revoked`,
+          );
+          throw new UnauthorizedException('Refresh token reuse detected; all sessions have been revoked');
+        }
+      }
       throw new UnauthorizedException('Refresh token not found or expired');
     }
 

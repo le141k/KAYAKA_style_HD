@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
 import { LoggerModule } from 'nestjs-pino';
 import { BullModule } from '@nestjs/bullmq';
 import { EventEmitterModule } from '@nestjs/event-emitter';
@@ -46,7 +47,12 @@ const redisUrl = new URL(config.REDIS_URL);
   imports: [
     // Global rate-limiting (300 req / 60 s per IP — headroom for a data-heavy SPA
     // that fires several React Query calls per page); login has a stricter override.
-    ThrottlerModule.forRoot([{ ttl: 60000, limit: 300 }]),
+    // Backed by Redis so the limit is shared across API instances — an in-memory
+    // store would let an attacker bypass the login limit behind a load balancer.
+    ThrottlerModule.forRoot({
+      throttlers: [{ ttl: 60000, limit: 300 }],
+      storage: new ThrottlerStorageRedisService(config.REDIS_URL),
+    }),
 
     // Structured JSON logging via Pino
     LoggerModule.forRoot({
@@ -59,9 +65,15 @@ const redisUrl = new URL(config.REDIS_URL);
       },
     }),
 
-    // Background queues (BullMQ) + in-process domain events
+    // Background queues (BullMQ) + in-process domain events. Carry the password
+    // from REDIS_URL through — prod requires Redis auth (see docker-compose.prod.yml).
     BullModule.forRoot({
-      connection: { host: redisUrl.hostname, port: Number(redisUrl.port) || 6379 },
+      connection: {
+        host: redisUrl.hostname,
+        port: Number(redisUrl.port) || 6379,
+        ...(redisUrl.username ? { username: decodeURIComponent(redisUrl.username) } : {}),
+        ...(redisUrl.password ? { password: decodeURIComponent(redisUrl.password) } : {}),
+      },
     }),
     EventEmitterModule.forRoot(),
 
