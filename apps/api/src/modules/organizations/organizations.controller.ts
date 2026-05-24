@@ -64,9 +64,11 @@ export class OrganizationsController {
   }
 
   @Delete(':id')
-  @RequirePermissions(PERMISSIONS.ORG_MANAGE)
+  // Deletion detaches all users from the org — admin-only (ORG_DELETE not in the
+  // agent preset), unlike create/update/list which agents can perform.
+  @RequirePermissions(PERMISSIONS.ORG_DELETE)
   @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Delete an organization' })
+  @ApiOperation({ summary: 'Delete an organization (admin only)' })
   delete(@Param('id', ParseIntPipe) id: number) {
     return this.orgsService.delete(id);
   }
