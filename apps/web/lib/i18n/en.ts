@@ -183,6 +183,8 @@ export const en: Dictionary = {
     splitSubmit: 'Split',
     splitSuccess: 'Ticket split',
     splitError: 'Failed to split ticket',
+    splitSelectHint: 'Select messages for the new ticket',
+    splitNoSelectable: 'No messages available to split',
     watchers: 'Watchers',
     watchersEmpty: 'No watchers',
     watchersAddPlaceholder: 'Staff ID',

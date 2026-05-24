@@ -182,6 +182,8 @@ export const ru = {
     splitSubmit: 'Разделить',
     splitSuccess: 'Тикет разделён',
     splitError: 'Не удалось разделить тикет',
+    splitSelectHint: 'Выберите сообщения для нового тикета',
+    splitNoSelectable: 'Нет сообщений для разделения',
     watchers: 'Наблюдатели',
     watchersEmpty: 'Нет наблюдателей',
     watchersAddPlaceholder: 'ID сотрудника',

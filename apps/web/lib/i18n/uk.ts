@@ -183,6 +183,8 @@ export const uk: Dictionary = {
     splitSubmit: 'Розділити',
     splitSuccess: 'Тикет розділено',
     splitError: 'Не вдалося розділити тикет',
+    splitSelectHint: 'Виберіть повідомлення для нового тикета',
+    splitNoSelectable: 'Немає повідомлень для розділення',
     watchers: 'Спостерігачі',
     watchersEmpty: 'Немає спостерігачів',
     watchersAddPlaceholder: 'ID співробітника',

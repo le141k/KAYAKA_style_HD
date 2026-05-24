@@ -40,6 +40,7 @@ import { TimeTrackingPanel } from '@/components/tickets/TimeTrackingPanel';
 import { FollowUpsPanel } from '@/components/tickets/FollowUpsPanel';
 import { LinkedTicketsPanel } from '@/components/tickets/LinkedTicketsPanel';
 import { MergeTicketPanel } from '@/components/tickets/MergeTicketPanel';
+import { SplitTicketPanel } from '@/components/tickets/SplitTicketPanel';
 import { WatchersPanel } from '@/components/tickets/WatchersPanel';
 import { RecipientsPanel } from '@/components/tickets/RecipientsPanel';
 import { toast } from '@/components/ui/use-toast';
@@ -764,6 +765,18 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
             <Separator />
             <section>
               <MergeTicketPanel ticketId={ticketId} />
+            </section>
+
+            {/* Split */}
+            <Separator />
+            <section>
+              <SplitTicketPanel
+                ticketId={ticketId}
+                posts={allReplies.map((r) => ({
+                  id: r.id,
+                  label: `${r.author?.name ?? ''}: ${(r.body ?? '').slice(0, 80)}`.trim(),
+                }))}
+              />
             </section>
 
             {/* Watchers */}
