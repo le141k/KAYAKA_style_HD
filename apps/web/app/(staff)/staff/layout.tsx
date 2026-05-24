@@ -21,11 +21,13 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/co
 import { getInitials } from '@/lib/utils';
 import { hasToken } from '@/lib/api';
 import { useLogout, useMe } from '@/lib/hooks/use-auth';
+import { useI18n } from '@/lib/i18n';
 
 export default function StaffLayout({ children }: { children: React.ReactNode }) {
   const [commandOpen, setCommandOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const { logout } = useLogout();
+  const { t } = useI18n();
   const router = useRouter();
   const { data: user, isLoading, isError } = useMe();
 
@@ -149,7 +151,7 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
                 </>
               )}
               <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={logout}>
-                Выйти
+                {t.nav.logout}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>

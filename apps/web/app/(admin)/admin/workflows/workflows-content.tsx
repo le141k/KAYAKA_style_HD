@@ -554,44 +554,60 @@ export function WorkflowsContent() {
                   Нет условий — правило применяется ко всем заявкам
                 </p>
               )}
-              {criteriaFields.map((field, idx) => (
-                <div key={field.id} className="flex gap-2 items-start">
-                  <select
-                    {...wfForm.register(`criteria.${idx}.field`)}
-                    className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
-                  >
-                    {CRITERION_FIELDS.map((f) => (
-                      <option key={f.value} value={f.value}>
-                        {f.label}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    {...wfForm.register(`criteria.${idx}.op`)}
-                    className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm"
-                  >
-                    {CRITERION_OPS.map((o) => (
-                      <option key={o.value} value={o.value}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
-                  <Input
-                    {...wfForm.register(`criteria.${idx}.value`)}
-                    placeholder="Значение"
-                    className="flex-1"
-                  />
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="h-9 w-9 text-destructive hover:text-destructive shrink-0"
-                    onClick={() => removeCriterion(idx)}
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </Button>
-                </div>
-              ))}
+              {criteriaFields.map((field, idx) => {
+                // A rule saved with a field NOT in the dropdown (e.g. a legacy
+                // free-text field) must NOT silently snap to the first option —
+                // surface it as a distinct "(unknown: X)" option + warn (H8-2).
+                const fieldVal = wfForm.watch(`criteria.${idx}.field`);
+                const known = !fieldVal || CRITERION_FIELDS.some((f) => f.value === fieldVal);
+                return (
+                  <div key={field.id} className="space-y-1">
+                    <div className="flex gap-2 items-start">
+                      <select
+                        {...wfForm.register(`criteria.${idx}.field`)}
+                        className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+                      >
+                        {!known && <option value={fieldVal}>{`(unknown: ${fieldVal})`}</option>}
+                        {CRITERION_FIELDS.map((f) => (
+                          <option key={f.value} value={f.value}>
+                            {f.label}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        {...wfForm.register(`criteria.${idx}.op`)}
+                        className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm"
+                      >
+                        {CRITERION_OPS.map((o) => (
+                          <option key={o.value} value={o.value}>
+                            {o.label}
+                          </option>
+                        ))}
+                      </select>
+                      <Input
+                        {...wfForm.register(`criteria.${idx}.value`)}
+                        placeholder="Значение"
+                        className="flex-1"
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-9 w-9 text-destructive hover:text-destructive shrink-0"
+                        onClick={() => removeCriterion(idx)}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                    {!known && (
+                      <p className="text-xs text-amber-600">
+                        Поле «{fieldVal}» не из стандартного списка (возможно, старое правило). Выберите поле
+                        заново, чтобы исправить.
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
             </div>
 
             {/* Actions builder */}

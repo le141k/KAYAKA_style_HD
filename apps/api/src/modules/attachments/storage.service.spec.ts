@@ -19,6 +19,11 @@ describe('StorageService — path containment', () => {
     expect(() => service.createReadStream('/etc/passwd')).toThrow(BadRequestException);
   });
 
+  it('H8-6: rejects an empty / whitespace storageKey (would resolve to the root)', () => {
+    expect(() => service.createReadStream('')).toThrow(BadRequestException);
+    expect(() => service.createReadStream('   ')).toThrow(BadRequestException);
+  });
+
   it('delete also refuses a traversal storageKey', async () => {
     await expect(service.delete('../../etc/passwd')).rejects.toThrow(BadRequestException);
   });

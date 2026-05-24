@@ -15,6 +15,12 @@ function makePrismaMock() {
     ticketNote: {
       create: vi.fn(),
     },
+    staff: {
+      findUnique: vi.fn(),
+    },
+    ticketAuditLog: {
+      create: vi.fn().mockResolvedValue({}),
+    },
   } as unknown as PrismaService;
 }
 
@@ -226,6 +232,8 @@ describe('WorkflowExecutor', () => {
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
       (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([workflow]);
       (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      // Owner is now existence-validated before assigning (H8-1).
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 7 });
 
       await executor.onTicketCreated({ ticketId: 1 });
 
@@ -339,6 +347,52 @@ describe('WorkflowExecutor', () => {
 
       // Just ensuring it runs without error
       expect(prisma.workflow.findMany).toHaveBeenCalled();
+    });
+  });
+
+  // ─── H8-1: assign action (vocab unify + validate + notify + audit) ───
+  describe('assign action', () => {
+    it('the macro-vocab "assign" sets owner, audits ASSIGN, and notifies', async () => {
+      const ticket = makeTicket({ ownerStaffId: null });
+      const workflow = makeWorkflow({
+        criteria: [] as any,
+        actions: [{ type: 'assign', value: '7' }] as any,
+      });
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([workflow]);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 7 });
+      const notifications = { notifyOnAssign: vi.fn().mockResolvedValue(undefined) };
+      executor = new WorkflowExecutor(prisma as unknown as PrismaService, undefined, notifications as never);
+
+      await executor.onTicketCreated({ ticketId: 1 });
+
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ ownerStaffId: 7 }) }),
+      );
+      expect(prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ action: 'ASSIGN', newValue: '7' }) }),
+      );
+      expect(notifications.notifyOnAssign).toHaveBeenCalledWith(1, 7);
+    });
+
+    it('skips assign to a nonexistent staff (no owner update, no notify)', async () => {
+      const ticket = makeTicket({ ownerStaffId: null });
+      const workflow = makeWorkflow({
+        criteria: [] as any,
+        actions: [{ type: 'assign', value: '999' }] as any,
+      });
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([workflow]);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const notifications = { notifyOnAssign: vi.fn() };
+      executor = new WorkflowExecutor(prisma as unknown as PrismaService, undefined, notifications as never);
+
+      await executor.onTicketCreated({ ticketId: 1 });
+
+      // ownerStaffId never set → no ticket.update, no notification.
+      expect(prisma.ticket.update as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+      expect(notifications.notifyOnAssign).not.toHaveBeenCalled();
     });
   });
 });

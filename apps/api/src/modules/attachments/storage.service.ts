@@ -45,10 +45,15 @@ export class StorageService {
    * absolute path — never let a read/delete escape the upload root.
    */
   private resolveWithinUploadDir(storageKey: string): string {
+    // H8-6: an empty/whitespace key resolves to the upload root itself (rel === '')
+    // which passes the `..`/absolute check — reject it explicitly.
+    if (!storageKey || !storageKey.trim()) {
+      throw new BadRequestException('Invalid storage key');
+    }
     const root = resolve(this.config.TELECOM_HD_UPLOAD_DIR);
     const fullPath = resolve(root, storageKey);
     const rel = relative(root, fullPath);
-    if (rel.startsWith('..') || isAbsolute(rel)) {
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
       throw new BadRequestException('Invalid storage key');
     }
     return fullPath;

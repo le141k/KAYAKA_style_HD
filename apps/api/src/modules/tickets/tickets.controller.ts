@@ -81,6 +81,11 @@ export class TicketsController {
   @UsePipes(new ZodValidationPipe(PublicCreateTicketSchema))
   @ApiOperation({ summary: 'Submit a ticket from the client portal (no auth required)' })
   async publicCreate(@Body() dto: PublicCreateTicketDto) {
+    // H8-3: a public adoption MUST carry the per-upload claimToken; without it
+    // linkToPost would adopt any orphan by id (IDOR). Reject the unscoped case.
+    if (dto.attachmentIds?.length && !dto.attachmentClaimToken) {
+      throw new BadRequestException('attachmentClaimToken is required when attachmentIds are provided');
+    }
     return this.ticketsService.createTicket({
       ...dto,
       contents: dto.contents,

@@ -52,6 +52,20 @@ const submitSchema = z.object({
 });
 type SubmitForm = z.infer<typeof submitSchema>;
 
+/**
+ * A v4 UUID claim token, always non-empty. Uses crypto.randomUUID when available
+ * and an RFC4122 fallback otherwise — never returns '' (H8-4), so the server-side
+ * token enforcement can't be bypassed and a legit attachment isn't silently dropped.
+ */
+function genClaimToken(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 export function SubmitTicketForm() {
   const createTicket = useSubmitPublicTicket();
   const [successMask, setSuccessMask] = useState<string | null>(null);
@@ -59,9 +73,7 @@ export function SubmitTicketForm() {
   const [attachmentIds, setAttachmentIds] = useState<number[]>([]);
   // One orphan-claim secret per form session: the server scopes orphan adoption to
   // it so uploaded files can only be attached to THIS submit (not stolen by others).
-  const [claimToken] = useState(() =>
-    typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : '',
-  );
+  const [claimToken] = useState(genClaimToken);
 
   // TICKET-scope custom fields (public, read-only) + their collected values.
   const { fields: customFields } = useCustomFields('TICKET');

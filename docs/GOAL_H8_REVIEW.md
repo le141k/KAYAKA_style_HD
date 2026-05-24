@@ -40,3 +40,19 @@ test per fix, `make reset && up && verify` green, never commit red, one commit.
 
 - H8-1..5 fixed with tests (esp. assign-fires + notification; criterion backward-compat; token enforced on public adopt); LOW items as time permits.
 - `make verify-full` green; live repro: workflow/macro `assign` actually assigns + notifies; omitting claimToken on public submit does NOT adopt others' orphans.
+
+---
+
+## ✅ RESOLUTION (DONE)
+
+- [x] **H8-1** — unified `assign` vocab: the workflow executor now handles `assign`/`assign_staff`/`change_owner` (validates the staff, sets owner, writes an `ASSIGN` audit, fires `notifyOnAssign` via an injected `NotificationService`); `applyMacro` routes the owner change through `assign()` instead of a raw update. **Live: macro `{assign}` → ticket owner set + ASSIGN audit + "[Assigned] …" email in MailHog.** +3 tests.
+- [x] **H8-2** — the workflow criterion `<select>` renders an unknown stored field as a distinct `(unknown: X)` option + an amber warning; no silent snap to `subject`.
+- [x] **H8-3** — public create (controller) + public reply (service) **reject** `attachmentIds` without `attachmentClaimToken` (400). **Live: public submit w/ attachmentIds, no token → 400.** +1 test.
+- [x] **H8-4** — `submit-form` generates the claim token via a crypto/RFC4122-fallback helper (`genClaimToken`), never `''`.
+- [x] **H8-5** — `applyMacro` validates `set_status`/`set_priority`/`change_department`/`assign` referenced ids and routes each through its `change*`/`assign()` helper; dangling ids are skipped + logged. +4 tests.
+- [x] **H8-6** — storage guard rejects an empty/whitespace `storageKey` (was resolving to the upload root). +1 test.
+- [x] **H8-8** — macro `add_tag` (≤100) / `add_note` (≤5000) length caps.
+- [x] **H8-10** — staff-menu "Выйти" now uses `t.nav.logout` (i18n).
+- **Acceptance:** `make verify` GREEN 9/9; api vitest 558; e2e 37/37; assign + token repros verified live.
+- ⏭️ **Deferred LOW (documented, not done):** H8-7 orphan-attachment GC cron, H8-9 upload-failure UI surfacing, H8-11 boolean-criteria UI hint.
+- 🔒 `kayako_db_export/` untouched (dump preserved).

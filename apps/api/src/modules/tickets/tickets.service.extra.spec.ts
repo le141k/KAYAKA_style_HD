@@ -96,6 +96,7 @@ function makePrismaMock() {
     },
     ticketPriority: {
       findFirst: vi.fn(),
+      findUnique: vi.fn().mockResolvedValue({ id: 2, title: 'Normal' }),
     },
     ticketAuditLog: {
       create: vi.fn(),

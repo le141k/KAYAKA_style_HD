@@ -6,11 +6,12 @@ import { WorkflowExecutor } from './workflow.executor';
 import { AutoCloseProcessor } from './auto-close.processor';
 import { WorkflowController, MacroCategoryController, MacroController } from './workflow.controller';
 import { MailModule } from '../mail/mail.module';
+import { NotificationService } from '../tickets/notification.service';
 
 @Module({
   imports: [BullModule.registerQueue({ name: 'workflow' }), MailModule],
   controllers: [WorkflowController, MacroCategoryController, MacroController],
-  providers: [WorkflowService, WorkflowExecutor, AutoCloseProcessor],
+  providers: [WorkflowService, WorkflowExecutor, AutoCloseProcessor, NotificationService],
   exports: [WorkflowService],
 })
 export class WorkflowModule implements OnModuleInit {

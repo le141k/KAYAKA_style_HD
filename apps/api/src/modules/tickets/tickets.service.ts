@@ -399,6 +399,13 @@ export class TicketsService {
     // integer id cannot be used to post on someone else's ticket.
     this.assertRequesterOwnsTicket(ticket, dto.requesterEmail);
 
+    // H8-3: a public adoption MUST carry a claimToken; otherwise linkToPost would
+    // fall back to adopting any orphan by id (IDOR). Reject rather than silently
+    // adopt without the per-upload secret.
+    if (dto.attachmentIds?.length && !dto.attachmentClaimToken) {
+      throw new BadRequestException('attachmentClaimToken is required when attachmentIds are provided');
+    }
+
     const now = new Date();
 
     const post = await this.prisma.ticketPost.create({
@@ -1392,7 +1399,8 @@ export class TicketsService {
             }
             case 'add_tag': {
               // Accept both the typed key (`tag`) and the UI's generic `value`.
-              const tag = (action['tag'] ?? action['value']) as string | undefined;
+              // H8-8: cap the length so a macro can't create an absurd tag.
+              const tag = ((action['tag'] ?? action['value']) as string | undefined)?.slice(0, 100);
               if (typeof tag === 'string' && tag) {
                 await this.prisma.ticket.update({
                   where: { id: ticketId },
@@ -1410,7 +1418,8 @@ export class TicketsService {
             }
             case 'add_note': {
               // Accept both the typed key (`note`) and the UI's generic `value`.
-              const note = (action['note'] ?? action['value']) as string | undefined;
+              // H8-8: cap the note length (defensive against an oversized macro).
+              const note = ((action['note'] ?? action['value']) as string | undefined)?.slice(0, 5000);
               if (typeof note === 'string' && note) {
                 await this.prisma.ticketNote.create({
                   data: {
@@ -1430,16 +1439,42 @@ export class TicketsService {
         }
       }
 
-      // A status change must go through changeStatus() so isResolved/resolvedAt and
-      // SLA timers are updated correctly (a raw update would leave them stale).
+      // Route EVERY accumulated change through its validated helper so existence
+      // is checked and the proper audit / notification / SLA side effects fire
+      // (H8-1 assign notification, H8-5 id validation) — never a raw FK-blind update.
       if (ticketUpdate['statusId']) {
-        await this.changeStatus(ticketId, { statusId: ticketUpdate['statusId'] as number }, staffId);
-        delete ticketUpdate['statusId'];
+        const sid = ticketUpdate['statusId'] as number;
+        if (await this.prisma.ticketStatus.findUnique({ where: { id: sid } })) {
+          await this.changeStatus(ticketId, { statusId: sid }, staffId);
+        } else {
+          this.logger.warn(`Macro ${macro.id}: skipped set_status — status ${sid} not found`);
+        }
       }
-
-      if (Object.keys(ticketUpdate).length > 0) {
-        ticketUpdate['lastActivityAt'] = new Date();
-        await this.prisma.ticket.update({ where: { id: ticketId }, data: ticketUpdate });
+      if (ticketUpdate['priorityId']) {
+        const pid = ticketUpdate['priorityId'] as number;
+        if (await this.prisma.ticketPriority.findUnique({ where: { id: pid } })) {
+          await this.changePriority(ticketId, { priorityId: pid }, staffId);
+        } else {
+          this.logger.warn(`Macro ${macro.id}: skipped set_priority — priority ${pid} not found`);
+        }
+      }
+      if (ticketUpdate['departmentId']) {
+        const did = ticketUpdate['departmentId'] as number;
+        if (await this.prisma.department.findUnique({ where: { id: did } })) {
+          await this.changeDepartment(ticketId, { departmentId: did }, staffId);
+        } else {
+          this.logger.warn(`Macro ${macro.id}: skipped change_department — department ${did} not found`);
+        }
+      }
+      if ('ownerStaffId' in ticketUpdate) {
+        const oid = ticketUpdate['ownerStaffId'] as number | null;
+        if (oid == null) {
+          await this.assign(ticketId, { ownerStaffId: null }, staffId);
+        } else if (await this.prisma.staff.findUnique({ where: { id: oid } })) {
+          await this.assign(ticketId, { ownerStaffId: oid }, staffId);
+        } else {
+          this.logger.warn(`Macro ${macro.id}: skipped assign — staff ${oid} not found`);
+        }
       }
     }
 

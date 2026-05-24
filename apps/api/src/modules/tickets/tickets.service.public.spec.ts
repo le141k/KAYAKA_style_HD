@@ -4,7 +4,7 @@
  *   - publicReply      — creates a USER post without requiring staffId
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException } from '@nestjs/common';
+import { NotFoundException, BadRequestException } from '@nestjs/common';
 import { TicketsService } from './tickets.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { UsersService } from '../users/users.service';
@@ -359,6 +359,22 @@ describe('TicketsService — public endpoints', () => {
       await expect(
         service.publicReply(999, { contents: 'Hi', requesterEmail: 'alice@example.com' }),
       ).rejects.toThrow(NotFoundException);
+    });
+
+    it('H8-3: rejects attachmentIds without a claimToken (no unscoped orphan adoption)', async () => {
+      const ticket = makeTicket({ requesterEmail: 'alice@example.com' });
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+
+      await expect(
+        service.publicReply(1, {
+          contents: 'Here is the file',
+          requesterEmail: 'alice@example.com',
+          attachmentIds: [10],
+          // no attachmentClaimToken
+        }),
+      ).rejects.toThrow(BadRequestException);
+      // The post must NOT have been created.
+      expect(prisma.ticketPost.create).not.toHaveBeenCalled();
     });
 
     it('throws NotFoundException when requesterEmail does not match the ticket (IDOR guard)', async () => {

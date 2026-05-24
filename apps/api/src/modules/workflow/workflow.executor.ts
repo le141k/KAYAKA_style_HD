@@ -2,6 +2,7 @@ import { Injectable, Logger, Optional } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
+import { NotificationService } from '../tickets/notification.service';
 import type { Workflow, Ticket } from '@prisma/client';
 
 /** The shape of a domain event emitted by TicketsService */
@@ -38,6 +39,7 @@ export class WorkflowExecutor {
   constructor(
     private readonly prisma: PrismaService,
     @Optional() private readonly mail?: MailService,
+    @Optional() private readonly notifications?: NotificationService,
   ) {}
 
   @OnEvent('ticket.created')
@@ -109,6 +111,8 @@ export class WorkflowExecutor {
     if (!Array.isArray(actions)) return;
 
     const ticketUpdate: Partial<Record<string, unknown>> = {};
+    // Track a real owner assignment so we can notify + audit after the update.
+    let assignedOwnerId: number | null = null;
 
     for (const action of actions) {
       try {
@@ -120,10 +124,20 @@ export class WorkflowExecutor {
           case 'assign_group': // UI label; ticket has no group → treat as department
             if (num(action.departmentId)) ticketUpdate['departmentId'] = num(action.departmentId);
             break;
+          // `assign` is the macro-builder vocab; `assign_staff`/`change_owner` the
+          // workflow vocab — unify so an "assign" action actually assigns.
+          case 'assign':
           case 'change_owner':
           case 'assign_staff': {
             const owner = num(action.ownerStaffId);
-            ticketUpdate['ownerStaffId'] = owner && !Number.isNaN(owner) ? owner : null;
+            if (owner == null || Number.isNaN(owner)) {
+              ticketUpdate['ownerStaffId'] = null; // explicit unassign
+            } else if (await this.prisma.staff.findUnique({ where: { id: owner } })) {
+              ticketUpdate['ownerStaffId'] = owner;
+              assignedOwnerId = owner;
+            } else {
+              this.logger.warn(`Workflow ${workflow.id}: skipped assign — staff ${owner} not found`);
+            }
             break;
           }
           case 'change_status':
@@ -192,6 +206,29 @@ export class WorkflowExecutor {
 
     if (Object.keys(ticketUpdate).length > 0) {
       await this.prisma.ticket.update({ where: { id: ticket.id }, data: ticketUpdate });
+    }
+
+    // A workflow assignment must notify the assignee + leave an audit trail, just
+    // like a manual assign() (H8-1). The workflow has no staff actor → SYSTEM.
+    if (assignedOwnerId != null) {
+      await this.prisma.ticketAuditLog.create({
+        data: {
+          ticketId: ticket.id,
+          staffId: null,
+          actorType: 'SYSTEM',
+          action: 'ASSIGN',
+          field: 'ownerStaffId',
+          oldValue: ticket.ownerStaffId?.toString() ?? null,
+          newValue: assignedOwnerId.toString(),
+        },
+      });
+      if (this.notifications) {
+        await this.notifications
+          .notifyOnAssign(ticket.id, assignedOwnerId)
+          .catch((err: unknown) =>
+            this.logger.error(`Workflow ${workflow.id} assign notification failed: ${String(err)}`),
+          );
+      }
     }
   }
 }
