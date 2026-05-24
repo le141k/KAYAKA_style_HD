@@ -1,7 +1,10 @@
 # 23 Telecom Help Desk — API (NestJS) multi-stage image.
 # Build context = repo root (npm workspaces).
+#
+# Base image pinned to a specific minor version. Review and update periodically
+# (check https://hub.docker.com/_/node for newer 22.x-alpine releases).
 
-FROM node:22-alpine AS deps
+FROM node:22.13-alpine AS deps
 WORKDIR /app
 # all workspace manifests are needed for `npm install` to resolve the workspace graph
 COPY package.json package-lock.json* ./
@@ -10,7 +13,7 @@ COPY apps/web/package.json apps/web/package.json
 COPY packages/shared/package.json packages/shared/package.json
 RUN npm install
 
-FROM node:22-alpine AS build
+FROM node:22.13-alpine AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -18,7 +21,7 @@ RUN npx -w apps/api prisma generate \
   && npm run build --workspace=apps/api
 
 # Production-only dependencies — no vitest/eslint/tsc/testcontainers in the runtime image.
-FROM node:22-alpine AS prod-deps
+FROM node:22.13-alpine AS prod-deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
 COPY apps/api/package.json apps/api/package.json
@@ -26,7 +29,7 @@ COPY apps/web/package.json apps/web/package.json
 COPY packages/shared/package.json packages/shared/package.json
 RUN npm ci --omit=dev
 
-FROM node:22-alpine AS runner
+FROM node:22.13-alpine AS runner
 ENV NODE_ENV=production
 WORKDIR /app
 # Prod deps only (prisma CLI is now a prod dep so `migrate deploy` works at boot)…
