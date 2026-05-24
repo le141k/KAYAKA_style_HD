@@ -26,10 +26,10 @@ test.describe('Agent workflow', () => {
     await page.getByTestId('reply-submit').click();
     await expect(page.getByText(`E2E reply ${stamp}`)).toBeVisible({ timeout: 10_000 });
 
-    // Internal note via the UI (note tab).
+    // Internal note via the UI (note tab — now its own form/submit).
     await page.getByRole('tab', { name: /заметка/i }).click();
     await page.locator('#note-textarea').fill(`E2E note ${stamp}`);
-    await page.getByTestId('reply-submit').click();
+    await page.getByTestId('note-submit').click();
     await page.waitForTimeout(1000);
 
     const after = await (await page.request.get(`${API}/tickets/1`)).json();

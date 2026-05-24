@@ -45,7 +45,8 @@ test.describe('Staff login flow', () => {
     await expect(passwordInput).toHaveAttribute('type', 'password');
   });
 
-  test('forgotten password link is visible', async ({ page }) => {
-    await expect(page.getByRole('link', { name: /забыли пароль/i })).toBeVisible();
+  test('forgotten password control is visible', async ({ page }) => {
+    // Now a functional button that opens the reset-request panel (was a dead link).
+    await expect(page.getByRole('button', { name: /забыли пароль/i })).toBeVisible();
   });
 });
