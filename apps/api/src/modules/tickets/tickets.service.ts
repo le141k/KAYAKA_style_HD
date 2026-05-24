@@ -982,6 +982,13 @@ export class TicketsService {
     if (source.mergedIntoId !== null) {
       throw new BadRequestException(`Ticket ${source.mask} is already merged`);
     }
+    // Guard against merging into a ticket that is itself merged away — its posts
+    // would be re-parented onto a ghost ticket excluded from all lists (data loss).
+    if (target.mergedIntoId !== null) {
+      throw new BadRequestException(
+        `Ticket ${target.mask} is already merged into another ticket; merge into the active target instead`,
+      );
+    }
 
     await this.prisma.$transaction(async (tx) => {
       const now = new Date();

@@ -26,6 +26,9 @@ export interface BreachEntry {
 
 type WorkHours = Record<string, Array<[string, string]>>;
 
+/** Max breached tickets processed per periodic scan — bounds memory/CPU. */
+const SLA_BREACH_SCAN_CAP = 1000;
+
 const DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const;
 
 /**
@@ -175,6 +178,9 @@ export class SlaService {
       where: {
         isResolved: false,
         mergedIntoId: null,
+        // Already-escalated tickets must be excluded, otherwise every 60s scan
+        // re-fires their escalation rule actions (notify/note/assign) indefinitely.
+        isEscalated: false,
         OR: [
           // First-response breach: dueAt passed and no firstResponseAt recorded
           { dueAt: { lt: now }, firstResponseAt: null },
@@ -182,6 +188,10 @@ export class SlaService {
           { resolutionDueAt: { lt: now } },
         ],
       },
+      // Bound the working set so a large breach backlog can't OOM the worker;
+      // the remainder is drained on subsequent scans as tickets get escalated.
+      orderBy: { id: 'asc' },
+      take: SLA_BREACH_SCAN_CAP,
     });
 
     const breaches: BreachEntry[] = [];

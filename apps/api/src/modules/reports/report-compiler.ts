@@ -21,6 +21,23 @@ import { resolveDate, bucketDate } from './reports.utils';
 
 export type ReportRow = Record<string, unknown>;
 
+/**
+ * Hard cap on rows pulled into memory for the in-JS "slow path" aggregation.
+ * Prevents an unbounded `findMany` from OOM-ing the API process on large
+ * datasets; if a report matches more than this, the caller must narrow the
+ * filter / date range rather than silently aggregating a partial set.
+ */
+const SLOW_PATH_SCAN_CAP = 50_000;
+
+/** Throws if a slow-path scan would exceed the cap (records fetched with cap+1). */
+function assertWithinScanCap(records: unknown[]): void {
+  if (records.length > SLOW_PATH_SCAN_CAP) {
+    throw new BadRequestException(
+      `Report matches more than ${SLOW_PATH_SCAN_CAP.toLocaleString()} rows; narrow the filters or date range.`,
+    );
+  }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -204,7 +221,9 @@ export class ReportCompiler {
       where,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       select: selectFields as any,
+      take: SLOW_PATH_SCAN_CAP + 1,
     });
+    assertWithinScanCap(records);
 
     return this.groupAndAggregate(records as Record<string, unknown>[], def);
   }
@@ -250,7 +269,9 @@ export class ReportCompiler {
       where,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       select: selectFields as any,
+      take: SLOW_PATH_SCAN_CAP + 1,
     });
+    assertWithinScanCap(records);
     return this.groupAndAggregate(records as Record<string, unknown>[], def);
   }
 
@@ -294,7 +315,9 @@ export class ReportCompiler {
       where,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       select: selectFields as any,
+      take: SLOW_PATH_SCAN_CAP + 1,
     });
+    assertWithinScanCap(records);
     return this.groupAndAggregate(records as Record<string, unknown>[], def);
   }
 

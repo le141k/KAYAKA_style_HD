@@ -1,6 +1,7 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { hashPassword } from '../../auth/password.util';
+import type { AuthStaff } from '../../auth/auth.decorators';
 import type {
   CreateStaffDto,
   UpdateStaffDto,
@@ -104,14 +105,26 @@ export class StaffService {
     return staff;
   }
 
-  async create(dto: CreateStaffDto): Promise<SafeStaff> {
+  /**
+   * Guard against privilege escalation: only an admin actor may place a staff
+   * member into a group flagged `isAdmin`. Also validates the group exists
+   * (returns 404 instead of a raw FK 500). Pass `actor` from the request.
+   */
+  private async assertCanAssignGroup(groupId: number, actor?: AuthStaff): Promise<void> {
+    const group = await this.getGroup(groupId); // validate exists (404 if not)
+    if (group.isAdmin && actor && !actor.isAdmin) {
+      throw new ForbiddenException('Only an administrator may assign a staff member to an admin group');
+    }
+  }
+
+  async create(dto: CreateStaffDto, actor?: AuthStaff): Promise<SafeStaff> {
     // Check uniqueness
     const exists = await this.prisma.staff.findFirst({
       where: { OR: [{ email: dto.email }, { username: dto.username }] },
     });
     if (exists) throw new ConflictException('Email or username already in use');
 
-    await this.getGroup(dto.staffGroupId); // validate group exists
+    await this.assertCanAssignGroup(dto.staffGroupId, actor); // validate + escalation guard
 
     const { password, departmentIds, ...rest } = dto;
     const passwordHash = await hashPassword(password);
@@ -130,8 +143,14 @@ export class StaffService {
     });
   }
 
-  async update(id: number, dto: UpdateStaffDto): Promise<SafeStaff> {
+  async update(id: number, dto: UpdateStaffDto, actor?: AuthStaff): Promise<SafeStaff> {
     await this.get(id); // validate exists
+
+    // Validate the target group exists and block non-admins from promoting a
+    // staff member into an admin group (privilege-escalation guard).
+    if (dto.staffGroupId !== undefined) {
+      await this.assertCanAssignGroup(dto.staffGroupId, actor);
+    }
 
     const { password, departmentIds, ...rest } = dto;
     const data: Record<string, unknown> = { ...rest };
