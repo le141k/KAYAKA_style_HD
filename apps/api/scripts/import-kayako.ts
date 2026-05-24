@@ -237,6 +237,103 @@ async function importEmailConfig(
   console.log(`  → imported ${qCount} email queues (disabled, no password), ${rCount} parser rules`);
 }
 
+/**
+ * Build kayakoId→ourId maps for the reference tables (status/priority/type/dept)
+ * by matching TITLE to our seeded rows. Macro action FKs are resolved through
+ * these (we look up reference data by title, never by Kayako id).
+ */
+async function buildReferenceMaps(sql: string, ids: IdMap): Promise<void> {
+  const refs: Array<{
+    table: string;
+    idCol: string;
+    titleCol: string;
+    model: 'ticketStatus' | 'ticketPriority' | 'ticketType' | 'department';
+  }> = [
+    { table: 'swticketstatus', idCol: 'ticketstatusid', titleCol: 'title', model: 'ticketStatus' },
+    { table: 'swticketpriorities', idCol: 'priorityid', titleCol: 'title', model: 'ticketPriority' },
+    { table: 'swtickettypes', idCol: 'tickettypeid', titleCol: 'title', model: 'ticketType' },
+    { table: 'swdepartments', idCol: 'departmentid', titleCol: 'title', model: 'department' },
+  ];
+  for (const r of refs) {
+    const parsed = parseTable(sql, r.table);
+    for (const row of parsed.rows) {
+      const kid = Number(row[r.idCol]);
+      const title = row[r.titleCol];
+      if (!title) continue;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ours = await (prisma as any)[r.model].findFirst({ where: { title }, select: { id: true } });
+      if (ours) ids.set(r.table, kid, ours.id);
+    }
+  }
+}
+
+/** Import swmacrocategories→MacroCategory (hierarchy) then swmacroreplies→Macro. */
+async function importMacros(
+  catsT: ParsedTable,
+  repliesT: ParsedTable,
+  replyDataT: ParsedTable,
+  ids: IdMap,
+): Promise<void> {
+  // Categories first (parents before children — sort by id ascending).
+  const cats = [...catsT.rows].sort((a, b) => Number(a['macrocategoryid']) - Number(b['macrocategoryid']));
+  let catCount = 0;
+  for (const row of cats) {
+    const kid = Number(row['macrocategoryid']);
+    const title = row['title'] ?? `Category ${kid}`;
+    const parentKid = Number(row['parentcategoryid']) || 0;
+    const parentId = parentKid ? (ids.get('swmacrocategories', parentKid) ?? null) : null;
+    const existing = await prisma.macroCategory.findFirst({ where: { title } });
+    const cat = existing
+      ? await prisma.macroCategory.update({ where: { id: existing.id }, data: { parentId } })
+      : await prisma.macroCategory.create({ data: { title, parentId } });
+    ids.set('swmacrocategories', kid, cat.id);
+    catCount++;
+  }
+
+  // Reply bodies.
+  const bodyByReply = new Map<number, string>();
+  for (const d of replyDataT.rows) bodyByReply.set(Number(d['macroreplyid']), d['contents'] ?? '');
+
+  // categorytype: 1=shared/public, 2=private (owner-only).
+  const sharedByCat = new Map<number, boolean>();
+  for (const row of catsT.rows) sharedByCat.set(Number(row['macrocategoryid']), row['categorytype'] !== '2');
+
+  let mCount = 0;
+  for (const row of repliesT.rows) {
+    const kid = Number(row['macroreplyid']);
+    const catKid = Number(row['macrocategoryid']);
+    // Build actions from the inline FK columns (≠ -1), mapped via the ref maps.
+    const actions: Array<{ type: string; value: string }> = [];
+    const statusId = ids.get('swticketstatus', Number(row['ticketstatusid']));
+    if (Number(row['ticketstatusid']) !== -1 && statusId)
+      actions.push({ type: 'set_status', value: String(statusId) });
+    const priorityId = ids.get('swticketpriorities', Number(row['priorityid']));
+    if (Number(row['priorityid']) !== -1 && priorityId)
+      actions.push({ type: 'set_priority', value: String(priorityId) });
+    const deptId = ids.get('swdepartments', Number(row['departmentid']));
+    if (Number(row['departmentid']) !== -1 && deptId)
+      actions.push({ type: 'change_department', value: String(deptId) });
+
+    const data = {
+      categoryId: ids.get('swmacrocategories', catKid) ?? null,
+      title: row['subject'] || `Macro ${kid}`,
+      subject: row['subject'] ?? '',
+      replyText: bodyByReply.get(kid) ?? '',
+      isHtml: false,
+      isShared: sharedByCat.get(catKid) ?? true,
+      actions,
+    };
+    await prisma.macro.upsert({
+      where: { kayakoId: kid },
+      create: { kayakoId: kid, ...data },
+      update: data,
+    });
+    mCount++;
+  }
+
+  console.log(`  → imported ${catCount} macro categories, ${mCount} macros`);
+}
+
 const DEPENDENCY_ORDER = [
   'swuserorganizations', // → Organization      (M0/M1)
   'swusers', // → User                          (M1)
@@ -285,6 +382,8 @@ async function main() {
   const userNoteData = parseTable(sql, 'swusernotedata');
   const ruleCriteria = parseTable(sql, 'swparserrulecriteria');
   const ruleActions = parseTable(sql, 'swparserruleactions');
+  const macroCats = parseTable(sql, 'swmacrocategories');
+  const macroReplyData = parseTable(sql, 'swmacroreplydata');
 
   // Import in dependency order.
   if (tables['swuserorganizations']?.rows.length) {
@@ -308,7 +407,10 @@ async function main() {
       ruleActions,
     );
   }
-  // macros → M4.
+  if (tables['swmacroreplies']?.rows.length || macroCats.rows.length) {
+    await buildReferenceMaps(sql, ids);
+    await importMacros(macroCats, tables['swmacroreplies'] ?? { columns: [], rows: [] }, macroReplyData, ids);
+  }
 
   if (sampled) {
     console.log(

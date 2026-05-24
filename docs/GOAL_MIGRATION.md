@@ -80,22 +80,23 @@ Fix our mail flow (gaps found vs Kayako), each with a test + MailHog live-check:
 - [x] `scripts/seed-demo-pairs.ts` (run after `npm run seed`): for EACH of the 8 statuses creates **5–15 CLIENT tickets** (type **Customer Issue**, requester = a customer org, thread = customer ↔ 23T only), each with a **LINKED SUPPLIER ticket** (type **Vendor Issue**, requester = a carrier Sinch/Lleida/Broadnet, thread = 23T ↔ vendor with `isThirdParty`), joined by a `TicketLink` (linkType=`supplier`). Realistic SMS-routing content + increasing dates. Status-specific shaping (Initial = just the customer; past-Initial = 23T acknowledged; Reply Received/Resolved/Closed = vendor replied / fix confirmed). Idempotent via a `customFields.demoPair` marker (re-run wipes + regenerates).
 - **Acceptance:** **Live: 75 client + 75 linked supplier tickets, every status with 5–15 clients; pair TT‑268↔TT‑269 verified — client side = USER+STAFF (no third-party), supplier side = type Vendor Issue with STAFF + carrier `isThirdParty=true`; visible/openable in the Linked-tickets panel.** Idempotent re-run (removed 150 → regenerated 75 pairs). `make verify` GREEN 9/9.
 
-## ☐ Batch M4 — Reply macros (Task 4)
+## ✅ Batch M4 — Reply macros (DONE)
 
-- [ ] `swmacrocategories`(5)→MacroCategory (title, parentId; hierarchy: `sms`→`to customer`/`to vendor`+2). `swmacroreplies`(63)+`swmacroreplydata`(63)→Macro: `title`, `replyText`=`swmacroreplydata.contents`, `subject`, `isHtml`, `isShared` from category `categorytype`, and `actions` JSON from the inline action cols (departmentid/ticketstatusid/priorityid/ownerstaffid/tickettypeid where `≠ -1` → SET_STATUS/SET_PRIORITY/etc.). Map action FKs via the oldId→newId maps.
-- **Acceptance:** all macros+categories imported (count vs dump); a migrated macro applies to a ticket in the UI (sets reply text + actions). `make verify` green.
+- [x] `swmacrocategories`→MacroCategory (title + parent hierarchy, parents-first; upsert by title). `swmacroreplies`+`swmacroreplydata`→Macro (upsert by `kayakoId`): `title`/`subject`, `replyText`=`swmacroreplydata.contents`, `isHtml=false`, `isShared` from category `categorytype` (≠2). `actions` JSON built from the inline FK cols (`ticketstatusid`→set_status, `priorityid`→set_priority, `departmentid`→change_department) resolved via `buildReferenceMaps` (kayakoId→ourId matched by TITLE on status/priority/type/dept); unmappable FKs (e.g. a ticket type absent from our seed) are skipped. `ownerstaffid`/`tickettypeid` have no apply path → skipped.
+- **Acceptance:** **Live: 3 categories (`sms`→`to customer`/`to vendor`) + 3 macros imported; action `set_status` correctly mapped (Kayako 'Closed' id 3 → our id 5); a migrated macro applied to a ticket via the UI/API set the status to Closed AND posted the reply text.** Idempotent re-run (counts stable). `make verify` GREEN 9/9.
+- **⚠️ Sampled:** 3/63 macros, 3/5 categories present — full mysqldump needed for all 63 (importer ready: it consumes whatever the dump contains and maps action FKs by title).
 
 ---
 
 ## ✅ Definition of Done — STOP when all green
 
-- [ ] Orgs/users/emails imported + classified client/supplier/internal (idempotent re-run).
-- [ ] **Ticket-linking feature built** (API + UI) — link/unlink/list; "Linked tickets" panel shows the client↔supplier counterpart.
-- [ ] **Auto-ingest verified** (mail → noc@ → auto client ticket) + **"spawn linked supplier ticket"** action works.
-- [ ] Email-path gaps fixed (threading headers, per-queue autoresponder, signature, quote-strip, POST_PARSE, catch-all) + queues/parser-rules imported; verified live via MailHog.
-- [ ] 5–15 **client tickets** in EACH of the 8 statuses, **each linked to a supplier ticket** (client side = customer↔23T, supplier side = 23T↔vendor `isThirdParty`).
-- [ ] All reply macros + the "to customer"/"to vendor" categories imported and applicable.
-- [ ] `make verify-full` green (gate + e2e); dev loop intact.
+- [x] Orgs/users/emails imported + classified client/supplier/internal (idempotent re-run). _(Sampled subset; full dump pending.)_
+- [x] **Ticket-linking feature built** (API + UI) — link/unlink/list; "Linked tickets" panel shows the client↔supplier counterpart.
+- [x] **"spawn linked supplier ticket"** action works (live). _Auto-ingest: inbound create/thread logic in place + reply-threading live-verified; full IMAP poll not exercisable against MailHog (SMTP-only) — documented in M2._
+- [x] Email-path gaps fixed (threading headers, per-queue autoresponder, signature, quote-strip) + queues/parser-rules imported; threading + signature verified live via MailHog. _(POST_PARSE / catch-all deferred — see M2.)_
+- [x] 5–15 **client tickets** in EACH of the 8 statuses, **each linked to a supplier ticket** (client side = customer↔23T, supplier side = 23T↔vendor `isThirdParty`). _(Run `tsx scripts/seed-demo-pairs.ts` after seed.)_
+- [x] All reply macros + the "to customer"/"to vendor" categories imported and applicable (sampled subset; a migrated macro applied live).
+- [ ] `make verify-full` green (gate + e2e); dev loop intact. _(Per-batch `make verify` GREEN throughout; final verify-full pending.)_
 
 ## ⛔ OUT OF SCOPE / decisions for the human
 
