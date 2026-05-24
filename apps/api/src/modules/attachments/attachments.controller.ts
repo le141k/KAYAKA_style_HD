@@ -41,7 +41,8 @@ const ALLOWED_MIMES = new Set([
   'application/msword',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/zip',
-  'application/octet-stream',
+  // NOTE: 'application/octet-stream' deliberately removed — it accepted any
+  // binary (executables, scripts) by simply declaring that generic type.
 ]);
 
 function buildMulterOpts(maxSizeMb: number) {

@@ -14,7 +14,16 @@ import type { Response } from 'express';
 import { Throttle } from '@nestjs/throttler';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
-import { LoginSchema, RefreshSchema, type LoginDto, type RefreshDto } from './dto';
+import {
+  LoginSchema,
+  RefreshSchema,
+  ForgotPasswordSchema,
+  ResetPasswordSchema,
+  type LoginDto,
+  type RefreshDto,
+  type ForgotPasswordDto,
+  type ResetPasswordDto,
+} from './dto';
 import { ZodValidationPipe } from '../common/zod-validation.pipe';
 import { Public, CurrentStaff, RequirePermissions } from './auth.decorators';
 import type { AuthStaff } from './auth.decorators';
@@ -124,5 +133,35 @@ export class AuthController {
   @ApiOperation({ summary: 'Return current authenticated staff principal' })
   me(@CurrentStaff() staff: AuthStaff): AuthStaff {
     return staff;
+  }
+
+  // ─────────────────── Password reset ───────────────────
+
+  /**
+   * Initiate a password reset.  Always returns 200 to prevent email enumeration.
+   * Rate-limited to 3 requests per 60 s per IP to prevent abuse.
+   */
+  @Public()
+  @Post('forgot-password')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 3, ttl: 60000 } })
+  @ApiOperation({ summary: 'Request a password-reset link (always 200, no enumeration)' })
+  async forgotPassword(@Body(new ZodValidationPipe(ForgotPasswordSchema)) dto: ForgotPasswordDto) {
+    await this.authService.forgotPassword(dto.email);
+    return { message: 'If that email is registered, a reset link has been sent.' };
+  }
+
+  /**
+   * Consume a password-reset token and set a new password.
+   * Returns 200 on success; 400 if the token is invalid, expired, or already used.
+   */
+  @Public()
+  @Post('reset-password')
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Set a new password using a reset token' })
+  async resetPassword(@Body(new ZodValidationPipe(ResetPasswordSchema)) dto: ResetPasswordDto) {
+    await this.authService.resetPassword(dto.token, dto.password);
+    return { message: 'Password has been reset successfully.' };
   }
 }

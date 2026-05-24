@@ -155,6 +155,8 @@ describe('TicketsService (extra coverage)', () => {
     } as unknown as MailService;
     const adminMock = {
       validateCustomFields: vi.fn().mockResolvedValue(undefined),
+      encryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
+      decryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
     } as unknown as AdminService;
     service = new TicketsService(
       prisma as unknown as PrismaService,

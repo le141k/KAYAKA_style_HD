@@ -3,6 +3,8 @@ import {
   Controller,
   Delete,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   ParseIntPipe,
   Patch,
@@ -12,7 +14,7 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { StaffService } from './staff.service';
-import { RequirePermissions } from '../../auth/auth.decorators';
+import { CurrentStaff, RequirePermissions, type AuthStaff } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
@@ -67,6 +69,14 @@ export class StaffController {
     return this.staffService.updateGroup(id, dto);
   }
 
+  @Delete('groups/:id')
+  @RequirePermissions(PERMISSIONS.STAFF_MANAGE)
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Delete a staff group (U9 — 409 if members still assigned)' })
+  deleteGroup(@Param('id', ParseIntPipe) id: number) {
+    return this.staffService.deleteGroup(id);
+  }
+
   // ─────────────────── Members ───────────────────
 
   @Get()
@@ -96,8 +106,8 @@ export class StaffController {
   @RequirePermissions(PERMISSIONS.STAFF_MANAGE)
   @UsePipes(new ZodValidationPipe(CreateStaffSchema))
   @ApiOperation({ summary: 'Create a staff member' })
-  create(@Body() dto: CreateStaffDto) {
-    return this.staffService.create(dto);
+  create(@Body() dto: CreateStaffDto, @CurrentStaff() actor: AuthStaff) {
+    return this.staffService.create(dto, actor);
   }
 
   @Patch(':id')
@@ -106,8 +116,9 @@ export class StaffController {
   update(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(UpdateStaffSchema)) dto: UpdateStaffDto,
+    @CurrentStaff() actor: AuthStaff,
   ) {
-    return this.staffService.update(id, dto);
+    return this.staffService.update(id, dto, actor);
   }
 
   @Delete(':id')

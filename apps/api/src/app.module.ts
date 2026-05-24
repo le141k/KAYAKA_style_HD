@@ -1,12 +1,15 @@
 import { Module } from '@nestjs/common';
 import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
 import { LoggerModule } from 'nestjs-pino';
 import { BullModule } from '@nestjs/bullmq';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { PrismaModule } from './prisma/prisma.module';
 import { loadConfig, APP_CONFIG } from './config/configuration';
 import { AuthModule } from './auth/auth.module';
+import { MAIL_SERVICE_TOKEN } from './auth/auth.service';
+import { MailService } from './modules/mail/mail.service';
 import { StaffModule } from './modules/staff/staff.module';
 import { UsersModule } from './modules/users/users.module';
 import { OrganizationsModule } from './modules/organizations/organizations.module';
@@ -46,7 +49,12 @@ const redisUrl = new URL(config.REDIS_URL);
   imports: [
     // Global rate-limiting (300 req / 60 s per IP — headroom for a data-heavy SPA
     // that fires several React Query calls per page); login has a stricter override.
-    ThrottlerModule.forRoot([{ ttl: 60000, limit: 300 }]),
+    // Backed by Redis so the limit is shared across API instances — an in-memory
+    // store would let an attacker bypass the login limit behind a load balancer.
+    ThrottlerModule.forRoot({
+      throttlers: [{ ttl: 60000, limit: 300 }],
+      storage: new ThrottlerStorageRedisService(config.REDIS_URL),
+    }),
 
     // Structured JSON logging via Pino
     LoggerModule.forRoot({
@@ -59,9 +67,15 @@ const redisUrl = new URL(config.REDIS_URL);
       },
     }),
 
-    // Background queues (BullMQ) + in-process domain events
+    // Background queues (BullMQ) + in-process domain events. Carry the password
+    // from REDIS_URL through — prod requires Redis auth (see docker-compose.prod.yml).
     BullModule.forRoot({
-      connection: { host: redisUrl.hostname, port: Number(redisUrl.port) || 6379 },
+      connection: {
+        host: redisUrl.hostname,
+        port: Number(redisUrl.port) || 6379,
+        ...(redisUrl.username ? { username: decodeURIComponent(redisUrl.username) } : {}),
+        ...(redisUrl.password ? { password: decodeURIComponent(redisUrl.password) } : {}),
+      },
     }),
     EventEmitterModule.forRoot(),
 
@@ -95,6 +109,13 @@ const redisUrl = new URL(config.REDIS_URL);
     {
       provide: APP_CONFIG,
       useValue: config,
+    },
+    // Wire MailService into AuthService for forgot-password email dispatch.
+    // AuthModule is @Global so it resolves this token; MailModule exports MailService
+    // and is imported here, so the factory has access to the already-registered provider.
+    {
+      provide: MAIL_SERVICE_TOKEN,
+      useExisting: MailService,
     },
     // Map Prisma known-request errors (P2025/P2003/P2002) to 404/400/409 instead of 500
     {

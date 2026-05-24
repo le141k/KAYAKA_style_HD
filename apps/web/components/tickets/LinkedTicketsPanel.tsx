@@ -22,6 +22,8 @@ export function LinkedTicketsPanel({ ticketId }: { ticketId: number }) {
   const [linkType, setLinkType] = useState<'supplier' | 'client' | 'related'>('supplier');
   const [spawnOpen, setSpawnOpen] = useState(false);
   const [supEmail, setSupEmail] = useState('');
+  const [supName, setSupName] = useState('');
+  const [supSubject, setSupSubject] = useState('');
   const [supMsg, setSupMsg] = useState('');
 
   const typeLabel = (lt: string) => (lt === 'supplier' ? l.supplier : lt === 'client' ? l.client : l.related);
@@ -41,10 +43,17 @@ export function LinkedTicketsPanel({ ticketId }: { ticketId: number }) {
   function handleSpawn() {
     if (!supEmail.trim() || !supMsg.trim()) return;
     spawnSupplier.mutate(
-      { supplierEmail: supEmail.trim(), contents: supMsg.trim() },
+      {
+        supplierEmail: supEmail.trim(),
+        supplierName: supName.trim() || undefined,
+        subject: supSubject.trim() || undefined,
+        contents: supMsg.trim(),
+      },
       {
         onSuccess: () => {
           setSupEmail('');
+          setSupName('');
+          setSupSubject('');
           setSupMsg('');
           setSpawnOpen(false);
         },
@@ -133,6 +142,18 @@ export function LinkedTicketsPanel({ ticketId }: { ticketId: number }) {
             onChange={(e) => setSupEmail(e.target.value)}
             placeholder={l.supplierEmail}
             type="email"
+            className="h-8"
+          />
+          <Input
+            value={supName}
+            onChange={(e) => setSupName(e.target.value)}
+            placeholder={l.supplierName}
+            className="h-8"
+          />
+          <Input
+            value={supSubject}
+            onChange={(e) => setSupSubject(e.target.value)}
+            placeholder={l.subject}
             className="h-8"
           />
           <textarea

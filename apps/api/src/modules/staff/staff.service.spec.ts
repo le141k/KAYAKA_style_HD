@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException, ConflictException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { StaffService } from './staff.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 
@@ -16,12 +16,13 @@ function makePrismaMock() {
       findUnique: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
+      delete: vi.fn(),
     },
     staff: {
       findMany: vi.fn(),
       findUnique: vi.fn(),
       findFirst: vi.fn(),
-      count: vi.fn(),
+      count: vi.fn().mockResolvedValue(0),
       create: vi.fn(),
       update: vi.fn(),
     },
@@ -120,6 +121,32 @@ describe('StaffService', () => {
     it('throws NotFoundException when group not found', async () => {
       (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.updateGroup(99, { title: 'X' } as any)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  // ─── deleteGroup ──────────────────────────────────────────────────────────────
+
+  describe('deleteGroup', () => {
+    it('deletes group when no members are assigned', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
+      (prisma.staff.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+      (prisma.staffGroup.delete as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
+
+      await service.deleteGroup(1);
+      expect(prisma.staffGroup.delete).toHaveBeenCalledWith({ where: { id: 1 } });
+    });
+
+    it('throws ConflictException when staff still assigned', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
+      (prisma.staff.count as ReturnType<typeof vi.fn>).mockResolvedValue(2);
+
+      await expect(service.deleteGroup(1)).rejects.toThrow(ConflictException);
+    });
+
+    it('throws NotFoundException when group not found', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+
+      await expect(service.deleteGroup(99)).rejects.toThrow(NotFoundException);
     });
   });
 

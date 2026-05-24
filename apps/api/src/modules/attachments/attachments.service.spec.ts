@@ -12,6 +12,7 @@ function makeAttachment(overrides: Partial<Attachment> = {}): Attachment {
     id: 1,
     ticketId: null,
     postId: null,
+    noteId: null,
     fileName: 'test.pdf',
     mimeType: 'application/pdf',
     size: 1024,
@@ -74,7 +75,7 @@ describe('AttachmentsService', () => {
           originalname: 'test.pdf',
           mimetype: 'application/pdf',
           size: 1024,
-          buffer: Buffer.from('pdf content'),
+          buffer: Buffer.from('%PDF-1.4 content'),
         },
       ]);
 
@@ -112,13 +113,28 @@ describe('AttachmentsService', () => {
       (prisma.attachment.create as ReturnType<typeof vi.fn>).mockResolvedValue(makeAttachment());
 
       await service.uploadFiles(
-        [{ originalname: 'a.pdf', mimetype: 'application/pdf', size: 10, buffer: Buffer.from('x') }],
+        [{ originalname: 'a.pdf', mimetype: 'application/pdf', size: 10, buffer: Buffer.from('%PDF-1.7') }],
         { claimToken: 'tok-xyz' },
       );
 
       expect(prisma.attachment.create).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ claimToken: 'tok-xyz' }) }),
       );
+    });
+
+    it('rejects a file whose bytes do not match the declared MIME (spoof guard)', async () => {
+      await expect(
+        service.uploadFiles([
+          {
+            originalname: 'evil.pdf',
+            mimetype: 'application/pdf',
+            size: 20,
+            // Declares PDF but the bytes are an ELF executable header.
+            buffer: Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]),
+          },
+        ]),
+      ).rejects.toThrow(/does not match its declared type/);
+      expect(prisma.attachment.create).not.toHaveBeenCalled();
     });
   });
 

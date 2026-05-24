@@ -1,8 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import Link from 'next/link';
-import { Search, BookOpen, Eye } from 'lucide-react';
+import { Search, BookOpen, Eye, X } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useKBCategories, useKBArticles } from '@/lib/hooks/use-kb';
@@ -10,8 +10,22 @@ import { QueryError } from '@/components/QueryError';
 import { formatDate } from '@/lib/utils';
 
 export function KBContent() {
+  const [inputValue, setInputValue] = useState('');
+  // Debounced value sent to the API — updated ~300 ms after the user stops typing.
   const [query, setQuery] = useState('');
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const [selectedCategory, setSelectedCategory] = useState<number | undefined>();
+
+  const handleSearchChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value;
+    setInputValue(value);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      setQuery(value);
+    }, 300);
+  }, []);
+
   const { data: categories, isLoading: catLoading } = useKBCategories();
   const {
     data: articles,
@@ -19,6 +33,8 @@ export function KBContent() {
     isError: artError,
     refetch: refetchArticles,
   } = useKBArticles(selectedCategory, query || undefined);
+
+  const activeCategory = categories?.find((c) => c.id === selectedCategory);
 
   return (
     <div className="space-y-8">
@@ -31,14 +47,50 @@ export function KBContent() {
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             placeholder="Поиск по статьям..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            value={inputValue}
+            onChange={handleSearchChange}
             className="pl-9 bg-background text-foreground"
             aria-label="Поиск по базе знаний"
             data-testid="kb-search-input"
           />
         </div>
       </div>
+
+      {/* Active filter indicator */}
+      {(query || selectedCategory) && (
+        <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+          <span>Фильтры:</span>
+          {query && (
+            <span className="flex items-center gap-1 rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-medium text-primary">
+              Поиск: «{query}»
+              <button
+                type="button"
+                onClick={() => {
+                  setInputValue('');
+                  setQuery('');
+                }}
+                className="ml-0.5 hover:text-primary/70"
+                aria-label="Очистить поиск"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          )}
+          {activeCategory && (
+            <span className="flex items-center gap-1 rounded-full bg-muted px-2.5 py-0.5 text-xs font-medium">
+              Раздел: {activeCategory.name}
+              <button
+                type="button"
+                onClick={() => setSelectedCategory(undefined)}
+                className="ml-0.5 hover:text-foreground/70"
+                aria-label="Очистить фильтр раздела"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Categories */}
       {!query && (
@@ -67,7 +119,13 @@ export function KBContent() {
 
       {/* Articles */}
       <div>
-        <h2 className="mb-4 text-lg font-semibold">{query ? `Результаты поиска: «${query}»` : 'Статьи'}</h2>
+        <h2 className="mb-4 text-lg font-semibold">
+          {query
+            ? `Результаты поиска: «${query}»`
+            : activeCategory
+              ? `Раздел: ${activeCategory.name}`
+              : 'Статьи'}
+        </h2>
         {artError ? (
           <QueryError message="Не удалось загрузить статьи." onRetry={() => void refetchArticles()} />
         ) : artLoading ? (

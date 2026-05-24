@@ -27,10 +27,13 @@ import {
   useCreateEscalationRule,
   useUpdateEscalationRule,
   useDeleteEscalationRule,
+  useAdminStaff,
+  useAdminPriorities,
   type AdminSlaPlan,
   type AdminSlaSchedule,
   type AdminSlaHoliday,
   type AdminEscalationRule,
+  type EscalationAction,
 } from '@/lib/hooks/use-admin';
 
 function fmtSeconds(s: number): string {
@@ -39,6 +42,291 @@ function fmtSeconds(s: number): string {
   if (m < 60) return `${m} мин`;
   const h = Math.round(m / 60);
   return `${h} ч`;
+}
+
+// ─── Days of week ─────────────────────────────────────────────────────────────
+
+const DAYS = [
+  { key: 'monday', label: 'Пн' },
+  { key: 'tuesday', label: 'Вт' },
+  { key: 'wednesday', label: 'Ср' },
+  { key: 'thursday', label: 'Чт' },
+  { key: 'friday', label: 'Пт' },
+  { key: 'saturday', label: 'Сб' },
+  { key: 'sunday', label: 'Вс' },
+];
+
+type DayHours = { enabled: boolean; intervals: { start: string; end: string }[] };
+type WorkHoursState = Record<string, DayHours>;
+
+function defaultWorkHours(): WorkHoursState {
+  return Object.fromEntries(
+    DAYS.map((d) => [
+      d.key,
+      d.key === 'saturday' || d.key === 'sunday'
+        ? { enabled: false, intervals: [{ start: '09:00', end: '18:00' }] }
+        : { enabled: true, intervals: [{ start: '09:00', end: '18:00' }] },
+    ]),
+  );
+}
+
+function apiToWorkHours(apiVal: Record<string, string[][]>): WorkHoursState {
+  return Object.fromEntries(
+    DAYS.map((d) => {
+      const intervals = apiVal[d.key] ?? [];
+      return [
+        d.key,
+        {
+          enabled: intervals.length > 0,
+          intervals:
+            intervals.length > 0
+              ? intervals.map(([start, end]) => ({ start: start ?? '09:00', end: end ?? '18:00' }))
+              : [{ start: '09:00', end: '18:00' }],
+        },
+      ];
+    }),
+  );
+}
+
+function workHoursToApi(wh: WorkHoursState): Record<string, string[][]> {
+  return Object.fromEntries(
+    DAYS.map((d) => {
+      const day: DayHours = wh[d.key] ?? { enabled: false, intervals: [] };
+      return [d.key, day.enabled ? day.intervals.map((i) => [i.start, i.end]) : []];
+    }),
+  );
+}
+
+// ─── Work Hours Editor ────────────────────────────────────────────────────────
+
+function WorkHoursEditor({
+  value,
+  onChange,
+}: {
+  value: WorkHoursState;
+  onChange: (v: WorkHoursState) => void;
+}) {
+  function toggleDay(key: string) {
+    const cur: DayHours = value[key] ?? { enabled: false, intervals: [{ start: '09:00', end: '18:00' }] };
+    onChange({ ...value, [key]: { ...cur, enabled: !cur.enabled } });
+  }
+
+  function addInterval(key: string) {
+    const day: DayHours = value[key] ?? { enabled: true, intervals: [] };
+    const updated: DayHours = { ...day, intervals: [...day.intervals, { start: '09:00', end: '18:00' }] };
+    onChange({ ...value, [key]: updated });
+  }
+
+  function removeInterval(key: string, idx: number) {
+    const day: DayHours = value[key] ?? { enabled: true, intervals: [] };
+    const updated: DayHours = { ...day, intervals: day.intervals.filter((_, i) => i !== idx) };
+    onChange({ ...value, [key]: updated });
+  }
+
+  function updateInterval(key: string, idx: number, field: 'start' | 'end', val: string) {
+    const day: DayHours = value[key] ?? { enabled: true, intervals: [] };
+    const intervals = day.intervals.map((iv, i) => (i === idx ? { ...iv, [field]: val } : iv));
+    const updated: DayHours = { ...day, intervals };
+    onChange({ ...value, [key]: updated });
+  }
+
+  return (
+    <div className="space-y-2 rounded-md border border-border p-3">
+      <p className="text-xs font-medium text-muted-foreground">Рабочие часы (по дням)</p>
+      {DAYS.map((d) => {
+        const day: DayHours = value[d.key] ?? {
+          enabled: false,
+          intervals: [{ start: '09:00', end: '18:00' }],
+        };
+        return (
+          <div key={d.key} className="space-y-1">
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id={`wh-${d.key}`}
+                checked={day.enabled}
+                onChange={() => toggleDay(d.key)}
+              />
+              <label htmlFor={`wh-${d.key}`} className="w-8 text-sm font-medium">
+                {d.label}
+              </label>
+              {day.enabled && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-2 text-xs"
+                  onClick={() => addInterval(d.key)}
+                >
+                  + интервал
+                </Button>
+              )}
+            </div>
+            {day.enabled &&
+              day.intervals.map((iv, idx) => (
+                <div key={idx} className="ml-10 flex items-center gap-1">
+                  <Input
+                    type="time"
+                    value={iv.start}
+                    onChange={(e) => updateInterval(d.key, idx, 'start', e.target.value)}
+                    className="h-7 w-28 text-xs"
+                  />
+                  <span className="text-xs text-muted-foreground">—</span>
+                  <Input
+                    type="time"
+                    value={iv.end}
+                    onChange={(e) => updateInterval(d.key, idx, 'end', e.target.value)}
+                    className="h-7 w-28 text-xs"
+                  />
+                  {day.intervals.length > 1 && (
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      className="h-6 w-6 text-destructive hover:text-destructive"
+                      onClick={() => removeInterval(d.key, idx)}
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </Button>
+                  )}
+                </div>
+              ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Escalation Actions Builder ───────────────────────────────────────────────
+
+const ESCALATION_ACTION_TYPES: { value: EscalationAction['type']; label: string }[] = [
+  { value: 'notify', label: 'Уведомить сотрудника' },
+  { value: 'change_priority', label: 'Изменить приоритет' },
+  { value: 'assign', label: 'Назначить исполнителя' },
+  { value: 'add_note', label: 'Добавить заметку' },
+  { value: 'mark_escalated', label: 'Отметить как эскалировано' },
+];
+
+function EscalationActionsBuilder({
+  actions,
+  onChange,
+}: {
+  actions: EscalationAction[];
+  onChange: (a: EscalationAction[]) => void;
+}) {
+  const { data: staffData } = useAdminStaff();
+  const { data: priorities = [] } = useAdminPriorities();
+  const staffList = staffData?.data ?? [];
+
+  function addAction() {
+    onChange([...actions, { type: 'notify' }]);
+  }
+
+  function removeAction(idx: number) {
+    onChange(actions.filter((_, i) => i !== idx));
+  }
+
+  function updateAction(idx: number, patch: Partial<EscalationAction>) {
+    onChange(actions.map((a, i) => (i === idx ? ({ ...a, ...patch } as EscalationAction) : a)));
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-medium">Действия эскалации</p>
+        <Button type="button" size="sm" variant="outline" onClick={addAction}>
+          <Plus className="mr-1 h-3.5 w-3.5" />
+          Добавить
+        </Button>
+      </div>
+      {actions.length === 0 && (
+        <p className="text-xs text-muted-foreground">Нет действий — эскалация только отметит правило</p>
+      )}
+      {actions.map((action, idx) => (
+        <div key={idx} className="space-y-1.5 rounded-md border border-border p-3">
+          <div className="flex items-center gap-2">
+            <select
+              value={action.type}
+              onChange={(e) =>
+                updateAction(idx, {
+                  type: e.target.value as EscalationAction['type'],
+                  staffId: undefined,
+                  priorityId: undefined,
+                  note: undefined,
+                })
+              }
+              className="h-8 flex-1 rounded-md border border-input bg-transparent px-2 text-sm"
+            >
+              {ESCALATION_ACTION_TYPES.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
+              ))}
+            </select>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="h-7 w-7 text-destructive hover:text-destructive shrink-0"
+              onClick={() => removeAction(idx)}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+          {(action.type === 'notify' || action.type === 'assign') && (
+            <div className="space-y-1">
+              <label className="text-xs text-muted-foreground">Сотрудник</label>
+              <select
+                value={action.staffId ?? ''}
+                onChange={(e) =>
+                  updateAction(idx, { staffId: e.target.value ? Number(e.target.value) : undefined })
+                }
+                className="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+              >
+                <option value="">— Выберите сотрудника —</option>
+                {staffList.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.fullName}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          {action.type === 'change_priority' && (
+            <div className="space-y-1">
+              <label className="text-xs text-muted-foreground">Приоритет</label>
+              <select
+                value={action.priorityId ?? ''}
+                onChange={(e) =>
+                  updateAction(idx, { priorityId: e.target.value ? Number(e.target.value) : undefined })
+                }
+                className="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+              >
+                <option value="">— Выберите приоритет —</option>
+                {priorities.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.title}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          {action.type === 'add_note' && (
+            <div className="space-y-1">
+              <label className="text-xs text-muted-foreground">Текст заметки</label>
+              <Input
+                value={action.note ?? ''}
+                onChange={(e) => updateAction(idx, { note: e.target.value })}
+                placeholder="Текст заметки..."
+                className="h-8 text-sm"
+              />
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // ─── SLA plan form ────────────────────────────────────────────────────────────
@@ -270,6 +558,7 @@ function EscalationRulesSection({ plan }: { plan: AdminSlaPlan }) {
 
   const [ruleDialog, setRuleDialog] = useState(false);
   const [editingRule, setEditingRule] = useState<AdminEscalationRule | null>(null);
+  const [ruleActions, setRuleActions] = useState<EscalationAction[]>([]);
 
   const ruleForm = useForm<EscalationFormValues>({
     resolver: zodResolver(escalationSchema),
@@ -278,12 +567,14 @@ function EscalationRulesSection({ plan }: { plan: AdminSlaPlan }) {
 
   function openCreateRule() {
     setEditingRule(null);
+    setRuleActions([]);
     ruleForm.reset({ name: '', targetType: 'FIRST_RESPONSE', thresholdSeconds: 3600, isEnabled: true });
     setRuleDialog(true);
   }
 
   function openEditRule(rule: AdminEscalationRule) {
     setEditingRule(rule);
+    setRuleActions(rule.actions as EscalationAction[]);
     ruleForm.reset({
       name: rule.name,
       targetType: rule.targetType,
@@ -298,11 +589,11 @@ function EscalationRulesSection({ plan }: { plan: AdminSlaPlan }) {
       if (editingRule) {
         await updateRule.mutateAsync({
           id: editingRule.id,
-          data: { ...values, actions: editingRule.actions },
+          data: { ...values, actions: ruleActions },
         });
         toast({ title: 'Правило эскалации обновлено' });
       } else {
-        await createRule.mutateAsync(values);
+        await createRule.mutateAsync({ ...values, actions: ruleActions });
         toast({ title: 'Правило эскалации создано' });
       }
       setRuleDialog(false);
@@ -359,6 +650,7 @@ function EscalationRulesSection({ plan }: { plan: AdminSlaPlan }) {
                     <p className="text-xs text-muted-foreground">
                       {r.targetType === 'FIRST_RESPONSE' ? 'Первый ответ' : 'Решение'} ·{' '}
                       {fmtSeconds(r.thresholdSeconds)} · {r.isEnabled ? 'Активно' : 'Выключено'}
+                      {r.actions.length > 0 && ` · ${r.actions.length} действ.`}
                     </p>
                   </div>
                   <div className="flex gap-1">
@@ -383,7 +675,7 @@ function EscalationRulesSection({ plan }: { plan: AdminSlaPlan }) {
       )}
 
       <Dialog open={ruleDialog} onOpenChange={setRuleDialog}>
-        <DialogContent>
+        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>
               {editingRule ? 'Редактировать правило эскалации' : 'Новое правило эскалации'}
@@ -422,6 +714,9 @@ function EscalationRulesSection({ plan }: { plan: AdminSlaPlan }) {
                 Активно
               </label>
             </div>
+
+            <EscalationActionsBuilder actions={ruleActions} onChange={setRuleActions} />
+
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setRuleDialog(false)}>
                 Отмена
@@ -455,6 +750,8 @@ export function SlaContent() {
 
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
   const [editingSchedule, setEditingSchedule] = useState<AdminSlaSchedule | null>(null);
+  // work-hours state lives outside the form (not in react-hook-form)
+  const [workHours, setWorkHours] = useState<WorkHoursState>(defaultWorkHours());
 
   const planForm = useForm<PlanFormValues>({
     resolver: zodResolver(planSchema),
@@ -523,23 +820,28 @@ export function SlaContent() {
 
   function openCreateSchedule() {
     setEditingSchedule(null);
+    setWorkHours(defaultWorkHours());
     scheduleForm.reset({ title: '' });
     setScheduleDialogOpen(true);
   }
 
   function openEditSchedule(schedule: AdminSlaSchedule) {
     setEditingSchedule(schedule);
+    setWorkHours(
+      Object.keys(schedule.workHours).length > 0 ? apiToWorkHours(schedule.workHours) : defaultWorkHours(),
+    );
     scheduleForm.reset({ title: schedule.title });
     setScheduleDialogOpen(true);
   }
 
   async function onScheduleSubmit(values: ScheduleFormValues) {
     try {
+      const payload = { ...values, workHours: workHoursToApi(workHours) };
       if (editingSchedule) {
-        await updateSchedule.mutateAsync({ id: editingSchedule.id, data: values });
+        await updateSchedule.mutateAsync({ id: editingSchedule.id, data: payload });
         toast({ title: 'График обновлён' });
       } else {
-        await createSchedule.mutateAsync(values);
+        await createSchedule.mutateAsync(payload);
         toast({ title: 'График создан' });
       }
       setScheduleDialogOpen(false);
@@ -776,7 +1078,7 @@ export function SlaContent() {
 
       {/* ─── Schedule dialog ────────────────────────────────────────────────── */}
       <Dialog open={scheduleDialogOpen} onOpenChange={setScheduleDialogOpen}>
-        <DialogContent>
+        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{editingSchedule ? 'Редактировать график' : 'Новый график'}</DialogTitle>
           </DialogHeader>
@@ -788,6 +1090,7 @@ export function SlaContent() {
                 <p className="text-xs text-destructive">{scheduleForm.formState.errors.title.message}</p>
               )}
             </div>
+            <WorkHoursEditor value={workHours} onChange={setWorkHours} />
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setScheduleDialogOpen(false)}>
                 Отмена

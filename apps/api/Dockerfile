@@ -37,6 +37,10 @@ COPY --from=build /app/node_modules/@prisma/client ./node_modules/@prisma/client
 COPY --from=build /app/apps/api/dist ./dist
 COPY --from=build /app/apps/api/prisma ./prisma
 COPY --from=build /app/apps/api/package.json ./package.json
+# Run as the unprivileged built-in `node` user. Pre-create the uploads dir owned
+# by node so the named volume mounted there is writable without root.
+RUN mkdir -p /app/uploads && chown -R node:node /app/uploads
+USER node
 EXPOSE 4000
 # migrations + seed + start are orchestrated by docker-compose `command`.
 CMD ["node", "dist/main.js"]

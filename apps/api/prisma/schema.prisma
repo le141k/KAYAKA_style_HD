@@ -164,6 +164,17 @@ model RefreshToken {
   @@index([staffId])
 }
 
+model PasswordReset {
+  id        Int       @id @default(autoincrement())
+  staffId   Int
+  tokenHash String    @unique   // sha256 hex of the raw token
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([staffId])
+}
+
 // ───────────────────────────── customers / orgs ─────────────────────────────
 
 model UserGroup {
@@ -373,6 +384,21 @@ model Ticket {
   @@index([userId])
   @@index([lastActivityAt])
   @@index([createdAt])
+  // Load: frequently filtered/sorted columns (list filters, SLA breach scan, reports)
+  @@index([priorityId])
+  @@index([typeId])
+  @@index([isResolved])
+  @@index([mergedIntoId])
+  @@index([dueAt])
+  @@index([resolutionDueAt])
+  // Composite for the 60s SLA breach scan (isResolved=false, isEscalated=false, mergedIntoId=null)
+  @@index([isResolved, isEscalated, mergedIntoId])
+  // Trigram GIN indexes so the list `search` (ILIKE '%term%') uses an index
+  // instead of a sequential scan. Requires the pg_trgm extension (prior migration).
+  @@index([subject(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([requesterEmail(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([requesterName(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([mask(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model TicketPost {
@@ -404,13 +430,14 @@ model TicketPost {
 }
 
 model TicketNote {
-  id        Int      @id @default(autoincrement())
-  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-  ticketId  Int
-  staff     Staff?   @relation(fields: [staffId], references: [id])
-  staffId   Int?
-  contents  String
-  createdAt DateTime @default(now())
+  id          Int          @id @default(autoincrement())
+  ticket      Ticket       @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId    Int
+  staff       Staff?       @relation(fields: [staffId], references: [id])
+  staffId     Int?
+  contents    String
+  attachments Attachment[]
+  createdAt   DateTime     @default(now())
 
   @@index([ticketId])
 }
@@ -421,6 +448,9 @@ model Attachment {
   ticketId   Int?
   post       TicketPost? @relation(fields: [postId], references: [id], onDelete: Cascade)
   postId     Int?
+  // U1: note attachments — link to the note that owns this attachment (null = post/ticket-level)
+  note       TicketNote? @relation(fields: [noteId], references: [id], onDelete: Cascade)
+  noteId     Int?
   fileName   String
   mimeType   String      @default("application/octet-stream")
   size       Int         @default(0)
@@ -434,6 +464,7 @@ model Attachment {
 
   @@index([ticketId])
   @@index([postId])
+  @@index([noteId])
   @@index([claimToken])
 }
 

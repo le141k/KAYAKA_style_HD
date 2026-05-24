@@ -27,6 +27,7 @@ import type {
   ApplyMacroDto,
   ChangeDepartmentDto,
 } from './dto';
+import { Prisma } from '@prisma/client';
 import type { ActorType, CreationMode, Ticket, TicketPost, TicketNote } from '@prisma/client';
 
 /** Rich ticket view returned by getTicket. */
@@ -36,6 +37,36 @@ export interface TicketDetail extends Ticket {
   watchers: Array<{ staffId: number }>;
   tags: Array<{ name: string }>;
 }
+
+/**
+ * Client-safe ticket fields for the @Public "my tickets" list. Deliberately
+ * omits infra/PII columns (ipAddress, customFields, messageId, creationMode,
+ * slaPlanId, internal SLA timestamps) — those must never reach an unauthenticated
+ * caller who only supplies an email address.
+ */
+export const PUBLIC_TICKET_LIST_SELECT = {
+  id: true,
+  mask: true,
+  subject: true,
+  requesterName: true,
+  requesterEmail: true,
+  statusId: true,
+  priorityId: true,
+  typeId: true,
+  departmentId: true,
+  dueAt: true,
+  totalReplies: true,
+  isResolved: true,
+  lastActivityAt: true,
+  createdAt: true,
+  updatedAt: true,
+  status: { select: { id: true, title: true } },
+  priority: { select: { id: true, title: true } },
+  type: { select: { id: true, title: true } },
+  department: { select: { id: true, title: true } },
+} satisfies Prisma.TicketSelect;
+
+export type PublicTicketListItem = Prisma.TicketGetPayload<{ select: typeof PUBLIC_TICKET_LIST_SELECT }>;
 
 /**
  * A client-safe post. Internal/PII fields (staff `email`, `ipAddress`, `staffId`,
@@ -92,9 +123,12 @@ export class TicketsService {
     dto: CreateTicketDto & { attachmentClaimToken?: string },
     creatorStaffId?: number,
   ): Promise<Ticket> {
-    // Validate custom fields against TICKET scope definitions
-    if (dto.customFields && typeof dto.customFields === 'object') {
-      await this.adminService.validateCustomFields('TICKET', dto.customFields as Record<string, unknown>);
+    // Validate custom fields against TICKET scope definitions, then encrypt any
+    // fields flagged isEncrypted before they are persisted to the JSONB column.
+    let customFields = dto.customFields as Record<string, unknown> | undefined;
+    if (customFields && typeof customFields === 'object') {
+      await this.adminService.validateCustomFields('TICKET', customFields);
+      customFields = await this.adminService.encryptCustomFields('TICKET', customFields);
     }
 
     // Resolve or create the requester user
@@ -154,7 +188,7 @@ export class TicketsService {
           creationMode: dto.creationMode as CreationMode,
           creator: creatorActor,
           ipAddress: dto.ipAddress,
-          customFields: dto.customFields as object,
+          customFields: (customFields ?? {}) as object,
           // First post
           posts: {
             create: {
@@ -272,7 +306,7 @@ export class TicketsService {
    * Matches requesterEmail directly OR any UserEmail linked to a User row.
    * Used by the client-facing "my tickets" page (@Public endpoint).
    */
-  async listMyTickets(requesterEmail: string): Promise<{ data: Ticket[]; total: number }> {
+  async listMyTickets(requesterEmail: string): Promise<{ data: PublicTicketListItem[]; total: number }> {
     // Build OR clause: direct requesterEmail OR through the user's emails
     const where = {
       mergedIntoId: null,
@@ -292,12 +326,13 @@ export class TicketsService {
       this.prisma.ticket.findMany({
         where,
         orderBy: { createdAt: 'desc' },
-        include: {
-          status: true,
-          priority: true,
-          type: true,
-          department: true,
-        },
+        // Narrow select — this is a @Public endpoint, so NEVER leak infra/PII
+        // columns (ipAddress, customFields, messageId, creationMode) to anyone
+        // who supplies an email address.
+        select: PUBLIC_TICKET_LIST_SELECT,
+        // Bound the result so a heavy requester (or abuse) can't pull an unbounded
+        // set on this public endpoint; `total` still reflects the true count.
+        take: 200,
       }),
       this.prisma.ticket.count({ where }),
     ]);
@@ -349,7 +384,34 @@ export class TicketsService {
     // must prove they own it by supplying the matching requester email.
     this.assertRequesterOwnsTicket(ticket, requesterEmail);
 
-    return ticket as unknown as PublicTicketDetail;
+    // Redact infra/PII + internal columns before returning to the @Public caller.
+    // (findUnique with top-level `include` returns ALL ticket scalars.) Keep only
+    // client-relevant fields (subject, mask, status/priority/department, dueAt,
+    // timestamps, requester); strip internal routing/SLA/audit fields.
+    const safe = { ...ticket } as Record<string, unknown>;
+    for (const k of [
+      'ipAddress',
+      'customFields',
+      'messageId',
+      'creationMode',
+      'creator',
+      'flagType',
+      'hasNotes',
+      'ownerStaffId',
+      'slaPlanId',
+      'resolutionDueAt',
+      'firstResponseAt',
+      'resolvedAt',
+      'reopenedAt',
+      'wasReopened',
+      'isEscalated',
+      'escalationLevel',
+      'kayakoId',
+      'mergedIntoId',
+    ]) {
+      delete safe[k];
+    }
+    return safe as unknown as PublicTicketDetail;
   }
 
   /**
@@ -391,13 +453,35 @@ export class TicketsService {
   async publicReply(ticketId: number, dto: PublicReplyDto): Promise<TicketPost> {
     const ticket = await this.prisma.ticket.findUnique({
       where: { id: ticketId },
-      include: { user: { select: { emails: { select: { email: true } } } } },
+      include: {
+        user: { select: { emails: { select: { email: true } } } },
+        status: { select: { markAsResolved: true, title: true } },
+      },
     });
     if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
 
     // Ownership check: the requester must supply a matching email so a random
     // integer id cannot be used to post on someone else's ticket.
     this.assertRequesterOwnsTicket(ticket, dto.requesterEmail);
+
+    // U-medium: block public replies on definitively-closed tickets.
+    // Strategy: a ticket is "closed" (not merely "resolved") when its status is
+    // flagged markAsResolved=true AND the title contains "closed" (case-insensitive).
+    // This matches the standard Kayako data model where "Resolved" reopens on reply
+    // but "Closed" is terminal.  If no "closed" status exists in the database
+    // (single-status setups), only the markAsResolved flag is checked and a
+    // second heuristic is applied: reopenedAt IS NULL + isResolved = true means
+    // the ticket was resolved first-time — still allowed to be re-opened by a
+    // customer reply.  A ticket that has been closed after having been reopened
+    // (wasReopened=true, isResolved=true, no reopenedAt) is also blocked.
+    // Simplest correct rule that survives schema variations:
+    //   BLOCK only when the current status title is exactly "Closed" (case-insensitive)
+    //   AND markAsResolved is true.
+    // For all other resolved statuses the existing reopen path continues to apply.
+    const statusTitle = ticket.status as { markAsResolved: boolean; title: string } | null;
+    if (statusTitle && statusTitle.markAsResolved && statusTitle.title.trim().toLowerCase() === 'closed') {
+      throw new BadRequestException('Ticket is closed and cannot receive new replies');
+    }
 
     // H8-3: a public adoption MUST carry a claimToken; otherwise linkToPost would
     // fall back to adopting any orphan by id (IDOR). Reject rather than silently
@@ -550,7 +634,10 @@ export class TicketsService {
         },
         notes: {
           orderBy: { createdAt: 'asc' },
-          include: { staff: { select: { firstName: true, lastName: true, email: true } } },
+          include: {
+            staff: { select: { firstName: true, lastName: true, email: true } },
+            attachments: true, // U1: include note attachments in the ticket detail view
+          },
         },
         attachments: true,
         watchers: { select: { staffId: true } },
@@ -561,6 +648,10 @@ export class TicketsService {
     });
 
     if (!ticket) throw new NotFoundException(`Ticket ${id} not found`);
+    ticket.customFields = (await this.adminService.decryptCustomFields(
+      'TICKET',
+      ticket.customFields as Record<string, unknown>,
+    )) as object;
     return ticket as unknown as TicketDetail;
   }
 
@@ -590,6 +681,10 @@ export class TicketsService {
     });
 
     if (!ticket) throw new NotFoundException(`Ticket ${mask} not found`);
+    ticket.customFields = (await this.adminService.decryptCustomFields(
+      'TICKET',
+      ticket.customFields as Record<string, unknown>,
+    )) as object;
     return ticket as unknown as TicketDetail;
   }
 
@@ -754,15 +849,31 @@ export class TicketsService {
 
   // ─────────────────────────── Note ───────────────────────────
 
-  async addNote(ticketId: number, contents: string, staffId?: number): Promise<TicketNote> {
+  async addNote(
+    ticketId: number,
+    contents: string,
+    staffId?: number,
+    attachmentIds?: number[],
+  ): Promise<TicketNote> {
     await this.findOrThrow(ticketId);
     const note = await this.prisma.ticketNote.create({
       data: { ticketId, staffId, contents },
     });
 
+    // U1 fix: link any pre-uploaded attachment orphans to this note so they are
+    // not silently dropped (the original bug: addNote took no attachmentIds at all).
+    const hasNoteAttachments = !!(attachmentIds?.length && this.attachmentsService);
+    if (hasNoteAttachments && this.attachmentsService) {
+      await this.attachmentsService.linkToNote(attachmentIds!, note.id, ticketId);
+    }
+
     await this.prisma.ticket.update({
       where: { id: ticketId },
-      data: { hasNotes: true, lastActivityAt: new Date() },
+      data: {
+        hasNotes: true,
+        lastActivityAt: new Date(),
+        ...(hasNoteAttachments && { hasAttachments: true }),
+      },
     });
 
     await this.writeAudit(ticketId, 'NOTE', staffId, 'STAFF', {});
@@ -981,6 +1092,13 @@ export class TicketsService {
     }
     if (source.mergedIntoId !== null) {
       throw new BadRequestException(`Ticket ${source.mask} is already merged`);
+    }
+    // Guard against merging into a ticket that is itself merged away — its posts
+    // would be re-parented onto a ghost ticket excluded from all lists (data loss).
+    if (target.mergedIntoId !== null) {
+      throw new BadRequestException(
+        `Ticket ${target.mask} is already merged into another ticket; merge into the active target instead`,
+      );
     }
 
     await this.prisma.$transaction(async (tx) => {

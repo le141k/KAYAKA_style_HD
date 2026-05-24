@@ -13,16 +13,18 @@ async function bootstrap(): Promise<void> {
   // Use Pino as the application-level logger (replaces NestJS default)
   app.useLogger(app.get(Logger));
 
+  const isProd = config.NODE_ENV === 'production';
+
   // Security headers (applies in dev + prod). The API is JSON-only behind a
-  // reverse proxy in prod, so the strict default CSP is fine; we relax it just
-  // enough for the self-hosted Swagger UI at /api/docs.
+  // reverse proxy in prod, so we use a strict CSP there. In non-prod we relax
+  // script/style-src just enough for the self-hosted Swagger UI at /api/docs.
   app.use(
     helmet({
       contentSecurityPolicy: {
         directives: {
           'default-src': ["'self'"],
-          'script-src': ["'self'", "'unsafe-inline'"],
-          'style-src': ["'self'", "'unsafe-inline'"],
+          'script-src': isProd ? ["'self'"] : ["'self'", "'unsafe-inline'"],
+          'style-src': isProd ? ["'self'"] : ["'self'", "'unsafe-inline'"],
           'img-src': ["'self'", 'data:'],
         },
       },
@@ -39,21 +41,26 @@ async function bootstrap(): Promise<void> {
     credentials: true,
   });
 
-  // Swagger / OpenAPI documentation
-  const swaggerConfig = new DocumentBuilder()
-    .setTitle('23 Telecom Help Desk API')
-    .setDescription('NestJS 10 + Prisma + PostgreSQL helpdesk backend')
-    .setVersion('1.0')
-    .addBearerAuth()
-    .build();
+  // Swagger / OpenAPI documentation — disabled in production so the full API
+  // surface (routes, auth schemes, request/response shapes) is not exposed.
+  if (!isProd) {
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle('23 Telecom Help Desk API')
+      .setDescription('NestJS 10 + Prisma + PostgreSQL helpdesk backend')
+      .setVersion('1.0')
+      .addBearerAuth()
+      .build();
 
-  const document = SwaggerModule.createDocument(app, swaggerConfig);
-  SwaggerModule.setup('api/docs', app, document);
+    const document = SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup('api/docs', app, document);
+  }
 
   const port = config.TELECOM_HD_API_PORT;
   await app.listen(port);
 
-  app.get(Logger).log(`API listening on :${port}   docs → http://localhost:${port}/api/docs`);
+  app
+    .get(Logger)
+    .log(`API listening on :${port}${isProd ? '' : `   docs → http://localhost:${port}/api/docs`}`);
 }
 
 void bootstrap();

@@ -57,7 +57,7 @@ export interface ApiEscalationRule {
   name: string;
   targetType: 'FIRST_RESPONSE' | 'RESOLUTION';
   thresholdSeconds: number;
-  actions: unknown[];
+  actions: EscalationAction[];
   isEnabled: boolean;
 }
 
@@ -117,6 +117,7 @@ export interface ApiMacro {
   title: string;
   categoryId: number | null;
   isShared: boolean;
+  replyText: string | null;
   actions: unknown[];
   createdAt: string;
   updatedAt: string;
@@ -137,8 +138,16 @@ export interface ApiCustomField {
   title: string;
   type: string;
   isRequired: boolean;
+  isEncrypted?: boolean;
   displayOrder: number;
   options: string[];
+}
+
+export interface ApiTicketType {
+  id: number;
+  title: string;
+  displayOrder: number;
+  displayIcon: string;
 }
 
 // ─── View models ─────────────────────────────────────────────────────────────
@@ -171,13 +180,20 @@ export interface AdminTicketPriority {
   bgColor: string;
 }
 
+export interface EscalationAction {
+  type: 'notify' | 'change_priority' | 'assign' | 'add_note' | 'mark_escalated';
+  staffId?: number;
+  priorityId?: number;
+  note?: string;
+}
+
 export interface AdminEscalationRule {
   id: number;
   slaPlanId: number;
   name: string;
   targetType: 'FIRST_RESPONSE' | 'RESOLUTION';
   thresholdSeconds: number;
-  actions: unknown[];
+  actions: EscalationAction[];
   isEnabled: boolean;
 }
 
@@ -243,6 +259,7 @@ export interface AdminMacro {
   title: string;
   categoryId: number | null;
   isShared: boolean;
+  replyText: string | null;
   actions: unknown[];
 }
 
@@ -260,8 +277,16 @@ export interface AdminCustomField {
   title: string;
   type: string;
   isRequired: boolean;
+  isEncrypted: boolean;
   displayOrder: number;
   options: string[];
+}
+
+export interface AdminTicketType {
+  id: number;
+  title: string;
+  displayOrder: number;
+  displayIcon: string;
 }
 
 // ─── Mappers ─────────────────────────────────────────────────────────────────
@@ -301,7 +326,7 @@ function mapEscalationRule(r: ApiEscalationRule): AdminEscalationRule {
     name: r.name,
     targetType: r.targetType,
     thresholdSeconds: r.thresholdSeconds,
-    actions: r.actions ?? [],
+    actions: (r.actions ?? []) as EscalationAction[],
     isEnabled: r.isEnabled,
   };
 }
@@ -361,7 +386,14 @@ function mapMacroCategory(c: ApiMacroCategory): AdminMacroCategory {
 }
 
 function mapMacro(m: ApiMacro): AdminMacro {
-  return { id: m.id, title: m.title, categoryId: m.categoryId, isShared: m.isShared, actions: m.actions };
+  return {
+    id: m.id,
+    title: m.title,
+    categoryId: m.categoryId,
+    isShared: m.isShared,
+    replyText: m.replyText ?? null,
+    actions: m.actions,
+  };
 }
 
 function mapFieldGroup(g: ApiCustomFieldGroup, fields: ApiCustomField[]): AdminCustomFieldGroup {
@@ -376,10 +408,15 @@ function mapFieldGroup(g: ApiCustomFieldGroup, fields: ApiCustomField[]): AdminC
       title: f.title,
       type: f.type,
       isRequired: f.isRequired,
+      isEncrypted: f.isEncrypted ?? false,
       displayOrder: f.displayOrder,
       options: f.options ?? [],
     })),
   };
+}
+
+function mapTicketType(t: ApiTicketType): AdminTicketType {
+  return { id: t.id, title: t.title, displayOrder: t.displayOrder, displayIcon: t.displayIcon };
 }
 
 // ─── Query keys ──────────────────────────────────────────────────────────────
@@ -388,6 +425,7 @@ export const adminKeys = {
   departments: ['admin', 'departments'] as const,
   statuses: ['admin', 'statuses'] as const,
   priorities: ['admin', 'priorities'] as const,
+  ticketTypes: ['admin', 'ticket-types'] as const,
   slaPlans: ['admin', 'sla', 'plans'] as const,
   slaSchedules: ['admin', 'sla', 'schedules'] as const,
   slaHolidays: (scheduleId: number) => ['admin', 'sla', 'holidays', scheduleId] as const,
@@ -415,13 +453,17 @@ export function useAdminDepartments() {
 export interface DepartmentInput {
   title: string;
   parentId?: number | null;
+  type?: string;
+  isDefault?: boolean;
+  displayOrder?: number;
 }
 
 // API schema treats parentId as optional-omitted, not nullable: sending JSON
 // `null` (or 0 from an empty <select>) fails validation. Drop it when empty.
-function cleanDepartment(data: DepartmentInput): { title: string; parentId?: number } {
-  const parentId = data.parentId;
-  return parentId == null || parentId === 0 ? { title: data.title } : { title: data.title, parentId };
+function cleanDepartment(data: DepartmentInput): Omit<DepartmentInput, 'parentId'> & { parentId?: number } {
+  const { parentId, ...rest } = data;
+  if (parentId == null || parentId === 0) return rest;
+  return { ...rest, parentId };
 }
 
 export function useCreateDepartment() {
@@ -466,6 +508,10 @@ export interface StatusInput {
   color?: string;
   bgColor?: string;
   markAsResolved?: boolean;
+  isDefault?: boolean;
+  displayOrder?: number;
+  triggersSurvey?: boolean;
+  displayIcon?: string;
 }
 
 export function useCreateStatus() {
@@ -599,6 +645,7 @@ export function useAdminSlaSchedules() {
 
 export interface SlaScheduleInput {
   title: string;
+  workHours?: Record<string, string[][]>;
 }
 
 export function useCreateSlaSchedule() {
@@ -686,7 +733,7 @@ export interface EscalationRuleInput {
   name: string;
   targetType: 'FIRST_RESPONSE' | 'RESOLUTION';
   thresholdSeconds: number;
-  actions?: unknown[];
+  actions?: EscalationAction[];
   isEnabled?: boolean;
 }
 
@@ -789,9 +836,18 @@ export function useAdminStaffGroups() {
   });
 }
 
+export function useDisableStaff() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.delete<ApiStaffMember>(`/staff/${id}`),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staff }),
+  });
+}
+
 export interface StaffGroupInput {
   title: string;
   isAdmin?: boolean;
+  permissions?: string[];
 }
 
 export function useCreateStaffGroup() {
@@ -805,8 +861,16 @@ export function useCreateStaffGroup() {
 export function useUpdateStaffGroup() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, data }: { id: number; data: StaffGroupInput }) =>
+    mutationFn: ({ id, data }: { id: number; data: Partial<StaffGroupInput> }) =>
       api.patch<ApiStaffGroup>(`/staff/groups/${id}`, data),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staffGroups }),
+  });
+}
+
+export function useDeleteStaffGroup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.delete<void>(`/staff/groups/${id}`),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staffGroups }),
   });
 }
@@ -826,6 +890,7 @@ export function useAdminWorkflows() {
 export interface WorkflowInput {
   title: string;
   isEnabled?: boolean;
+  sortOrder?: number;
   criteria?: unknown[];
   actions?: unknown[];
 }
@@ -841,7 +906,7 @@ export function useCreateWorkflow() {
 export function useUpdateWorkflow() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, data }: { id: number; data: WorkflowInput }) =>
+    mutationFn: ({ id, data }: { id: number; data: Partial<WorkflowInput> }) =>
       api.put<ApiWorkflow>(`/admin/workflows/${id}`, data),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.workflows }),
   });
@@ -879,6 +944,15 @@ export function useCreateMacroCategory() {
   });
 }
 
+export function useUpdateMacroCategory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: MacroCategoryInput }) =>
+      api.put<ApiMacroCategory>(`/admin/macro-categories/${id}`, data),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.macroCategories }),
+  });
+}
+
 export function useDeleteMacroCategory() {
   const qc = useQueryClient();
   return useMutation({
@@ -905,6 +979,7 @@ export interface MacroInput {
   title: string;
   categoryId?: number | null;
   isShared?: boolean;
+  replyText?: string | null;
   actions?: unknown[];
 }
 
@@ -949,15 +1024,23 @@ export function useAdminCustomFieldGroups() {
 
 export interface CustomFieldGroupInput {
   title: string;
-  scope?: 'TICKET' | 'USER' | 'STAFF' | 'ORGANIZATION';
+  scope: 'TICKET' | 'USER' | 'STAFF' | 'ORGANIZATION';
 }
 
 export function useCreateCustomFieldGroup() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (data: CustomFieldGroupInput) =>
-      // API requires `scope`; default to TICKET when the form doesn't specify one.
-      api.post<ApiCustomFieldGroup>('/admin/custom-field-groups', { scope: 'TICKET', ...data }),
+      api.post<ApiCustomFieldGroup>('/admin/custom-field-groups', data),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.customFieldGroups }),
+  });
+}
+
+export function useUpdateCustomFieldGroup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: Partial<CustomFieldGroupInput> }) =>
+      api.patch<ApiCustomFieldGroup>(`/admin/custom-field-groups/${id}`, data),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.customFieldGroups }),
   });
 }
@@ -990,6 +1073,7 @@ export interface CustomFieldInput {
   type: string;
   fieldKey?: string;
   isRequired?: boolean;
+  isEncrypted?: boolean;
   options?: string[];
 }
 
@@ -1013,7 +1097,20 @@ export function useCreateCustomField(groupId: number) {
         fieldKey: data.fieldKey || slugifyFieldKey(data.title),
         type: FIELD_TYPE_MAP[data.type.toLowerCase()] ?? data.type.toUpperCase(),
         isRequired: data.isRequired ?? false,
+        isEncrypted: data.isEncrypted ?? false,
         options: data.options ?? [],
+      }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.customFieldGroups }),
+  });
+}
+
+export function useUpdateCustomField() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: Partial<CustomFieldInput> }) =>
+      api.patch<ApiCustomField>(`/admin/custom-fields/${id}`, {
+        ...data,
+        ...(data.type ? { type: FIELD_TYPE_MAP[data.type.toLowerCase()] ?? data.type.toUpperCase() } : {}),
       }),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.customFieldGroups }),
   });
@@ -1024,5 +1121,48 @@ export function useDeleteCustomField() {
   return useMutation({
     mutationFn: (id: number) => api.delete<void>(`/admin/custom-fields/${id}`),
     onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.customFieldGroups }),
+  });
+}
+
+// ─── Ticket types ─────────────────────────────────────────────────────────────
+
+export function useAdminTicketTypes() {
+  return useQuery({
+    queryKey: adminKeys.ticketTypes,
+    queryFn: async () => {
+      const data = await api.get<ApiTicketType[]>('/ticket-types');
+      return data.map(mapTicketType);
+    },
+  });
+}
+
+export interface TicketTypeInput {
+  title: string;
+  displayOrder?: number;
+  displayIcon?: string;
+}
+
+export function useCreateTicketType() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: TicketTypeInput) => api.post<ApiTicketType>('/ticket-types', data),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.ticketTypes }),
+  });
+}
+
+export function useUpdateTicketType() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: Partial<TicketTypeInput> }) =>
+      api.patch<ApiTicketType>(`/ticket-types/${id}`, data),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.ticketTypes }),
+  });
+}
+
+export function useDeleteTicketType() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.delete<void>(`/ticket-types/${id}`),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.ticketTypes }),
   });
 }

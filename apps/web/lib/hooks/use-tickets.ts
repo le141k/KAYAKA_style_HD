@@ -48,6 +48,7 @@ interface ApiNote {
   contents: string;
   createdAt: string;
   staff?: ApiStaffRel | null;
+  attachments?: ApiAttachment[];
 }
 interface ApiTicket {
   id: number;
@@ -133,6 +134,13 @@ function mapNoteToReply(n: ApiNote): Reply {
     body: n.contents,
     is_internal: true,
     created_at: n.createdAt,
+    attachments: n.attachments?.map((a) => ({
+      id: a.id,
+      filename: a.fileName,
+      size: a.size,
+      mime_type: a.mimeType,
+      url: `${API_URL}/attachments/${a.id}/download`,
+    })),
   };
 }
 
@@ -162,6 +170,8 @@ function mapTicket(t: ApiTicket): Ticket {
     body: t.posts?.[0]?.contents ?? '',
     status: statusSlug(t.status?.title),
     priority: prioritySlug(t.priority?.title),
+    typeId: t.typeId ?? undefined,
+    typeName: t.type?.title ?? undefined,
     requester,
     assignee,
     department,
@@ -186,6 +196,8 @@ export const ticketKeys = {
   detail: (id: number) => [...ticketKeys.all, 'detail', id] as const,
   replies: (id: number) => [...ticketKeys.all, id, 'replies'] as const,
   links: (id: number) => [...ticketKeys.all, id, 'links'] as const,
+  watchers: (id: number) => [...ticketKeys.all, id, 'watchers'] as const,
+  recipients: (id: number) => [...ticketKeys.all, id, 'recipients'] as const,
   stats: ['dashboard-stats'] as const,
 };
 
@@ -375,7 +387,10 @@ export function useReply(ticketId: number) {
   return useMutation({
     mutationFn: (data: CreateReplyInput) =>
       data.is_internal
-        ? api.post(`/tickets/${ticketId}/notes`, { contents: data.body })
+        ? api.post(`/tickets/${ticketId}/notes`, {
+            contents: data.body,
+            ...(data.attachmentIds?.length ? { attachmentIds: data.attachmentIds } : {}),
+          })
         : api.post(`/tickets/${ticketId}/reply`, {
             contents: data.body,
             ...(data.attachmentIds?.length ? { attachmentIds: data.attachmentIds } : {}),
@@ -387,13 +402,16 @@ export function useReply(ticketId: number) {
   });
 }
 
-// Status/priority updates map slug → id via the reference endpoints, then hit
+// Status/priority/type updates map slug → id via the reference endpoints, then hit
 // the dedicated sub-resource PATCH routes.
 export function useUpdateTicket(ticketId: number) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (
-      data: Partial<Pick<Ticket, 'status' | 'priority'>> & { assigneeId?: number | null },
+      data: Partial<Pick<Ticket, 'status' | 'priority'>> & {
+        assigneeId?: number | null;
+        typeId?: number | null;
+      },
     ) => {
       if (data.status) {
         const statuses = await api.get<ApiRef[]>('/ticket-statuses');
@@ -408,6 +426,9 @@ export function useUpdateTicket(ticketId: number) {
       if (data.assigneeId !== undefined) {
         // API schema is { ownerStaffId } — { staffId } was silently rejected (400).
         await api.patch(`/tickets/${ticketId}/assign`, { ownerStaffId: data.assigneeId });
+      }
+      if (data.typeId !== undefined) {
+        await api.patch(`/tickets/${ticketId}/type`, { typeId: data.typeId });
       }
     },
     onSuccess: () => {
@@ -468,7 +489,29 @@ export function useChangeTicketStatus() {
       const id = await statusIdForSlug(status);
       if (id) await api.patch(`/tickets/${ticketId}/status`, { statusId: id });
     },
-    onSuccess: () => {
+    // Optimistic rollback: snapshot previous cache entry, restore on error.
+    onMutate: async ({ ticketId, status }) => {
+      await qc.cancelQueries({ queryKey: ticketKeys.lists() });
+      const snapshots = qc.getQueriesData<PaginatedResponse<Ticket>>({ queryKey: ticketKeys.lists() });
+      // Optimistically update all list caches
+      qc.setQueriesData<PaginatedResponse<Ticket>>({ queryKey: ticketKeys.lists() }, (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          data: old.data.map((t) => (t.id === ticketId ? { ...t, status } : t)),
+        };
+      });
+      return { snapshots };
+    },
+    onError: (_err, _vars, ctx) => {
+      // Restore all snapshotted list caches
+      if (ctx?.snapshots) {
+        for (const [key, data] of ctx.snapshots) {
+          qc.setQueryData(key, data);
+        }
+      }
+    },
+    onSettled: () => {
       void qc.invalidateQueries({ queryKey: ticketKeys.lists() });
     },
   });
@@ -500,8 +543,12 @@ export function useTicketLinks(ticketId: number) {
   });
   // The NOC "Contact supplier" action: spawns a Vendor-Issue ticket linked back here.
   const spawnSupplier = useMutation({
-    mutationFn: (input: { supplierEmail: string; supplierName?: string; contents: string }) =>
-      api.post<{ ticket: { id: number; mask: string } }>(`/tickets/${ticketId}/spawn-supplier`, input),
+    mutationFn: (input: {
+      supplierEmail: string;
+      supplierName?: string;
+      subject?: string;
+      contents: string;
+    }) => api.post<{ ticket: { id: number; mask: string } }>(`/tickets/${ticketId}/spawn-supplier`, input),
     onSuccess: invalidate,
   });
   return { list, add, remove, spawnSupplier };
@@ -569,6 +616,55 @@ export function useStaffOptions() {
   });
 }
 
+// Picker options loaded from the API (replaces hardcoded STATUS_OPTIONS/PRIORITY_OPTIONS).
+export interface StatusOption {
+  value: Ticket['status'];
+  label: string;
+  id: number;
+}
+export interface PriorityOption {
+  value: Ticket['priority'];
+  label: string;
+  id: number;
+}
+export interface TypeOption {
+  value: string;
+  label: string;
+}
+
+export function useStatusOptions() {
+  return useQuery({
+    queryKey: ['ticket-statuses', 'options'],
+    queryFn: async (): Promise<StatusOption[]> => {
+      const res = await api.get<ApiRef[]>('/ticket-statuses');
+      return res.map((s) => ({ value: statusSlug(s.title), label: s.title, id: s.id }));
+    },
+    staleTime: 5 * 60_000,
+  });
+}
+
+export function usePriorityOptions() {
+  return useQuery({
+    queryKey: ['ticket-priorities', 'options'],
+    queryFn: async (): Promise<PriorityOption[]> => {
+      const res = await api.get<ApiRef[]>('/ticket-priorities');
+      return res.map((p) => ({ value: prioritySlug(p.title), label: p.title, id: p.id }));
+    },
+    staleTime: 5 * 60_000,
+  });
+}
+
+export function useTypeOptions() {
+  return useQuery({
+    queryKey: ['ticket-types', 'options'],
+    queryFn: async (): Promise<TypeOption[]> => {
+      const res = await api.get<ApiRef[]>('/ticket-types');
+      return res.map((ty) => ({ value: String(ty.id), label: ty.title }));
+    },
+    staleTime: 5 * 60_000,
+  });
+}
+
 // Dashboard stats: derive the named counters from /reports/dashboard + statuses.
 export function useDashboardStats() {
   return useQuery({
@@ -598,4 +694,89 @@ export function useDashboardStats() {
     },
     staleTime: 60_000,
   });
+}
+
+// ─── Merge / Split ──────────────────────────────────────────────────────────
+export function useMergeTicket(ticketId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (targetTicketId: number) => api.post(`/tickets/${ticketId}/merge`, { targetTicketId }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });
+      void qc.invalidateQueries({ queryKey: ticketKeys.lists() });
+    },
+  });
+}
+
+export function useSplitTicket(ticketId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { postIds: number[]; subject: string }) =>
+      api.post<{ ticket: { id: number; mask: string } }>(`/tickets/${ticketId}/split`, input),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ticketKeys.lists() });
+    },
+  });
+}
+
+// ─── Watchers ───────────────────────────────────────────────────────────────
+export interface Watcher {
+  staffId: number;
+  name: string;
+  email: string;
+}
+
+export function useTicketWatchers(ticketId: number) {
+  const qc = useQueryClient();
+  const invalidate = () => void qc.invalidateQueries({ queryKey: ticketKeys.watchers(ticketId) });
+
+  const list = useQuery({
+    queryKey: ticketKeys.watchers(ticketId),
+    queryFn: () => api.get<Watcher[]>(`/tickets/${ticketId}/watchers`),
+    enabled: ticketId > 0,
+  });
+
+  const add = useMutation({
+    mutationFn: (staffId: number) => api.post(`/tickets/${ticketId}/watchers`, { staffId }),
+    onSuccess: invalidate,
+  });
+
+  const remove = useMutation({
+    mutationFn: (staffId: number) => api.delete(`/tickets/${ticketId}/watchers/${staffId}`),
+    onSuccess: invalidate,
+  });
+
+  return { list, add, remove };
+}
+
+// ─── Recipients (CC / BCC) ──────────────────────────────────────────────────
+export interface Recipient {
+  id: number;
+  email: string;
+  name?: string;
+  type: 'cc' | 'bcc';
+}
+
+export function useTicketRecipients(ticketId: number) {
+  const qc = useQueryClient();
+  const invalidate = () => void qc.invalidateQueries({ queryKey: ticketKeys.recipients(ticketId) });
+
+  const list = useQuery({
+    queryKey: ticketKeys.recipients(ticketId),
+    queryFn: () => api.get<Recipient[]>(`/tickets/${ticketId}/recipients`),
+    enabled: ticketId > 0,
+  });
+
+  const add = useMutation({
+    mutationFn: (input: { email: string; name?: string; type: 'cc' | 'bcc' }) =>
+      api.post(`/tickets/${ticketId}/recipients`, input),
+    onSuccess: invalidate,
+  });
+
+  const remove = useMutation({
+    mutationFn: (recipientId: number) => api.delete(`/tickets/${ticketId}/recipients/${recipientId}`),
+    onSuccess: invalidate,
+  });
+
+  return { list, add, remove };
 }

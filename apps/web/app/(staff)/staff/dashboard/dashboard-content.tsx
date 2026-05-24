@@ -13,7 +13,12 @@ import { useI18n } from '@/lib/i18n';
 export function DashboardContent() {
   const { t } = useI18n();
   const { data: stats, isLoading: statsLoading, isError: statsError, refetch } = useDashboardStats();
-  const { data: tickets, isLoading: ticketsLoading } = useTickets({
+  const {
+    data: tickets,
+    isLoading: ticketsLoading,
+    isError: ticketsError,
+    refetch: refetchTickets,
+  } = useTickets({
     per_page: 5,
   });
 
@@ -91,6 +96,8 @@ export function DashboardContent() {
 
         {ticketsLoading ? (
           <TicketListSkeleton count={5} />
+        ) : ticketsError ? (
+          <QueryError message="Не удалось загрузить заявки." onRetry={() => void refetchTickets()} />
         ) : recentTickets.length === 0 ? (
           <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-border text-sm text-muted-foreground">
             Нет заявок

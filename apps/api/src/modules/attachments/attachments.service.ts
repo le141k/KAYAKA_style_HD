@@ -1,7 +1,8 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import type { Attachment } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { StorageService } from './storage.service';
+import { verifyFileSignature } from './file-signature.util';
 
 export interface UploadFileInput {
   originalname: string;
@@ -31,6 +32,14 @@ export class AttachmentsService {
     const results: Attachment[] = [];
 
     for (const file of files) {
+      // Verify the actual bytes match the declared MIME — the Multer filter only
+      // checks the spoofable Content-Type header.
+      if (!verifyFileSignature(file.mimetype, file.buffer)) {
+        throw new BadRequestException(
+          `File ${file.originalname} content does not match its declared type (${file.mimetype})`,
+        );
+      }
+
       const subdir = ctx.ticketId ? `tickets/${ctx.ticketId}` : 'orphan';
       const { storageKey, sha1 } = await this.storageService.write(subdir, file.originalname, file.buffer);
 
@@ -78,6 +87,28 @@ export class AttachmentsService {
         postId,
         ticketId,
         claimToken: null, // consume the token so it can't be replayed
+      },
+    });
+  }
+
+  /**
+   * Link orphan attachment rows to a specific internal note and ticket.
+   * Mirrors linkToPost — used by TicketsService.addNote when attachmentIds are supplied.
+   * Only staff-authenticated callers reach this path; no claimToken is needed.
+   */
+  async linkToNote(ids: number[], noteId: number, ticketId: number): Promise<void> {
+    if (!ids.length) return;
+
+    await this.prisma.attachment.updateMany({
+      where: {
+        id: { in: ids },
+        postId: null, // only adopt orphans (not already linked to a post)
+        noteId: null, // not already linked to another note
+      },
+      data: {
+        noteId,
+        ticketId,
+        claimToken: null,
       },
     });
   }

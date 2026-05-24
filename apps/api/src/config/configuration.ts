@@ -20,6 +20,9 @@ const schema = z.object({
       z.boolean(),
     )
     .default(false),
+  // SMTP auth — optional (MailHog needs none); a real relay requires both.
+  TELECOM_HD_SMTP_USER: z.string().optional(),
+  TELECOM_HD_SMTP_PASSWORD: z.string().optional(),
   TELECOM_HD_MAIL_FROM: z.string().default('23 Telecom Help Desk <support@23telecom.example>'),
   TELECOM_HD_LOG_LEVEL: z.string().default('info'),
   // Shared-secret for the Alaris webhook. Must be at least 32 chars so it carries

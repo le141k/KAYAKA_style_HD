@@ -126,25 +126,31 @@ export class ReportsService {
   async dashboard() {
     const now = new Date();
     const startOfDay = new Date(new Date().setHours(0, 0, 0, 0));
+    // U-high: exclude merged-away tickets from all dashboard counts so the card
+    // totals match the ticket-list page (which already filters mergedIntoId:null).
+    const notMerged = { mergedIntoId: null } as const;
     const [byStatus, byPriority, total, resolved, slaBreached, avgRows] = await Promise.all([
       this.prisma.ticket.groupBy({
         by: ['statusId'],
+        where: notMerged,
         _count: { _all: true },
       }),
       this.prisma.ticket.groupBy({
         by: ['priorityId'],
+        where: notMerged,
         _count: { _all: true },
       }),
-      this.prisma.ticket.count(),
+      this.prisma.ticket.count({ where: notMerged }),
       // "resolved today" — resolved with resolvedAt since local midnight
       this.prisma.ticket.count({
         where: {
+          ...notMerged,
           isResolved: true,
           resolvedAt: { gte: startOfDay },
         },
       }),
       // SLA breached: past due and not yet resolved
-      this.prisma.ticket.count({ where: { isResolved: false, dueAt: { lt: now } } }),
+      this.prisma.ticket.count({ where: { ...notMerged, isResolved: false, dueAt: { lt: now } } }),
       // Avg first-response time computed DB-side (no unbounded findMany).
       // AVG over (firstResponseAt - createdAt) in minutes for responded tickets.
       this.prisma.$queryRaw<{ avg_minutes: number | null }[]>`

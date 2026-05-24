@@ -1,6 +1,6 @@
 import { Global, Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
-import { AuthService } from './auth.service';
+import { AuthService, MAIL_SERVICE_TOKEN } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { PermissionsGuard } from './permissions.guard';
@@ -21,11 +21,24 @@ const config = loadConfig();
   providers: [
     // Provide config locally so AuthService can inject it via APP_CONFIG
     { provide: APP_CONFIG, useValue: config },
+    // MAIL_SERVICE_TOKEN is satisfied by AppModule when MailModule is imported.
+    // Using undefined here means AuthModule itself doesn't import MailModule
+    // (avoiding a circular dependency); AppModule overrides this with the real
+    // MailService via the MAIL_SERVICE_TOKEN provider.
+    { provide: MAIL_SERVICE_TOKEN, useValue: undefined },
     AuthService,
     JwtAuthGuard,
     PermissionsGuard,
     TokenBlocklistService,
   ],
-  exports: [AuthService, JwtAuthGuard, PermissionsGuard, TokenBlocklistService, JwtModule, APP_CONFIG],
+  exports: [
+    AuthService,
+    JwtAuthGuard,
+    PermissionsGuard,
+    TokenBlocklistService,
+    JwtModule,
+    APP_CONFIG,
+    MAIL_SERVICE_TOKEN,
+  ],
 })
 export class AuthModule {}

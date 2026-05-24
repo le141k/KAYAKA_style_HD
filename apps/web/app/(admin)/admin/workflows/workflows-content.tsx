@@ -21,9 +21,15 @@ import {
   useDeleteMacro,
   useAdminMacroCategories,
   useCreateMacroCategory,
+  useUpdateMacroCategory,
   useDeleteMacroCategory,
+  useAdminStatuses,
+  useAdminPriorities,
+  useAdminDepartments,
+  useAdminStaff,
   type AdminWorkflow,
   type AdminMacro,
+  type AdminMacroCategory,
 } from '@/lib/hooks/use-admin';
 
 // ─── Criterion row schema ────────────────────────────────────────────────────
@@ -44,6 +50,7 @@ const actionSchema = z.object({
 const workflowSchema = z.object({
   title: z.string().min(1, 'Обязательное поле'),
   isEnabled: z.boolean().optional(),
+  sortOrder: z.coerce.number().int().optional(),
   criteria: z.array(criterionSchema),
   actions: z.array(actionSchema),
 });
@@ -55,6 +62,7 @@ const macroSchema = z.object({
   title: z.string().min(1, 'Обязательное поле'),
   isShared: z.boolean().optional(),
   categoryId: z.coerce.number().nullable().optional(),
+  replyText: z.string().optional(),
   actions: z.array(actionSchema),
 });
 type MacroFormValues = z.infer<typeof macroSchema>;
@@ -78,6 +86,11 @@ const ACTION_TYPES = [
   { value: 'send_email', label: 'Отправить email' },
 ];
 
+// Actions that use a picker instead of free-text
+const ACTION_WITH_STATUS = new Set(['set_status']);
+const ACTION_WITH_PRIORITY = new Set(['set_priority']);
+const ACTION_WITH_STAFF = new Set(['assign_staff']);
+
 const CRITERION_OPS = [
   { value: 'is', label: 'равно' },
   { value: 'is_not', label: 'не равно' },
@@ -87,15 +100,13 @@ const CRITERION_OPS = [
   { value: 'ends_with', label: 'заканчивается на' },
 ];
 
-// Real ticket columns the executor matches against (`ticket[field]`). A dropdown
-// instead of free text so an admin can't silently save a rule that never matches.
 const CRITERION_FIELDS = [
   { value: 'subject', label: 'Тема' },
-  { value: 'statusId', label: 'Статус (ID)' },
-  { value: 'priorityId', label: 'Приоритет (ID)' },
-  { value: 'departmentId', label: 'Отдел (ID)' },
-  { value: 'typeId', label: 'Тип (ID)' },
-  { value: 'ownerStaffId', label: 'Исполнитель (ID)' },
+  { value: 'statusId', label: 'Статус' },
+  { value: 'priorityId', label: 'Приоритет' },
+  { value: 'departmentId', label: 'Отдел' },
+  { value: 'typeId', label: 'Тип' },
+  { value: 'ownerStaffId', label: 'Исполнитель' },
   { value: 'requesterEmail', label: 'Email заявителя' },
   { value: 'creationMode', label: 'Канал (WEB/EMAIL/API/STAFF/ALARIS)' },
   { value: 'flagType', label: 'Флаг' },
@@ -103,17 +114,296 @@ const CRITERION_FIELDS = [
   { value: 'isEscalated', label: 'Эскалирована (true/false)' },
 ];
 
-// Macro action vocabulary — only the types `applyMacro` actually executes. The
-// generic `value` carries the target (status/priority/owner/department ID, tag
-// name, or note text); applyMacro reads `value` for every one of these.
+// Fields that use a picker for value
+const CRITERION_FIELD_STATUS = 'statusId';
+const CRITERION_FIELD_PRIORITY = 'priorityId';
+const CRITERION_FIELD_DEPARTMENT = 'departmentId';
+const CRITERION_FIELD_STAFF = 'ownerStaffId';
+
+// Macro action vocabulary
 const MACRO_ACTION_TYPES = [
-  { value: 'set_status', label: 'Установить статус (ID)' },
-  { value: 'set_priority', label: 'Установить приоритет (ID)' },
-  { value: 'assign', label: 'Назначить исполнителя (ID, пусто = снять)' },
-  { value: 'change_department', label: 'Сменить отдел (ID)' },
+  { value: 'set_status', label: 'Установить статус' },
+  { value: 'set_priority', label: 'Установить приоритет' },
+  { value: 'assign', label: 'Назначить исполнителя' },
+  { value: 'change_department', label: 'Сменить отдел' },
   { value: 'add_tag', label: 'Добавить тег (имя)' },
   { value: 'add_note', label: 'Добавить заметку (текст)' },
 ];
+
+const MACRO_ACTION_WITH_STATUS = new Set(['set_status']);
+const MACRO_ACTION_WITH_PRIORITY = new Set(['set_priority']);
+const MACRO_ACTION_WITH_STAFF = new Set(['assign']);
+const MACRO_ACTION_WITH_DEPT = new Set(['change_department']);
+
+// ─── Pickers helper ──────────────────────────────────────────────────────────
+
+function usePickerData() {
+  const { data: statuses = [] } = useAdminStatuses();
+  const { data: priorities = [] } = useAdminPriorities();
+  const { data: depts = [] } = useAdminDepartments();
+  const { data: staffData } = useAdminStaff();
+  const staffList = staffData?.data ?? [];
+  return { statuses, priorities, depts, staffList };
+}
+
+// Flatten department tree for picker
+interface FlatDept {
+  id: number;
+  title: string;
+  depth: number;
+}
+interface DeptNode {
+  id: number;
+  title: string;
+  children?: DeptNode[];
+}
+function flattenDepts(tree: DeptNode[], depth = 0): FlatDept[] {
+  const out: FlatDept[] = [];
+  for (const d of tree) {
+    out.push({ id: d.id, title: d.title, depth });
+    if (d.children?.length) out.push(...flattenDepts(d.children, depth + 1));
+  }
+  return out;
+}
+
+// ─── Value picker for workflow/macro actions ──────────────────────────────────
+
+function ActionValuePicker({
+  actionType,
+  value,
+  onChange,
+  macroMode,
+}: {
+  actionType: string;
+  value: string;
+  onChange: (v: string) => void;
+  macroMode: boolean;
+}) {
+  const { statuses, priorities, depts, staffList } = usePickerData();
+  const flatDepts = flattenDepts(depts);
+
+  if (ACTION_WITH_STATUS.has(actionType) || (macroMode && MACRO_ACTION_WITH_STATUS.has(actionType))) {
+    return (
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+      >
+        <option value="">— Выберите статус —</option>
+        {statuses.map((s) => (
+          <option key={s.id} value={String(s.id)}>
+            {s.title}
+          </option>
+        ))}
+      </select>
+    );
+  }
+
+  if (ACTION_WITH_PRIORITY.has(actionType) || (macroMode && MACRO_ACTION_WITH_PRIORITY.has(actionType))) {
+    return (
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+      >
+        <option value="">— Выберите приоритет —</option>
+        {priorities.map((p) => (
+          <option key={p.id} value={String(p.id)}>
+            {p.title}
+          </option>
+        ))}
+      </select>
+    );
+  }
+
+  if (ACTION_WITH_STAFF.has(actionType) || (macroMode && MACRO_ACTION_WITH_STAFF.has(actionType))) {
+    return (
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+      >
+        <option value="">— Выберите сотрудника —</option>
+        {staffList.map((s) => (
+          <option key={s.id} value={String(s.id)}>
+            {s.fullName}
+          </option>
+        ))}
+      </select>
+    );
+  }
+
+  if (macroMode && MACRO_ACTION_WITH_DEPT.has(actionType)) {
+    return (
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+      >
+        <option value="">— Выберите отдел —</option>
+        {flatDepts.map((d) => (
+          <option key={d.id} value={String(d.id)}>
+            {' '.repeat(d.depth * 2)}
+            {d.title}
+          </option>
+        ))}
+      </select>
+    );
+  }
+
+  return (
+    <Input
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder="Значение"
+      className="flex-1"
+    />
+  );
+}
+
+// ─── Criterion value picker ───────────────────────────────────────────────────
+
+function CriterionValuePicker({
+  field,
+  value,
+  onChange,
+}: {
+  field: string;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const { statuses, priorities, depts, staffList } = usePickerData();
+  const flatDepts = flattenDepts(depts);
+
+  if (field === CRITERION_FIELD_STATUS) {
+    return (
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+      >
+        <option value="">— Статус —</option>
+        {statuses.map((s) => (
+          <option key={s.id} value={String(s.id)}>
+            {s.title}
+          </option>
+        ))}
+      </select>
+    );
+  }
+  if (field === CRITERION_FIELD_PRIORITY) {
+    return (
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+      >
+        <option value="">— Приоритет —</option>
+        {priorities.map((p) => (
+          <option key={p.id} value={String(p.id)}>
+            {p.title}
+          </option>
+        ))}
+      </select>
+    );
+  }
+  if (field === CRITERION_FIELD_DEPARTMENT) {
+    return (
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+      >
+        <option value="">— Отдел —</option>
+        {flatDepts.map((d) => (
+          <option key={d.id} value={String(d.id)}>
+            {' '.repeat(d.depth * 2)}
+            {d.title}
+          </option>
+        ))}
+      </select>
+    );
+  }
+  if (field === CRITERION_FIELD_STAFF) {
+    return (
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm flex-1"
+      >
+        <option value="">— Сотрудник —</option>
+        {staffList.map((s) => (
+          <option key={s.id} value={String(s.id)}>
+            {s.fullName}
+          </option>
+        ))}
+      </select>
+    );
+  }
+  return (
+    <Input
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder="Значение"
+      className="flex-1"
+    />
+  );
+}
+
+// ─── Rename macro category dialog ─────────────────────────────────────────────
+
+function RenameCategoryDialog({
+  cat,
+  open,
+  onClose,
+}: {
+  cat: AdminMacroCategory;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const updateCat = useUpdateMacroCategory();
+  const form = useForm<MacroCategoryFormValues>({
+    resolver: zodResolver(macroCategorySchema),
+    defaultValues: { title: cat.title },
+  });
+
+  async function onSubmit(values: MacroCategoryFormValues) {
+    try {
+      await updateCat.mutateAsync({ id: cat.id, data: values });
+      toast({ title: 'Категория переименована' });
+      onClose();
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось переименовать', variant: 'destructive' });
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Переименовать категорию</DialogTitle>
+        </DialogHeader>
+        <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">Название</label>
+            <Input {...form.register('title')} />
+            {form.formState.errors.title && (
+              <p className="text-xs text-destructive">{form.formState.errors.title.message}</p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={onClose}>
+              Отмена
+            </Button>
+            <Button type="submit" disabled={updateCat.isPending}>
+              {updateCat.isPending ? 'Сохранение…' : 'Сохранить'}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
 
 export function WorkflowsContent() {
   const { data: workflows = [], isLoading: loadingWorkflows } = useAdminWorkflows();
@@ -137,9 +427,11 @@ export function WorkflowsContent() {
   const [macroDialog, setMacroDialog] = useState(false);
   const [editingMacro, setEditingMacro] = useState<AdminMacro | null>(null);
 
+  const [renameCatTarget, setRenameCatTarget] = useState<AdminMacroCategory | null>(null);
+
   const wfForm = useForm<WorkflowFormValues>({
     resolver: zodResolver(workflowSchema),
-    defaultValues: { title: '', isEnabled: true, criteria: [], actions: [] },
+    defaultValues: { title: '', isEnabled: true, sortOrder: 0, criteria: [], actions: [] },
   });
 
   const {
@@ -156,7 +448,7 @@ export function WorkflowsContent() {
 
   const macroForm = useForm<MacroFormValues>({
     resolver: zodResolver(macroSchema),
-    defaultValues: { title: '', isShared: true, categoryId: null, actions: [] },
+    defaultValues: { title: '', isShared: true, categoryId: null, replyText: '', actions: [] },
   });
 
   const {
@@ -172,13 +464,12 @@ export function WorkflowsContent() {
 
   function openCreateWf() {
     setEditingWf(null);
-    wfForm.reset({ title: '', isEnabled: true, criteria: [], actions: [] });
+    wfForm.reset({ title: '', isEnabled: true, sortOrder: 0, criteria: [], actions: [] });
     setWfDialog(true);
   }
 
   function openEditWf(wf: AdminWorkflow) {
     setEditingWf(wf);
-    // Pre-populate criteria and actions from the existing workflow
     const criteria = (wf.criteria as { field?: string; op?: string; value?: string }[]).map((c) => ({
       field: c.field ?? '',
       op: c.op ?? 'is',
@@ -186,7 +477,6 @@ export function WorkflowsContent() {
     }));
     const actions = (wf.actions as { type?: string; value?: string; [k: string]: unknown }[]).map((a) => ({
       type: a.type ?? '',
-      // try to extract a single "value" field: take the first non-type key's string value
       value:
         (a.value as string | undefined) ??
         Object.entries(a)
@@ -194,13 +484,12 @@ export function WorkflowsContent() {
           .map(([, v]) => String(v ?? ''))
           .join(''),
     }));
-    wfForm.reset({ title: wf.title, isEnabled: wf.isEnabled, criteria, actions });
+    wfForm.reset({ title: wf.title, isEnabled: wf.isEnabled, sortOrder: wf.sortOrder, criteria, actions });
     setWfDialog(true);
   }
 
   async function onWfSubmit(values: WorkflowFormValues) {
     try {
-      // Serialize criteria and actions into the API shape
       const criteria = values.criteria.map((c) => ({ field: c.field, op: c.op, value: c.value }));
       const actions = values.actions.map((a) => ({ type: a.type, value: a.value }));
       if (editingWf) {
@@ -226,15 +515,22 @@ export function WorkflowsContent() {
     }
   }
 
+  async function toggleWfEnabled(wf: AdminWorkflow) {
+    try {
+      await updateWorkflow.mutateAsync({ id: wf.id, data: { title: wf.title, isEnabled: !wf.isEnabled } });
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось изменить статус', variant: 'destructive' });
+    }
+  }
+
   function openCreateMacro() {
     setEditingMacro(null);
-    macroForm.reset({ title: '', isShared: true, categoryId: null, actions: [] });
+    macroForm.reset({ title: '', isShared: true, categoryId: null, replyText: '', actions: [] });
     setMacroDialog(true);
   }
 
   function openEditMacro(macro: AdminMacro) {
     setEditingMacro(macro);
-    // Pre-populate the actions builder from the stored macro (mirror openEditWf).
     const actions = (macro.actions as { type?: string; value?: string; [k: string]: unknown }[]).map((a) => ({
       type: a.type ?? '',
       value:
@@ -248,16 +544,20 @@ export function WorkflowsContent() {
       title: macro.title,
       isShared: macro.isShared,
       categoryId: macro.categoryId,
+      replyText: macro.replyText ?? '',
       actions,
     });
     setMacroDialog(true);
   }
 
   async function onMacroSubmit(values: MacroFormValues) {
-    // Ensure isShared is explicitly boolean (checkbox may be undefined when unchecked)
-    // and serialize the actions the admin built into the API's {type,value} shape.
     const actions = values.actions.map((a) => ({ type: a.type, value: a.value }));
-    const payload = { ...values, isShared: values.isShared ?? false, actions };
+    const payload = {
+      ...values,
+      isShared: values.isShared ?? false,
+      replyText: values.replyText || null,
+      actions,
+    };
     try {
       if (editingMacro) {
         await updateMacro.mutateAsync({ id: editingMacro.id, data: payload });
@@ -302,6 +602,11 @@ export function WorkflowsContent() {
     }
   }
 
+  // Watch form values for pickers
+  const wfActionsWatch = wfForm.watch('actions');
+  const macroActionsWatch = macroForm.watch('actions');
+  const criteriaWatch = wfForm.watch('criteria');
+
   return (
     <div className="space-y-8">
       <div>
@@ -341,9 +646,9 @@ export function WorkflowsContent() {
                   <TableHead>Название</TableHead>
                   <TableHead>Порядок</TableHead>
                   <TableHead>Условия</TableHead>
-                  <TableHead>Действия</TableHead>
+                  <TableHead>Действий</TableHead>
                   <TableHead>Статус</TableHead>
-                  <TableHead className="w-20">Действия</TableHead>
+                  <TableHead className="w-28">Управление</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -358,15 +663,18 @@ export function WorkflowsContent() {
                       {(wf.actions as unknown[]).length} шт.
                     </TableCell>
                     <TableCell>
-                      <span
-                        className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                      <button
+                        type="button"
+                        onClick={() => toggleWfEnabled(wf)}
+                        className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium cursor-pointer transition-colors ${
                           wf.isEnabled
-                            ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-                            : 'bg-muted text-muted-foreground'
+                            ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200 hover:bg-green-200'
+                            : 'bg-muted text-muted-foreground hover:bg-muted/80'
                         }`}
+                        title="Нажмите для переключения"
                       >
                         {wf.isEnabled ? 'Активно' : 'Выключено'}
-                      </span>
+                      </button>
                     </TableCell>
                     <TableCell>
                       <div className="flex gap-1">
@@ -423,7 +731,7 @@ export function WorkflowsContent() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Название</TableHead>
-                  <TableHead className="w-16">Действия</TableHead>
+                  <TableHead className="w-24">Действия</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -431,15 +739,25 @@ export function WorkflowsContent() {
                   <TableRow key={cat.id}>
                     <TableCell className="font-medium">{cat.title}</TableCell>
                     <TableCell>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-7 w-7 text-destructive hover:text-destructive"
-                        onClick={() => handleDeleteMacroCategory(cat.id, cat.title)}
-                        disabled={deleteMacroCategory.isPending}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </Button>
+                      <div className="flex gap-1">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7"
+                          onClick={() => setRenameCatTarget(cat)}
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 text-destructive hover:text-destructive"
+                          onClick={() => handleDeleteMacroCategory(cat.id, cat.title)}
+                          disabled={deleteMacroCategory.isPending}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}
@@ -528,11 +846,17 @@ export function WorkflowsContent() {
                 <p className="text-xs text-destructive">{wfForm.formState.errors.title.message}</p>
               )}
             </div>
-            <div className="flex items-center gap-2">
-              <input type="checkbox" id="wfEnabled" {...wfForm.register('isEnabled')} />
-              <label htmlFor="wfEnabled" className="text-sm">
-                Активно
-              </label>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="flex items-center gap-2">
+                <input type="checkbox" id="wfEnabled" {...wfForm.register('isEnabled')} />
+                <label htmlFor="wfEnabled" className="text-sm">
+                  Активно
+                </label>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">Порядок</label>
+                <Input type="number" min={0} {...wfForm.register('sortOrder')} className="h-8" />
+              </div>
             </div>
 
             {/* Criteria builder */}
@@ -555,10 +879,7 @@ export function WorkflowsContent() {
                 </p>
               )}
               {criteriaFields.map((field, idx) => {
-                // A rule saved with a field NOT in the dropdown (e.g. a legacy
-                // free-text field) must NOT silently snap to the first option —
-                // surface it as a distinct "(unknown: X)" option + warn (H8-2).
-                const fieldVal = wfForm.watch(`criteria.${idx}.field`);
+                const fieldVal = criteriaWatch[idx]?.field ?? '';
                 const known = !fieldVal || CRITERION_FIELDS.some((f) => f.value === fieldVal);
                 return (
                   <div key={field.id} className="space-y-1">
@@ -584,10 +905,10 @@ export function WorkflowsContent() {
                           </option>
                         ))}
                       </select>
-                      <Input
-                        {...wfForm.register(`criteria.${idx}.value`)}
-                        placeholder="Значение"
-                        className="flex-1"
+                      <CriterionValuePicker
+                        field={fieldVal}
+                        value={criteriaWatch[idx]?.value ?? ''}
+                        onChange={(v) => wfForm.setValue(`criteria.${idx}.value`, v)}
                       />
                       <Button
                         type="button"
@@ -601,8 +922,7 @@ export function WorkflowsContent() {
                     </div>
                     {!known && (
                       <p className="text-xs text-amber-600">
-                        Поле «{fieldVal}» не из стандартного списка (возможно, старое правило). Выберите поле
-                        заново, чтобы исправить.
+                        Поле «{fieldVal}» не из стандартного списка. Выберите поле заново, чтобы исправить.
                       </p>
                     )}
                   </div>
@@ -637,10 +957,11 @@ export function WorkflowsContent() {
                       </option>
                     ))}
                   </select>
-                  <Input
-                    {...wfForm.register(`actions.${idx}.value`)}
-                    placeholder="Значение"
-                    className="flex-1"
+                  <ActionValuePicker
+                    actionType={wfActionsWatch[idx]?.type ?? ''}
+                    value={wfActionsWatch[idx]?.value ?? ''}
+                    onChange={(v) => wfForm.setValue(`actions.${idx}.value`, v)}
+                    macroMode={false}
                   />
                   <Button
                     type="button"
@@ -669,7 +990,7 @@ export function WorkflowsContent() {
 
       {/* Macro dialog */}
       <Dialog open={macroDialog} onOpenChange={setMacroDialog}>
-        <DialogContent>
+        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{editingMacro ? 'Редактировать макрос' : 'Новый макрос'}</DialogTitle>
           </DialogHeader>
@@ -704,7 +1025,18 @@ export function WorkflowsContent() {
               </label>
             </div>
 
-            {/* Macro actions builder — without these a macro applies nothing. */}
+            {/* Reply text */}
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">Текст ответа (replyText)</label>
+              <textarea
+                {...macroForm.register('replyText')}
+                rows={3}
+                className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm resize-y"
+                placeholder="Текст, который будет вставлен в ответ при применении макроса"
+              />
+            </div>
+
+            {/* Macro actions builder */}
             <div className="space-y-2">
               <div className="flex items-center justify-between">
                 <label className="text-sm font-medium">Действия</label>
@@ -735,10 +1067,11 @@ export function WorkflowsContent() {
                       </option>
                     ))}
                   </select>
-                  <Input
-                    {...macroForm.register(`actions.${idx}.value`)}
-                    placeholder="Значение"
-                    className="flex-1"
+                  <ActionValuePicker
+                    actionType={macroActionsWatch[idx]?.type ?? ''}
+                    value={macroActionsWatch[idx]?.value ?? ''}
+                    onChange={(v) => macroForm.setValue(`actions.${idx}.value`, v)}
+                    macroMode={true}
                   />
                   <Button
                     type="button"
@@ -764,6 +1097,11 @@ export function WorkflowsContent() {
           </form>
         </DialogContent>
       </Dialog>
+
+      {/* Rename category dialog */}
+      {renameCatTarget && (
+        <RenameCategoryDialog cat={renameCatTarget} open={true} onClose={() => setRenameCatTarget(null)} />
+      )}
     </div>
   );
 }

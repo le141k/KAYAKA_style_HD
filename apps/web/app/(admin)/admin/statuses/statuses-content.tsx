@@ -27,6 +27,10 @@ const statusSchema = z.object({
   color: z.string().optional(),
   bgColor: z.string().optional(),
   markAsResolved: z.boolean().optional(),
+  isDefault: z.boolean().optional(),
+  displayOrder: z.coerce.number().int().optional(),
+  triggersSurvey: z.boolean().optional(),
+  displayIcon: z.string().optional(),
 });
 type StatusFormValues = z.infer<typeof statusSchema>;
 
@@ -34,6 +38,7 @@ const prioritySchema = z.object({
   title: z.string().min(1, 'Обязательное поле'),
   color: z.string().optional(),
   bgColor: z.string().optional(),
+  displayOrder: z.coerce.number().int().optional(),
 });
 type PriorityFormValues = z.infer<typeof prioritySchema>;
 
@@ -62,23 +67,43 @@ export function StatusesContent() {
 
   const [statusDialog, setStatusDialog] = useState(false);
   const [editingStatus, setEditingStatus] = useState<AdminTicketStatus | null>(null);
+  const [statusDeleteError, setStatusDeleteError] = useState<string | null>(null);
 
   const [priorityDialog, setPriorityDialog] = useState(false);
   const [editingPriority, setEditingPriority] = useState<AdminTicketPriority | null>(null);
+  const [priorityDeleteError, setPriorityDeleteError] = useState<string | null>(null);
 
   const statusForm = useForm<StatusFormValues>({
     resolver: zodResolver(statusSchema),
-    defaultValues: { title: '', color: '#ffffff', bgColor: '#22c55e', markAsResolved: false },
+    defaultValues: {
+      title: '',
+      color: '#ffffff',
+      bgColor: '#22c55e',
+      markAsResolved: false,
+      isDefault: false,
+      displayOrder: 0,
+      triggersSurvey: false,
+      displayIcon: '',
+    },
   });
 
   const priorityForm = useForm<PriorityFormValues>({
     resolver: zodResolver(prioritySchema),
-    defaultValues: { title: '', color: '#374151', bgColor: '#dbeafe' },
+    defaultValues: { title: '', color: '#374151', bgColor: '#dbeafe', displayOrder: 0 },
   });
 
   function openCreateStatus() {
     setEditingStatus(null);
-    statusForm.reset({ title: '', color: '#ffffff', bgColor: '#22c55e', markAsResolved: false });
+    statusForm.reset({
+      title: '',
+      color: '#ffffff',
+      bgColor: '#22c55e',
+      markAsResolved: false,
+      isDefault: false,
+      displayOrder: 0,
+      triggersSurvey: false,
+      displayIcon: '',
+    });
     setStatusDialog(true);
   }
 
@@ -89,6 +114,8 @@ export function StatusesContent() {
       color: s.color,
       bgColor: s.bgColor,
       markAsResolved: s.markAsResolved,
+      isDefault: s.isDefault,
+      displayOrder: s.displayOrder,
     });
     setStatusDialog(true);
   }
@@ -110,23 +137,31 @@ export function StatusesContent() {
 
   async function handleDeleteStatus(s: AdminTicketStatus) {
     if (!confirm(`Удалить статус «${s.title}»?`)) return;
+    setStatusDeleteError(null);
     try {
       await deleteStatus.mutateAsync(s.id);
       toast({ title: 'Статус удалён' });
-    } catch {
-      toast({ title: 'Ошибка', description: 'Не удалось удалить статус', variant: 'destructive' });
+    } catch (err: unknown) {
+      const status = (err as { status?: number })?.status;
+      if (status === 409) {
+        setStatusDeleteError(
+          `Нельзя удалить статус «${s.title}» — он используется в заявках. Сначала переназначьте заявки на другой статус.`,
+        );
+      } else {
+        toast({ title: 'Ошибка', description: 'Не удалось удалить статус', variant: 'destructive' });
+      }
     }
   }
 
   function openCreatePriority() {
     setEditingPriority(null);
-    priorityForm.reset({ title: '', color: '#374151', bgColor: '#dbeafe' });
+    priorityForm.reset({ title: '', color: '#374151', bgColor: '#dbeafe', displayOrder: 0 });
     setPriorityDialog(true);
   }
 
   function openEditPriority(p: AdminTicketPriority) {
     setEditingPriority(p);
-    priorityForm.reset({ title: p.title, color: p.color, bgColor: p.bgColor });
+    priorityForm.reset({ title: p.title, color: p.color, bgColor: p.bgColor, displayOrder: p.displayOrder });
     setPriorityDialog(true);
   }
 
@@ -147,11 +182,17 @@ export function StatusesContent() {
 
   async function handleDeletePriority(p: AdminTicketPriority) {
     if (!confirm(`Удалить приоритет «${p.title}»?`)) return;
+    setPriorityDeleteError(null);
     try {
       await deletePriority.mutateAsync(p.id);
       toast({ title: 'Приоритет удалён' });
-    } catch {
-      toast({ title: 'Ошибка', description: 'Не удалось удалить приоритет', variant: 'destructive' });
+    } catch (err: unknown) {
+      const status = (err as { status?: number })?.status;
+      if (status === 409) {
+        setPriorityDeleteError(`Нельзя удалить приоритет «${p.title}» — он используется в заявках.`);
+      } else {
+        toast({ title: 'Ошибка', description: 'Не удалось удалить приоритет', variant: 'destructive' });
+      }
     }
   }
 
@@ -171,12 +212,27 @@ export function StatusesContent() {
             Добавить
           </Button>
         </div>
+
+        {statusDeleteError && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            {statusDeleteError}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="ml-2 h-5 px-2 text-xs"
+              onClick={() => setStatusDeleteError(null)}
+            >
+              ✕
+            </Button>
+          </div>
+        )}
+
         {loadingStatuses ? (
           <p className="text-sm text-muted-foreground">Загрузка…</p>
         ) : (
           <div className="flex flex-wrap gap-3">
             {statuses.map((s) => (
-              <div key={s.id} className="rounded-lg border border-border bg-card p-4 min-w-[140px]">
+              <div key={s.id} className="rounded-lg border border-border bg-card p-4 min-w-[160px]">
                 <div className="flex items-center justify-between gap-2">
                   <ColorSwatch color={s.color} bg={s.bgColor} />
                   <div className="flex gap-1">
@@ -195,7 +251,15 @@ export function StatusesContent() {
                   </div>
                 </div>
                 <p className="mt-2 font-medium text-sm">{s.title}</p>
-                {s.markAsResolved && <p className="text-xs text-muted-foreground">Закрывает заявку</p>}
+                <div className="mt-1 space-y-0.5">
+                  {s.markAsResolved && <p className="text-xs text-muted-foreground">Закрывает заявку</p>}
+                  {s.isDefault && (
+                    <span className="inline-flex items-center rounded-full bg-blue-100 px-1.5 py-0.5 text-xs text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
+                      По умолч.
+                    </span>
+                  )}
+                  <p className="text-xs text-muted-foreground">Порядок: {s.displayOrder}</p>
+                </div>
               </div>
             ))}
           </div>
@@ -211,6 +275,21 @@ export function StatusesContent() {
             Добавить
           </Button>
         </div>
+
+        {priorityDeleteError && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            {priorityDeleteError}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="ml-2 h-5 px-2 text-xs"
+              onClick={() => setPriorityDeleteError(null)}
+            >
+              ✕
+            </Button>
+          </div>
+        )}
+
         {loadingPriorities ? (
           <p className="text-sm text-muted-foreground">Загрузка…</p>
         ) : (
@@ -240,6 +319,7 @@ export function StatusesContent() {
                   </div>
                 </div>
                 <p className="mt-2 font-medium text-sm">{p.title}</p>
+                <p className="text-xs text-muted-foreground">Порядок: {p.displayOrder}</p>
               </div>
             ))}
           </div>
@@ -270,11 +350,33 @@ export function StatusesContent() {
                 <Input type="color" {...statusForm.register('bgColor')} className="h-9 px-2" />
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              <input type="checkbox" id="markAsResolved" {...statusForm.register('markAsResolved')} />
-              <label htmlFor="markAsResolved" className="text-sm">
-                Закрывает заявку
-              </label>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">Порядок отображения</label>
+              <Input type="number" min={0} {...statusForm.register('displayOrder')} className="h-8" />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">Иконка (CSS-класс или emoji)</label>
+              <Input {...statusForm.register('displayIcon')} placeholder="Необязательно" />
+            </div>
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <input type="checkbox" id="markAsResolved" {...statusForm.register('markAsResolved')} />
+                <label htmlFor="markAsResolved" className="text-sm">
+                  Закрывает заявку
+                </label>
+              </div>
+              <div className="flex items-center gap-2">
+                <input type="checkbox" id="statusIsDefault" {...statusForm.register('isDefault')} />
+                <label htmlFor="statusIsDefault" className="text-sm">
+                  По умолчанию
+                </label>
+              </div>
+              <div className="flex items-center gap-2">
+                <input type="checkbox" id="triggersSurvey" {...statusForm.register('triggersSurvey')} />
+                <label htmlFor="triggersSurvey" className="text-sm">
+                  Запускает опрос удовлетворённости
+                </label>
+              </div>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setStatusDialog(false)}>
@@ -311,6 +413,10 @@ export function StatusesContent() {
                 <label className="text-sm font-medium">Цвет фона</label>
                 <Input type="color" {...priorityForm.register('bgColor')} className="h-9 px-2" />
               </div>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">Порядок отображения</label>
+              <Input type="number" min={0} {...priorityForm.register('displayOrder')} className="h-8" />
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setPriorityDialog(false)}>

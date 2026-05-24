@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useImperativeHandle, forwardRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, X, FileText, CheckCircle2, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -13,6 +13,11 @@ interface UploadedFile {
   progress: number;
   status: 'uploading' | 'done' | 'error';
   attachmentId?: number;
+}
+
+export interface FileUploadZoneHandle {
+  /** Clear all uploaded files (call after a successful form submit). */
+  clear: () => void;
 }
 
 interface FileUploadZoneProps {
@@ -32,19 +37,18 @@ interface FileUploadZoneProps {
   className?: string;
 }
 
-export function FileUploadZone({
-  onFiles,
-  uploadEndpoint,
-  onUploaded,
-  claimToken,
-  accept = '*',
-  maxSizeMb = 25,
-  maxFiles = 10,
-  className,
-}: FileUploadZoneProps) {
+export const FileUploadZone = forwardRef<FileUploadZoneHandle, FileUploadZoneProps>(function FileUploadZone(
+  { onFiles, uploadEndpoint, onUploaded, claimToken, accept = '*', maxSizeMb = 25, maxFiles = 10, className },
+  ref,
+) {
   const [isDragging, setIsDragging] = useState(false);
   const [uploads, setUploads] = useState<UploadedFile[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Expose clear() to parent forms via ref so they can reset after submit.
+  useImperativeHandle(ref, () => ({
+    clear: () => setUploads([]),
+  }));
 
   const uploadFile = useCallback(
     async (upload: UploadedFile): Promise<void> => {
@@ -147,9 +151,9 @@ export function FileUploadZone({
     [processFiles],
   );
 
-  const removeFile = (id: string) => {
+  const removeFile = useCallback((id: string) => {
     setUploads((prev) => prev.filter((u) => u.id !== id));
-  };
+  }, []);
 
   return (
     <div className={cn('space-y-3', className)}>
@@ -172,7 +176,12 @@ export function FileUploadZone({
         )}
         role="button"
         tabIndex={0}
-        onKeyDown={(e) => e.key === 'Enter' && inputRef.current?.click()}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            inputRef.current?.click();
+          }
+        }}
         aria-label="Загрузить файлы"
       >
         <motion.div
@@ -252,7 +261,9 @@ export function FileUploadZone({
                   )}
                 </div>
               </div>
+              {/* type="button" prevents this from submitting the parent form */}
               <button
+                type="button"
                 onClick={() => removeFile(upload.id)}
                 className="flex-shrink-0 text-muted-foreground hover:text-foreground"
                 aria-label={`Удалить ${upload.file.name}`}
@@ -265,4 +276,4 @@ export function FileUploadZone({
       </AnimatePresence>
     </div>
   );
-}
+});

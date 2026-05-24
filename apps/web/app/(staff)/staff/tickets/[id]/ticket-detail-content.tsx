@@ -17,6 +17,9 @@ import {
   useChangeTicketDepartment,
   useApplyMacro,
   useMacroOptions,
+  useStatusOptions,
+  usePriorityOptions,
+  useTypeOptions,
 } from '@/lib/hooks/use-tickets';
 import type { Ticket, Attachment } from '@/lib/types';
 import { StatusBadge } from '@/components/premium/StatusBadge';
@@ -36,61 +39,87 @@ import { RelativeTime } from '@/components/RelativeTime';
 import { TimeTrackingPanel } from '@/components/tickets/TimeTrackingPanel';
 import { FollowUpsPanel } from '@/components/tickets/FollowUpsPanel';
 import { LinkedTicketsPanel } from '@/components/tickets/LinkedTicketsPanel';
+import { MergeTicketPanel } from '@/components/tickets/MergeTicketPanel';
+import { SplitTicketPanel } from '@/components/tickets/SplitTicketPanel';
+import { WatchersPanel } from '@/components/tickets/WatchersPanel';
+import { RecipientsPanel } from '@/components/tickets/RecipientsPanel';
 import { toast } from '@/components/ui/use-toast';
+import { useI18n } from '@/lib/i18n';
 
-const STATUS_OPTIONS: { value: Ticket['status']; label: string }[] = [
-  { value: 'open', label: 'Открыта' },
-  { value: 'pending', label: 'Ожидает' },
-  { value: 'in_progress', label: 'В работе' },
-  { value: 'resolved', label: 'Решена' },
-  { value: 'closed', label: 'Закрыта' },
-];
-const PRIORITY_OPTIONS: { value: Ticket['priority']; label: string }[] = [
-  { value: 'urgent', label: 'Критический' },
-  { value: 'high', label: 'Высокий' },
-  { value: 'normal', label: 'Обычный' },
-  { value: 'low', label: 'Низкий' },
-];
-
+// ── Separate RHF schemas for reply and note so they never share a single ref ──
 const replySchema = z.object({
-  body: z.string().min(1, 'Введите текст ответа'),
+  replyBody: z.string().min(1, 'Введите текст ответа'),
+});
+const noteSchema = z.object({
+  noteBody: z.string().min(1, 'Введите текст заметки'),
 });
 type ReplyForm = z.infer<typeof replySchema>;
+type NoteForm = z.infer<typeof noteSchema>;
+
+const MAX_BODY_CHARS = 10_000;
 
 export function TicketDetailContent({ ticketId }: { ticketId: number }) {
+  const { t } = useI18n();
+  const ta = t.ticketActions;
+
   const { data: ticket, isLoading: ticketLoading, isError: ticketError, refetch } = useTicket(ticketId);
   const replyMutation = useReply(ticketId);
   const updateTicket = useUpdateTicket(ticketId);
   const { data: staffOptions = [] } = useStaffOptions();
   const { data: departmentOptions = [] } = useDepartmentOptions();
   const { data: macroOptions = [] } = useMacroOptions();
+  const { data: statusOptions = [] } = useStatusOptions();
+  const { data: priorityOptions = [] } = usePriorityOptions();
+  const { data: typeOptions = [] } = useTypeOptions();
   const changeDepartment = useChangeTicketDepartment(ticketId);
   const applyMacro = useApplyMacro(ticketId);
   const tags = useTicketTags(ticketId);
   const [newTag, setNewTag] = useState('');
 
   const [replyTab, setReplyTab] = useState<'reply' | 'note'>('reply');
-  const [attachmentIds, setAttachmentIds] = useState<number[]>([]);
+  // Separate attachment state per tab so they don't bleed across
+  const [replyAttachmentIds, setReplyAttachmentIds] = useState<number[]>([]);
+  const [noteAttachmentIds, setNoteAttachmentIds] = useState<number[]>([]);
   const [assigneeId, setAssigneeId] = useState<string>('');
   const [departmentId, setDepartmentId] = useState<string>('');
+  const [typeId, setTypeId] = useState<string>('');
+
+  // Snapshot previous assignee/dept for error rollback
+  const prevAssigneeRef = useRef<string>('');
+  const prevDeptRef = useRef<string>('');
 
   // Sync the assignee picker once the ticket loads (it starts undefined).
   useEffect(() => {
-    if (ticket?.assignee) setAssigneeId(String(ticket.assignee.id));
+    if (ticket?.assignee) {
+      setAssigneeId(String(ticket.assignee.id));
+      prevAssigneeRef.current = String(ticket.assignee.id);
+    }
   }, [ticket?.assignee]);
   // Sync the department picker once the ticket loads.
   useEffect(() => {
-    if (ticket?.department) setDepartmentId(String(ticket.department.id));
+    if (ticket?.department) {
+      setDepartmentId(String(ticket.department.id));
+      prevDeptRef.current = String(ticket.department.id);
+    }
   }, [ticket?.department]);
+  // Sync type picker
+  useEffect(() => {
+    if (ticket?.typeId) setTypeId(String(ticket.typeId));
+  }, [ticket?.typeId]);
 
   const handleChangeDepartment = async (v: string) => {
     if (!v) return;
+    const snapshot = prevDeptRef.current;
     setDepartmentId(v);
+    prevDeptRef.current = v;
     try {
       await changeDepartment.mutateAsync(Number(v));
       const dept = departmentOptions.find((o) => o.value === v);
       toast({ title: dept ? `Отдел: ${dept.label}` : 'Отдел изменён' });
     } catch {
+      // Rollback
+      setDepartmentId(snapshot);
+      prevDeptRef.current = snapshot;
       toast({ title: 'Ошибка', description: 'Не удалось изменить отдел', variant: 'destructive' });
     }
   };
@@ -109,7 +138,8 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const changeStatus = async (status: Ticket['status']) => {
     try {
       await updateTicket.mutateAsync({ status });
-      toast({ title: `Статус: ${STATUS_OPTIONS.find((s) => s.value === status)?.label ?? status}` });
+      const label = statusOptions.find((s) => s.value === status)?.label ?? status;
+      toast({ title: `Статус: ${label}` });
     } catch {
       toast({ title: 'Ошибка', description: 'Не удалось изменить статус', variant: 'destructive' });
     }
@@ -117,52 +147,79 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const changePriority = async (priority: Ticket['priority']) => {
     try {
       await updateTicket.mutateAsync({ priority });
-      toast({ title: `Приоритет: ${PRIORITY_OPTIONS.find((p) => p.value === priority)?.label ?? priority}` });
+      const label = priorityOptions.find((p) => p.value === priority)?.label ?? priority;
+      toast({ title: `Приоритет: ${label}` });
     } catch {
       toast({ title: 'Ошибка', description: 'Не удалось изменить приоритет', variant: 'destructive' });
     }
   };
   const changeAssignee = async (v: string) => {
+    const snapshot = prevAssigneeRef.current;
     setAssigneeId(v);
+    prevAssigneeRef.current = v;
     try {
       await updateTicket.mutateAsync({ assigneeId: v ? Number(v) : null });
       const agent = staffOptions.find((o) => o.value === v);
       toast({ title: agent ? `Назначено: ${agent.label}` : 'Исполнитель снят' });
     } catch {
+      // Rollback
+      setAssigneeId(snapshot);
+      prevAssigneeRef.current = snapshot;
       toast({ title: 'Ошибка', description: 'Не удалось назначить исполнителя', variant: 'destructive' });
     }
   };
+  const changeType = async (v: string) => {
+    setTypeId(v);
+    try {
+      await updateTicket.mutateAsync({ typeId: v ? Number(v) : null });
+      const label = typeOptions.find((o) => o.value === v)?.label ?? v;
+      toast({ title: `Тип: ${label}` });
+    } catch {
+      toast({ title: 'Ошибка', description: ta.typeError, variant: 'destructive' });
+    }
+  };
 
-  const {
-    register,
-    handleSubmit,
-    reset,
-    watch,
-    setValue,
-    formState: { errors },
-  } = useForm<ReplyForm>({
+  // ── Separate RHF instances for reply and note tabs ──
+  const replyForm = useForm<ReplyForm>({
     resolver: zodResolver(replySchema),
   });
+  const noteForm = useForm<NoteForm>({
+    resolver: zodResolver(noteSchema),
+  });
 
-  // ── Reply draft auto-save ──
-  // Persist the in-progress reply per ticket AND per tab (reply vs internal note
-  // have separate drafts) so navigating away/reload doesn't lose it. Switching
-  // ticket or tab loads that key's draft (resets the field). Cleared on send.
-  const draftKey = `th_reply_draft_${ticketId}_${replyTab}`;
-  const restoredKeyRef = useRef<string | null>(null);
+  // ── Reply draft auto-save (per tab) ──
+  const replyDraftKey = `th_reply_draft_${ticketId}_reply`;
+  const noteDraftKey = `th_reply_draft_${ticketId}_note`;
+
+  const replyRestoredRef = useRef(false);
+  const noteRestoredRef = useRef(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || replyRestoredRef.current) return;
+    replyForm.setValue('replyBody', localStorage.getItem(replyDraftKey) ?? '');
+    replyRestoredRef.current = true;
+  }, [replyDraftKey, replyForm]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || noteRestoredRef.current) return;
+    noteForm.setValue('noteBody', localStorage.getItem(noteDraftKey) ?? '');
+    noteRestoredRef.current = true;
+  }, [noteDraftKey, noteForm]);
+
+  const replyBody = replyForm.watch('replyBody');
+  const noteBody = noteForm.watch('noteBody');
+
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    setValue('body', localStorage.getItem(draftKey) ?? '');
-    restoredKeyRef.current = draftKey;
-  }, [draftKey, setValue]);
-  const draftBody = watch('body');
+    if (replyBody?.trim()) localStorage.setItem(replyDraftKey, replyBody);
+    else localStorage.removeItem(replyDraftKey);
+  }, [replyBody, replyDraftKey]);
+
   useEffect(() => {
-    // Only persist once the field has been (re)hydrated for the CURRENT key —
-    // prevents the restore→watch cycle from writing a stale value to the new key.
-    if (typeof window === 'undefined' || restoredKeyRef.current !== draftKey) return;
-    if (draftBody && draftBody.trim() !== '') localStorage.setItem(draftKey, draftBody);
-    else localStorage.removeItem(draftKey);
-  }, [draftBody, draftKey]);
+    if (typeof window === 'undefined') return;
+    if (noteBody?.trim()) localStorage.setItem(noteDraftKey, noteBody);
+    else localStorage.removeItem(noteDraftKey);
+  }, [noteBody, noteDraftKey]);
 
   // r hotkey → focus reply
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
@@ -178,18 +235,36 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
 
-  const onSubmit = async (data: ReplyForm) => {
-    await replyMutation.mutateAsync({
-      body: data.body,
-      is_internal: replyTab === 'note',
-      attachmentIds,
-    });
-    reset();
-    setAttachmentIds([]);
-    if (typeof window !== 'undefined') localStorage.removeItem(draftKey);
-    toast({
-      title: replyTab === 'note' ? 'Заметка добавлена' : 'Ответ отправлен',
-    });
+  const onSubmitReply = async (data: ReplyForm) => {
+    try {
+      await replyMutation.mutateAsync({
+        body: data.replyBody,
+        is_internal: false,
+        attachmentIds: replyAttachmentIds,
+      });
+      replyForm.reset();
+      setReplyAttachmentIds([]);
+      if (typeof window !== 'undefined') localStorage.removeItem(replyDraftKey);
+      toast({ title: 'Ответ отправлен' });
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось отправить ответ', variant: 'destructive' });
+    }
+  };
+
+  const onSubmitNote = async (data: NoteForm) => {
+    try {
+      await replyMutation.mutateAsync({
+        body: data.noteBody,
+        is_internal: true,
+        attachmentIds: noteAttachmentIds,
+      });
+      noteForm.reset();
+      setNoteAttachmentIds([]);
+      if (typeof window !== 'undefined') localStorage.removeItem(noteDraftKey);
+      toast({ title: 'Заметка добавлена' });
+    } catch {
+      toast({ title: 'Ошибка', description: 'Не удалось добавить заметку', variant: 'destructive' });
+    }
   };
 
   if (ticketLoading)
@@ -214,6 +289,10 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   }
 
   const allReplies = ticket.replies ?? [];
+
+  // Build status/priority options for the combobox (need value:string, label:string)
+  const statusComboOptions = statusOptions.map((s) => ({ value: s.value, label: s.label }));
+  const priorityComboOptions = priorityOptions.map((p) => ({ value: p.value, label: p.label }));
 
   return (
     <div className="flex h-full flex-col">
@@ -315,54 +394,106 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                 <TabsTrigger value="reply">Ответ</TabsTrigger>
                 <TabsTrigger value="note">Внутренняя заметка</TabsTrigger>
               </TabsList>
-              <form onSubmit={handleSubmit(onSubmit)}>
-                <TabsContent value="reply">
-                  <Textarea
-                    id="reply-textarea"
-                    placeholder="Введите ответ клиенту... (R)"
-                    className="min-h-[100px] resize-none"
-                    {...register('body')}
-                    aria-label="Текст ответа"
-                  />
-                </TabsContent>
-                <TabsContent value="note">
-                  <Textarea
-                    id="note-textarea"
-                    placeholder="Внутренняя заметка (видна только агентам)..."
-                    className="min-h-[100px] resize-none border-status-pending/40 bg-status-pending/5"
-                    {...register('body')}
-                    aria-label="Внутренняя заметка"
-                  />
-                </TabsContent>
-                {errors.body && <p className="mt-1 text-xs text-destructive">{errors.body.message}</p>}
-                {draftBody && draftBody.trim() !== '' && (
-                  <p className="mt-1 text-xs text-muted-foreground">Черновик сохраняется автоматически</p>
-                )}
 
-                <div className="mt-3 space-y-3">
-                  <FileUploadZone
-                    uploadEndpoint="/attachments/upload"
-                    onUploaded={(ids) => setAttachmentIds((prev) => [...prev, ...ids])}
-                    maxFiles={10}
-                    className="text-sm"
-                  />
-                  <div className="flex justify-end">
-                    <Button
-                      type="submit"
-                      disabled={replyMutation.isPending}
-                      className="gap-2"
-                      data-testid="reply-submit"
-                    >
-                      {replyMutation.isPending ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Send className="h-4 w-4" />
-                      )}
-                      {replyTab === 'note' ? 'Добавить заметку' : 'Отправить'}
-                    </Button>
+              {/* REPLY tab — separate RHF registration */}
+              <TabsContent value="reply">
+                <form onSubmit={replyForm.handleSubmit(onSubmitReply)}>
+                  <div className="relative">
+                    <Textarea
+                      id="reply-textarea"
+                      placeholder="Введите ответ клиенту... (R)"
+                      className="min-h-[100px] resize-none"
+                      maxLength={MAX_BODY_CHARS}
+                      {...replyForm.register('replyBody')}
+                      aria-label="Текст ответа"
+                    />
+                    <span className="absolute bottom-1 right-2 text-[10px] text-muted-foreground">
+                      {(replyBody ?? '').length}/{MAX_BODY_CHARS} {ta.chars}
+                    </span>
                   </div>
-                </div>
-              </form>
+                  {replyForm.formState.errors.replyBody && (
+                    <p className="mt-1 text-xs text-destructive">
+                      {replyForm.formState.errors.replyBody.message}
+                    </p>
+                  )}
+                  {replyBody && replyBody.trim() !== '' && (
+                    <p className="mt-1 text-xs text-muted-foreground">Черновик сохраняется автоматически</p>
+                  )}
+                  <div className="mt-3 space-y-3">
+                    <FileUploadZone
+                      uploadEndpoint="/attachments/upload"
+                      onUploaded={(ids) => setReplyAttachmentIds((prev) => [...prev, ...ids])}
+                      maxFiles={10}
+                      className="text-sm"
+                    />
+                    <div className="flex justify-end">
+                      <Button
+                        type="submit"
+                        disabled={replyMutation.isPending}
+                        className="gap-2"
+                        data-testid="reply-submit"
+                      >
+                        {replyMutation.isPending ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Send className="h-4 w-4" />
+                        )}
+                        Отправить
+                      </Button>
+                    </div>
+                  </div>
+                </form>
+              </TabsContent>
+
+              {/* NOTE tab — separate RHF registration */}
+              <TabsContent value="note">
+                <form onSubmit={noteForm.handleSubmit(onSubmitNote)}>
+                  <div className="relative">
+                    <Textarea
+                      id="note-textarea"
+                      placeholder="Внутренняя заметка (видна только агентам)..."
+                      className="min-h-[100px] resize-none border-status-pending/40 bg-status-pending/5"
+                      maxLength={MAX_BODY_CHARS}
+                      {...noteForm.register('noteBody')}
+                      aria-label="Внутренняя заметка"
+                    />
+                    <span className="absolute bottom-1 right-2 text-[10px] text-muted-foreground">
+                      {(noteBody ?? '').length}/{MAX_BODY_CHARS} {ta.chars}
+                    </span>
+                  </div>
+                  {noteForm.formState.errors.noteBody && (
+                    <p className="mt-1 text-xs text-destructive">
+                      {noteForm.formState.errors.noteBody.message}
+                    </p>
+                  )}
+                  {noteBody && noteBody.trim() !== '' && (
+                    <p className="mt-1 text-xs text-muted-foreground">Черновик сохраняется автоматически</p>
+                  )}
+                  <div className="mt-3 space-y-3">
+                    <FileUploadZone
+                      uploadEndpoint="/attachments/upload"
+                      onUploaded={(ids) => setNoteAttachmentIds((prev) => [...prev, ...ids])}
+                      maxFiles={10}
+                      className="text-sm"
+                    />
+                    <div className="flex justify-end">
+                      <Button
+                        type="submit"
+                        disabled={replyMutation.isPending}
+                        className="gap-2"
+                        data-testid="note-submit"
+                      >
+                        {replyMutation.isPending ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Lock className="h-4 w-4" />
+                        )}
+                        Добавить заметку
+                      </Button>
+                    </div>
+                  </div>
+                </form>
+              </TabsContent>
             </Tabs>
           </div>
         </div>
@@ -380,11 +511,16 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                   <dt className="text-muted-foreground">Статус</dt>
                   <dd className="flex-1 max-w-[150px]">
                     <Combobox
-                      options={STATUS_OPTIONS}
+                      options={
+                        statusComboOptions.length > 0
+                          ? statusComboOptions
+                          : [{ value: ticket.status, label: ticket.status }]
+                      }
                       value={ticket.status}
                       onValueChange={(v) => void changeStatus(v as Ticket['status'])}
                       placeholder="Статус"
                       triggerWidth="w-full"
+                      disabled={updateTicket.isPending}
                     />
                   </dd>
                 </div>
@@ -392,11 +528,31 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                   <dt className="text-muted-foreground">Приоритет</dt>
                   <dd className="flex-1 max-w-[150px]">
                     <Combobox
-                      options={PRIORITY_OPTIONS}
+                      options={
+                        priorityComboOptions.length > 0
+                          ? priorityComboOptions
+                          : [{ value: ticket.priority, label: ticket.priority }]
+                      }
                       value={ticket.priority}
                       onValueChange={(v) => void changePriority(v as Ticket['priority'])}
                       placeholder="Приоритет"
                       triggerWidth="w-full"
+                      disabled={updateTicket.isPending}
+                    />
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <dt className="text-muted-foreground">{ta.type}</dt>
+                  <dd className="flex-1 max-w-[150px]">
+                    <Combobox
+                      options={typeOptions}
+                      value={typeId}
+                      onValueChange={(v) => void changeType(v)}
+                      placeholder={ta.typePlaceholder}
+                      searchPlaceholder="Поиск типа..."
+                      emptyMessage="Типы не найдены"
+                      triggerWidth="w-full"
+                      disabled={updateTicket.isPending}
                     />
                   </dd>
                 </div>
@@ -455,6 +611,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                 searchPlaceholder="Поиск агента..."
                 emptyMessage="Агент не найден"
                 triggerWidth="w-full"
+                disabled={updateTicket.isPending}
               />
             </section>
 
@@ -541,7 +698,16 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                       type="button"
                       aria-label={`Удалить метку ${tag}`}
                       className="text-muted-foreground/60 hover:text-destructive"
-                      onClick={() => tags.remove.mutate(tag)}
+                      onClick={() =>
+                        tags.remove.mutate(tag, {
+                          onError: () =>
+                            toast({
+                              title: 'Ошибка',
+                              description: 'Не удалось удалить метку',
+                              variant: 'destructive',
+                            }),
+                        })
+                      }
                     >
                       ×
                     </button>
@@ -555,10 +721,16 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                 onSubmit={(e) => {
                   e.preventDefault();
                   const name = newTag.trim();
-                  if (name) {
-                    tags.add.mutate(name);
-                    setNewTag('');
-                  }
+                  if (!name) return;
+                  tags.add.mutate(name, {
+                    onSuccess: () => setNewTag(''),
+                    onError: () =>
+                      toast({
+                        title: 'Ошибка',
+                        description: 'Не удалось добавить метку',
+                        variant: 'destructive',
+                      }),
+                  });
                 }}
               >
                 <input
@@ -587,6 +759,36 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
             <Separator />
             <section>
               <LinkedTicketsPanel ticketId={ticketId} />
+            </section>
+
+            {/* Merge */}
+            <Separator />
+            <section>
+              <MergeTicketPanel ticketId={ticketId} />
+            </section>
+
+            {/* Split */}
+            <Separator />
+            <section>
+              <SplitTicketPanel
+                ticketId={ticketId}
+                posts={allReplies.map((r) => ({
+                  id: r.id,
+                  label: `${r.author?.name ?? ''}: ${(r.body ?? '').slice(0, 80)}`.trim(),
+                }))}
+              />
+            </section>
+
+            {/* Watchers */}
+            <Separator />
+            <section>
+              <WatchersPanel ticketId={ticketId} />
+            </section>
+
+            {/* Recipients CC/BCC */}
+            <Separator />
+            <section>
+              <RecipientsPanel ticketId={ticketId} />
             </section>
           </div>
         </aside>

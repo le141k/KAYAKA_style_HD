@@ -11,6 +11,7 @@ import { useMe } from '@/lib/hooks/use-auth';
 const ADMIN_TABS = [
   { label: 'Отделы', href: '/admin/departments' },
   { label: 'Статусы и приоритеты', href: '/admin/statuses' },
+  { label: 'Типы заявок', href: '/admin/ticket-types' },
   { label: 'SLA-планы', href: '/admin/sla' },
   { label: 'Правила и макросы', href: '/admin/workflows' },
   { label: 'Сотрудники и группы', href: '/admin/staff' },

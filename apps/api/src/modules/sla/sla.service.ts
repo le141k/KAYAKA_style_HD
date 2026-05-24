@@ -26,6 +26,9 @@ export interface BreachEntry {
 
 type WorkHours = Record<string, Array<[string, string]>>;
 
+/** Max breached tickets processed per periodic scan — bounds memory/CPU. */
+const SLA_BREACH_SCAN_CAP = 1000;
+
 const DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const;
 
 /**
@@ -41,58 +44,60 @@ function parseMinutes(time: string): number {
  * Uses the SlaSchedule workHours convention (mon, tue, …, sun).
  */
 function dayKey(date: Date): string {
-  return DAY_NAMES[date.getDay()] ?? 'sun';
+  // UTC weekday — the whole working-time calc is UTC-consistent (prod runs the
+  // container in UTC) so it never mixes UTC and local bases (which mis-matched holidays).
+  return DAY_NAMES[date.getUTCDay()] ?? 'sun';
 }
 
 /**
- * Check whether a given Date falls within a schedule's working hours,
- * taking holidays into account.
- */
-function isWorkingTime(date: Date, workHours: WorkHours, holidays: SlaHoliday[]): boolean {
-  // Holiday check (compare date only, not time)
-  const dateOnly = date.toISOString().slice(0, 10);
-  if (holidays.some((h) => h.date.toISOString().slice(0, 10) === dateOnly)) return false;
-
-  const slots = workHours[dayKey(date)];
-  if (!slots || slots.length === 0) return false;
-
-  const minutesNow = date.getHours() * 60 + date.getMinutes();
-
-  return slots.some(([start, end]) => {
-    const s = parseMinutes(start ?? '00:00');
-    const e = parseMinutes(end ?? '23:59');
-    return minutesNow >= s && minutesNow < e;
-  });
-}
-
-/**
- * Advance `cursor` forward by `remainingSeconds` of business time,
- * honouring the work schedule and holidays.
+ * Advance `start` forward by `seconds` of business time, honouring the work
+ * schedule and holidays.
  *
- * Strategy: step forward one minute at a time when within working hours.
- * This is O(minutes) and sufficient for SLA windows up to ~24 h.
- * For production scale, replace with a calendar-interval algorithm.
+ * Calendar-interval algorithm: walks day-by-day and consumes whole working
+ * slots at once (O(days), bounded to 60), instead of stepping minute-by-minute
+ * (the old O(minutes) loop blocked the event loop on every ticket create/reply).
  */
 function addWorkingSeconds(start: Date, seconds: number, workHours: WorkHours, holidays: SlaHoliday[]): Date {
-  let cursor = new Date(start);
   let remaining = seconds;
+  const holidaySet = new Set(holidays.map((h) => h.date.toISOString().slice(0, 10)));
 
-  // Safety cap: prevent infinite loops for misconfigured schedules (max 60 days)
-  const limit = new Date(start);
-  limit.setDate(limit.getDate() + 60);
+  let day = new Date(start);
+  for (let d = 0; d < 60 && remaining > 0; d++) {
+    const isHoliday = holidaySet.has(day.toISOString().slice(0, 10));
+    const slots = isHoliday ? [] : (workHours[dayKey(day)] ?? []);
 
-  while (remaining > 0 && cursor < limit) {
-    if (isWorkingTime(cursor, workHours, holidays)) {
-      const minuteMs = 60_000;
-      cursor = new Date(cursor.getTime() + minuteMs);
-      remaining -= 60;
-    } else {
-      // Jump to next minute
-      cursor = new Date(cursor.getTime() + 60_000);
+    for (const [startStr, endStr] of slots) {
+      const sMin = parseMinutes(startStr ?? '00:00');
+      const eMin = parseMinutes(endStr ?? '23:59');
+      if (eMin <= sMin) continue;
+
+      const slotStart = new Date(day);
+      slotStart.setUTCHours(0, 0, 0, 0);
+      slotStart.setUTCMinutes(sMin);
+      const slotEnd = new Date(day);
+      slotEnd.setUTCHours(0, 0, 0, 0);
+      slotEnd.setUTCMinutes(eMin);
+
+      // On the first day, never count time before `start`.
+      const windowStart = d === 0 && start > slotStart ? start : slotStart;
+      if (windowStart >= slotEnd) continue;
+
+      const availSec = Math.floor((slotEnd.getTime() - windowStart.getTime()) / 1000);
+      if (remaining <= availSec) {
+        return new Date(windowStart.getTime() + remaining * 1000);
+      }
+      remaining -= availSec;
     }
+
+    // Advance to 00:00 (UTC) of the next day.
+    day = new Date(day);
+    day.setUTCHours(0, 0, 0, 0);
+    day.setUTCDate(day.getUTCDate() + 1);
   }
 
-  return cursor;
+  // Budget not exhausted within the 60-day safety cap (e.g. empty/misconfigured
+  // schedule) — return the cap, matching the previous loop's fail-safe.
+  return day;
 }
 
 /** Escalation action shape stored in EscalationRule.actions JSON */
@@ -175,6 +180,9 @@ export class SlaService {
       where: {
         isResolved: false,
         mergedIntoId: null,
+        // Already-escalated tickets must be excluded, otherwise every 60s scan
+        // re-fires their escalation rule actions (notify/note/assign) indefinitely.
+        isEscalated: false,
         OR: [
           // First-response breach: dueAt passed and no firstResponseAt recorded
           { dueAt: { lt: now }, firstResponseAt: null },
@@ -182,6 +190,10 @@ export class SlaService {
           { resolutionDueAt: { lt: now } },
         ],
       },
+      // Bound the working set so a large breach backlog can't OOM the worker;
+      // the remainder is drained on subsequent scans as tickets get escalated.
+      orderBy: { id: 'asc' },
+      take: SLA_BREACH_SCAN_CAP,
     });
 
     const breaches: BreachEntry[] = [];

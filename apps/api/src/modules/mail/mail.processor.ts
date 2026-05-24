@@ -20,7 +20,8 @@ export class MailProcessor extends WorkerHost {
 
   async process(job: Job<SendMailJobData>): Promise<void> {
     this.logger.debug(`Mail job ${job.id}: sending to ${String(job.data.to)}`);
-    await this.mailService.send(job.data);
+    // deliver() = actual SMTP. Must NOT call send() here (that would re-enqueue).
+    await this.mailService.deliver(job.data);
     this.logger.debug(`Mail job ${job.id}: done`);
   }
 }

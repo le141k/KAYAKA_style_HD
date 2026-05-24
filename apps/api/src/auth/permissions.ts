@@ -21,6 +21,9 @@ export const PERMISSIONS = {
   USER_MANAGE: 'user.manage',
   STAFF_MANAGE: 'staff.manage',
   ORG_MANAGE: 'org.manage',
+  // Deleting an organization detaches all its users (FK SET NULL) — admin-only,
+  // deliberately NOT in the agent preset.
+  ORG_DELETE: 'org.delete',
   // reports
   REPORT_RUN: 'report.run',
   REPORT_MANAGE: 'report.manage',
