@@ -23,7 +23,7 @@ name: telecom-hd-prod
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.6-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${TELECOM_HD_DB_USER:?set in .env.prod}
@@ -36,9 +36,14 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine
     restart: unless-stopped
     # Require a password — even on the internal network, an unauthenticated Redis
     # lets any compromised container read/write the BullMQ queues and token state.
@@ -48,6 +53,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   api:
     build:
@@ -72,9 +82,26 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Apply migrations, then start. Seed is intentionally NOT run in prod (seed.ts
-    # also hard-refuses to create the demo admin under NODE_ENV=production).
-    command: ["sh", "-c", "npx prisma migrate deploy && node dist/main.js"]
+    # Apply migrations, bootstrap the admin user (idempotent), then start.
+    command: ["sh", "-c", "npx prisma migrate deploy && node dist/seed/bootstrap-admin.js && node dist/main.js"]
+    # node:alpine ships busybox wget (not curl) — use wget for the in-container probe.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/api/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
 
   web:
     build:
@@ -91,7 +118,27 @@ services:
     expose:
       - "3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    # Probe /login (returns 200) — the root "/" 307-redirects to /kb and busybox
+    # wget exits non-zero on a 3xx, which would mark web permanently unhealthy.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/login >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
 
 volumes:
   pgdata:

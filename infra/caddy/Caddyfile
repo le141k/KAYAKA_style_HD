@@ -1,0 +1,108 @@
+# 23 Telecom Help Desk — Caddy reverse proxy with automatic TLS (Let's Encrypt).
+#
+# HOW TO RUN (as an extra compose service):
+#
+#   Add the following to a docker-compose.override.yml (or a separate
+#   docker-compose.proxy.yml) in the repo root, then bring it up alongside
+#   the prod compose:
+#
+#     services:
+#       caddy:
+#         image: caddy:2-alpine
+#         restart: unless-stopped
+#         ports:
+#           - "80:80"
+#           - "443:443"
+#           - "443:443/udp"     # HTTP/3
+#         volumes:
+#           - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+#           - caddy_data:/data
+#           - caddy_config:/config
+#         networks:
+#           - telecom-hd-prod_default   # join the prod compose network
+#     volumes:
+#       caddy_data:
+#       caddy_config:
+#
+#   Then:
+#     docker compose \
+#       -f docker-compose.prod.yml \
+#       -f docker-compose.proxy.yml \
+#       --env-file .env.prod up -d
+#
+# DOMAIN: set DOMAIN in .env.prod (e.g. DOMAIN=help.example.com).
+# Caddy resolves it automatically; no separate cert management needed.
+#
+# COOKIES / AUTH: Caddy forwards Set-Cookie headers untouched by default.
+# The API sets HttpOnly + Secure session cookies — do not add header transforms
+# that strip Set-Cookie or Cookie.
+
+{$DOMAIN} {
+    # ----------------------------------------------------------------
+    # /api/* → API service on port 4000
+    # ----------------------------------------------------------------
+    handle /api/* {
+        reverse_proxy api:4000 {
+            # Preserve the original Host so the API's CORS check against
+            # TELECOM_HD_PUBLIC_URL passes correctly.
+            header_up Host {host}
+
+            # Standard forwarding headers the API (and Prisma logs) rely on.
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+
+            # WebSocket upgrade for future real-time features / SSE keep-alives.
+            # Caddy handles the Upgrade header automatically when the upstream
+            # speaks WS; no extra config required.
+
+            # Do NOT strip: Cookie, Set-Cookie (HttpOnly auth session cookies).
+        }
+    }
+
+    # ----------------------------------------------------------------
+    # Everything else → Next.js frontend on port 3000
+    # ----------------------------------------------------------------
+    handle {
+        reverse_proxy web:3000 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # ----------------------------------------------------------------
+    # Security headers
+    # ----------------------------------------------------------------
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Remove the server fingerprint.
+        -Server
+    }
+
+    # ----------------------------------------------------------------
+    # Automatic TLS via Let's Encrypt (default Caddy behaviour).
+    # Requires ports 80 and 443 reachable from the internet on first run.
+    # ----------------------------------------------------------------
+    tls {
+        # Uses the ACME HTTP-01 challenge by default.
+        # For wildcard certs switch to a DNS-01 challenge module.
+    }
+
+    # ----------------------------------------------------------------
+    # Encoding (gzip + zstd).
+    # Caddy's encode directive handles content negotiation automatically.
+    # ----------------------------------------------------------------
+    encode gzip zstd
+
+    # ----------------------------------------------------------------
+    # Upload size limit — match the API's 25 MB multer limit.
+    # ----------------------------------------------------------------
+    request_body {
+        max_size 25MB
+    }
+}
