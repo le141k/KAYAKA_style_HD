@@ -3,6 +3,8 @@ import {
   Controller,
   Delete,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   ParseIntPipe,
   Patch,
@@ -65,6 +67,14 @@ export class StaffController {
     @Body(new ZodValidationPipe(UpdateStaffGroupSchema)) dto: UpdateStaffGroupDto,
   ) {
     return this.staffService.updateGroup(id, dto);
+  }
+
+  @Delete('groups/:id')
+  @RequirePermissions(PERMISSIONS.STAFF_MANAGE)
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Delete a staff group (U9 — 409 if members still assigned)' })
+  deleteGroup(@Param('id', ParseIntPipe) id: number) {
+    return this.staffService.deleteGroup(id);
   }
 
   // ─────────────────── Members ───────────────────

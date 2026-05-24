@@ -8,6 +8,8 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { PrismaModule } from './prisma/prisma.module';
 import { loadConfig, APP_CONFIG } from './config/configuration';
 import { AuthModule } from './auth/auth.module';
+import { MAIL_SERVICE_TOKEN } from './auth/auth.service';
+import { MailService } from './modules/mail/mail.service';
 import { StaffModule } from './modules/staff/staff.module';
 import { UsersModule } from './modules/users/users.module';
 import { OrganizationsModule } from './modules/organizations/organizations.module';
@@ -107,6 +109,13 @@ const redisUrl = new URL(config.REDIS_URL);
     {
       provide: APP_CONFIG,
       useValue: config,
+    },
+    // Wire MailService into AuthService for forgot-password email dispatch.
+    // AuthModule is @Global so it resolves this token; MailModule exports MailService
+    // and is imported here, so the factory has access to the already-registered provider.
+    {
+      provide: MAIL_SERVICE_TOKEN,
+      useExisting: MailService,
     },
     // Map Prisma known-request errors (P2025/P2003/P2002) to 404/400/409 instead of 500
     {

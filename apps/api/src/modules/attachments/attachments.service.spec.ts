@@ -12,6 +12,7 @@ function makeAttachment(overrides: Partial<Attachment> = {}): Attachment {
     id: 1,
     ticketId: null,
     postId: null,
+    noteId: null,
     fileName: 'test.pdf',
     mimeType: 'application/pdf',
     size: 1024,

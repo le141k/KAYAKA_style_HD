@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import type { CreateDepartmentDto, UpdateDepartmentDto } from './dto';
 import type { Department } from '@prisma/client';
@@ -60,6 +60,16 @@ export class DepartmentsService {
 
   async delete(id: number): Promise<void> {
     await this.get(id);
+
+    // U-high: pre-check for dependent tickets and return a 409 instead of a raw
+    // P2003 FK violation which surfaced as an opaque 500 to the client.
+    const ticketCount = await this.prisma.ticket.count({ where: { departmentId: id, mergedIntoId: null } });
+    if (ticketCount > 0) {
+      throw new ConflictException(
+        `Cannot delete: still in use by ${ticketCount} ticket${ticketCount === 1 ? '' : 's'}`,
+      );
+    }
+
     await this.prisma.department.delete({ where: { id } });
   }
 }

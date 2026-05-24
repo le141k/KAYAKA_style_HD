@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { DepartmentsService } from './departments.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 
@@ -11,6 +11,9 @@ function makePrismaMock() {
       create: vi.fn(),
       update: vi.fn(),
       delete: vi.fn(),
+    },
+    ticket: {
+      count: vi.fn().mockResolvedValue(0),
     },
   } as unknown as PrismaService;
 }
@@ -162,6 +165,16 @@ describe('DepartmentsService', () => {
     it('throws NotFoundException when department not found', async () => {
       (prisma.department.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.delete(99)).rejects.toThrow(NotFoundException);
+    });
+
+    it('throws ConflictException when department still has tickets', async () => {
+      (prisma.department.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_DEPT,
+        children: [],
+      });
+      (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(3);
+
+      await expect(service.delete(1)).rejects.toThrow(ConflictException);
     });
   });
 });

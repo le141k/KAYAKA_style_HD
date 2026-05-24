@@ -66,6 +66,8 @@ export interface Ticket {
   body: string;
   status: TicketStatus;
   priority: TicketPriority;
+  typeId?: number;
+  typeName?: string;
   requester: User;
   assignee?: User;
   department?: Department;

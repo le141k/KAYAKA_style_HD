@@ -91,6 +91,28 @@ export class AttachmentsService {
     });
   }
 
+  /**
+   * Link orphan attachment rows to a specific internal note and ticket.
+   * Mirrors linkToPost — used by TicketsService.addNote when attachmentIds are supplied.
+   * Only staff-authenticated callers reach this path; no claimToken is needed.
+   */
+  async linkToNote(ids: number[], noteId: number, ticketId: number): Promise<void> {
+    if (!ids.length) return;
+
+    await this.prisma.attachment.updateMany({
+      where: {
+        id: { in: ids },
+        postId: null, // only adopt orphans (not already linked to a post)
+        noteId: null, // not already linked to another note
+      },
+      data: {
+        noteId,
+        ticketId,
+        claimToken: null,
+      },
+    });
+  }
+
   async getAttachmentOrThrow(id: number): Promise<Attachment> {
     const attachment = await this.prisma.attachment.findUnique({ where: { id } });
     if (!attachment) throw new NotFoundException(`Attachment ${id} not found`);

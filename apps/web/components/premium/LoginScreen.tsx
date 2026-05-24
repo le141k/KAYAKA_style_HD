@@ -4,8 +4,8 @@ import { useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { motion } from 'framer-motion';
-import { Eye, EyeOff, Wifi, Lock, Mail, ArrowRight, Loader2 } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Eye, EyeOff, Wifi, Lock, Mail, ArrowRight, Loader2, ArrowLeft, CheckCircle2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -13,11 +13,18 @@ import { Label } from '@/components/ui/label';
 import { useLogin } from '@/lib/hooks/use-auth';
 import { useI18n } from '@/lib/i18n';
 
+const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
+
 const loginSchema = z.object({
   email: z.string().email('Введите корректный email'),
   password: z.string().min(6, 'Минимум 6 символов'),
 });
 type LoginForm = z.infer<typeof loginSchema>;
+
+const forgotSchema = z.object({
+  email: z.string().email('Введите корректный email'),
+});
+type ForgotForm = z.infer<typeof forgotSchema>;
 
 interface LoginScreenProps {
   redirectTo?: string;
@@ -86,9 +93,129 @@ function BrandLogo({ className }: { className?: string }) {
   );
 }
 
+/** Forgot-password form panel */
+function ForgotPasswordPanel({ onBack }: { onBack: () => void }) {
+  const [sent, setSent] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const {
+    register,
+    handleSubmit,
+    setError,
+    formState: { errors },
+  } = useForm<ForgotForm>({ resolver: zodResolver(forgotSchema) });
+
+  const onSubmit = async (data: ForgotForm) => {
+    setIsSubmitting(true);
+    try {
+      await fetch(`${API_URL}/auth/forgot-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email: data.email }),
+      });
+      // Always show success to avoid email-enumeration attacks
+      setSent(true);
+    } catch {
+      setError('root', { message: 'Не удалось отправить письмо. Попробуйте ещё раз.' });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  if (sent) {
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="space-y-4 text-center"
+      >
+        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-primary/10">
+          <CheckCircle2 className="h-7 w-7 text-primary" />
+        </div>
+        <div>
+          <h2 className="text-xl font-bold">Письмо отправлено</h2>
+          <p className="mt-1.5 text-sm text-muted-foreground">
+            Если этот email зарегистрирован в системе, вы получите ссылку для сброса пароля.
+          </p>
+        </div>
+        <Button variant="ghost" size="sm" onClick={onBack} className="gap-1.5">
+          <ArrowLeft className="h-3.5 w-3.5" />
+          Вернуться к входу
+        </Button>
+      </motion.div>
+    );
+  }
+
+  return (
+    <motion.div
+      key="forgot"
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -8 }}
+      className="space-y-4"
+    >
+      <div>
+        <button
+          type="button"
+          onClick={onBack}
+          className="mb-3 flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" />
+          Назад
+        </button>
+        <h2 className="text-xl font-bold">Восстановление пароля</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Введите email — мы пришлём ссылку для сброса пароля.
+        </p>
+      </div>
+      <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
+        <div className="space-y-1.5">
+          <Label htmlFor="forgot-email">Email</Label>
+          <div className="relative">
+            <Mail className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              id="forgot-email"
+              type="email"
+              autoComplete="email"
+              placeholder="agent@23telecom.ru"
+              className={cn('pl-9', errors.email && 'border-destructive')}
+              {...register('email')}
+              aria-invalid={!!errors.email}
+            />
+          </div>
+          {errors.email && <p className="text-xs text-destructive">{errors.email.message}</p>}
+        </div>
+
+        {errors.root && (
+          <motion.p
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="rounded-md bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive"
+            role="alert"
+          >
+            {errors.root.message}
+          </motion.p>
+        )}
+
+        <Button type="submit" className="w-full" disabled={isSubmitting}>
+          {isSubmitting ? (
+            <>
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Отправка...
+            </>
+          ) : (
+            'Отправить ссылку'
+          )}
+        </Button>
+      </form>
+    </motion.div>
+  );
+}
+
 export function LoginScreen({ redirectTo = '/staff/dashboard' }: LoginScreenProps) {
   const { t } = useI18n();
   const [showPassword, setShowPassword] = useState(false);
+  const [showForgot, setShowForgot] = useState(false);
   const loginMutation = useLogin();
 
   const {
@@ -179,92 +306,110 @@ export function LoginScreen({ redirectTo = '/staff/dashboard' }: LoginScreenProp
             <span className="text-lg font-bold">23T Help Desk</span>
           </div>
 
-          <div>
-            <h1 className="text-2xl font-bold">{t.auth.loginTitle}</h1>
-            <p className="mt-1 text-sm text-muted-foreground">{t.auth.loginSubtitle}</p>
-          </div>
-
-          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
-            <div className="space-y-1.5">
-              <Label htmlFor="email">{t.auth.email}</Label>
-              <div className="relative">
-                <Mail className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  id="email"
-                  type="email"
-                  autoComplete="email"
-                  placeholder="agent@23telecom.ru"
-                  className={cn('pl-9', errors.email && 'border-destructive')}
-                  {...register('email')}
-                  aria-invalid={!!errors.email}
-                  aria-describedby={errors.email ? 'email-error' : undefined}
-                />
-              </div>
-              {errors.email && (
-                <p id="email-error" className="text-xs text-destructive">
-                  {errors.email.message}
-                </p>
-              )}
-            </div>
-
-            <div className="space-y-1.5">
-              <Label htmlFor="password">{t.auth.password}</Label>
-              <div className="relative">
-                <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  id="password"
-                  type={showPassword ? 'text' : 'password'}
-                  autoComplete="current-password"
-                  placeholder="••••••••"
-                  className={cn('pl-9 pr-9', errors.password && 'border-destructive')}
-                  {...register('password')}
-                  aria-invalid={!!errors.password}
-                  aria-describedby={errors.password ? 'pw-error' : undefined}
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword((v) => !v)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                  aria-label={showPassword ? 'Скрыть пароль' : 'Показать пароль'}
-                >
-                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
-              </div>
-              {errors.password && (
-                <p id="pw-error" className="text-xs text-destructive">
-                  {errors.password.message}
-                </p>
-              )}
-            </div>
-
-            {errors.root && (
-              <motion.p
-                initial={{ opacity: 0, y: -4 }}
+          <AnimatePresence mode="wait">
+            {showForgot ? (
+              <ForgotPasswordPanel key="forgot" onBack={() => setShowForgot(false)} />
+            ) : (
+              <motion.div
+                key="login"
+                initial={{ opacity: 0, y: 12 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="rounded-md bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive"
-                role="alert"
+                exit={{ opacity: 0, y: -8 }}
+                className="space-y-6"
               >
-                {errors.root.message}
-              </motion.p>
+                <div>
+                  <h1 className="text-2xl font-bold">{t.auth.loginTitle}</h1>
+                  <p className="mt-1 text-sm text-muted-foreground">{t.auth.loginSubtitle}</p>
+                </div>
+
+                <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="email">{t.auth.email}</Label>
+                    <div className="relative">
+                      <Mail className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        id="email"
+                        type="email"
+                        autoComplete="email"
+                        placeholder="agent@23telecom.ru"
+                        className={cn('pl-9', errors.email && 'border-destructive')}
+                        {...register('email')}
+                        aria-invalid={!!errors.email}
+                        aria-describedby={errors.email ? 'email-error' : undefined}
+                      />
+                    </div>
+                    {errors.email && (
+                      <p id="email-error" className="text-xs text-destructive">
+                        {errors.email.message}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label htmlFor="password">{t.auth.password}</Label>
+                    <div className="relative">
+                      <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        id="password"
+                        type={showPassword ? 'text' : 'password'}
+                        autoComplete="current-password"
+                        placeholder="••••••••"
+                        className={cn('pl-9 pr-9', errors.password && 'border-destructive')}
+                        {...register('password')}
+                        aria-invalid={!!errors.password}
+                        aria-describedby={errors.password ? 'pw-error' : undefined}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword((v) => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                        aria-label={showPassword ? 'Скрыть пароль' : 'Показать пароль'}
+                      >
+                        {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                      </button>
+                    </div>
+                    {errors.password && (
+                      <p id="pw-error" className="text-xs text-destructive">
+                        {errors.password.message}
+                      </p>
+                    )}
+                  </div>
+
+                  {errors.root && (
+                    <motion.p
+                      initial={{ opacity: 0, y: -4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="rounded-md bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive"
+                      role="alert"
+                    >
+                      {errors.root.message}
+                    </motion.p>
+                  )}
+
+                  <Button type="submit" className="w-full" disabled={loginMutation.isPending}>
+                    {loginMutation.isPending ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Вход...
+                      </>
+                    ) : (
+                      t.auth.login
+                    )}
+                  </Button>
+                </form>
+
+                <p className="text-center text-xs text-muted-foreground">
+                  <button
+                    type="button"
+                    onClick={() => setShowForgot(true)}
+                    className="text-primary hover:underline"
+                  >
+                    {t.auth.forgotPassword}
+                  </button>
+                </p>
+              </motion.div>
             )}
-
-            <Button type="submit" className="w-full" disabled={loginMutation.isPending}>
-              {loginMutation.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Вход...
-                </>
-              ) : (
-                t.auth.login
-              )}
-            </Button>
-          </form>
-
-          <p className="text-center text-xs text-muted-foreground">
-            <a href="#" className="text-primary hover:underline">
-              {t.auth.forgotPassword}
-            </a>
-          </p>
+          </AnimatePresence>
 
           <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground">
             <Wifi className="h-3.5 w-3.5" />

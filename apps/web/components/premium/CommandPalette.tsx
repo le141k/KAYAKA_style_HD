@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -23,14 +23,15 @@ import {
   CommandSeparator,
 } from '@/components/ui/command';
 import { useTickets } from '@/lib/hooks/use-tickets';
+import { useAuth } from '@/lib/auth/auth-context';
 
 const NAV_ITEMS = [
-  { label: 'Дашборд', href: '/staff/dashboard', Icon: LayoutDashboard },
-  { label: 'Заявки (список)', href: '/staff/tickets', Icon: Ticket },
-  { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare },
-  { label: 'База знаний', href: '/kb', Icon: BookOpen },
-  { label: 'Настройки', href: '/admin', Icon: Settings },
-  { label: 'Сотрудники', href: '/admin/staff', Icon: Users },
+  { label: 'Дашборд', href: '/staff/dashboard', Icon: LayoutDashboard, adminOnly: false },
+  { label: 'Заявки (список)', href: '/staff/tickets', Icon: Ticket, adminOnly: false },
+  { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare, adminOnly: false },
+  { label: 'База знаний', href: '/kb', Icon: BookOpen, adminOnly: false },
+  { label: 'Настройки', href: '/admin', Icon: Settings, adminOnly: true },
+  { label: 'Сотрудники', href: '/admin/staff', Icon: Users, adminOnly: true },
 ];
 
 interface CommandPaletteProps {
@@ -40,7 +41,21 @@ interface CommandPaletteProps {
 
 export function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const router = useRouter();
+  const { user } = useAuth();
+  const isAdmin = user?.role === 'admin';
+
+  const [inputValue, setInputValue] = useState('');
+  // Debounced query sent to the API — updated ~300 ms after the user stops typing.
   const [query, setQuery] = useState('');
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleInputChange = useCallback((value: string) => {
+    setInputValue(value);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      setQuery(value);
+    }, 300);
+  }, []);
 
   const { data } = useTickets({ q: query || undefined, per_page: 5, enabled: open });
   const tickets = data?.data ?? [];
@@ -49,6 +64,7 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
     (href: string) => {
       router.push(href);
       onClose();
+      setInputValue('');
       setQuery('');
     },
     [router, onClose],
@@ -62,6 +78,20 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [onClose]);
+
+  // Reset state when palette is closed
+  useEffect(() => {
+    if (!open) {
+      setInputValue('');
+      setQuery('');
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    }
+  }, [open]);
+
+  const visibleNavItems = NAV_ITEMS.filter((item) => {
+    if (item.adminOnly && !isAdmin) return false;
+    return inputValue ? item.label.toLowerCase().includes(inputValue.toLowerCase()) : true;
+  });
 
   return (
     <AnimatePresence>
@@ -91,8 +121,8 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
             <Command shouldFilter={false} onValueChange={() => {}}>
               <CommandInput
                 placeholder="Поиск заявок, разделов..."
-                value={query}
-                onValueChange={setQuery}
+                value={inputValue}
+                onValueChange={handleInputChange}
                 autoFocus
               />
               <CommandList className="max-h-80">
@@ -105,9 +135,7 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
 
                 {/* Navigation */}
                 <CommandGroup heading="Навигация">
-                  {NAV_ITEMS.filter((item) =>
-                    query ? item.label.toLowerCase().includes(query.toLowerCase()) : true,
-                  ).map((item) => (
+                  {visibleNavItems.map((item) => (
                     <CommandItem
                       key={item.href}
                       value={item.href}

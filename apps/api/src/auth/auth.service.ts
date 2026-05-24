@@ -1,4 +1,12 @@
-import { Injectable, UnauthorizedException, Logger, Inject, Optional } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  UnauthorizedException,
+  Logger,
+  Inject,
+  Optional,
+} from '@nestjs/common';
+import { createHash, randomBytes } from 'crypto';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppConfig, APP_CONFIG } from '../config/configuration';
@@ -19,6 +27,9 @@ export interface LoginResult extends TokenPair {
 /** Full staff record joined with group, used internally. */
 type StaffWithGroup = Staff & { staffGroup: StaffGroup };
 
+/** Token used to inject MailService optionally without creating a circular module dep. */
+export const MAIL_SERVICE_TOKEN = Symbol('MAIL_SERVICE_TOKEN');
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -28,6 +39,9 @@ export class AuthService {
     private readonly jwt: JwtService,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
     @Optional() private readonly blocklist?: TokenBlocklistService,
+    @Optional()
+    @Inject(MAIL_SERVICE_TOKEN)
+    private readonly mailService?: { sendTemplate: (...args: unknown[]) => Promise<void> },
   ) {}
 
   /** Validate credentials; returns Staff+Group on success, throws otherwise. */
@@ -162,6 +176,85 @@ export class AuthService {
       await this.blocklist.block(accessJti, ttl);
     }
     this.logger.log(`Staff ${staffId} logged out (tokens revoked)`);
+  }
+
+  // ─────────────────────────── Password reset ────────────────────────────────
+
+  /**
+   * Initiate a password-reset flow.
+   * Always returns without error to avoid user enumeration — if the email does not
+   * match any staff member, no email is sent but the response is identical.
+   * Token is a 32-byte hex random; sha256 hash is stored (not argon2: the raw
+   * token is a short-lived nonce so collision resistance is sufficient; using
+   * sha256 keeps reset-password validation fast without a BCrypt/argon2 round).
+   */
+  async forgotPassword(email: string): Promise<void> {
+    const staff = await this.prisma.staff.findUnique({ where: { email } });
+    if (!staff || !staff.isEnabled) {
+      // Silent no-op — do NOT leak whether the email exists.
+      return;
+    }
+
+    const rawToken = randomBytes(32).toString('hex');
+    const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await this.prisma.passwordReset.create({
+      data: { staffId: staff.id, tokenHash, expiresAt },
+    });
+
+    const resetUrl = `${this.config.TELECOM_HD_PUBLIC_URL}/reset-password?token=${rawToken}`;
+
+    // Non-blocking — if mail fails the user can request again
+    if (this.mailService) {
+      this.mailService
+        .sendTemplate(email, 'password_reset', 'en', {
+          firstName: staff.firstName,
+          resetUrl,
+          expiresInHours: '1',
+        })
+        .catch((err: unknown) =>
+          this.logger.error(`Password-reset email failed for ${email}: ${String(err)}`),
+        );
+    } else {
+      // Fallback: log the reset URL so dev/test environments without mail still work
+      this.logger.log(`[DEV] Password reset link for ${email}: ${resetUrl}`);
+    }
+  }
+
+  /**
+   * Consume a password-reset token and set the new password.
+   * Verifies: token sha256 matches a stored hash, not expired, not already used.
+   * On success: updates passwordHash, marks token used, revokes all refresh tokens.
+   */
+  async resetPassword(token: string, newPassword: string): Promise<void> {
+    const tokenHash = createHash('sha256').update(token).digest('hex');
+
+    const record = await this.prisma.passwordReset.findUnique({ where: { tokenHash } });
+
+    if (!record || record.usedAt !== null || record.expiresAt < new Date()) {
+      throw new BadRequestException('Invalid or expired reset token');
+    }
+
+    const passwordHash = await hashPassword(newPassword);
+
+    await this.prisma.$transaction([
+      this.prisma.staff.update({
+        where: { id: record.staffId },
+        data: { passwordHash },
+      }),
+      this.prisma.passwordReset.update({
+        where: { id: record.id },
+        data: { usedAt: new Date() },
+      }),
+      // Revoke all active refresh tokens so existing sessions are invalidated
+      this.prisma.refreshToken.updateMany({
+        where: { staffId: record.staffId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+
+    this.logger.log(`Password reset completed for staffId ${record.staffId}`);
   }
 
   // ─────────────────────── private helpers ───────────────────────

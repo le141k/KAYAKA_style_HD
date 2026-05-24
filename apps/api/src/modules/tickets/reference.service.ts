@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import type { TicketStatus, TicketPriority, TicketType } from '@prisma/client';
 import { z } from 'zod';
@@ -53,6 +53,13 @@ export class ReferenceService {
   async deleteStatus(id: number): Promise<void> {
     const s = await this.prisma.ticketStatus.findUnique({ where: { id } });
     if (!s) throw new NotFoundException(`TicketStatus ${id} not found`);
+    // U-high: pre-check so the client receives 409 instead of a raw P2003 500
+    const ticketCount = await this.prisma.ticket.count({ where: { statusId: id, mergedIntoId: null } });
+    if (ticketCount > 0) {
+      throw new ConflictException(
+        `Cannot delete: still in use by ${ticketCount} ticket${ticketCount === 1 ? '' : 's'}`,
+      );
+    }
     await this.prisma.ticketStatus.delete({ where: { id } });
   }
 
@@ -83,6 +90,12 @@ export class ReferenceService {
   async deletePriority(id: number): Promise<void> {
     const p = await this.prisma.ticketPriority.findUnique({ where: { id } });
     if (!p) throw new NotFoundException(`TicketPriority ${id} not found`);
+    const ticketCount = await this.prisma.ticket.count({ where: { priorityId: id, mergedIntoId: null } });
+    if (ticketCount > 0) {
+      throw new ConflictException(
+        `Cannot delete: still in use by ${ticketCount} ticket${ticketCount === 1 ? '' : 's'}`,
+      );
+    }
     await this.prisma.ticketPriority.delete({ where: { id } });
   }
 
@@ -105,6 +118,12 @@ export class ReferenceService {
   async deleteType(id: number): Promise<void> {
     const t = await this.prisma.ticketType.findUnique({ where: { id } });
     if (!t) throw new NotFoundException(`TicketType ${id} not found`);
+    const ticketCount = await this.prisma.ticket.count({ where: { typeId: id, mergedIntoId: null } });
+    if (ticketCount > 0) {
+      throw new ConflictException(
+        `Cannot delete: still in use by ${ticketCount} ticket${ticketCount === 1 ? '' : 's'}`,
+      );
+    }
     await this.prisma.ticketType.delete({ where: { id } });
   }
 }

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -11,7 +11,7 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { FileUploadZone } from '@/components/premium/FileUploadZone';
+import { FileUploadZone, type FileUploadZoneHandle } from '@/components/premium/FileUploadZone';
 import { useSubmitPublicTicket } from '@/lib/hooks/use-tickets';
 import { useCustomFields } from '@/lib/hooks/use-custom-fields';
 import {
@@ -71,6 +71,7 @@ export function SubmitTicketForm() {
   const [successMask, setSuccessMask] = useState<string | null>(null);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [attachmentIds, setAttachmentIds] = useState<number[]>([]);
+  const fileUploadRef = useRef<FileUploadZoneHandle>(null);
   // One orphan-claim secret per form session: the server scopes orphan adoption to
   // it so uploaded files can only be attached to THIS submit (not stolen by others).
   const [claimToken] = useState(genClaimToken);
@@ -136,6 +137,8 @@ export function SubmitTicketForm() {
       setSuccessMask(ticket?.mask ?? generateTicketMask(Date.now() % 99999));
       reset();
       setCfValues({});
+      setAttachmentIds([]);
+      fileUploadRef.current?.clear();
     } catch (err: unknown) {
       // CL-1: surface the error instead of swallowing it
       const message =
@@ -266,6 +269,7 @@ export function SubmitTicketForm() {
       <div className="space-y-1.5">
         <Label>Вложения (необязательно)</Label>
         <FileUploadZone
+          ref={fileUploadRef}
           uploadEndpoint="/attachments/upload/public"
           claimToken={claimToken}
           onUploaded={(ids) => setAttachmentIds((prev) => [...prev, ...ids])}

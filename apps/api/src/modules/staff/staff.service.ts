@@ -56,6 +56,22 @@ export class StaffService {
     return this.prisma.staffGroup.update({ where: { id }, data: dto });
   }
 
+  /**
+   * Delete a staff group.
+   * Guards: refuses if any staff members are still assigned to the group
+   * (returning 409 ConflictException so the UI can show a clear message).
+   */
+  async deleteGroup(id: number): Promise<void> {
+    await this.getGroup(id); // 404 if not found
+    const memberCount = await this.prisma.staff.count({ where: { staffGroupId: id } });
+    if (memberCount > 0) {
+      throw new ConflictException(
+        `Cannot delete: ${memberCount} staff member${memberCount === 1 ? ' is' : 's are'} still assigned to this group`,
+      );
+    }
+    await this.prisma.staffGroup.delete({ where: { id } });
+  }
+
   // ─────────────────── Staff Members ───────────────────
 
   /** Minimal staff directory for assignee pickers (no sensitive fields). */

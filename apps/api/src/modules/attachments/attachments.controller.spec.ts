@@ -20,6 +20,7 @@ function makeAttachment(id: number): Attachment {
     id,
     ticketId: null,
     postId: null,
+    noteId: null,
     fileName: 'a.pdf',
     mimeType: 'application/pdf',
     size: 10,

@@ -1,7 +1,8 @@
 'use client';
 
+import { useState, useRef } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Send, Loader2 } from 'lucide-react';
+import { ArrowLeft, Send, Loader2, Paperclip, Download } from 'lucide-react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -10,12 +11,15 @@ import { useClientTicket, useClientReply } from '@/lib/hooks/use-client-tickets'
 import { StatusBadge } from '@/components/premium/StatusBadge';
 import { SlaPill } from '@/components/premium/SlaPill';
 import { TicketDetailSkeleton } from '@/components/premium/SkeletonLoaders';
+import { FileUploadZone, type FileUploadZoneHandle } from '@/components/premium/FileUploadZone';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
+import { Label } from '@/components/ui/label';
 import { formatDate, getInitials } from '@/lib/utils';
 import { RelativeTime } from '@/components/RelativeTime';
 import { toast } from '@/components/ui/use-toast';
+import type { Attachment } from '@/lib/types';
 
 const replySchema = z.object({
   contents: z.string().min(1, 'Введите текст'),
@@ -23,9 +27,45 @@ const replySchema = z.object({
 
 type ReplyForm = { contents: string };
 
+/** A v4 UUID claim token for reply attachment orphan-binding. */
+function genClaimToken(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+function AttachmentList({ attachments }: { attachments: Attachment[] }) {
+  if (!attachments.length) return null;
+  return (
+    <div className="mt-3 flex flex-wrap gap-2">
+      {attachments.map((att) => (
+        <a
+          key={att.id}
+          href={att.url}
+          download={att.filename}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1 text-xs text-foreground hover:bg-primary/10 hover:border-primary/40 transition-colors"
+        >
+          <Paperclip className="h-3 w-3 flex-shrink-0 text-muted-foreground" />
+          <span className="max-w-[180px] truncate">{att.filename}</span>
+          <Download className="h-3 w-3 flex-shrink-0 text-muted-foreground" />
+        </a>
+      ))}
+    </div>
+  );
+}
+
 export function ClientTicketDetail({ ticketId }: { ticketId: number }) {
   const { data: ticket, isLoading } = useClientTicket(ticketId);
   const replyMutation = useClientReply(ticketId);
+
+  const [attachmentIds, setAttachmentIds] = useState<number[]>([]);
+  const [claimToken] = useState(genClaimToken);
+  const fileUploadRef = useRef<FileUploadZoneHandle>(null);
 
   const {
     register,
@@ -44,8 +84,13 @@ export function ClientTicketDetail({ ticketId }: { ticketId: number }) {
 
   const onSubmit = async (data: ReplyForm) => {
     try {
-      await replyMutation.mutateAsync({ contents: data.contents });
+      await replyMutation.mutateAsync({
+        contents: data.contents,
+        ...(attachmentIds.length ? { attachmentIds, attachmentClaimToken: claimToken } : {}),
+      });
       reset();
+      setAttachmentIds([]);
+      fileUploadRef.current?.clear();
       toast({
         title: 'Сообщение отправлено',
         description: ticket.status === 'resolved' ? 'Обращение снова открыто для рассмотрения.' : undefined,
@@ -112,6 +157,9 @@ export function ClientTicketDetail({ ticketId }: { ticketId: number }) {
               <RelativeTime className="ml-auto text-xs text-muted-foreground" date={reply.created_at} />
             </div>
             <p className="text-sm leading-relaxed whitespace-pre-line">{reply.body}</p>
+            {reply.attachments && reply.attachments.length > 0 && (
+              <AttachmentList attachments={reply.attachments} />
+            )}
           </motion.div>
         ))}
       </div>
@@ -133,6 +181,20 @@ export function ClientTicketDetail({ ticketId }: { ticketId: number }) {
               data-testid="client-reply-input"
             />
             {errors.contents && <p className="text-xs text-destructive">{String(errors.contents.message)}</p>}
+
+            <div className="space-y-1.5">
+              <Label className="text-xs text-muted-foreground">Вложения (необязательно)</Label>
+              <FileUploadZone
+                ref={fileUploadRef}
+                uploadEndpoint="/attachments/upload/public"
+                claimToken={claimToken}
+                onUploaded={(ids) => setAttachmentIds((prev) => [...prev, ...ids])}
+                accept="image/*,.pdf,.txt,.log,.pcap"
+                maxSizeMb={25}
+                maxFiles={5}
+              />
+            </div>
+
             <div className="flex justify-end">
               <Button type="submit" disabled={replyMutation.isPending} data-testid="client-reply-btn">
                 {replyMutation.isPending ? (

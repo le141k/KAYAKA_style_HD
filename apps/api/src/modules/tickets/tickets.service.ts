@@ -429,13 +429,35 @@ export class TicketsService {
   async publicReply(ticketId: number, dto: PublicReplyDto): Promise<TicketPost> {
     const ticket = await this.prisma.ticket.findUnique({
       where: { id: ticketId },
-      include: { user: { select: { emails: { select: { email: true } } } } },
+      include: {
+        user: { select: { emails: { select: { email: true } } } },
+        status: { select: { markAsResolved: true, title: true } },
+      },
     });
     if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
 
     // Ownership check: the requester must supply a matching email so a random
     // integer id cannot be used to post on someone else's ticket.
     this.assertRequesterOwnsTicket(ticket, dto.requesterEmail);
+
+    // U-medium: block public replies on definitively-closed tickets.
+    // Strategy: a ticket is "closed" (not merely "resolved") when its status is
+    // flagged markAsResolved=true AND the title contains "closed" (case-insensitive).
+    // This matches the standard Kayako data model where "Resolved" reopens on reply
+    // but "Closed" is terminal.  If no "closed" status exists in the database
+    // (single-status setups), only the markAsResolved flag is checked and a
+    // second heuristic is applied: reopenedAt IS NULL + isResolved = true means
+    // the ticket was resolved first-time — still allowed to be re-opened by a
+    // customer reply.  A ticket that has been closed after having been reopened
+    // (wasReopened=true, isResolved=true, no reopenedAt) is also blocked.
+    // Simplest correct rule that survives schema variations:
+    //   BLOCK only when the current status title is exactly "Closed" (case-insensitive)
+    //   AND markAsResolved is true.
+    // For all other resolved statuses the existing reopen path continues to apply.
+    const statusTitle = ticket.status as { markAsResolved: boolean; title: string } | null;
+    if (statusTitle && statusTitle.markAsResolved && statusTitle.title.trim().toLowerCase() === 'closed') {
+      throw new BadRequestException('Ticket is closed and cannot receive new replies');
+    }
 
     // H8-3: a public adoption MUST carry a claimToken; otherwise linkToPost would
     // fall back to adopting any orphan by id (IDOR). Reject rather than silently
@@ -588,7 +610,10 @@ export class TicketsService {
         },
         notes: {
           orderBy: { createdAt: 'asc' },
-          include: { staff: { select: { firstName: true, lastName: true, email: true } } },
+          include: {
+            staff: { select: { firstName: true, lastName: true, email: true } },
+            attachments: true, // U1: include note attachments in the ticket detail view
+          },
         },
         attachments: true,
         watchers: { select: { staffId: true } },
@@ -800,15 +825,31 @@ export class TicketsService {
 
   // ─────────────────────────── Note ───────────────────────────
 
-  async addNote(ticketId: number, contents: string, staffId?: number): Promise<TicketNote> {
+  async addNote(
+    ticketId: number,
+    contents: string,
+    staffId?: number,
+    attachmentIds?: number[],
+  ): Promise<TicketNote> {
     await this.findOrThrow(ticketId);
     const note = await this.prisma.ticketNote.create({
       data: { ticketId, staffId, contents },
     });
 
+    // U1 fix: link any pre-uploaded attachment orphans to this note so they are
+    // not silently dropped (the original bug: addNote took no attachmentIds at all).
+    const hasNoteAttachments = !!(attachmentIds?.length && this.attachmentsService);
+    if (hasNoteAttachments && this.attachmentsService) {
+      await this.attachmentsService.linkToNote(attachmentIds!, note.id, ticketId);
+    }
+
     await this.prisma.ticket.update({
       where: { id: ticketId },
-      data: { hasNotes: true, lastActivityAt: new Date() },
+      data: {
+        hasNotes: true,
+        lastActivityAt: new Date(),
+        ...(hasNoteAttachments && { hasAttachments: true }),
+      },
     });
 
     await this.writeAudit(ticketId, 'NOTE', staffId, 'STAFF', {});

@@ -15,7 +15,9 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '@/lib/api';
-import type { Ticket, Reply, User, Department, PaginatedResponse } from '@/lib/types';
+import type { Ticket, Reply, User, Department, PaginatedResponse, Attachment } from '@/lib/types';
+
+const API_BASE = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
 // ─── API raw shapes (mirrors use-tickets.ts) ────────────────────────────────
 interface ApiRef {
@@ -28,6 +30,13 @@ interface ApiStaffRef {
   lastName: string;
   email: string;
 }
+interface ApiAttachment {
+  id: number;
+  filename: string;
+  size: number;
+  storageKey?: string;
+  mimeType?: string;
+}
 interface ApiPost {
   id: number;
   ticketId: number;
@@ -38,6 +47,7 @@ interface ApiPost {
   email?: string;
   contents: string;
   createdAt: string;
+  attachments?: ApiAttachment[];
 }
 interface ApiTicket {
   id: number;
@@ -79,6 +89,18 @@ function prioritySlug(title?: string): Ticket['priority'] {
   return (PRIORITY_SLUGS as readonly string[]).includes(p) ? (p as Ticket['priority']) : 'normal';
 }
 
+function mapApiAttachment(a: ApiAttachment): Attachment {
+  // Backend serves file downloads at /api/attachments/:id/download
+  const url = `${API_BASE}/attachments/${a.id}/download`;
+  return {
+    id: a.id,
+    filename: a.filename,
+    size: a.size,
+    url,
+    mime_type: a.mimeType ?? 'application/octet-stream',
+  };
+}
+
 function mapPostToReply(p: ApiPost): Reply {
   return {
     id: p.id,
@@ -92,6 +114,7 @@ function mapPostToReply(p: ApiPost): Reply {
     body: p.contents,
     is_internal: false,
     created_at: p.createdAt,
+    attachments: p.attachments?.map(mapApiAttachment),
   };
 }
 
@@ -203,6 +226,8 @@ export function useClientTicket(id: number) {
 
 export interface ClientReplyInput {
   contents: string;
+  attachmentIds?: number[];
+  attachmentClaimToken?: string;
 }
 
 /**
@@ -213,15 +238,20 @@ export function useClientReply(ticketId: number) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (data: ClientReplyInput) => {
+      const payload = {
+        contents: data.contents,
+        ...(data.attachmentIds?.length ? { attachmentIds: data.attachmentIds } : {}),
+        ...(data.attachmentClaimToken ? { attachmentClaimToken: data.attachmentClaimToken } : {}),
+      };
       try {
-        return await api.post(`/tickets/${ticketId}/reply`, { contents: data.contents });
+        return await api.post(`/tickets/${ticketId}/reply`, payload);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           // Fall back to the public reply endpoint, including the stored email so
           // the post is attributed to the right requester.
           const requesterEmail = getRequesterEmail() || undefined;
           return api.post(`/tickets/public/${ticketId}/reply`, {
-            contents: data.contents,
+            ...payload,
             ...(requesterEmail ? { requesterEmail } : {}),
           });
         }

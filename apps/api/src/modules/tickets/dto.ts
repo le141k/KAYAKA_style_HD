@@ -48,6 +48,16 @@ export const ReplyTicketSchema = z.object({
 });
 export type ReplyTicketDto = z.infer<typeof ReplyTicketSchema>;
 
+// ─────────────────── add note ───────────────────
+
+/** Dedicated schema for POST /tickets/:id/notes — accepts attachmentIds (U1 fix). */
+export const AddNoteSchema = z.object({
+  contents: z.string().min(1),
+  /** Attachment IDs (pre-uploaded orphans) to link to this note (U1 data-loss fix). */
+  attachmentIds: z.array(z.number().int().positive()).optional(),
+});
+export type AddNoteDto = z.infer<typeof AddNoteSchema>;
+
 // ─────────────────── assign ───────────────────
 
 export const AssignTicketSchema = z.object({

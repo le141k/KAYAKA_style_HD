@@ -18,9 +18,17 @@ import {
   type AdminDepartment,
 } from '@/lib/hooks/use-admin';
 
+const DEPT_TYPES = [
+  { value: 'PUBLIC', label: 'Публичный' },
+  { value: 'PRIVATE', label: 'Приватный' },
+];
+
 const schema = z.object({
   title: z.string().min(1, 'Обязательное поле'),
   parentId: z.number().nullable().optional(),
+  type: z.string().optional(),
+  isDefault: z.boolean().optional(),
+  displayOrder: z.coerce.number().int().optional(),
 });
 type FormValues = z.infer<typeof schema>;
 
@@ -41,21 +49,28 @@ export function DepartmentsContent() {
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<AdminDepartment | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const form = useForm<FormValues>({
     resolver: zodResolver(schema),
-    defaultValues: { title: '', parentId: null },
+    defaultValues: { title: '', parentId: null, type: 'PUBLIC', isDefault: false, displayOrder: 0 },
   });
 
   function openCreate() {
     setEditing(null);
-    form.reset({ title: '', parentId: null });
+    form.reset({ title: '', parentId: null, type: 'PUBLIC', isDefault: false, displayOrder: 0 });
     setDialogOpen(true);
   }
 
   function openEdit(dept: AdminDepartment) {
     setEditing(dept);
-    form.reset({ title: dept.title, parentId: dept.parentId ?? null });
+    form.reset({
+      title: dept.title,
+      parentId: dept.parentId ?? null,
+      type: dept.type || 'PUBLIC',
+      isDefault: dept.isDefault,
+      displayOrder: dept.displayOrder,
+    });
     setDialogOpen(true);
   }
 
@@ -76,11 +91,19 @@ export function DepartmentsContent() {
 
   async function handleDelete(dept: AdminDepartment) {
     if (!confirm(`Удалить отдел «${dept.title}»?`)) return;
+    setDeleteError(null);
     try {
       await deleteMut.mutateAsync(dept.id);
       toast({ title: 'Отдел удалён' });
-    } catch {
-      toast({ title: 'Ошибка', description: 'Не удалось удалить отдел', variant: 'destructive' });
+    } catch (err: unknown) {
+      const status = (err as { status?: number })?.status;
+      if (status === 409) {
+        setDeleteError(
+          `Нельзя удалить отдел «${dept.title}» — он используется в заявках или настройках. Сначала переназначьте связанные объекты.`,
+        );
+      } else {
+        toast({ title: 'Ошибка', description: 'Не удалось удалить отдел', variant: 'destructive' });
+      }
     }
   }
 
@@ -100,26 +123,42 @@ export function DepartmentsContent() {
         </Button>
       </div>
 
+      {deleteError && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {deleteError}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="ml-2 h-5 px-2 text-xs"
+            onClick={() => setDeleteError(null)}
+          >
+            ✕
+          </Button>
+        </div>
+      )}
+
       <div className="rounded-xl border border-border bg-card">
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>Название</TableHead>
               <TableHead>Тип</TableHead>
+              <TableHead>Порядок</TableHead>
+              <TableHead>По умолчанию</TableHead>
               <TableHead className="w-20">Действия</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {isLoading && (
               <TableRow>
-                <TableCell colSpan={3} className="text-center text-muted-foreground py-8">
+                <TableCell colSpan={5} className="text-center text-muted-foreground py-8">
                   Загрузка…
                 </TableCell>
               </TableRow>
             )}
             {!isLoading && flat.length === 0 && (
               <TableRow>
-                <TableCell colSpan={3} className="text-center text-muted-foreground py-8">
+                <TableCell colSpan={5} className="text-center text-muted-foreground py-8">
                   Нет отделов
                 </TableCell>
               </TableRow>
@@ -132,7 +171,17 @@ export function DepartmentsContent() {
                     {dept.title}
                   </span>
                 </TableCell>
-                <TableCell className="text-sm text-muted-foreground">{dept.type}</TableCell>
+                <TableCell className="text-sm text-muted-foreground">{dept.type || '—'}</TableCell>
+                <TableCell className="text-sm text-muted-foreground">{dept.displayOrder}</TableCell>
+                <TableCell className="text-sm">
+                  {dept.isDefault ? (
+                    <span className="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-800 dark:bg-green-900 dark:text-green-200">
+                      По умолч.
+                    </span>
+                  ) : (
+                    '—'
+                  )}
+                </TableCell>
                 <TableCell>
                   <div className="flex gap-1">
                     <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openEdit(dept)}>
@@ -183,11 +232,38 @@ export function DepartmentsContent() {
                   .filter(({ dept }) => dept.id !== editing?.id)
                   .map(({ dept, depth }) => (
                     <option key={dept.id} value={dept.id}>
-                      {' '.repeat(depth * 2)}
+                      {' '.repeat(depth * 2)}
                       {dept.title}
                     </option>
                   ))}
               </select>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">Тип</label>
+              <select
+                className="h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
+                {...form.register('type')}
+              >
+                {DEPT_TYPES.map((t) => (
+                  <option key={t.value} value={t.value}>
+                    {t.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">Порядок отображения</label>
+                <Input type="number" min={0} {...form.register('displayOrder')} className="h-8" />
+              </div>
+              <div className="flex items-end pb-1">
+                <div className="flex items-center gap-2">
+                  <input type="checkbox" id="deptDefault" {...form.register('isDefault')} />
+                  <label htmlFor="deptDefault" className="text-sm">
+                    По умолчанию
+                  </label>
+                </div>
+              </div>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setDialogOpen(false)}>

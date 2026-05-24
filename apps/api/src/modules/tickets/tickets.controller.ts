@@ -39,6 +39,7 @@ import {
   PublicCreateTicketSchema,
   ApplyMacroSchema,
   ChangeDepartmentSchema,
+  AddNoteSchema,
   type CreateTicketDto,
   type ReplyTicketDto,
   type AssignTicketDto,
@@ -58,6 +59,7 @@ import {
   type ApplyMacroDto,
   type ChangeDepartmentDto,
   type BulkTicketActionDto,
+  type AddNoteDto,
 } from './dto';
 
 // Per-endpoint throttle limits for the unauthenticated portal. Env-overridable so
@@ -202,14 +204,13 @@ export class TicketsController {
 
   @Post(':id/notes')
   @RequirePermissions(PERMISSIONS.TICKET_NOTE)
-  @ApiOperation({ summary: 'Add an internal note to a ticket' })
+  @ApiOperation({ summary: 'Add an internal note to a ticket (U1: supports attachmentIds)' })
   addNote(
     @Param('id', ParseIntPipe) id: number,
-    @Body(new ZodValidationPipe(ReplyTicketSchema)) dto: ReplyTicketDto,
+    @Body(new ZodValidationPipe(AddNoteSchema)) dto: AddNoteDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    // Force isNote=true regardless of body
-    return this.ticketsService.addNote(id, dto.contents, staff.staffId);
+    return this.ticketsService.addNote(id, dto.contents, staff.staffId, dto.attachmentIds);
   }
 
   @Patch(':id/assign')
