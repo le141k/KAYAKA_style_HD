@@ -33,6 +33,17 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Guard against an unfilled .env.prod placeholder or a non-email value — never
+  // create a garbage-email admin (the email column is unique, which would then
+  // block creating the real admin later).
+  if (email.includes('<<<') || password.includes('<<<') || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    console.warn(
+      `[bootstrap-admin] Skipping — TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL is not a valid email (got "${email}"). ` +
+        'Fill the .env.prod placeholder and redeploy.',
+    );
+    return;
+  }
+
   console.log(`[bootstrap-admin] Ensuring admin StaffGroup and staff account for <${email}>…`);
 
   // ── 1. Ensure the admin StaffGroup exists ──────────────────────────────────

@@ -38,8 +38,10 @@ fi
 
 # ── Load .env.prod if present (values already in env take precedence) ────────
 if [[ -f "${ENV_FILE}" ]]; then
-  # shellcheck disable=SC2046
-  export $(grep -v '^\s*#' "${ENV_FILE}" | grep -v '^\s*$' | xargs)
+  set -a
+  # shellcheck disable=SC1090
+  . "${ENV_FILE}"
+  set +a
 fi
 
 DB_NAME="${TELECOM_HD_DB_NAME:-telecom_hd}"
@@ -115,6 +117,6 @@ gunzip -c "${DUMP_FILE}" \
 echo "[db-restore] Restore complete."
 echo ""
 echo "Next steps:"
-echo "  1. Run a quick sanity check: ./scripts/db-restore.sh --verify (or see docs/BACKUP.md)"
+echo "  1. Verify the restore (row counts / migration version) — see docs/BACKUP.md"
 echo "  2. Restart API containers if needed:"
 echo "       docker compose -f docker-compose.prod.yml --env-file .env.prod restart api"

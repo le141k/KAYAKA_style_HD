@@ -120,12 +120,14 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    # Probe /login (returns 200) — the root "/" 307-redirects to /kb and busybox
+    # wget exits non-zero on a 3xx, which would mark web permanently unhealthy.
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/ >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/login >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 40s
     logging:
       driver: json-file
       options:

@@ -61,17 +61,17 @@ ok "$ENV_FILE exists"
 # ─────────────────────────────────────────────────────────────────────────────
 echo
 echo "--- 1. Unfilled placeholder markers ---"
-if grep -qE '<<<' "$ENV_FILE" 2>/dev/null; then
-  # Show the line numbers and key names only, never the values.
+# Only scan KEY=VALUE lines, not comments (the file header legitimately mentions '<<<').
+placeholder_hits="$(grep -nE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=.*<<<' "$ENV_FILE" 2>/dev/null || true)"
+if [[ -n "$placeholder_hits" ]]; then
   while IFS= read -r line_with_num; do
     line_num="${line_with_num%%:*}"
     line_content="${line_with_num#*:}"
-    # Extract just the key name (before '=')
     key_name="$(echo "$line_content" | sed 's/=.*//')"
     fail "line ${line_num}: ${key_name} still contains '<<<' placeholder"
-  done < <(grep -nE '<<<' "$ENV_FILE")
+  done <<< "$placeholder_hits"
 else
-  ok "No '<<<' placeholder markers found"
+  ok "No '<<<' placeholder markers in any variable"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

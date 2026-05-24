@@ -102,16 +102,14 @@ Run this command once per secret below.
 
 ### 3c. Validate with preflight
 
-There is no `scripts/preflight.sh` in this repo yet. Manually verify the file before proceeding:
+Run the preflight validator — it checks for unfilled `<<<` placeholders, required keys,
+secret strength, `https://` URLs, the 64-hex field key, and a non-default admin password,
+mirroring the server-side `assertProductionSecrets()` guard. It prints only key names (never
+values) and exits non-zero on any failure:
 
 ```bash
-# Confirm no placeholder patterns remain
-grep -E 'change[-_]?me|CHANGE_ME|example\.com|demo1234|0000' .env.prod && echo "FIX THESE" || echo "OK"
-
-# Confirm JWT secrets are distinct
-ACCESS=$(grep TELECOM_HD_JWT_ACCESS_SECRET .env.prod | cut -d= -f2)
-REFRESH=$(grep TELECOM_HD_JWT_REFRESH_SECRET .env.prod | cut -d= -f2)
-[ "$ACCESS" = "$REFRESH" ] && echo "ERROR: JWT secrets must differ" || echo "JWT secrets distinct: OK"
+bash scripts/preflight.sh .env.prod
+# All [✓] and exit 0 → ready. Any [✗] → fix before deploying.
 ```
 
 ---
@@ -230,7 +228,7 @@ Run each check in order. All must pass before declaring the deployment live.
 
 ```bash
 curl -f https://help.example.com/api/health
-# Expected: {"status":"ok"} with HTTP 200
+# Expected: {"status":"ok","db":"up","redis":"up"} with HTTP 200
 ```
 
 ### 6b. Log in as the bootstrap admin
@@ -307,11 +305,10 @@ Restore from backup:
 # Find the backup file
 ls backups/
 
-# Restore (WARNING: this overwrites the current database)
-docker compose -f docker-compose.prod.yml --env-file .env.prod \
-  exec -T postgres \
-  pg_restore -U telecom_hd -d telecom_hd --clean --if-exists \
-  < backups/telecom_hd_<timestamp>.dump.gz
+# Restore with the helper (WARNING: overwrites the current DB; prompts for YES).
+# It gunzips the .dump.gz and runs pg_restore in a single transaction — do NOT pipe
+# the .gz straight into pg_restore (it cannot read gzip).
+bash scripts/db-restore.sh backups/telecom_hd_<timestamp>.dump.gz
 ```
 
 Copy backups off-server to object storage (S3, GCS, Backblaze) regularly.

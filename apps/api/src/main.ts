@@ -10,6 +10,12 @@ async function bootstrap(): Promise<void> {
 
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
 
+  // Trust the first proxy hop (Caddy/nginx) so req.ip / X-Forwarded-* reflect the
+  // real client — without this the per-IP rate limiter keys on the proxy's IP and
+  // collapses all clients into one bucket.
+  const expressInstance = app.getHttpAdapter().getInstance() as { set?: (k: string, v: unknown) => void };
+  expressInstance.set?.('trust proxy', 1);
+
   // Use Pino as the application-level logger (replaces NestJS default)
   app.useLogger(app.get(Logger));
 

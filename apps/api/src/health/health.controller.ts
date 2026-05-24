@@ -1,4 +1,13 @@
-import { Controller, Get, HttpCode, HttpStatus, Inject, Logger } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  HttpCode,
+  HttpException,
+  HttpStatus,
+  Inject,
+  Logger,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import Redis from 'ioredis';
 import { Public } from '../auth/auth.decorators';
@@ -24,7 +33,7 @@ export interface HealthResponse {
  */
 @ApiTags('health')
 @Controller('health')
-export class HealthController {
+export class HealthController implements OnModuleDestroy {
   private readonly logger = new Logger(HealthController.name);
   private readonly redis: Redis;
 
@@ -63,13 +72,20 @@ export class HealthController {
     const body: HealthResponse = { status: allOk ? 'ok' : 'error', db, redis };
 
     if (!allOk) {
-      // NestJS doesn't let us change the status code from a method that returns
-      // a plain object directly, so we throw an HttpException with the body.
-      const { HttpException } = await import('@nestjs/common');
+      // Throw with the body so the response carries a 503 status code.
       throw new HttpException(body, HttpStatus.SERVICE_UNAVAILABLE);
     }
 
     return body;
+  }
+
+  /** Close the dedicated Redis client on shutdown so it doesn't leak a connection. */
+  async onModuleDestroy(): Promise<void> {
+    try {
+      await this.redis.quit();
+    } catch {
+      this.redis.disconnect();
+    }
   }
 
   // ---------------------------------------------------------------------------

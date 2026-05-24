@@ -35,8 +35,11 @@ done
 
 # ── Load .env.prod if present (values already in env take precedence) ────────
 if [[ -f "${ENV_FILE}" ]]; then
-  # shellcheck disable=SC2046
-  export $(grep -v '^\s*#' "${ENV_FILE}" | grep -v '^\s*$' | xargs)
+  # Use `set -a` + source so values with spaces/special chars aren't mangled (xargs breaks on quotes).
+  set -a
+  # shellcheck disable=SC1090
+  . "${ENV_FILE}"
+  set +a
 fi
 
 DB_NAME="${TELECOM_HD_DB_NAME:-telecom_hd}"
