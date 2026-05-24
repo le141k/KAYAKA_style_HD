@@ -384,10 +384,31 @@ export class TicketsService {
     // must prove they own it by supplying the matching requester email.
     this.assertRequesterOwnsTicket(ticket, requesterEmail);
 
-    // Redact infra/PII scalar columns before returning to the @Public caller.
-    // (findUnique with top-level `include` returns ALL ticket scalars.)
+    // Redact infra/PII + internal columns before returning to the @Public caller.
+    // (findUnique with top-level `include` returns ALL ticket scalars.) Keep only
+    // client-relevant fields (subject, mask, status/priority/department, dueAt,
+    // timestamps, requester); strip internal routing/SLA/audit fields.
     const safe = { ...ticket } as Record<string, unknown>;
-    for (const k of ['ipAddress', 'customFields', 'messageId', 'creationMode', 'creator', 'flagType']) {
+    for (const k of [
+      'ipAddress',
+      'customFields',
+      'messageId',
+      'creationMode',
+      'creator',
+      'flagType',
+      'hasNotes',
+      'ownerStaffId',
+      'slaPlanId',
+      'resolutionDueAt',
+      'firstResponseAt',
+      'resolvedAt',
+      'reopenedAt',
+      'wasReopened',
+      'isEscalated',
+      'escalationLevel',
+      'kayakoId',
+      'mergedIntoId',
+    ]) {
       delete safe[k];
     }
     return safe as unknown as PublicTicketDetail;

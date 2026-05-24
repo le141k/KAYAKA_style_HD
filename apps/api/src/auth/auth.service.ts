@@ -195,6 +195,13 @@ export class AuthService {
       return;
     }
 
+    // Invalidate any prior unused reset tokens for this staff so only the latest
+    // link is valid (a "resend" shouldn't leave multiple live tokens).
+    await this.prisma.passwordReset.updateMany({
+      where: { staffId: staff.id, usedAt: null },
+      data: { usedAt: new Date() },
+    });
+
     const rawToken = randomBytes(32).toString('hex');
     const tokenHash = createHash('sha256').update(rawToken).digest('hex');
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour

@@ -157,6 +157,7 @@ export class AuthController {
    */
   @Public()
   @Post('reset-password')
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Set a new password using a reset token' })
   async resetPassword(@Body(new ZodValidationPipe(ResetPasswordSchema)) dto: ResetPasswordDto) {

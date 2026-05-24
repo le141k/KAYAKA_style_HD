@@ -192,12 +192,16 @@ export function KanbanBoard({ tickets, onOpen, onMove, filters = {} }: KanbanBoa
   const [dropTarget, setDropTarget] = useState<TicketStatus | null>(null);
 
   // Re-sync when the upstream ticket list or filters change (refetch after a move).
-  // Depend on the primitive filter fields (not the object identity) to avoid
-  // resetting local column state on every parent re-render.
-  const filterKey = `${filters.status ?? ''}|${filters.priority ?? ''}|${filters.assigneeId ?? ''}|${filters.q ?? ''}`;
+  // Depend on the primitive filter fields (not the object identity) so we don't
+  // reset local column state on every parent re-render — and exhaustive-deps is happy.
+  const { status: fStatus, priority: fPriority, assigneeId: fAssignee, q: fQuery } = filters;
   useEffect(() => {
-    setColumnTickets(group(applyFilters(tickets, filters)));
-  }, [tickets, filterKey]);
+    setColumnTickets(
+      group(
+        applyFilters(tickets, { status: fStatus, priority: fPriority, assigneeId: fAssignee, q: fQuery }),
+      ),
+    );
+  }, [tickets, fStatus, fPriority, fAssignee, fQuery]);
 
   const handleDragEnd = () => {
     // Clear dragging state when the user drops outside any valid column —

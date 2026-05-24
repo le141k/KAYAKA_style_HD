@@ -44,7 +44,9 @@ function parseMinutes(time: string): number {
  * Uses the SlaSchedule workHours convention (mon, tue, …, sun).
  */
 function dayKey(date: Date): string {
-  return DAY_NAMES[date.getDay()] ?? 'sun';
+  // UTC weekday — the whole working-time calc is UTC-consistent (prod runs the
+  // container in UTC) so it never mixes UTC and local bases (which mis-matched holidays).
+  return DAY_NAMES[date.getUTCDay()] ?? 'sun';
 }
 
 /**
@@ -70,11 +72,11 @@ function addWorkingSeconds(start: Date, seconds: number, workHours: WorkHours, h
       if (eMin <= sMin) continue;
 
       const slotStart = new Date(day);
-      slotStart.setHours(0, 0, 0, 0);
-      slotStart.setMinutes(sMin);
+      slotStart.setUTCHours(0, 0, 0, 0);
+      slotStart.setUTCMinutes(sMin);
       const slotEnd = new Date(day);
-      slotEnd.setHours(0, 0, 0, 0);
-      slotEnd.setMinutes(eMin);
+      slotEnd.setUTCHours(0, 0, 0, 0);
+      slotEnd.setUTCMinutes(eMin);
 
       // On the first day, never count time before `start`.
       const windowStart = d === 0 && start > slotStart ? start : slotStart;
@@ -87,10 +89,10 @@ function addWorkingSeconds(start: Date, seconds: number, workHours: WorkHours, h
       remaining -= availSec;
     }
 
-    // Advance to 00:00 of the next day.
+    // Advance to 00:00 (UTC) of the next day.
     day = new Date(day);
-    day.setHours(0, 0, 0, 0);
-    day.setDate(day.getDate() + 1);
+    day.setUTCHours(0, 0, 0, 0);
+    day.setUTCDate(day.getUTCDate() + 1);
   }
 
   // Budget not exhausted within the 60-day safety cap (e.g. empty/misconfigured

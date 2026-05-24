@@ -98,15 +98,25 @@ export class UsersService {
     const existing = await this.findByEmail(email);
     if (existing) return existing;
 
-    return this.prisma.user.create({
-      data: {
-        fullName,
-        emails: {
-          create: [{ email, isPrimary: true }],
+    try {
+      return await this.prisma.user.create({
+        data: {
+          fullName,
+          emails: {
+            create: [{ email, isPrimary: true }],
+          },
         },
-      },
-      select: SAFE_USER_SELECT,
-    });
+        select: SAFE_USER_SELECT,
+      });
+    } catch (err) {
+      // Concurrency: two requests for the same new email race to insert (UserEmail.email
+      // is @unique → P2002). The loser re-reads the row the winner just created.
+      if ((err as { code?: string }).code === 'P2002') {
+        const created = await this.findByEmail(email);
+        if (created) return created;
+      }
+      throw err;
+    }
   }
 
   async create(dto: CreateUserDto): Promise<SafeUser> {

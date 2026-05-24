@@ -398,6 +398,7 @@ model Ticket {
   @@index([subject(ops: raw("gin_trgm_ops"))], type: Gin)
   @@index([requesterEmail(ops: raw("gin_trgm_ops"))], type: Gin)
   @@index([requesterName(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([mask(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model TicketPost {
