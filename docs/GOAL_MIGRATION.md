@@ -74,15 +74,11 @@ Fix our mail flow (gaps found vs Kayako), each with a test + MailHog live-check:
 - [ ] (optional) ticket forward (`swticketforwards`), spam filter — defer if time-boxed.
 - **Acceptance:** inbound IMAP (MailHog) → ticket; reply by mask threads; staff reply carries In-Reply-To + signature; autoresponder only when queue opts in; quoted history stripped; parser/queue rows imported. Tests + `make verify` green.
 
-## ☐ Batch M3 — Emails into all 8 statuses with client↔supplier (Task 3)
+## ✅ Batch M3 — Emails into all 8 statuses with client↔supplier (DONE)
 
-- [ ] Confirm the **8 statuses** (5 known: Initial, In Progress, Closed[markResolved], Pending Vendor, Reply Received; 3 only in the full dump) → seed/map to TicketStatus.
-- [ ] For EACH of the 8 statuses, create **5–15 CLIENT tickets**, and for each one a **LINKED SUPPLIER ticket** (the real 23T model = a linked pair, see Domain model):
-  - **Client ticket:** requester = a customer (CLIENT org, e.g. via `noc@`, type Customer Issue), thread = customer ↔ 23T posts only (no vendor posts here). Status = the target status.
-  - **Supplier ticket:** requester/recipient = the matched carrier (SUPPLIER org: Sinch/Lleida/Broadnet…), type Vendor Issue, thread = 23T ↔ vendor posts (`isThirdParty` for the carrier). Created via the M2 "spawn linked supplier ticket" action.
-  - **Link them** with a `TicketLink` (linkType=`supplier`/`client`). Realistic SMS-routing content (delivery issue → ask vendor to fix route → vendor adjusts → customer retests). Increasing dates.
-  - **Status-specific shape (on the CLIENT ticket):** Initial = customer just wrote in, no supplier ticket yet; In Progress = supplier ticket spawned + linked; Pending Vendor = supplier ticket awaiting vendor reply; Reply Received = vendor replied on the supplier ticket; Closed = both resolved (vendor fixed → customer confirmed).
-- **Acceptance:** every status has 5–15 client tickets; each is **linked to a supplier ticket** (visible in the "Linked tickets" panel, openable), client side shows customer↔23T, supplier side shows 23T↔vendor (`isThirdParty`); both reachable in the staff UI. `make verify` green.
+- [x] **8 statuses** ensured by the generator (5 seeded — Open/Pending/In Progress/Resolved/Closed — + 3 23T-specific: **Initial, Pending Vendor, Reply Received**). The 3 _Kayako_ unknown status names still need the full dump; this demo uses the documented 23T set.
+- [x] `scripts/seed-demo-pairs.ts` (run after `npm run seed`): for EACH of the 8 statuses creates **5–15 CLIENT tickets** (type **Customer Issue**, requester = a customer org, thread = customer ↔ 23T only), each with a **LINKED SUPPLIER ticket** (type **Vendor Issue**, requester = a carrier Sinch/Lleida/Broadnet, thread = 23T ↔ vendor with `isThirdParty`), joined by a `TicketLink` (linkType=`supplier`). Realistic SMS-routing content + increasing dates. Status-specific shaping (Initial = just the customer; past-Initial = 23T acknowledged; Reply Received/Resolved/Closed = vendor replied / fix confirmed). Idempotent via a `customFields.demoPair` marker (re-run wipes + regenerates).
+- **Acceptance:** **Live: 75 client + 75 linked supplier tickets, every status with 5–15 clients; pair TT‑268↔TT‑269 verified — client side = USER+STAFF (no third-party), supplier side = type Vendor Issue with STAFF + carrier `isThirdParty=true`; visible/openable in the Linked-tickets panel.** Idempotent re-run (removed 150 → regenerated 75 pairs). `make verify` GREEN 9/9.
 
 ## ☐ Batch M4 — Reply macros (Task 4)
 
