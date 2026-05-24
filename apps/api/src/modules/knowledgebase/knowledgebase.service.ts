@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
+import { sanitizeRichHtml } from '../../common/html-sanitize.util';
 import type { CreateArticleDto, CreateCategoryDto, ListArticlesDto, UpdateArticleDto } from './dto';
 
 /** Strips HTML to a plaintext blob used for search + previews. */
@@ -27,10 +28,16 @@ export class KnowledgebaseService {
   constructor(private readonly prisma: PrismaService) {}
 
   // ── categories ──
-  async listCategories() {
+  async listCategories(publishedOnly = false) {
     const rows = await this.prisma.kbCategory.findMany({
+      // Public callers must not see unpublished/draft categories.
+      where: publishedOnly ? { isPublished: true } : {},
       orderBy: { displayOrder: 'asc' },
-      include: { _count: { select: { articles: true } } },
+      include: {
+        _count: {
+          select: { articles: publishedOnly ? { where: { isPublished: true } } : true },
+        },
+      },
     });
     return rows.map((c) => ({
       id: c.id,
@@ -107,13 +114,15 @@ export class KnowledgebaseService {
     // ensure unique slug
     if (await this.prisma.kbArticle.findUnique({ where: { slug } }))
       slug = `${slug}-${Date.now().toString(36)}`;
+    // Sanitize the staff-authored HTML before storing (stored-XSS defense).
+    const contents = sanitizeRichHtml(dto.contents);
     return this.prisma.kbArticle.create({
       data: {
         title: dto.title,
         slug,
         categoryId: dto.categoryId,
-        contents: dto.contents,
-        contentsText: toPlainText(dto.contents),
+        contents,
+        contentsText: toPlainText(contents),
         isPublished: dto.isPublished,
         authorStaffId,
       },
@@ -126,12 +135,13 @@ export class KnowledgebaseService {
     await this.prisma.kbArticleRevision.create({
       data: { articleId: id, contents: existing.contents, editedByStaffId },
     });
+    const sanitized = dto.contents !== undefined ? sanitizeRichHtml(dto.contents) : undefined;
     return this.prisma.kbArticle.update({
       where: { id },
       data: {
         ...(dto.title ? { title: dto.title } : {}),
         ...(dto.categoryId !== undefined ? { categoryId: dto.categoryId } : {}),
-        ...(dto.contents ? { contents: dto.contents, contentsText: toPlainText(dto.contents) } : {}),
+        ...(sanitized !== undefined ? { contents: sanitized, contentsText: toPlainText(sanitized) } : {}),
         ...(dto.isPublished !== undefined ? { isPublished: dto.isPublished } : {}),
       },
     });

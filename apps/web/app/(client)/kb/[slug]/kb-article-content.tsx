@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import DOMPurify from 'isomorphic-dompurify';
 import { ArrowLeft, Eye, Calendar } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -67,10 +68,11 @@ export function KBArticleContent({ slug }: { slug: string }) {
         </div>
       </div>
 
-      {/* body is staff-authored HTML — render it as markup (KB-3) */}
+      {/* body is staff-authored HTML — sanitized client-side as defense-in-depth
+          (the API also sanitizes on write) before rendering as markup (KB-3) */}
       <div
         className="prose prose-sm max-w-none text-foreground"
-        dangerouslySetInnerHTML={{ __html: article.body }}
+        dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(article.body) }}
       />
 
       <div className="rounded-xl border border-border bg-card p-5">

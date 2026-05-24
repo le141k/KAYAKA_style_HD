@@ -41,7 +41,8 @@ export class KnowledgebaseController {
   @Get('categories')
   @ApiOperation({ summary: 'List knowledgebase categories' })
   categories() {
-    return this.kb.listCategories();
+    // Public endpoint — published categories only (no draft leak).
+    return this.kb.listCategories(true);
   }
 
   // ── staff/admin (manage) ──
