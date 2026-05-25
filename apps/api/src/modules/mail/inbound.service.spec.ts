@@ -351,6 +351,45 @@ describe('InboundMailService — parser rule helpers', () => {
       await svc.processMessage({ source: Buffer.from(rawEmail) }, 1);
       expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
     });
+
+    // Subject-mask threading ownership guard.
+    const maskEmail = (from: string) =>
+      [
+        `From: ${from}`,
+        'To: support@test.example',
+        'Subject: Re: TT-000005 still broken',
+        `Message-ID: <mask-${Math.random()}@x.example>`,
+        '',
+        'still broken',
+        '',
+      ].join('\r\n');
+
+    it('does NOT thread by subject mask when the sender is not the ticket requester', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = callProcess(prisma as unknown as PrismaService);
+      (svc.ticketsService as unknown as { getTicketByMask: ReturnType<typeof vi.fn> }).getTicketByMask = vi
+        .fn()
+        .mockResolvedValue({ id: 5, mask: 'TT-000005', requesterEmail: 'owner@acme.example' });
+
+      await svc.processMessage({ source: Buffer.from(maskEmail('attacker@evil.example')) }, 1);
+
+      // Not threaded onto ticket 5; a new ticket is created instead.
+      expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+      expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
+    });
+
+    it('threads by subject mask when the sender IS the ticket requester', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = callProcess(prisma as unknown as PrismaService);
+      (svc.ticketsService as unknown as { getTicketByMask: ReturnType<typeof vi.fn> }).getTicketByMask = vi
+        .fn()
+        .mockResolvedValue({ id: 5, mask: 'TT-000005', requesterEmail: 'owner@acme.example' });
+
+      await svc.processMessage({ source: Buffer.from(maskEmail('Owner <owner@acme.example>')) }, 1);
+
+      expect(svc.ticketsService.reply).toHaveBeenCalledTimes(1);
+      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+    });
   });
 
   // ─── A5(ii): loop / auto-reply detection ─────────────────────────────────────
@@ -370,6 +409,13 @@ describe('InboundMailService — parser rule helpers', () => {
     it('skips Precedence bulk/list/junk', () => {
       expect(call({ precedence: 'bulk' })).toBe(true);
       expect(call({ precedence: 'list' })).toBe(true);
+    });
+
+    it('skips a multi-valued (array) Precedence header', () => {
+      // mailparser returns repeated header lines as an array — must still match.
+      const headers = new Map<string, unknown>([['precedence', ['list', 'bulk']]]);
+      const svc = service as unknown as { isLoopMessage: (p: unknown, f: string) => boolean };
+      expect(svc.isLoopMessage({ headers }, 'someone@external.example')).toBe(true);
     });
 
     it('skips X-Loop / X-Autoreply', () => {

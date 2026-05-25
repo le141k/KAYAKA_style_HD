@@ -151,6 +151,23 @@ describe('SlaService – escalation actions via runPeriodicCheck', () => {
   // bumps the level once when it first marks a breach escalated. Using an ALREADY
   // escalated ticket (so the initial bump at sla.service.ts:252 is skipped) proves the
   // action itself no longer double-increments.
+  // D8 dual-breach — a ticket breaching BOTH first-response and resolution in one
+  // scan must still only increment escalationLevel ONCE.
+  it('increments escalationLevel once for a ticket breaching both targets in one scan', async () => {
+    const past = new Date(Date.now() - 120 * 60_000);
+    setupBreach(
+      makeBreachedTicket({ dueAt: past, firstResponseAt: null, resolutionDueAt: past }),
+      [], // no actions; we only care about the escalation mark
+    );
+
+    await service.runPeriodicCheck();
+
+    const incrementCalls = (prisma.ticket.update as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c: any[]) => c[0]?.data?.escalationLevel !== undefined,
+    );
+    expect(incrementCalls).toHaveLength(1);
+  });
+
   it('mark_escalated does not increment escalationLevel (no double-bump)', async () => {
     setupBreach(makeBreachedTicket({ isEscalated: true, escalationLevel: 1 }), [{ type: 'mark_escalated' }]);
 

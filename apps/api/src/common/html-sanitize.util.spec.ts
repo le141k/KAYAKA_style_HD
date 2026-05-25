@@ -25,4 +25,17 @@ describe('sanitizeRichHtml', () => {
     const out = sanitizeRichHtml(html);
     expect(out).not.toContain('svg+xml');
   });
+
+  // Regression: leading whitespace / control chars must not bypass the data: guard
+  // (browsers strip them before resolving the URL).
+  it('drops a leading-space-padded data:text/html on <img>', () => {
+    expect(sanitizeRichHtml('<img src=" data:text/html;base64,PHM+" alt="x">')).not.toContain(
+      'data:text/html',
+    );
+  });
+
+  it('drops a leading-tab/newline-padded data:image/svg+xml on <img>', () => {
+    expect(sanitizeRichHtml('<img src="\tdata:image/svg+xml;base64,PHN2Zz4=">')).not.toContain('svg+xml');
+    expect(sanitizeRichHtml('<img src="\ndata:image/svg+xml;base64,PHN2Zz4=">')).not.toContain('svg+xml');
+  });
 });

@@ -245,12 +245,16 @@ export class SlaService {
     for (const { ticket, breachType, minutesOverdue } of breaches) {
       this.logger.warn(`SLA ${breachType} breach on ${ticket.mask}: ${minutesOverdue}m overdue`);
 
-      // Mark as escalated
+      // Mark as escalated. A ticket that breaches BOTH first-response and
+      // resolution in the same scan appears twice in `breaches` sharing one
+      // in-memory object; flip the local flag after the update so the second
+      // entry doesn't increment escalationLevel a second time (D8 dual-breach).
       if (!ticket.isEscalated) {
         await this.prisma.ticket.update({
           where: { id: ticket.id },
           data: { isEscalated: true, escalationLevel: { increment: 1 } },
         });
+        ticket.isEscalated = true;
       }
 
       // Execute EscalationRule.actions for this ticket's SLA plan

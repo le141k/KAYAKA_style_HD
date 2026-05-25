@@ -254,14 +254,33 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    */
   private isLoopMessage(parsed: { headers?: Map<string, unknown> }, fromEmail: string): boolean {
     const headers = parsed.headers;
-    const get = (k: string): string =>
-      headers && typeof headers.get === 'function' ? String(headers.get(k) ?? '').toLowerCase() : '';
+    // A header can arrive as a string, an array (repeated header lines), or a
+    // structured object (mailparser parses params). Flatten all to a lowercased
+    // string so a multi-valued `Precedence: list` + `Precedence: bulk` (array) or
+    // a parameterised value can't slip past the checks below.
+    const get = (k: string): string => {
+      if (!headers || typeof headers.get !== 'function') return '';
+      const raw = headers.get(k);
+      if (raw == null) return '';
+      const flat = Array.isArray(raw)
+        ? raw.map((v) => (typeof v === 'object' && v ? JSON.stringify(v) : String(v))).join(' ')
+        : typeof raw === 'object'
+          ? JSON.stringify(raw)
+          : String(raw);
+      return flat.toLowerCase();
+    };
+    // True if any whitespace/comma-separated token of the header equals one of `tokens`.
+    const hasToken = (headerVal: string, tokens: string[]): boolean => {
+      const parts = headerVal.split(/[\s,;]+/).filter(Boolean);
+      return parts.some((p) => tokens.includes(p));
+    };
 
     const autoSubmitted = get('auto-submitted');
-    if (autoSubmitted && autoSubmitted !== 'no') return true;
+    // Anything other than an explicit "no" (incl. multi/parameterised) is a loop.
+    if (autoSubmitted && !hasToken(autoSubmitted, ['no'])) return true;
 
     const precedence = get('precedence');
-    if (['bulk', 'list', 'junk', 'auto_reply'].includes(precedence)) return true;
+    if (hasToken(precedence, ['bulk', 'list', 'junk', 'auto_reply'])) return true;
 
     if (get('x-loop') || get('x-autoreply') || get('x-autorespond')) return true;
 
@@ -384,6 +403,17 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       const mask = maskMatch[0].toUpperCase();
       try {
         const ticket = await this.ticketsService.getTicketByMask(mask);
+        // Ownership guard: unlike the RFC path (which requires possessing a real
+        // Message-ID), a subject mask is guessable. Only thread onto the ticket if
+        // the sender is its requester — otherwise anyone could append to (and
+        // reopen) an arbitrary or another customer's ticket by quoting "TT-NNNNNN".
+        const senderOwns = (ticket.requesterEmail ?? '').trim().toLowerCase() === fromEmail.toLowerCase();
+        if (!senderOwns) {
+          this.logger.warn(
+            `IMAP: mask ${mask} in subject but sender ${fromEmail} is not the requester — creating new ticket`,
+          );
+          throw new Error('sender-not-requester');
+        }
         await this.ticketsService.reply(ticket.id, {
           contents: htmlBody ?? textBody,
           isHtml: !!htmlBody,
