@@ -36,3 +36,7 @@ npm-debug.log*
 !.vscode/extensions.json
 apps/web/e2e/.auth/
 .env.prod
+
+# Operator deploy notes + secrets for the 10.0.0.20 VM rollout — never commit
+deploy.md
+secrets.md
