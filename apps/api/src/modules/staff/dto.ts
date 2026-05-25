@@ -1,10 +1,19 @@
 import { z } from 'zod';
 import { optionalBoolParam } from '../../common/zod-bool.util';
+import { ALL_PERMISSIONS } from '../../auth/permissions';
+
+const PERMISSION_SET = new Set<string>(ALL_PERMISSIONS);
 
 export const CreateStaffGroupSchema = z.object({
   title: z.string().min(1).max(100),
   isAdmin: z.boolean().default(false),
-  permissions: z.array(z.string()).default([]),
+  // Only known permission keys from the catalog (rejects typos / injected keys).
+  permissions: z
+    .array(z.string())
+    .default([])
+    .refine((perms) => perms.every((p) => PERMISSION_SET.has(p)), {
+      message: 'permissions must all be valid permission keys',
+    }),
 });
 export type CreateStaffGroupDto = z.infer<typeof CreateStaffGroupSchema>;
 

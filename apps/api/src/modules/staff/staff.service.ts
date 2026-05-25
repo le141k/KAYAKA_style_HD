@@ -47,12 +47,37 @@ export class StaffService {
     return group;
   }
 
-  async createGroup(dto: CreateStaffGroupDto): Promise<StaffGroup> {
+  /**
+   * Privilege guard for group create/update: a non-admin actor may neither create
+   * an admin group nor grant any permission they don't already hold (escalation).
+   * Admins (or no actor = seed/internal) are unrestricted.
+   */
+  private assertGroupPrivilege(
+    isAdmin: boolean | undefined,
+    permissions: string[] | undefined,
+    actor?: AuthStaff,
+  ) {
+    if (!actor || actor.isAdmin) return;
+    if (isAdmin) {
+      throw new ForbiddenException('Only an administrator may create an admin group');
+    }
+    if (permissions && permissions.length) {
+      const held = new Set<string>(actor.permissions);
+      const escalated = permissions.filter((p) => !held.has(p));
+      if (escalated.length) {
+        throw new ForbiddenException(`Cannot grant permissions you do not hold: ${escalated.join(', ')}`);
+      }
+    }
+  }
+
+  async createGroup(dto: CreateStaffGroupDto, actor?: AuthStaff): Promise<StaffGroup> {
+    this.assertGroupPrivilege(dto.isAdmin, dto.permissions, actor);
     return this.prisma.staffGroup.create({ data: dto });
   }
 
-  async updateGroup(id: number, dto: UpdateStaffGroupDto): Promise<StaffGroup> {
+  async updateGroup(id: number, dto: UpdateStaffGroupDto, actor?: AuthStaff): Promise<StaffGroup> {
     await this.getGroup(id);
+    this.assertGroupPrivilege(false, dto.permissions, actor);
     return this.prisma.staffGroup.update({ where: { id }, data: dto });
   }
 
@@ -159,6 +184,24 @@ export class StaffService {
     });
   }
 
+  /**
+   * Refuse an operation that would leave zero enabled administrators (lockout).
+   * No-op unless the target is currently an enabled admin and is the only one.
+   */
+  private async assertNotLastAdmin(staffId: number): Promise<void> {
+    const target = await this.prisma.staff.findUnique({
+      where: { id: staffId },
+      select: { isEnabled: true, staffGroup: { select: { isAdmin: true } } },
+    });
+    if (!target?.isEnabled || !target.staffGroup?.isAdmin) return; // not an enabled admin
+    const enabledAdmins = await this.prisma.staff.count({
+      where: { isEnabled: true, staffGroup: { isAdmin: true } },
+    });
+    if (enabledAdmins <= 1) {
+      throw new ForbiddenException('Cannot disable or de-admin the last enabled administrator');
+    }
+  }
+
   async update(id: number, dto: UpdateStaffDto, actor?: AuthStaff): Promise<SafeStaff> {
     await this.get(id); // validate exists
 
@@ -166,6 +209,18 @@ export class StaffService {
     // staff member into an admin group (privilege-escalation guard).
     if (dto.staffGroupId !== undefined) {
       await this.assertCanAssignGroup(dto.staffGroupId, actor);
+    }
+
+    // Last-admin lockout guard: disabling, or moving the sole admin into a
+    // non-admin group, would lock everyone out.
+    if (dto.isEnabled === false) {
+      await this.assertNotLastAdmin(id);
+    } else if (dto.staffGroupId !== undefined) {
+      const newGroup = await this.prisma.staffGroup.findUnique({
+        where: { id: dto.staffGroupId },
+        select: { isAdmin: true },
+      });
+      if (!newGroup?.isAdmin) await this.assertNotLastAdmin(id);
     }
 
     const { password, departmentIds, ...rest } = dto;
@@ -195,6 +250,7 @@ export class StaffService {
   /** Soft-disable a staff member rather than deleting. */
   async disable(id: number): Promise<SafeStaff> {
     await this.get(id);
+    await this.assertNotLastAdmin(id); // never lock out the last admin
     return this.prisma.staff.update({
       where: { id },
       data: { isEnabled: false },

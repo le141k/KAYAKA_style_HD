@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { StaffService } from './staff.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 
@@ -101,6 +101,30 @@ describe('StaffService', () => {
       (prisma.staffGroup.create as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
       const result = await service.createGroup({ title: 'Support' } as any);
       expect(result.title).toBe('Support');
+    });
+
+    // B2: privilege guards
+    const NON_ADMIN = { isAdmin: false, permissions: ['ticket.view'] } as any;
+
+    it('B2: forbids a non-admin actor from creating an admin group', async () => {
+      await expect(
+        service.createGroup({ title: 'X', isAdmin: true, permissions: [] } as any, NON_ADMIN),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.staffGroup.create).not.toHaveBeenCalled();
+    });
+
+    it('B2: forbids a non-admin actor from granting permissions it does not hold', async () => {
+      await expect(
+        service.createGroup({ title: 'X', isAdmin: false, permissions: ['staff.manage'] } as any, NON_ADMIN),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('B2: allows an admin actor to create an admin group', async () => {
+      (prisma.staffGroup.create as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
+      const ADMIN = { isAdmin: true, permissions: [] } as any;
+      await expect(
+        service.createGroup({ title: 'X', isAdmin: true, permissions: ['staff.manage'] } as any, ADMIN),
+      ).resolves.toBeDefined();
     });
   });
 
@@ -404,6 +428,31 @@ describe('StaffService', () => {
     it('throws NotFoundException when staff not found', async () => {
       (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.disable(999)).rejects.toThrow(NotFoundException);
+    });
+
+    it('B3: refuses to disable the last enabled admin', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        isEnabled: true,
+        staffGroup: { ...MOCK_GROUP, isAdmin: true },
+      });
+      (prisma.staff.count as ReturnType<typeof vi.fn>).mockResolvedValue(1); // only one enabled admin
+      await expect(service.disable(1)).rejects.toThrow(ForbiddenException);
+      expect(prisma.staff.update).not.toHaveBeenCalled();
+    });
+
+    it('B3: allows disabling an admin when others remain', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        isEnabled: true,
+        staffGroup: { ...MOCK_GROUP, isAdmin: true },
+      });
+      (prisma.staff.count as ReturnType<typeof vi.fn>).mockResolvedValue(3);
+      (prisma.staff.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        isEnabled: false,
+      });
+      await expect(service.disable(1)).resolves.toBeDefined();
     });
   });
 });

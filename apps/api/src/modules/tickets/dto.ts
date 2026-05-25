@@ -21,8 +21,9 @@ export const CreateTicketSchema = z.object({
   slaPlanId: z.number().int().positive().optional(),
   customFields: z.record(z.unknown()).default({}),
   tags: z.array(z.string()).default([]),
-  creationMode: z.enum(['WEB', 'EMAIL', 'API', 'STAFF', 'ALARIS']).default('STAFF'),
-  ipAddress: z.string().default('0.0.0.0'),
+  // NOTE: creationMode + ipAddress are deliberately NOT accepted from the request
+  // body (mass-assignment guard) — the controller forces creationMode='STAFF' and
+  // the real req.ip; internal callers (public/alaris/inbound) pass them explicitly.
   attachmentIds: z.array(z.number().int().positive()).optional(),
   /** CC/BCC recipients stored in TicketRecipient */
   ccEmails: z.array(z.string().email()).optional(),
@@ -39,8 +40,6 @@ export const ReplyTicketSchema = z.object({
   isNote: z.boolean().default(false),
   isEmailed: z.boolean().default(false),
   isThirdParty: z.boolean().default(false),
-  creationMode: z.enum(['WEB', 'EMAIL', 'API', 'STAFF', 'ALARIS']).default('STAFF'),
-  ipAddress: z.string().default('0.0.0.0'),
   attachmentIds: z.array(z.number().int().positive()).optional(),
   /** CC/BCC recipients for outbound staff reply email */
   ccEmails: z.array(z.string().email()).optional(),

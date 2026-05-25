@@ -55,8 +55,8 @@ export class StaffController {
   @RequirePermissions(PERMISSIONS.STAFF_MANAGE)
   @UsePipes(new ZodValidationPipe(CreateStaffGroupSchema))
   @ApiOperation({ summary: 'Create a staff group' })
-  createGroup(@Body() dto: CreateStaffGroupDto) {
-    return this.staffService.createGroup(dto);
+  createGroup(@Body() dto: CreateStaffGroupDto, @CurrentStaff() actor: AuthStaff) {
+    return this.staffService.createGroup(dto, actor);
   }
 
   @Patch('groups/:id')
@@ -65,8 +65,9 @@ export class StaffController {
   updateGroup(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(UpdateStaffGroupSchema)) dto: UpdateStaffGroupDto,
+    @CurrentStaff() actor: AuthStaff,
   ) {
-    return this.staffService.updateGroup(id, dto);
+    return this.staffService.updateGroup(id, dto, actor);
   }
 
   @Delete('groups/:id')

@@ -7,6 +7,7 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  Ip,
   Param,
   ParseIntPipe,
   Patch,
@@ -169,8 +170,9 @@ export class TicketsController {
   @RequirePermissions(PERMISSIONS.TICKET_CREATE)
   @UsePipes(new ZodValidationPipe(CreateTicketSchema))
   @ApiOperation({ summary: 'Create a ticket (staff)' })
-  create(@Body() dto: CreateTicketDto, @CurrentStaff() staff: AuthStaff) {
-    return this.ticketsService.createTicket(dto, staff.staffId);
+  create(@Body() dto: CreateTicketDto, @CurrentStaff() staff: AuthStaff, @Ip() ip: string) {
+    // Force a trusted creationMode + real client IP — never from the request body.
+    return this.ticketsService.createTicket({ ...dto, creationMode: 'STAFF', ipAddress: ip }, staff.staffId);
   }
 
   @Post('bulk')
@@ -198,8 +200,10 @@ export class TicketsController {
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(ReplyTicketSchema)) dto: ReplyTicketDto,
     @CurrentStaff() staff: AuthStaff,
+    @Ip() ip: string,
   ) {
-    return this.ticketsService.reply(id, dto, staff.staffId);
+    // Trusted creationMode + real client IP — never from the request body.
+    return this.ticketsService.reply(id, { ...dto, creationMode: 'STAFF', ipAddress: ip }, staff.staffId);
   }
 
   @Post(':id/notes')
