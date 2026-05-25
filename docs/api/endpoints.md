@@ -162,6 +162,21 @@ All routes are under the `/api` global prefix.
 
 ---
 
+## Inbound mail
+
+| Method | Path              | Auth                         | Body             | Returns              |
+| ------ | ----------------- | ---------------------------- | ---------------- | -------------------- |
+| POST   | /api/inbound/pipe | 🔑 `x-inbound-secret` header | `{ raw: string}` | `{ accepted: true }` |
+
+> Note: `@Public()` (bypasses JWT) but enforces `x-inbound-secret` against
+> `TELECOM_HD_INBOUND_WEBHOOK_SECRET` (constant-time). `raw` is the full RFC822
+> message; it feeds the same parse→thread→dedup→ticket pipeline as the IMAP poller
+> (`InboundMailService.ingestRawMessage`). For MTA/PIPE delivery (Postfix/Exim pipe
+> transport). Loop-guarded (Auto-Submitted / Precedence / X-Loop / self-from) and
+> deduplicated by `Message-ID`. Returns `202 Accepted`.
+
+---
+
 ## Reports
 
 | Method | Path                   | Auth                | Body                                   | Returns                                       |

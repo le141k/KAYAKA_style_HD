@@ -68,7 +68,21 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async onModuleInit(): Promise<void> {
-    // Only start if at least one IMAP queue is enabled
+    // A1: surface enabled queues whose transport we don't poll (e.g. PIPE) instead
+    // of silently ignoring them — their mail would otherwise be dropped on the
+    // floor. PIPE/MTA queues are fed via POST /api/inbound/pipe (see controller).
+    const enabledNonImap = await this.prisma.emailQueue.findMany({
+      where: { isEnabled: true, type: { not: 'IMAP' } },
+      select: { id: true, emailAddress: true, type: true },
+    });
+    for (const q of enabledNonImap) {
+      this.logger.warn(
+        `EmailQueue ${q.id} (${q.emailAddress}, type=${q.type}) is enabled but not IMAP — ` +
+          `the poller will not fetch it. Use the inbound webhook (POST /api/inbound/pipe) for PIPE/MTA delivery.`,
+      );
+    }
+
+    // Only start polling if at least one IMAP queue is enabled
     const queues = await this.prisma.emailQueue.findMany({
       where: { isEnabled: true, type: 'IMAP' },
     });
@@ -259,10 +273,17 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async processMessage(msg: FetchMessageObject, departmentId: number | undefined): Promise<void> {
-    const { simpleParser } = await import('mailparser');
     const source = msg.source;
     if (!source) return;
+    await this.ingestRawMessage(source, departmentId);
+  }
 
+  /**
+   * Parse a raw RFC822 message and route it (thread / new ticket). Shared by the
+   * IMAP poller and the inbound webhook (A1) so both transports behave identically.
+   */
+  async ingestRawMessage(source: Buffer | string, departmentId: number | undefined): Promise<void> {
+    const { simpleParser } = await import('mailparser');
     const parsed = await simpleParser(source);
     const subject = parsed.subject ?? '(no subject)';
     const from = parsed.from?.value?.[0];

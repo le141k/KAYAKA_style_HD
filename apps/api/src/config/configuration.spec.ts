@@ -21,6 +21,7 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
     TELECOM_HD_MAIL_FROM: 'Help <help@example.com>',
     TELECOM_HD_LOG_LEVEL: 'info',
     TELECOM_HD_ALARIS_WEBHOOK_SECRET: STRONG_A.replace('17', '99'),
+    TELECOM_HD_INBOUND_WEBHOOK_SECRET: STRONG_B.replace('42', '77'),
     TELECOM_HD_UPLOAD_DIR: '/app/uploads',
     TELECOM_HD_UPLOAD_MAX_SIZE_MB: 25,
     TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined,
