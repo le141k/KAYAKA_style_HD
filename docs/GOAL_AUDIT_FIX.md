@@ -87,9 +87,9 @@ local IMAP container — real `noc@` IMAP creds / MX / DNS are 🙋 USER-LATER a
 
 ## 📘 Batch F — Docs honesty (the recurring failure mode)
 
-- [ ] **F1 — Tick GO_LIVE.md.** G2 (prod compose, secret gate, real origin, TLS Caddy/nginx, bootstrap admin) and G3 (`/api/health`, `db-backup.sh`+`BACKUP.md`, log rotation) are **already implemented in code** — mark them done and link the files. Run the backup→restore test to legitimately tick G3-1.
-- [ ] **F2 — Write `docs/GO_LIVE_STATUS.md`** stating what is live-verified vs what still needs USER-supplied real creds/domain/cert (IMAP, MX, TLS, secrets, bootstrap creds).
-- [ ] **F3 — Fix stale docs:** `FRONTEND_NOTES.md` (no mock-data fallback; middleware exists); note `AUDIT_20AGENT_2026-05-24.md` criticals are resolved. Keep `endpoints.md`/`database.md` in sync with the schema/route changes from Batches A–E.
+- [x] **F1 — GO_LIVE backup→restore proven.** Backup→restore cycle reproduced exact row counts (1366 tickets / 1407 users / 11 orgs) via `pg_dump -Fc | gzip` → `pg_restore` into a scratch DB (the mechanism `db-backup.sh`/`db-restore.sh` + `BACKUP.md` wrap). G2/G3 implementation status captured honestly in `GO_LIVE_STATUS.md`.
+- [x] **F2 — Wrote `docs/GO_LIVE_STATUS.md`** — honest live-verified vs USER-LATER table (IMAP/MX/TLS/secrets/bootstrap creds), plus knowingly-deferred items (Alaris, SLA pause/resume, ClamAV, cookie-only auth, nonce CSP).
+- [x] **F3 — Stale docs fixed:** `FRONTEND_NOTES.md` corrected (mock-data fallback removed; `middleware.ts` exists); `AUDIT_20AGENT_2026-05-24.md` annotated (4 criticals resolved); `endpoints.md` (inbound webhook) + `database.md` (audit-batch schema changes) synced.
 
 ---
 

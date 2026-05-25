@@ -75,22 +75,22 @@ apps/web/
 
 ## Premium Components (10+)
 
-| Component | Feature highlights |
-|---|---|
-| `AnimatedStatCard` | count-up via rAF, SVG sparkline, gradient top-bar, hover lift |
-| `TicketRow` | status dot, priority chip, assignee avatar, SLA pill, j/k keyboard nav |
-| `StatusBadge` | framer-motion AnimatePresence on status change, ping pulse for open |
-| `KanbanBoard` | framer-motion Reorder, drag-glow box-shadow, column counts |
-| `CommandPalette` | ⌘K / Ctrl+K, cmdk fuzzy search, ticket results, kbd hints |
-| `SidebarNav` | collapsible with width animation, active-route layoutId glow |
-| `LoginScreen` | split layout, animated SVG broadcast-arcs logo, RHF+Zod |
-| `FileUploadZone` | drag-drop visual states, per-file progress bar simulation |
-| `NotificationBell` | badge count, shake animation on new notification, popover list |
-| `SkeletonLoaders` | TicketList, Dashboard stats, TicketDetail, Kanban skeleton sets |
-| `SlaPill` | ok/warn/breach states, breach pulse animation |
-| `PriorityChip` | CVA-based color variants per priority |
-| `ThemeToggle` | framer-motion rotate transition between sun/moon icons |
-| `LocaleSwitcher` | ru/en/uk dropdown, updates I18nContext |
+| Component          | Feature highlights                                                     |
+| ------------------ | ---------------------------------------------------------------------- |
+| `AnimatedStatCard` | count-up via rAF, SVG sparkline, gradient top-bar, hover lift          |
+| `TicketRow`        | status dot, priority chip, assignee avatar, SLA pill, j/k keyboard nav |
+| `StatusBadge`      | framer-motion AnimatePresence on status change, ping pulse for open    |
+| `KanbanBoard`      | framer-motion Reorder, drag-glow box-shadow, column counts             |
+| `CommandPalette`   | ⌘K / Ctrl+K, cmdk fuzzy search, ticket results, kbd hints              |
+| `SidebarNav`       | collapsible with width animation, active-route layoutId glow           |
+| `LoginScreen`      | split layout, animated SVG broadcast-arcs logo, RHF+Zod                |
+| `FileUploadZone`   | drag-drop visual states, per-file progress bar simulation              |
+| `NotificationBell` | badge count, shake animation on new notification, popover list         |
+| `SkeletonLoaders`  | TicketList, Dashboard stats, TicketDetail, Kanban skeleton sets        |
+| `SlaPill`          | ok/warn/breach states, breach pulse animation                          |
+| `PriorityChip`     | CVA-based color variants per priority                                  |
+| `ThemeToggle`      | framer-motion rotate transition between sun/moon icons                 |
+| `LocaleSwitcher`   | ru/en/uk dropdown, updates I18nContext                                 |
 
 ## Design System
 
@@ -102,9 +102,14 @@ apps/web/
 
 ## API Integration
 
-All React Query hooks gracefully fall back to `lib/mock-data.ts` when the API returns an error. This means all screens render with realistic data even without a running backend.
+> **Corrected 2026-05-25:** the mock-data fallback was **removed** during hardening — hooks now
+> surface real API errors (no `lib/mock-data.ts` import remains; the orphan file is unused).
+> Screens require a running backend. (Historical note retained below.)
+
+~~All React Query hooks gracefully fall back to `lib/mock-data.ts` when the API returns an error.~~
 
 Endpoints wired:
+
 - `POST /auth/login` · `GET /auth/me`
 - `GET /tickets` · `GET /tickets/:id` · `POST /tickets` · `PATCH /tickets/:id`
 - `POST /tickets/:id/reply` · `GET /tickets/:id/replies`
@@ -122,7 +127,7 @@ Endpoints wired:
 4. `date-fns` import used in one file — add to deps or replace with custom formatter (already have `formatDate` in `lib/utils.ts`, switch to that)
 5. KanbanBoard uses `framer-motion` Reorder — verify framer-motion ≥ 10.16 is installed
 6. Playwright tests: run `npx playwright install` before `npm run test:e2e`
-7. Auth guard middleware (`middleware.ts`) — not created; add Next.js middleware to redirect unauthenticated users away from `/staff/*` and `/admin/*`
+7. ~~Auth guard middleware (`middleware.ts`) — not created~~ **DONE:** `apps/web/middleware.ts` exists and guards `/staff/*` and `/admin/*`.
 8. `@radix-ui/react-accordion` and `@radix-ui/react-collapsible` included in package.json but not yet used — can be removed if not needed
 9. Admin route tabs use static `href` matching for `data-[active]` — wire with `usePathname()` in a client component wrapper if needed
 10. Real file upload: `FileUploadZone` simulates progress; wire to `POST /tickets/:id/attachments` with `multipart/form-data`
