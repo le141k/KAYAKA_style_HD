@@ -17,6 +17,7 @@
  */
 import { readFileSync, existsSync } from 'node:fs';
 import { PrismaClient, ActorType, CreationMode } from '@prisma/client';
+import type { PrismaPromise } from '@prisma/client';
 import { parseTable, datelineToDate } from '../src/migration/kayako-parser';
 
 const prisma = new PrismaClient();
@@ -48,13 +49,16 @@ async function main(): Promise<void> {
   const sql = readFileSync(dumpPath, 'utf8');
 
   // Resolve product reference ids by title.
-  const [statuses, priorities, types, depts, users] = await Promise.all([
+  const [statuses, priorities, types, depts, users, emails] = await Promise.all([
     prisma.ticketStatus.findMany({ select: { id: true, title: true } }),
     prisma.ticketPriority.findMany({ select: { id: true, title: true } }),
     prisma.ticketType.findMany({ select: { id: true, title: true } }),
     prisma.department.findMany({ select: { id: true, title: true, isDefault: true } }),
     prisma.user.findMany({ where: { kayakoId: { not: null } }, select: { id: true, kayakoId: true } }),
+    // D4(c): reconcile requesters by email when Kayako's userid FK is wrong/missing.
+    prisma.userEmail.findMany({ select: { email: true, userId: true } }),
   ]);
+  const userIdByEmail = new Map(emails.map((e) => [e.email.trim().toLowerCase(), e.userId]));
   const idByTitle = (arr: Array<{ id: number; title: string }>) => new Map(arr.map((x) => [x.title, x.id]));
   const stMap = idByTitle(statuses);
   const prMap = idByTitle(priorities);
@@ -67,12 +71,27 @@ async function main(): Promise<void> {
     stMap.get(STATUS_MAP[t ?? ''] ?? 'Open') ?? stMap.get('Open') ?? statuses[0].id;
   const resolvePriority = (t: string | null): number =>
     prMap.get(PRIORITY_MAP[t ?? ''] ?? 'Normal') ?? prMap.get('Normal') ?? priorities[0].id;
-  const resolveType = (t: string | null): number | null => tyMap.get(TYPE_MAP[t ?? ''] ?? 'Issue') ?? null;
+  // D4(b): an empty source type must stay NULL (not silently become "Issue").
+  // Only a non-empty title is mapped; unknown non-empty titles fall back to Issue.
+  const resolveType = (t: string | null): number | null => {
+    const key = (t ?? '').trim();
+    if (!key) return null;
+    return tyMap.get(TYPE_MAP[key] ?? 'Issue') ?? null;
+  };
   // Kayako's single "General" dept → product default (Support).
   const resolveDept = (t: string | null): number => deptMap.get(t ?? '') ?? defaultDeptId;
 
   const ticketsT = parseTable(sql, 'swtickets');
   const postsT = parseTable(sql, 'swticketposts');
+  const notesT = parseTable(sql, 'swticketnotes');
+
+  // D4(d): which source tickets carry at least one (non-empty) internal note, so
+  // the ticket's hasNotes flag is set faithfully at import time.
+  const hasNotesKayako = new Set<number>();
+  for (const r of notesT.rows) {
+    if (r['linktype'] !== '1') continue;
+    if ((r['note'] ?? '').trim()) hasNotesKayako.add(Number(r['linktypeid']));
+  }
 
   const ticketIdByKayako = new Map<number, number>();
   let tCount = 0;
@@ -80,6 +99,10 @@ async function main(): Promise<void> {
     const kid = Number(row['ticketid']);
     if (!kid) continue;
     const statusTitle = row['ticketstatustitle'];
+    const requesterEmail = (row['email'] ?? '').trim().toLowerCase();
+    // D4(d): preserve the real historical activity time (default now() would make
+    // every imported ticket look freshly active).
+    const lastActivityAt = datelineToDate(row['lastactivity'] ?? row['dateline'] ?? null);
     const data = {
       mask: 'TT-' + String(kid).padStart(6, '0'),
       subject: (row['subject'] ?? '').trim() || '(no subject)',
@@ -87,18 +110,21 @@ async function main(): Promise<void> {
       statusId: resolveStatus(statusTitle),
       priorityId: resolvePriority(row['prioritytitle']),
       typeId: resolveType(row['tickettypetitle']),
-      userId: userByKayako.get(Number(row['userid'])) ?? null,
+      // D4(c): prefer the Kayako userid FK, fall back to matching by requester email.
+      userId: userByKayako.get(Number(row['userid'])) ?? userIdByEmail.get(requesterEmail) ?? null,
       requesterName: row['fullname'] ?? '',
-      requesterEmail: (row['email'] ?? '').trim().toLowerCase(),
+      requesterEmail,
       creationMode: CreationMode.EMAIL,
       creator: ActorType.USER,
       isResolved: statusTitle === 'Closed',
       isEscalated: statusTitle === 'Escalated',
+      hasNotes: hasNotesKayako.has(kid),
       totalReplies: Number(row['totalreplies']) || 0,
       ipAddress: row['ipaddress'] || '0.0.0.0',
       messageId: row['messageid'] ?? '',
       createdAt: datelineToDate(row['dateline'] ?? null),
-      lastReplyAt: datelineToDate(row['lastactivity'] ?? row['dateline'] ?? null),
+      lastReplyAt: lastActivityAt,
+      lastActivityAt: lastActivityAt ?? undefined,
     };
     const t = await prisma.ticket.upsert({
       where: { kayakoId: kid },
@@ -110,11 +136,14 @@ async function main(): Promise<void> {
   }
 
   // Posts: replace per imported ticket (idempotent re-run), skip internal notes.
-  for (const tid of ticketIdByKayako.values()) {
-    await prisma.ticketPost.deleteMany({ where: { ticketId: tid } });
-  }
+  // D4(a): the delete + re-insert runs in ONE transaction so a crash mid-loop
+  // can't leave a ticket with its old posts wiped and the new ones missing.
+  const ticketIds = [...ticketIdByKayako.values()];
   let pCount = 0;
   let skippedPrivate = 0;
+  const postOps: PrismaPromise<unknown>[] = [
+    prisma.ticketPost.deleteMany({ where: { ticketId: { in: ticketIds } } }),
+  ];
   for (const row of postsT.rows) {
     const tid = ticketIdByKayako.get(Number(row['ticketid']));
     if (!tid) continue;
@@ -123,25 +152,28 @@ async function main(): Promise<void> {
       continue;
     }
     const isStaff = Number(row['staffid']) > 0;
-    await prisma.ticketPost.create({
-      data: {
-        ticketId: tid,
-        authorType: isStaff ? ActorType.STAFF : ActorType.USER,
-        userId: isStaff ? null : (userByKayako.get(Number(row['userid'])) ?? null),
-        fullName: row['fullname'] ?? '',
-        email: (row['email'] ?? '').trim().toLowerCase(),
-        subject: row['subject'] ?? '',
-        contents: row['contents'] ?? '',
-        isHtml: row['ishtml'] === '1',
-        isEmailed: row['isemailed'] === '1',
-        isThirdParty: row['isthirdparty'] === '1',
-        creationMode: CreationMode.EMAIL,
-        ipAddress: row['ipaddress'] || '0.0.0.0',
-        createdAt: datelineToDate(row['dateline'] ?? null),
-      },
-    });
+    postOps.push(
+      prisma.ticketPost.create({
+        data: {
+          ticketId: tid,
+          authorType: isStaff ? ActorType.STAFF : ActorType.USER,
+          userId: isStaff ? null : (userByKayako.get(Number(row['userid'])) ?? null),
+          fullName: row['fullname'] ?? '',
+          email: (row['email'] ?? '').trim().toLowerCase(),
+          subject: row['subject'] ?? '',
+          contents: row['contents'] ?? '',
+          isHtml: row['ishtml'] === '1',
+          isEmailed: row['isemailed'] === '1',
+          isThirdParty: row['isthirdparty'] === '1',
+          creationMode: CreationMode.EMAIL,
+          ipAddress: row['ipaddress'] || '0.0.0.0',
+          createdAt: datelineToDate(row['dateline'] ?? null),
+        },
+      }),
+    );
     pCount++;
   }
+  await prisma.$transaction(postOps);
 
   // TAGS: swtaglinks(linktype=1, linkid=ticketid) → swtags.tagname → connect to the ticket (m2m).
   const tagNameById = new Map<number, string>();
@@ -173,20 +205,25 @@ async function main(): Promise<void> {
     tagCount += names.size;
   }
 
-  // NOTES: swticketnotes(linktype=1, linktypeid=ticketid).note → internal note (replace per ticket = idempotent).
-  for (const tid of ticketIdByKayako.values())
-    await prisma.ticketNote.deleteMany({ where: { ticketId: tid } });
+  // NOTES: swticketnotes(linktype=1, linktypeid=ticketid).note → internal note.
+  // D4(a): delete + re-insert in ONE transaction (idempotent re-run, crash-safe).
   let noteCount = 0;
-  for (const r of parseTable(sql, 'swticketnotes').rows) {
+  const noteOps: PrismaPromise<unknown>[] = [
+    prisma.ticketNote.deleteMany({ where: { ticketId: { in: ticketIds } } }),
+  ];
+  for (const r of notesT.rows) {
     if (r['linktype'] !== '1') continue;
     const tid = ticketIdByKayako.get(Number(r['linktypeid']));
     const contents = (r['note'] ?? '').trim();
     if (!tid || !contents) continue;
-    await prisma.ticketNote.create({
-      data: { ticketId: tid, contents, createdAt: datelineToDate(r['dateline'] ?? null) },
-    });
+    noteOps.push(
+      prisma.ticketNote.create({
+        data: { ticketId: tid, contents, createdAt: datelineToDate(r['dateline'] ?? null) },
+      }),
+    );
     noteCount++;
   }
+  await prisma.$transaction(noteOps);
 
   console.log(
     `✅ imported ${tCount} tickets, ${pCount} posts (${skippedPrivate} private skipped), ${tagCount} tag-links, ${noteCount} notes.`,
