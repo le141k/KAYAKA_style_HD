@@ -97,9 +97,18 @@ export class AuthService {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
-    // Active (non-revoked) stored tokens — the normal rotation path.
+    // Opportunistic cleanup of this staff's expired tokens (bounded, indexed) so the
+    // scan below stays small. Fire-and-forget; failure must not block a valid refresh.
+    void this.prisma.refreshToken
+      .deleteMany({ where: { staffId: payload.sub, expiresAt: { lt: new Date() } } })
+      .catch(() => undefined);
+
+    // Active (non-revoked) stored tokens — the normal rotation path. Cap the scan
+    // (newest first) so a staff with many sessions can't blow up the argon2 loop.
     const active = await this.prisma.refreshToken.findMany({
       where: { staffId: payload.sub, revokedAt: null },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
     });
 
     // Find matching token by verifying argon2 hash
@@ -119,6 +128,8 @@ export class AuthService {
       // Treat it as a compromise and revoke the entire token family for this staff.
       const revoked = await this.prisma.refreshToken.findMany({
         where: { staffId: payload.sub, NOT: { revokedAt: null }, expiresAt: { gt: new Date() } },
+        orderBy: { createdAt: 'desc' },
+        take: 20,
       });
       for (const t of revoked) {
         if (await verifyPassword(t.tokenHash, rawRefreshToken)) {

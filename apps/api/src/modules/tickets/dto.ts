@@ -144,7 +144,14 @@ export const ListTicketsQuerySchema = z.object({
   unassigned: optionalBoolParam(),
   /** When true, list only SLA-breached tickets (unresolved + dueAt in the past). */
   sla_breached: optionalBoolParam(),
-  search: z.string().optional(),
+  // Ignore <3-char search terms: an ILIKE '%ab%' can't use the trigram GIN index
+  // and seq-scans the table. Short terms are treated as "no search filter".
+  search: z
+    .string()
+    .trim()
+    .max(200)
+    .optional()
+    .transform((s) => (s && s.length >= 3 ? s : undefined)),
   /** Filter by requester user id */
   userId: z.coerce.number().int().positive().optional(),
   isResolved: optionalBoolParam(),

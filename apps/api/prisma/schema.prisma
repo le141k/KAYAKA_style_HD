@@ -162,6 +162,9 @@ model RefreshToken {
   createdAt DateTime @default(now())
 
   @@index([staffId])
+  // Load: bound the refresh-rotation scan + support expired-token cleanup.
+  @@index([staffId, revokedAt])
+  @@index([staffId, expiresAt])
 }
 
 model PasswordReset {
@@ -497,6 +500,7 @@ model TicketAuditLog {
   createdAt DateTime  @default(now())
 
   @@index([ticketId])
+  @@index([createdAt])
 }
 
 model TicketLink {
@@ -611,6 +615,9 @@ model Workflow {
   sortOrder Int      @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // Load: every ticket event queries enabled workflows ordered by sortOrder.
+  @@index([isEnabled, sortOrder])
 }
 
 // ───────────────────────────── mail ─────────────────────────────
@@ -835,6 +842,8 @@ model ReportSchedule {
   nextRunAt   DateTime?
 
   @@index([reportId])
+  // Load: the schedule scanner polls due+enabled schedules every 5 min.
+  @@index([isEnabled, nextRunAt])
 }
 
 model ReportRun {
