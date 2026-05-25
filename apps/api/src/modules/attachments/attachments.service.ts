@@ -2,7 +2,7 @@ import { BadRequestException, Injectable, Logger, NotFoundException } from '@nes
 import type { Attachment } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { StorageService } from './storage.service';
-import { verifyFileSignature } from './file-signature.util';
+import { verifyFileSignature, isExtensionAllowed } from './file-signature.util';
 
 export interface UploadFileInput {
   originalname: string;
@@ -28,10 +28,22 @@ export class AttachmentsService {
     files: UploadFileInput[],
     ctx: { ticketId?: number; postId?: number; claimToken?: string } = {},
   ): Promise<Attachment[]> {
-    // TODO (P1): ClamAV scan
+    // Async AV (ClamAV) scanning is deferred (TELECOM_HD_CLAMAV_* not wired yet);
+    // until then we rely on the MIME allowlist + magic-byte check + the extension
+    // denylist below. When AV is enabled, scan each buffer here before persisting
+    // and reject on a positive verdict. Tracked as D6 follow-up.
     const results: Attachment[] = [];
 
     for (const file of files) {
+      // Defence-in-depth: refuse executable/script extensions outright — a script
+      // sent as text/plain passes the MIME + magic-byte checks (looksTextual), so
+      // the extension denylist is the layer that stops it being stored at all.
+      if (!isExtensionAllowed(file.originalname)) {
+        throw new BadRequestException(
+          `File ${file.originalname} has a blocked file type and cannot be uploaded`,
+        );
+      }
+
       // Verify the actual bytes match the declared MIME — the Multer filter only
       // checks the spoofable Content-Type header.
       if (!verifyFileSignature(file.mimetype, file.buffer)) {
