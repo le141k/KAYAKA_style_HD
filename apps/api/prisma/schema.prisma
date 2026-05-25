@@ -628,7 +628,7 @@ model Workflow {
 model EmailQueue {
   id             Int            @id @default(autoincrement())
   type           EmailQueueType @default(IMAP)
-  emailAddress   String
+  emailAddress   String         @unique
   host           String         @default("")
   port           Int            @default(993)
   username       String         @default("")
