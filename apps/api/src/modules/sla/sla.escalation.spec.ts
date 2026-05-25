@@ -142,11 +142,26 @@ describe('SlaService – escalation actions via runPeriodicCheck', () => {
     await service.runPeriodicCheck();
 
     const updateCalls = (prisma.ticket.update as ReturnType<typeof vi.fn>).mock.calls;
-    // There should be a call with isEscalated: true from mark_escalated (distinct from the initial escalation mark)
-    const markCall = updateCalls.find(
-      (c: any[]) => c[0]?.data?.isEscalated === true && c[0]?.data?.escalationLevel !== undefined,
-    );
+    // The mark_escalated action must set isEscalated: true.
+    const markCall = updateCalls.find((c: any[]) => c[0]?.data?.isEscalated === true);
     expect(markCall).toBeDefined();
+  });
+
+  // D8 — mark_escalated must NOT increment escalationLevel: runPeriodicCheck already
+  // bumps the level once when it first marks a breach escalated. Using an ALREADY
+  // escalated ticket (so the initial bump at sla.service.ts:252 is skipped) proves the
+  // action itself no longer double-increments.
+  it('mark_escalated does not increment escalationLevel (no double-bump)', async () => {
+    setupBreach(makeBreachedTicket({ isEscalated: true, escalationLevel: 1 }), [{ type: 'mark_escalated' }]);
+
+    await service.runPeriodicCheck();
+
+    const updateCalls = (prisma.ticket.update as ReturnType<typeof vi.fn>).mock.calls;
+    // No ticket.update in this run may carry an escalationLevel increment.
+    const incrementCall = updateCalls.find((c: any[]) => c[0]?.data?.escalationLevel !== undefined);
+    expect(incrementCall).toBeUndefined();
+    // …and the action still flips isEscalated true.
+    expect(updateCalls.find((c: any[]) => c[0]?.data?.isEscalated === true)).toBeDefined();
   });
 
   it('executes notify action with a staffId from the action', async () => {

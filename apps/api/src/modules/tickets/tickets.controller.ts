@@ -89,7 +89,7 @@ export class TicketsController {
     if (dto.attachmentIds?.length && !dto.attachmentClaimToken) {
       throw new BadRequestException('attachmentClaimToken is required when attachmentIds are provided');
     }
-    return this.ticketsService.createTicket({
+    const ticket = await this.ticketsService.createTicket({
       ...dto,
       contents: dto.contents,
       departmentId: dto.departmentId ?? 1,
@@ -99,6 +99,16 @@ export class TicketsController {
       tags: [],
       customFields: dto.customFields,
     });
+    // D7: never echo the raw Ticket to an unauthenticated submitter — it carries
+    // ipAddress, creationMode, slaPlanId, internal SLA timestamps and (encrypted)
+    // customFields. Return only what the portal needs to confirm the submission.
+    return {
+      id: ticket.id,
+      mask: ticket.mask,
+      subject: ticket.subject,
+      statusId: ticket.statusId,
+      createdAt: ticket.createdAt,
+    };
   }
 
   // ─────────────────── Client: my tickets ───────────────────
@@ -136,11 +146,20 @@ export class TicketsController {
   @Post('public/:id/reply')
   @Throttle({ default: { limit: PUBLIC_REPLY_LIMIT, ttl: 60000 } })
   @ApiOperation({ summary: 'Add a user reply to a ticket from the client portal (no auth required)' })
-  publicReply(
+  async publicReply(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(PublicReplySchema)) dto: PublicReplyDto,
   ) {
-    return this.ticketsService.publicReply(id, dto);
+    const post = await this.ticketsService.publicReply(id, dto);
+    // D7: the raw TicketPost carries ipAddress, creationMode, staffId and the
+    // author email — strip them. The portal only needs the created post's identity.
+    return {
+      id: post.id,
+      ticketId: post.ticketId,
+      contents: post.contents,
+      isHtml: post.isHtml,
+      createdAt: post.createdAt,
+    };
   }
 
   // ─────────────────── Staff routes ───────────────────

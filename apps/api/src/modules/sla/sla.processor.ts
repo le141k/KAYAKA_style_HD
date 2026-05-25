@@ -6,8 +6,11 @@ import { SlaService } from './sla.service';
 /**
  * BullMQ processor for the 'sla' queue.
  * Consumes repeatable 'scan' jobs to run periodic SLA breach checks.
+ *
+ * concurrency:1 + a long lockDuration so two scans can't overlap (a scan can run
+ * longer than the 60s repeat interval at scale and would otherwise double-fire).
  */
-@Processor('sla')
+@Processor('sla', { concurrency: 1, lockDuration: 120_000 })
 export class SlaProcessor extends WorkerHost {
   private readonly logger = new Logger(SlaProcessor.name);
 

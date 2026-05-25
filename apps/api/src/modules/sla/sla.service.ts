@@ -344,9 +344,11 @@ export class SlaService {
           break;
         }
         case 'mark_escalated': {
+          // D8: do NOT increment escalationLevel here — runPeriodicCheck already
+          // bumped it once when it flagged the breach (double-increment otherwise).
           await this.prisma.ticket.update({
             where: { id: ticket.id },
-            data: { isEscalated: true, escalationLevel: { increment: 1 } },
+            data: { isEscalated: true },
           });
           break;
         }
