@@ -48,3 +48,13 @@ placeholders). Substitute real values and flip the switch:
 - **Cookie-only auth** (stop returning the raw token in the login/refresh body) — coordinated
   FE change; tokens are already also set as HttpOnly cookies.
 - **Nonce-based CSP** `script-src` tightening (Next App Router inline scripts).
+- **Inbound dedup atomicity** — dedup is a check-then-act on `Message-ID`; a rare
+  concurrent IMAP-poll + webhook re-delivery of the same message could still double-create.
+  Hardening = a partial-unique index on non-empty `messageId` + insert-catch.
+- **Workflow re-entrancy guard** conflates concurrency with recursion depth — 5+ genuinely
+  concurrent events on one hot ticket could hit the cap and skip a run. Needs a proper
+  re-entrancy token vs a shared counter.
+- **Merge** does not re-parent `TicketRecipient`/tags/`TicketLink`/time-entries onto the
+  surviving ticket (product decision — flag for spec confirmation).
+- **Workflow auto-assign** (`WorkflowExecutor`) doesn't skip a disabled assignee the way the
+  manual `assign` path does (low impact — mail still goes to the intended staff).
