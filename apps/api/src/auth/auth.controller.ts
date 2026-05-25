@@ -101,6 +101,9 @@ export class AuthController {
   @Public()
   @Post('refresh')
   @HttpCode(HttpStatus.OK)
+  // E2: rate-limit token rotation too (a stolen/guessed refresh token shouldn't be
+  // brute-forceable). Slightly higher than login since legit clients rotate often.
+  @Throttle({ default: { limit: 20, ttl: 60000 } })
   @ApiOperation({ summary: 'Rotate refresh token; returns new JWT pair' })
   async refresh(@Body() body: Partial<RefreshDto>, @Res({ passthrough: true }) res: Response) {
     // Accept the refresh token from the request body (legacy localStorage client)
@@ -131,8 +134,13 @@ export class AuthController {
   @Get('me')
   @RequirePermissions()
   @ApiOperation({ summary: 'Return current authenticated staff principal' })
-  me(@CurrentStaff() staff: AuthStaff): AuthStaff {
-    return staff;
+  me(@CurrentStaff() staff: AuthStaff): Omit<AuthStaff, 'jti' | 'exp'> {
+    // E2: don't expose the JWT id / expiry to the client — they're internal token
+    // bookkeeping (used by logout), not part of the staff principal.
+    const { jti: _jti, exp: _exp, ...principal } = staff;
+    void _jti;
+    void _exp;
+    return principal;
   }
 
   // ─────────────────── Password reset ───────────────────

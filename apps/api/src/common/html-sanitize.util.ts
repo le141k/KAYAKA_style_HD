@@ -63,6 +63,18 @@ const KB_OPTIONS: sanitizeHtml.IOptions = {
   // Force external links to be safe.
   transformTags: {
     a: sanitizeHtml.simpleTransform('a', { rel: 'noopener noreferrer nofollow' }),
+    // E4: the img `data:` scheme is allowed for inline images, but restrict it to
+    // genuine image media types — a `data:text/html`/`data:image/svg+xml` payload
+    // must not ride in on an <img src>. Drop the src if it isn't a raster data URI.
+    img: (tagName, attribs) => {
+      const src = attribs['src'] ?? '';
+      if (/^data:/i.test(src) && !/^data:image\/(png|jpe?g|gif|webp|bmp);/i.test(src)) {
+        const { src: _dropped, ...rest } = attribs;
+        void _dropped;
+        return { tagName, attribs: rest };
+      }
+      return { tagName, attribs };
+    },
   },
 };
 
