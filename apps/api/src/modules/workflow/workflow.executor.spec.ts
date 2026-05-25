@@ -415,4 +415,48 @@ describe('WorkflowExecutor', () => {
       expect(prisma.workflow.findMany).toHaveBeenCalledTimes(2);
     });
   });
+
+  // ─── A5(iii): re-entrancy depth guard ──────────────────────────────────────
+  describe('recursion guard (A5)', () => {
+    it('stops re-entrant evaluation of the same ticket past the depth cap', async () => {
+      const ticket = makeTicket();
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+
+      // A self-re-entrant workflow: its action re-enters evaluation for the same
+      // ticket. Without the guard this recurses forever; with it, it terminates.
+      let evaluations = 0;
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        evaluations++;
+        // Re-enter synchronously (simulating an action that re-fires the event).
+        await executor.onTicketStatusChanged({ ticketId: ticket.id });
+        return [];
+      });
+
+      await executor.onTicketStatusChanged({ ticketId: ticket.id });
+
+      // Bounded by MAX_WORKFLOW_DEPTH (5) — not unbounded.
+      expect(evaluations).toBeLessThanOrEqual(5);
+      expect(evaluations).toBeGreaterThan(0);
+    });
+
+    it('re-fetches the ticket after a mutating workflow (no stale snapshot)', async () => {
+      const ticket = makeTicket({ statusId: 1 });
+      const fresh = makeTicket({ statusId: 3 });
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(ticket)
+        .mockResolvedValueOnce(fresh);
+      // One workflow that changes status (mutates) → triggers a re-fetch.
+      const wf = makeWorkflow({
+        criteria: [] as any,
+        actions: [{ type: 'change_status', statusId: 3 }] as any,
+      });
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([wf]);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(fresh);
+
+      await executor.onTicketStatusChanged({ ticketId: 1 });
+
+      // findUnique called twice: initial snapshot + re-fetch after the mutation.
+      expect(prisma.ticket.findUnique).toHaveBeenCalledTimes(2);
+    });
+  });
 });
