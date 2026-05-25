@@ -113,12 +113,12 @@ describe('Tickets integration', () => {
       })
       .expect(201);
 
-    const body = res.body as { id: number; mask: string; subject: string; totalReplies: number };
+    // D7: the public projection returns only id/mask/subject/statusId/createdAt
+    // (no internal fields). totalReplies is verified via the authenticated GET below.
+    const body = res.body as { id: number; mask: string; subject: string };
     expect(body.mask).toMatch(/^TT-\d{6,}$/);
     expect(body.subject).toBe('Integration test ticket');
     ticketId = body.id;
-    ticketTotalRepliesAfterCreate = body.totalReplies;
-    expect(ticketTotalRepliesAfterCreate).toBe(1);
   });
 
   it('GET /api/tickets/:id — retrieves the created ticket with posts', async () => {
@@ -127,9 +127,16 @@ describe('Tickets integration', () => {
       .set('Authorization', `Bearer ${adminToken}`)
       .expect(200);
 
-    const body = res.body as { id: number; posts: unknown[]; tags: Array<{ name: string }> };
+    const body = res.body as {
+      id: number;
+      posts: unknown[];
+      tags: Array<{ name: string }>;
+      totalReplies: number;
+    };
     expect(body.id).toBe(ticketId);
     expect(body.posts).toHaveLength(1);
+    ticketTotalRepliesAfterCreate = body.totalReplies;
+    expect(ticketTotalRepliesAfterCreate).toBe(1);
   });
 
   it('POST /api/tickets/:id/reply — adds a staff reply', async () => {
