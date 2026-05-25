@@ -369,6 +369,10 @@ export class TicketsService {
         // Only posts (USER/STAFF replies) — notes are intentionally excluded.
         // Narrow select: NEVER expose staff email/ipAddress or internal audit fields.
         posts: {
+          // Third-party/vendor correspondence (isThirdParty) is internal-facing in
+          // the Kayako model (hidden from the customer by default) — never expose it
+          // on the public ticket view.
+          where: { isThirdParty: false },
           orderBy: { createdAt: 'asc' },
           select: {
             id: true,
@@ -1232,51 +1236,51 @@ export class TicketsService {
       resolutionDueAt = dueDates.resolutionDueAt;
     }
 
-    // Create new ticket
-    const newTicket = await this.prisma.ticket.create({
-      data: {
-        mask: 'TT-PENDING',
-        subject: dto.subject,
-        departmentId,
-        statusId,
-        priorityId,
-        typeId: source.typeId,
-        userId: source.userId,
-        requesterName: source.requesterName,
-        requesterEmail: source.requesterEmail,
-        ownerStaffId: source.ownerStaffId,
-        slaPlanId: source.slaPlanId,
-        dueAt,
-        resolutionDueAt,
-        creationMode: source.creationMode,
-        creator: 'STAFF',
-        customFields: source.customFields as object,
-        totalReplies: posts.length,
-      },
-    });
-
-    const newMask = formatTicketMask(newTicket.id);
-
-    await this.prisma.$transaction([
-      // Update mask on new ticket
-      this.prisma.ticket.update({
-        where: { id: newTicket.id },
-        data: { mask: newMask },
-      }),
-      // Move posts to new ticket
-      this.prisma.ticketPost.updateMany({
-        where: { id: { in: dto.postIds } },
-        data: { ticketId: newTicket.id },
-      }),
-      // Decrement source reply count
-      this.prisma.ticket.update({
-        where: { id: sourceTicketId },
+    // Create the new ticket, assign its mask, move the posts, and decrement the
+    // source — all in ONE interactive transaction. Previously the create ran
+    // outside the transaction, so a failure left an orphan TT-PENDING ticket with
+    // no posts. The post move is also scoped to `ticketId: sourceTicketId` so a
+    // concurrent split/merge can't let us yank posts that no longer belong to the
+    // source (TOCTOU between the verify above and the move).
+    const { newTicket, newMask } = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.ticket.create({
         data: {
-          totalReplies: { decrement: posts.length },
-          lastActivityAt: now,
+          mask: 'TT-PENDING',
+          subject: dto.subject,
+          departmentId,
+          statusId,
+          priorityId,
+          typeId: source.typeId,
+          userId: source.userId,
+          requesterName: source.requesterName,
+          requesterEmail: source.requesterEmail,
+          ownerStaffId: source.ownerStaffId,
+          slaPlanId: source.slaPlanId,
+          dueAt,
+          resolutionDueAt,
+          creationMode: source.creationMode,
+          creator: 'STAFF',
+          customFields: source.customFields as object,
+          totalReplies: posts.length,
         },
-      }),
-    ]);
+      });
+      const mask = formatTicketMask(created.id);
+      await tx.ticket.update({ where: { id: created.id }, data: { mask } });
+      const moved = await tx.ticketPost.updateMany({
+        where: { id: { in: dto.postIds }, ticketId: sourceTicketId },
+        data: { ticketId: created.id },
+      });
+      // Defend the invariant: if a concurrent op moved some posts away between the
+      // verify and here, abort the whole transaction rather than split-brain.
+      if (moved.count !== dto.postIds.length) {
+        throw new BadRequestException('Posts changed during split; please retry');
+      }
+      await tx.ticket.update({
+        where: { id: sourceTicketId },
+        data: { totalReplies: { decrement: posts.length }, lastActivityAt: now },
+      });
+      return { newTicket: created, newMask: mask };
+    });
 
     // Audit on both
     await this.writeAudit(sourceTicketId, 'SPLIT', staffId, 'STAFF', {

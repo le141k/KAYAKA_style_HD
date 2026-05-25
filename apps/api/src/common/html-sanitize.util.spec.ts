@@ -38,4 +38,10 @@ describe('sanitizeRichHtml', () => {
     expect(sanitizeRichHtml('<img src="\tdata:image/svg+xml;base64,PHN2Zz4=">')).not.toContain('svg+xml');
     expect(sanitizeRichHtml('<img src="\ndata:image/svg+xml;base64,PHN2Zz4=">')).not.toContain('svg+xml');
   });
+
+  // Embedded tab/newline mid-scheme: browsers strip these from URLs, so the guard must too.
+  it('drops a data: URI split by an embedded tab/newline (da\\tta:, data\\n:)', () => {
+    expect(sanitizeRichHtml('<img src="da\tta:image/svg+xml;base64,PHM+">')).not.toContain('svg+xml');
+    expect(sanitizeRichHtml('<img src="data\n:text/html;base64,PHM+">')).not.toContain('text/html');
+  });
 });

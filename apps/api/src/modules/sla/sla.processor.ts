@@ -9,8 +9,12 @@ import { SlaService } from './sla.service';
  *
  * concurrency:1 + a long lockDuration so two scans can't overlap (a scan can run
  * longer than the 60s repeat interval at scale and would otherwise double-fire).
+ * lockDuration must exceed the worst-case scan: up to SLA_BREACH_SCAN_CAP (1000)
+ * tickets, each with several awaited DB calls + a mail enqueue. 120s was too tight
+ * (lock could expire mid-scan → a second worker re-runs and double-fires notify/
+ * add_note); 10 min is comfortably above the realistic worst case.
  */
-@Processor('sla', { concurrency: 1, lockDuration: 120_000 })
+@Processor('sla', { concurrency: 1, lockDuration: 600_000 })
 export class SlaProcessor extends WorkerHost {
   private readonly logger = new Logger(SlaProcessor.name);
 

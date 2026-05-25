@@ -92,7 +92,7 @@ export class MailService {
    * critical path) or inline as a fallback. Logs and swallows errors so a send
    * failure never crashes the ticket flow.
    */
-  async deliver(opts: SendMailOptions): Promise<void> {
+  async deliver(opts: SendMailOptions, throwOnError = false): Promise<void> {
     try {
       const toStr = Array.isArray(opts.to) ? opts.to.join(', ') : opts.to;
       const ccStr = opts.cc ? (Array.isArray(opts.cc) ? opts.cc.join(', ') : opts.cc) : undefined;
@@ -112,6 +112,10 @@ export class MailService {
       this.logger.debug(`Mail sent to ${opts.to}: ${opts.subject}`);
     } catch (err) {
       this.logger.error(`Failed to send mail to ${opts.to}: ${String(err)}`);
+      // When delivering from the BullMQ processor, rethrow so the job's retry/backoff
+      // (attempts:3) actually fires. Inline fallback callers pass false so a send
+      // failure never crashes the ticket flow.
+      if (throwOnError) throw err instanceof Error ? err : new Error(String(err));
     }
   }
 
