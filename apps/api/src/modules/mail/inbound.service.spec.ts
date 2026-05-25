@@ -318,6 +318,40 @@ describe('InboundMailService — parser rule helpers', () => {
     });
   });
 
+  // ─── A3: dedup by Message-ID ─────────────────────────────────────────────────
+  describe('processMessage dedup (A3)', () => {
+    const rawEmail = [
+      'From: customer@acme.example',
+      'To: support@test.example',
+      'Subject: Need help',
+      'Message-ID: <dup-123@acme.example>',
+      '',
+      'Body text',
+      '',
+    ].join('\r\n');
+
+    const callProcess = (prismaArg: PrismaService) =>
+      makeInboundService(prismaArg) as unknown as {
+        processMessage: (m: unknown, d: number | undefined) => Promise<void>;
+        ticketsService: { createTicket: ReturnType<typeof vi.fn>; reply: ReturnType<typeof vi.fn> };
+      };
+
+    it('skips a message whose Message-ID already exists on a post', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 99 });
+      const svc = callProcess(prisma as unknown as PrismaService);
+      await svc.processMessage({ source: Buffer.from(rawEmail) }, 1);
+      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+      expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+    });
+
+    it('creates a ticket when the Message-ID is new', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = callProcess(prisma as unknown as PrismaService);
+      await svc.processMessage({ source: Buffer.from(rawEmail) }, 1);
+      expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
+    });
+  });
+
   // ─── A5(ii): loop / auto-reply detection ─────────────────────────────────────
   describe('isLoopMessage', () => {
     const call = (headers: Record<string, string>, fromEmail = 'someone@external.example') =>

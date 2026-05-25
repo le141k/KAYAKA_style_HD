@@ -275,6 +275,22 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       this.logger.log(`IMAP: skipped auto/loop message from ${fromEmail} — "${subject}"`);
       return;
     }
+
+    // A3 dedup: if we've already ingested a post bearing this exact Message-ID,
+    // this is a re-delivery (re-poll, or the same mail arriving via IMAP + webhook)
+    // — skip it so no duplicate ticket/reply is created. Empty IDs are never matched.
+    const incomingMessageId = parsed.messageId ?? undefined;
+    if (incomingMessageId) {
+      const existing = await this.prisma.ticketPost.findFirst({
+        where: { messageId: incomingMessageId },
+        select: { id: true },
+      });
+      if (existing) {
+        this.logger.log(`IMAP: duplicate message ${incomingMessageId} from ${fromEmail} — skipped`);
+        return;
+      }
+    }
+
     // Strip the quoted reply history so a threaded reply stores only the new text
     // (Kayako keeps the whole quoted chain on every message). HTML is left as-is —
     // the plain-text body is what we persist when there is no HTML part.
@@ -297,26 +313,27 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       emailAttachmentIds = uploaded.map((a) => a.id);
     }
 
-    // RFC threading identifiers
-    const incomingMessageId = parsed.messageId ?? undefined;
+    // RFC threading identifiers (incomingMessageId already resolved above for dedup).
     const inReplyTo = parsed.inReplyTo ?? undefined;
     const references = (parsed.references as string[] | string | undefined) ?? undefined;
 
-    // Build list of message IDs from In-Reply-To and References to try
+    // Build list of message IDs from In-Reply-To and References to try.
+    // Filter empties so a blank id can never match the '' default on legacy posts.
     const referencedIds: string[] = [];
     if (inReplyTo) referencedIds.push(inReplyTo);
     if (references) {
       if (Array.isArray(references)) {
         referencedIds.push(...references);
       } else {
-        referencedIds.push(...String(references).split(/\s+/).filter(Boolean));
+        referencedIds.push(...String(references).split(/\s+/));
       }
     }
+    const cleanReferencedIds = referencedIds.filter((id) => id && id.trim().length > 0);
 
     // 1. Try RFC threading by In-Reply-To / References
-    if (referencedIds.length > 0) {
+    if (cleanReferencedIds.length > 0) {
       const linkedPost = await this.prisma.ticketPost.findFirst({
-        where: { messageId: { in: referencedIds } },
+        where: { messageId: { in: cleanReferencedIds } },
         include: { ticket: true },
       });
 
