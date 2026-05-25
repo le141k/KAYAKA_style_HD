@@ -5,6 +5,11 @@ import { MailService } from '../mail/mail.service';
 import { NotificationService } from '../tickets/notification.service';
 import type { Workflow, Ticket } from '@prisma/client';
 
+/** Domain event WorkflowService emits after any workflow write, to bust the cache below. */
+export const WORKFLOW_CHANGED_EVENT = 'workflow.changed';
+/** Short TTL: bounds staleness if an invalidation event is ever missed. */
+const WORKFLOW_CACHE_TTL_MS = 10_000;
+
 /** The shape of a domain event emitted by TicketsService */
 interface TicketEvent {
   ticketId: number;
@@ -42,6 +47,28 @@ export class WorkflowExecutor {
     @Optional() private readonly notifications?: NotificationService,
   ) {}
 
+  // C3: cache the enabled-workflows list — it was queried on EVERY ticket event.
+  // Invalidated on any workflow write (event below) with a short TTL as a backstop.
+  private workflowCache: { data: Workflow[]; expiresAt: number } | null = null;
+
+  @OnEvent(WORKFLOW_CHANGED_EVENT)
+  invalidateWorkflowCache(): void {
+    this.workflowCache = null;
+  }
+
+  private async getEnabledWorkflows(): Promise<Workflow[]> {
+    const now = Date.now();
+    if (this.workflowCache && this.workflowCache.expiresAt > now) {
+      return this.workflowCache.data;
+    }
+    const data = await this.prisma.workflow.findMany({
+      where: { isEnabled: true },
+      orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+    });
+    this.workflowCache = { data, expiresAt: now + WORKFLOW_CACHE_TTL_MS };
+    return data;
+  }
+
   @OnEvent('ticket.created')
   async onTicketCreated(payload: TicketEvent): Promise<void> {
     await this.evaluate(payload.ticketId, 'ticket.created');
@@ -61,10 +88,7 @@ export class WorkflowExecutor {
     const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
     if (!ticket) return;
 
-    const workflows = await this.prisma.workflow.findMany({
-      where: { isEnabled: true },
-      orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
-    });
+    const workflows = await this.getEnabledWorkflows();
 
     for (const workflow of workflows) {
       if (this.matchesCriteria(ticket, workflow)) {

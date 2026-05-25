@@ -65,7 +65,8 @@ describe('WorkflowService', () => {
 
   beforeEach(() => {
     prisma = makePrismaMock();
-    service = new WorkflowService(prisma as unknown as PrismaService);
+    const events = { emit: vi.fn() } as unknown as import('@nestjs/event-emitter').EventEmitter2;
+    service = new WorkflowService(prisma as unknown as PrismaService, events);
   });
 
   // ─── Workflow CRUD ────────────────────────────────────────────────────────────

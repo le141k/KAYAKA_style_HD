@@ -153,6 +153,9 @@ model Staff {
   updatedAt       DateTime  @updatedAt
 
   @@index([staffGroupId])
+  // C5: trigram GIN for ILIKE staff name search.
+  @@index([firstName(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([lastName(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model RefreshToken {
@@ -211,6 +214,9 @@ model Organization {
   customFields Json    @default("{}")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+
+  // C5: trigram GIN for ILIKE org name search (OrganizationsService.list).
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model User {
@@ -237,6 +243,8 @@ model User {
   updatedAt      DateTime      @updatedAt
 
   @@index([organizationId])
+  // C5: trigram GIN for ILIKE user search (UsersService.list). Needs pg_trgm (enabled).
+  @@index([fullName(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model UserEmail {
@@ -725,6 +733,9 @@ model KbArticle {
   updatedAt     DateTime           @updatedAt
 
   @@index([categoryId])
+  // C5: trigram GIN for KB article search over title + plaintext body.
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([contentsText(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model KbArticleRevision {

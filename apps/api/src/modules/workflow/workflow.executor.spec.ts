@@ -395,4 +395,24 @@ describe('WorkflowExecutor', () => {
       expect(notifications.notifyOnAssign).not.toHaveBeenCalled();
     });
   });
+
+  // ─── C3: enabled-workflows cache ───────────────────────────────────────────
+  describe('workflow cache (C3)', () => {
+    it('queries workflows once across multiple ticket events, then re-queries after invalidation', async () => {
+      const ticket = makeTicket();
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      await executor.onTicketCreated({ ticketId: 1 });
+      await executor.onTicketReplied({ ticketId: 1 });
+      await executor.onTicketStatusChanged({ ticketId: 1 });
+      // Three events, one workflow query (the ticket itself is still fetched each time).
+      expect(prisma.workflow.findMany).toHaveBeenCalledTimes(1);
+
+      // A workflow write busts the cache → next event re-queries.
+      executor.invalidateWorkflowCache();
+      await executor.onTicketCreated({ ticketId: 1 });
+      expect(prisma.workflow.findMany).toHaveBeenCalledTimes(2);
+    });
+  });
 });

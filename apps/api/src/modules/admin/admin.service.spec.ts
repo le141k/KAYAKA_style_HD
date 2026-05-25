@@ -379,7 +379,10 @@ describe('AdminService', () => {
     });
 
     it('encrypts only fields flagged isEncrypted and round-trips on decrypt', async () => {
-      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ fieldKey: 'secret' }]);
+      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { fieldKey: 'secret', isEncrypted: true },
+        { fieldKey: 'plain', isEncrypted: false },
+      ]);
 
       const values = { secret: 'p@ss', plain: 'visible' };
       const encrypted = await service.encryptCustomFields('TICKET', values);
@@ -400,13 +403,15 @@ describe('AdminService', () => {
       expect(await service.encryptCustomFields('TICKET', values)).toEqual(values);
     });
 
-    // D9 — list endpoints decrypt a whole page in one definition lookup.
-    it('decryptCustomFieldsMany decrypts every row with a single field-def query', async () => {
-      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ fieldKey: 'secret' }]);
+    // D9 + C5 — a whole page decrypts off a single definition lookup, and the
+    // per-scope cache means repeat reads issue no further queries at all.
+    it('decryptCustomFieldsMany decrypts every row; defs are cached across reads', async () => {
+      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { fieldKey: 'secret', isEncrypted: true },
+      ]);
 
       const enc1 = await service.encryptCustomFields('TICKET', { secret: 'one', plain: 'a' });
       const enc2 = await service.encryptCustomFields('TICKET', { secret: 'two', plain: 'b' });
-      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockClear();
 
       const rows = [
         { id: 1, customFields: enc1 },
@@ -417,8 +422,24 @@ describe('AdminService', () => {
       expect((out[0]!.customFields as Record<string, unknown>)['secret']).toBe('one');
       expect((out[1]!.customFields as Record<string, unknown>)['secret']).toBe('two');
       expect((out[0]!.customFields as Record<string, unknown>)['plain']).toBe('a');
-      // One definition query for the whole page, not one-per-row.
+      // C5: two encrypts + one batch decrypt over the same scope hit the DB exactly once.
       expect(prisma.customField.findMany).toHaveBeenCalledTimes(1);
+    });
+
+    // C5 — a definition write busts the cache so stale defs aren't served.
+    it('invalidates the field-def cache after a field write', async () => {
+      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { fieldKey: 'secret', isEncrypted: true },
+      ]);
+      await service.validateCustomFields('TICKET', { secret: 'x' }); // populates cache (1)
+      await service.validateCustomFields('TICKET', { secret: 'y' }); // cached (still 1)
+      expect(prisma.customField.findMany).toHaveBeenCalledTimes(1);
+
+      (prisma.customField.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 9 });
+      await service.createField(1, { fieldKey: 'k', label: 'K', type: 'TEXT' } as never); // busts cache
+
+      await service.validateCustomFields('TICKET', { secret: 'z' }); // re-queries (2)
+      expect(prisma.customField.findMany).toHaveBeenCalledTimes(2);
     });
 
     it('decryptCustomFieldsMany is a no-op on an empty page (no query)', async () => {
