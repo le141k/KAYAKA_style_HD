@@ -618,6 +618,8 @@ export class TicketsService {
       this.prisma.ticket.count({ where }),
     ]);
 
+    // D9: decrypt encrypted customFields so ciphertext never reaches the staff UI.
+    await this.adminService.decryptCustomFieldsMany('TICKET', data);
     return { data, total };
   }
 

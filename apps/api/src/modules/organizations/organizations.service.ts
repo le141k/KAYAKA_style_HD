@@ -33,6 +33,8 @@ export class OrganizationsService {
       this.prisma.organization.count({ where }),
     ]);
 
+    // D9: decrypt encrypted customFields so ciphertext never reaches the staff UI.
+    await this.adminService.decryptCustomFieldsMany('ORGANIZATION', data);
     return { data, total };
   }
 

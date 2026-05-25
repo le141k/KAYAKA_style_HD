@@ -139,6 +139,36 @@ export class AdminService {
     return out;
   }
 
+  /**
+   * Batch variant of decryptCustomFields for list endpoints (D9): resolves the
+   * scope's encrypted field keys ONCE, then decrypts each row's customFields
+   * in-memory — so a page of N rows costs one definition query, not N. Mutates
+   * each entity's `customFields` in place and returns the same array.
+   */
+  async decryptCustomFieldsMany<T extends { customFields?: unknown }>(
+    scope: CustomFieldScope,
+    rows: T[],
+  ): Promise<T[]> {
+    if (rows.length === 0) return rows;
+    const encryptedFields = await this.prisma.customField.findMany({
+      where: { group: { scope }, isEncrypted: true },
+      select: { fieldKey: true },
+    });
+    if (encryptedFields.length === 0) return rows;
+    const keys = encryptedFields.map((f) => f.fieldKey);
+    for (const row of rows) {
+      const values = row.customFields;
+      if (!values || typeof values !== 'object') continue;
+      const out = { ...(values as Record<string, unknown>) };
+      for (const fieldKey of keys) {
+        const v = out[fieldKey];
+        if (typeof v === 'string' && v !== '') out[fieldKey] = decryptField(v);
+      }
+      row.customFields = out;
+    }
+    return rows;
+  }
+
   private checkType(type: string, value: unknown): boolean {
     switch (type) {
       case 'CHECKBOX':

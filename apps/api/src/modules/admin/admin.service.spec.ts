@@ -399,5 +399,33 @@ describe('AdminService', () => {
       const values = { a: '1' };
       expect(await service.encryptCustomFields('TICKET', values)).toEqual(values);
     });
+
+    // D9 — list endpoints decrypt a whole page in one definition lookup.
+    it('decryptCustomFieldsMany decrypts every row with a single field-def query', async () => {
+      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ fieldKey: 'secret' }]);
+
+      const enc1 = await service.encryptCustomFields('TICKET', { secret: 'one', plain: 'a' });
+      const enc2 = await service.encryptCustomFields('TICKET', { secret: 'two', plain: 'b' });
+      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockClear();
+
+      const rows = [
+        { id: 1, customFields: enc1 },
+        { id: 2, customFields: enc2 },
+      ];
+      const out = await service.decryptCustomFieldsMany('TICKET', rows);
+
+      expect((out[0]!.customFields as Record<string, unknown>)['secret']).toBe('one');
+      expect((out[1]!.customFields as Record<string, unknown>)['secret']).toBe('two');
+      expect((out[0]!.customFields as Record<string, unknown>)['plain']).toBe('a');
+      // One definition query for the whole page, not one-per-row.
+      expect(prisma.customField.findMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('decryptCustomFieldsMany is a no-op on an empty page (no query)', async () => {
+      (prisma.customField.findMany as ReturnType<typeof vi.fn>).mockClear();
+      const out = await service.decryptCustomFieldsMany('TICKET', []);
+      expect(out).toEqual([]);
+      expect(prisma.customField.findMany).not.toHaveBeenCalled();
+    });
   });
 });

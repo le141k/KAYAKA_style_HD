@@ -155,6 +155,9 @@ describe('TicketsService — public endpoints', () => {
       validateCustomFields: vi.fn().mockResolvedValue(undefined),
       encryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
       decryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
+      decryptCustomFieldsMany: vi
+        .fn()
+        .mockImplementation((_s: unknown, rows: unknown) => Promise.resolve(rows)),
     } as unknown as AdminService;
 
     service = new TicketsService(prisma as unknown as PrismaService, users, sla, eventEmitter, mail, admin);
