@@ -930,6 +930,10 @@ export class TicketsService {
       });
       if (!status) throw new NotFoundException(`Status ${dto.statusId} not found`);
     }
+    // E3: validate the bulk assignee once before the transaction (clean 404 vs FK 500).
+    if (dto.action === 'assignee' && dto.ownerStaffId != null) {
+      await this.assertAssignableStaff(dto.ownerStaffId);
+    }
 
     const now = new Date();
     await this.prisma.$transaction(async (tx) => {
@@ -979,6 +983,12 @@ export class TicketsService {
 
   async assign(ticketId: number, dto: AssignTicketDto, staffId: number): Promise<Ticket> {
     const ticket = await this.findOrThrow(ticketId);
+
+    // E3: validate the assignee exists (and is enabled) up front — a bad id would
+    // otherwise surface as an opaque FK 500 from the update below.
+    if (dto.ownerStaffId != null) {
+      await this.assertAssignableStaff(dto.ownerStaffId);
+    }
 
     const updated = await this.prisma.ticket.update({
       where: { id: ticketId },
@@ -1663,6 +1673,17 @@ export class TicketsService {
     const t = await this.prisma.ticket.findUnique({ where: { id } });
     if (!t) throw new NotFoundException(`Ticket ${id} not found`);
     return t;
+  }
+
+  /** E3: a ticket can only be assigned to an existing, enabled staff member. */
+  private async assertAssignableStaff(staffId: number): Promise<void> {
+    const staff = await this.prisma.staff.findUnique({
+      where: { id: staffId },
+      select: { id: true, isEnabled: true },
+    });
+    if (!staff) throw new NotFoundException(`Staff ${staffId} not found`);
+    if (!staff.isEnabled)
+      throw new BadRequestException(`Staff ${staffId} is disabled and cannot be assigned`);
   }
 
   private async defaultStatusId(): Promise<number> {

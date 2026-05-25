@@ -20,6 +20,6 @@ export type UpdateOrganizationDto = z.infer<typeof UpdateOrganizationSchema>;
 export const ListOrganizationsQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   limit: z.coerce.number().int().positive().max(100).default(20),
-  search: z.string().optional(),
+  search: z.string().trim().max(200).optional(),
 });
 export type ListOrganizationsQueryDto = z.infer<typeof ListOrganizationsQuerySchema>;

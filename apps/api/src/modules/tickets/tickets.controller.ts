@@ -17,6 +17,7 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import { z } from 'zod';
 import { TicketsService } from './tickets.service';
 import { RequirePermissions, CurrentStaff, Public } from '../../auth/auth.decorators';
 import type { AuthStaff } from '../../auth/auth.decorators';
@@ -118,10 +119,16 @@ export class TicketsController {
   @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
   @ApiOperation({ summary: "List the current requester's tickets by email (client portal)" })
   listMy(@Query('email') email: string | undefined) {
-    if (!email) {
-      throw new BadRequestException('Query parameter "email" is required');
+    return this.ticketsService.listMyTickets(this.requireEmailParam(email));
+  }
+
+  /** E1: validate the `email` query param as a real (bounded) email address. */
+  private requireEmailParam(email: string | undefined): string {
+    const parsed = z.string().trim().email().max(320).safeParse(email);
+    if (!parsed.success) {
+      throw new BadRequestException('Query parameter "email" must be a valid email address');
     }
-    return this.ticketsService.listMyTickets(email);
+    return parsed.data.toLowerCase();
   }
 
   // ─────────────────── Client: public ticket detail ───────────────────
@@ -134,10 +141,7 @@ export class TicketsController {
       'Get a single ticket (no auth) with public posts only — no internal notes. Requires ?email= matching the ticket requester.',
   })
   getPublic(@Param('id', ParseIntPipe) id: number, @Query('email') email: string | undefined) {
-    if (!email) {
-      throw new BadRequestException('Query parameter "email" is required');
-    }
-    return this.ticketsService.getPublicTicket(id, email);
+    return this.ticketsService.getPublicTicket(id, this.requireEmailParam(email));
   }
 
   // ─────────────────── Client: public reply ───────────────────

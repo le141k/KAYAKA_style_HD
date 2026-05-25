@@ -78,9 +78,9 @@ local IMAP container — real `noc@` IMAP creds / MX / DNS are 🙋 USER-LATER a
 
 ## 🟢 Batch E — LOW / polish (do as time permits, group into 1–2 commits)
 
-- [ ] **E1 — Input caps:** add `.max()` to unbounded strings/arrays — ticket `contents`, macro `replyText`, staff `signature`, `tags`, `ccEmails`/`bccEmails`, all list `search` params (`tickets/dto.ts`, `workflow/dto.ts`, `staff/dto.ts`, list query schemas). Validate `GET /tickets/my?email=` as an email (`tickets.controller.ts:~109`).
+- [x] **E1 — Input caps:** `.max()` added to ticket/reply/note/public `contents` (100k), `tags` (50×100), `ccEmails`/`bccEmails` (100), spawn-supplier `contents`, macro `replyText` (50k)+`actions` (50), staff `signature`/`designation`/`password`/`mobileNumber`/`timezone`/`departmentIds`, and the org/user/staff list `search` params (trim+200). `GET /tickets/my` and `/tickets/public/:id` now validate `?email=` as a real bounded email. Tests in `dto.mass-assignment.spec.ts`.
 - [ ] **E2 — Auth surface:** add explicit `@Throttle` to `POST /auth/refresh`; stop returning raw `accessToken`/`refreshToken` in the login/refresh JSON body once localStorage migration is done; drop `jti`/`exp` from `GET /auth/me`; pin argon2 params explicitly.
-- [ ] **E3 — Validation gaps:** Zod-validate the Alaris webhook body (`alaris.controller.ts:~38`); pre-check staff existence in `assign`/`bulkAction` assignee (`tickets.service.ts:~939,962`) and ticket existence in time-entry/follow-up create → clean 400/404 instead of opaque 500.
+- [~] **E3 — Validation gaps:** `assign`/`bulkAction` now pre-check the assignee exists + is enabled (`assertAssignableStaff` → clean 404/400 vs FK 500); time-entry and follow-up `create` now 404 on a missing ticket. **Alaris webhook body validation deferred** — 🙋 USER will rewrite the Alaris module later (do not touch). Tests updated.
 - [ ] **E4 — Misc:** `KbArticle` `getArticleBySlug` excludes `authorStaffId`; restrict KB `data:` img URIs to `data:image/`; `bootstrap-admin.ts` refuses `demo1234`.
 
 ---

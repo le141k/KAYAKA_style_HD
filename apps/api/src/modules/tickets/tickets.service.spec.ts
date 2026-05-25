@@ -103,6 +103,10 @@ function makePrismaMock() {
     ticketAuditLog: {
       create: vi.fn(),
     },
+    staff: {
+      // E3: assign/bulkAction validate the assignee exists + is enabled.
+      findUnique: vi.fn().mockResolvedValue({ id: 5, isEnabled: true }),
+    },
     ticketWatcher: {
       upsert: vi.fn(),
       deleteMany: vi.fn(),

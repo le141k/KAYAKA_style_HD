@@ -8,7 +8,10 @@ export class TimeTrackingService {
   constructor(private readonly prisma: PrismaService) {}
 
   /** Create a time entry for a ticket by the given staff member. */
-  create(ticketId: number, staffId: number, dto: LogTimeDto) {
+  async create(ticketId: number, staffId: number, dto: LogTimeDto) {
+    // E3: 404 on a non-existent ticket instead of an opaque FK 500.
+    const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId }, select: { id: true } });
+    if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
     return this.prisma.timeEntry.create({
       data: {
         ticketId,

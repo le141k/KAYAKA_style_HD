@@ -3,10 +3,16 @@ import { optionalBoolParam } from '../../common/zod-bool.util';
 
 // ─────────────────── create ───────────────────
 
+/** Cap on free-text bodies (post/reply/note) — generous for email but bounded. */
+const MAX_BODY = 100_000;
+/** Cap on tag/recipient arrays to stop an unbounded payload. */
+const MAX_TAGS = 50;
+const MAX_RECIPIENTS = 100;
+
 export const CreateTicketSchema = z.object({
   subject: z.string().min(1).max(500),
   /** Initial post body */
-  contents: z.string().min(1),
+  contents: z.string().min(1).max(MAX_BODY),
   isHtml: z.boolean().default(true),
   departmentId: z.number().int().positive(),
   statusId: z.number().int().positive().optional(),
@@ -20,21 +26,21 @@ export const CreateTicketSchema = z.object({
   ownerStaffId: z.number().int().positive().optional(),
   slaPlanId: z.number().int().positive().optional(),
   customFields: z.record(z.unknown()).default({}),
-  tags: z.array(z.string()).default([]),
+  tags: z.array(z.string().min(1).max(100)).max(MAX_TAGS).default([]),
   // NOTE: creationMode + ipAddress are deliberately NOT accepted from the request
   // body (mass-assignment guard) — the controller forces creationMode='STAFF' and
   // the real req.ip; internal callers (public/alaris/inbound) pass them explicitly.
   attachmentIds: z.array(z.number().int().positive()).optional(),
   /** CC/BCC recipients stored in TicketRecipient */
-  ccEmails: z.array(z.string().email()).optional(),
-  bccEmails: z.array(z.string().email()).optional(),
+  ccEmails: z.array(z.string().email()).max(MAX_RECIPIENTS).optional(),
+  bccEmails: z.array(z.string().email()).max(MAX_RECIPIENTS).optional(),
 });
 export type CreateTicketDto = z.infer<typeof CreateTicketSchema>;
 
 // ─────────────────── reply / note ───────────────────
 
 export const ReplyTicketSchema = z.object({
-  contents: z.string().min(1),
+  contents: z.string().min(1).max(MAX_BODY),
   isHtml: z.boolean().default(true),
   /** True = internal note only; stored in TicketNote not TicketPost */
   isNote: z.boolean().default(false),
@@ -42,8 +48,8 @@ export const ReplyTicketSchema = z.object({
   isThirdParty: z.boolean().default(false),
   attachmentIds: z.array(z.number().int().positive()).optional(),
   /** CC/BCC recipients for outbound staff reply email */
-  ccEmails: z.array(z.string().email()).optional(),
-  bccEmails: z.array(z.string().email()).optional(),
+  ccEmails: z.array(z.string().email()).max(MAX_RECIPIENTS).optional(),
+  bccEmails: z.array(z.string().email()).max(MAX_RECIPIENTS).optional(),
 });
 export type ReplyTicketDto = z.infer<typeof ReplyTicketSchema>;
 
@@ -51,7 +57,7 @@ export type ReplyTicketDto = z.infer<typeof ReplyTicketSchema>;
 
 /** Dedicated schema for POST /tickets/:id/notes — accepts attachmentIds (U1 fix). */
 export const AddNoteSchema = z.object({
-  contents: z.string().min(1),
+  contents: z.string().min(1).max(MAX_BODY),
   /** Attachment IDs (pre-uploaded orphans) to link to this note (U1 data-loss fix). */
   attachmentIds: z.array(z.number().int().positive()).optional(),
 });
@@ -126,7 +132,7 @@ export const SpawnSupplierSchema = z.object({
   supplierEmail: z.string().email(),
   supplierName: z.string().max(200).optional(),
   subject: z.string().min(1).max(500).optional(),
-  contents: z.string().min(1),
+  contents: z.string().min(1).max(MAX_BODY),
 });
 export type SpawnSupplierDto = z.infer<typeof SpawnSupplierSchema>;
 
@@ -180,7 +186,7 @@ export type SplitTicketDto = z.infer<typeof SplitTicketSchema>;
 
 export const PublicCreateTicketSchema = z.object({
   subject: z.string().min(1).max(500),
-  contents: z.string().min(1),
+  contents: z.string().min(1).max(MAX_BODY),
   requesterEmail: z.string().email(),
   requesterName: z.string().min(1).max(200),
   departmentId: z.number().int().positive().optional(),
@@ -196,7 +202,7 @@ export type PublicCreateTicketDto = z.infer<typeof PublicCreateTicketSchema>;
 // ─────────────────── public reply ───────────────────
 
 export const PublicReplySchema = z.object({
-  contents: z.string().min(1),
+  contents: z.string().min(1).max(MAX_BODY),
   /** The requester's email — used to attribute the post to the right user. */
   requesterEmail: z.string().email().optional(),
   attachmentIds: z.array(z.number().int().positive()).optional(),

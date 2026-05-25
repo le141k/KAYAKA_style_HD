@@ -29,7 +29,7 @@ export type UpdateUserDto = z.infer<typeof UpdateUserSchema>;
 export const ListUsersQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   limit: z.coerce.number().int().positive().max(100).default(20),
-  search: z.string().optional(),
+  search: z.string().trim().max(200).optional(),
   organizationId: z.coerce.number().int().positive().optional(),
   email: z.string().email().optional(),
 });
