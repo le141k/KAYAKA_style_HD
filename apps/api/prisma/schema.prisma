@@ -146,6 +146,9 @@ model Staff {
   followUps       FollowUp[]
   savedViews      SavedView[]
   lastLoginAt     DateTime?
+  // D2 — per-account brute-force lockout (complements the per-IP rate limiter).
+  failedLoginAttempts Int    @default(0)
+  lockedUntil     DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 

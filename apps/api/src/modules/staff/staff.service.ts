@@ -11,8 +11,8 @@ import type {
 } from './dto';
 import type { Staff, StaffGroup } from '@prisma/client';
 
-/** Safe staff shape — never exposes passwordHash. */
-export type SafeStaff = Omit<Staff, 'passwordHash'>;
+/** Safe staff shape — never exposes passwordHash or the internal lockout columns. */
+export type SafeStaff = Omit<Staff, 'passwordHash' | 'failedLoginAttempts' | 'lockedUntil'>;
 
 const SAFE_STAFF_SELECT = {
   id: true,
