@@ -317,4 +317,38 @@ describe('InboundMailService — parser rule helpers', () => {
       processSpy.mockRestore();
     });
   });
+
+  // ─── A5(ii): loop / auto-reply detection ─────────────────────────────────────
+  describe('isLoopMessage', () => {
+    const call = (headers: Record<string, string>, fromEmail = 'someone@external.example') =>
+      (service as unknown as { isLoopMessage: (p: unknown, f: string) => boolean }).isLoopMessage(
+        { headers: new Map(Object.entries(headers)) },
+        fromEmail,
+      );
+
+    it('skips Auto-Submitted other than "no"', () => {
+      expect(call({ 'auto-submitted': 'auto-replied' })).toBe(true);
+      expect(call({ 'auto-submitted': 'auto-generated' })).toBe(true);
+      expect(call({ 'auto-submitted': 'no' })).toBe(false);
+    });
+
+    it('skips Precedence bulk/list/junk', () => {
+      expect(call({ precedence: 'bulk' })).toBe(true);
+      expect(call({ precedence: 'list' })).toBe(true);
+    });
+
+    it('skips X-Loop / X-Autoreply', () => {
+      expect(call({ 'x-loop': 'support@test.example' })).toBe(true);
+      expect(call({ 'x-autoreply': 'yes' })).toBe(true);
+    });
+
+    it('skips mail from our own MAIL_FROM (self-loop)', () => {
+      expect(call({}, 'support@test.example')).toBe(true);
+      expect(call({}, 'SUPPORT@TEST.EXAMPLE')).toBe(true);
+    });
+
+    it('accepts an ordinary external message', () => {
+      expect(call({ from: 'x' }, 'customer@acme.example')).toBe(false);
+    });
+  });
 });

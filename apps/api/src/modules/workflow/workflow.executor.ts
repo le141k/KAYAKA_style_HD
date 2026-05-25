@@ -247,6 +247,7 @@ export class WorkflowExecutor {
               to,
               subject: `[${ticket.mask}] ${ticket.subject}`,
               text: body,
+              autoSubmitted: 'auto-generated', // A5(i): workflow mail is machine-generated
             });
             break;
           }

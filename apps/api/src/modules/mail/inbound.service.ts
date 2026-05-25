@@ -232,6 +232,32 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    *   3. Apply parser rules (PRE_PARSE) — may discard or override routing
    *   4. Fall back to creating a new ticket
    */
+  /**
+   * A5(ii): true when an inbound message looks machine-generated or self-sent, so
+   * we must not auto-reply to it. Checks RFC 3834 Auto-Submitted, Precedence:bulk/
+   * list/junk, any X-Loop, and a From that matches our own MAIL_FROM / a configured
+   * queue address (self-loop).
+   */
+  private isLoopMessage(parsed: { headers?: Map<string, unknown> }, fromEmail: string): boolean {
+    const headers = parsed.headers;
+    const get = (k: string): string =>
+      headers && typeof headers.get === 'function' ? String(headers.get(k) ?? '').toLowerCase() : '';
+
+    const autoSubmitted = get('auto-submitted');
+    if (autoSubmitted && autoSubmitted !== 'no') return true;
+
+    const precedence = get('precedence');
+    if (['bulk', 'list', 'junk', 'auto_reply'].includes(precedence)) return true;
+
+    if (get('x-loop') || get('x-autoreply') || get('x-autorespond')) return true;
+
+    // Self-from: never react to mail we ourselves sent.
+    const own = (this.config.TELECOM_HD_MAIL_FROM ?? '').toLowerCase();
+    if (own && fromEmail.toLowerCase() === own) return true;
+
+    return false;
+  }
+
   private async processMessage(msg: FetchMessageObject, departmentId: number | undefined): Promise<void> {
     const { simpleParser } = await import('mailparser');
     const source = msg.source;
@@ -242,6 +268,13 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const from = parsed.from?.value?.[0];
     const fromEmail = from?.address ?? 'unknown@example.com';
     const fromName = from?.name ?? fromEmail;
+
+    // A5(ii): drop machine-generated / looping mail before it can create a ticket
+    // or reply (which would trigger our autoresponder and ping-pong).
+    if (this.isLoopMessage(parsed, fromEmail)) {
+      this.logger.log(`IMAP: skipped auto/loop message from ${fromEmail} — "${subject}"`);
+      return;
+    }
     // Strip the quoted reply history so a threaded reply stores only the new text
     // (Kayako keeps the whole quoted chain on every message). HTML is left as-is —
     // the plain-text body is what we persist when there is no HTML part.

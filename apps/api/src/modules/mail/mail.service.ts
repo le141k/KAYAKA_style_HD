@@ -18,7 +18,20 @@ export interface SendMailOptions {
   inReplyTo?: string;
   /** RFC threading: the References chain. */
   references?: string | string[];
+  /**
+   * A5(i): RFC 3834 Auto-Submitted header. Set for machine-generated mail
+   * (autoresponders, notifications) so a remote auto-responder won't ping-pong
+   * with us. Human staff replies leave this unset.
+   */
+  autoSubmitted?: 'auto-replied' | 'auto-generated';
 }
+
+/**
+ * Template keys that are NOT machine-generated (a human composed them) — these
+ * must NOT carry an Auto-Submitted header. Everything else sent via sendTemplate
+ * is automated and is marked auto-generated for loop protection.
+ */
+const HUMAN_TEMPLATE_KEYS = new Set<string>(['ticket_user_reply']);
 
 export interface RenderedTemplate {
   subject: string;
@@ -94,6 +107,7 @@ export class MailService {
         ...(bccStr ? { bcc: bccStr } : {}),
         ...(opts.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}),
         ...(opts.references ? { references: opts.references } : {}),
+        ...(opts.autoSubmitted ? { headers: { 'Auto-Submitted': opts.autoSubmitted } } : {}),
       });
       this.logger.debug(`Mail sent to ${opts.to}: ${opts.subject}`);
     } catch (err) {
@@ -151,11 +165,19 @@ export class MailService {
     opts?: { cc?: string[]; bcc?: string[]; inReplyTo?: string; references?: string | string[] },
   ): Promise<void> {
     const rendered = await this.renderTemplate(templateKey, locale, vars);
+    // A5(i): autoresponder is an auto-reply; other templated mail (notifications,
+    // SLA breach, auto-close) is auto-generated; human staff replies are neither.
+    const autoSubmitted = HUMAN_TEMPLATE_KEYS.has(templateKey)
+      ? undefined
+      : templateKey === 'autoresponder'
+        ? ('auto-replied' as const)
+        : ('auto-generated' as const);
     await this.send({
       to,
       subject: rendered.subject,
       html: rendered.html,
       text: rendered.text,
+      ...(autoSubmitted ? { autoSubmitted } : {}),
       ...(opts?.cc?.length ? { cc: opts.cc } : {}),
       ...(opts?.bcc?.length ? { bcc: opts.bcc } : {}),
       ...(opts?.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}),

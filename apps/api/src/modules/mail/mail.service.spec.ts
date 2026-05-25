@@ -222,6 +222,30 @@ describe('MailService', () => {
         }),
       );
     });
+
+    // A5(i) — loop protection: automated templates carry Auto-Submitted, human
+    // staff replies do not.
+    it('marks the autoresponder auto-replied', async () => {
+      (prisma.emailTemplate.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TEMPLATE);
+      const sendSpy = vi.spyOn(service, 'send').mockResolvedValue(undefined);
+      await service.sendTemplate('u@example.com', 'autoresponder', 'en', { mask: 'TT-1' });
+      expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({ autoSubmitted: 'auto-replied' }));
+    });
+
+    it('marks notifications auto-generated', async () => {
+      (prisma.emailTemplate.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TEMPLATE);
+      const sendSpy = vi.spyOn(service, 'send').mockResolvedValue(undefined);
+      await service.sendTemplate('s@example.com', 'notify_staff_assigned', 'en', { mask: 'TT-1' });
+      expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({ autoSubmitted: 'auto-generated' }));
+    });
+
+    it('does NOT mark a human staff reply (ticket_user_reply)', async () => {
+      (prisma.emailTemplate.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TEMPLATE);
+      const sendSpy = vi.spyOn(service, 'send').mockResolvedValue(undefined);
+      await service.sendTemplate('u@example.com', 'ticket_user_reply', 'en', { mask: 'TT-1' });
+      const arg = sendSpy.mock.calls[0]![0] as unknown as Record<string, unknown>;
+      expect('autoSubmitted' in arg).toBe(false);
+    });
   });
 
   // ─── send (cc/bcc) ─────────────────────────────────────────────────────────
