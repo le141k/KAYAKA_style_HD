@@ -22,7 +22,7 @@ const NAV_ITEMS = [
   { label: 'Дашборд', href: '/staff/dashboard', Icon: LayoutDashboard, adminOnly: false },
   { label: 'Заявки', href: '/staff/tickets', Icon: Ticket, adminOnly: false },
   { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare, adminOnly: false },
-  { label: 'База знаний', href: '/kb', Icon: BookOpen, adminOnly: false },
+  { label: 'База знаний', href: '/staff/kb', Icon: BookOpen, adminOnly: false },
   { label: 'Настройки', href: '/admin', Icon: Settings, adminOnly: true },
 ];
 

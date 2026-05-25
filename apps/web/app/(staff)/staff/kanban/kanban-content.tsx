@@ -20,7 +20,7 @@ export function KanbanPageContent() {
   const kf = t.kanban.filters;
   const kc = t.kanban.columns;
 
-  const KANBAN_LIMIT = 50;
+  const KANBAN_LIMIT = 100;
 
   // Filters state
   const [filters, setFilters] = useState<KanbanFilters>({});

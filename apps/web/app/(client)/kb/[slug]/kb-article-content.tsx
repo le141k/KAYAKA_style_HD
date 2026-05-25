@@ -9,7 +9,7 @@ import { useKBArticle } from '@/lib/hooks/use-kb';
 import { QueryError } from '@/components/QueryError';
 import { formatDate } from '@/lib/utils';
 
-export function KBArticleContent({ slug }: { slug: string }) {
+export function KBArticleContent({ slug, basePath = '/kb' }: { slug: string; basePath?: string }) {
   const { data: article, isLoading, isError, refetch } = useKBArticle(slug);
 
   if (isError) {
@@ -34,7 +34,7 @@ export function KBArticleContent({ slug }: { slug: string }) {
       <div className="text-center py-16">
         <p className="text-muted-foreground">Статья не найдена</p>
         <Button asChild className="mt-4" variant="outline">
-          <Link href="/kb">В базу знаний</Link>
+          <Link href={basePath}>В базу знаний</Link>
         </Button>
       </div>
     );
@@ -43,7 +43,7 @@ export function KBArticleContent({ slug }: { slug: string }) {
   return (
     <article className="mx-auto max-w-2xl space-y-6">
       <Button variant="ghost" size="sm" asChild>
-        <Link href="/kb">
+        <Link href={basePath}>
           <ArrowLeft className="mr-1.5 h-3.5 w-3.5" />
           База знаний
         </Link>
