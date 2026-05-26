@@ -31,23 +31,23 @@ export function TicketRow({ ticket, href, selected, onSelect }: TicketRowProps) 
         )}
         data-testid="ticket-row"
       >
-        {/* ── LEFT: categorization — Status, Priority, Type ── */}
-        {/* Status badge */}
-        <div className="w-28 flex-shrink-0">
+        {/* ── LEFT: categorization — Status, Priority, Type (intrinsic width, so the
+             subject gets the remaining space) ── */}
+        <div className="flex-shrink-0">
           <StatusBadge status={ticket.status} size="sm" />
         </div>
 
         {/* Priority */}
-        <div className="w-20 flex-shrink-0">
+        <div className="flex-shrink-0">
           <PriorityChip priority={ticket.priority} />
         </div>
 
         {/* Type */}
-        <div className="hidden w-28 flex-shrink-0 sm:block">
+        <div className="hidden flex-shrink-0 sm:block">
           {ticket.typeName ? (
-            <span className="inline-flex max-w-full items-center gap-1 rounded-full border border-border bg-muted/60 px-2 py-0.5 text-[11px] text-muted-foreground">
+            <span className="inline-flex items-center gap-1 rounded-full border border-border bg-muted/60 px-2 py-0.5 text-[11px] text-muted-foreground">
               <Tag className="h-3 w-3 flex-shrink-0" />
-              <span className="truncate">{ticket.typeName}</span>
+              <span className="whitespace-nowrap">{ticket.typeName}</span>
             </span>
           ) : (
             <span className="text-xs text-muted-foreground/50">—</span>
@@ -55,9 +55,11 @@ export function TicketRow({ ticket, href, selected, onSelect }: TicketRowProps) 
         </div>
 
         {/* Mask */}
-        <span className="w-24 flex-shrink-0 font-mono text-xs text-muted-foreground">{ticket.mask}</span>
+        <span className="hidden w-20 flex-shrink-0 font-mono text-xs text-muted-foreground sm:inline">
+          {ticket.mask}
+        </span>
 
-        {/* Subject (+ tags) */}
+        {/* Subject (+ tags) — takes all remaining space */}
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
             <p className="truncate font-medium group-hover:text-primary">{ticket.subject}</p>

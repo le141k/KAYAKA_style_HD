@@ -15,6 +15,8 @@ import {
   ChevronLeft,
   ChevronRight,
   ArrowUpDown,
+  Tag,
+  Building2,
 } from 'lucide-react';
 import { format } from 'date-fns';
 import { ru } from 'date-fns/locale';
@@ -27,8 +29,12 @@ import { Calendar } from '@/components/ui/calendar';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
-import { TicketRow } from '@/components/premium/TicketRow';
 import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
+import { StatusBadge } from '@/components/premium/StatusBadge';
+import { PriorityChip } from '@/components/premium/PriorityChip';
+import { RelativeTime } from '@/components/RelativeTime';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { cn, getInitials } from '@/lib/utils';
 import { SavedViews } from '@/components/tickets/SavedViews';
 import { QueryError } from '@/components/QueryError';
 import {
@@ -552,36 +558,116 @@ export function TicketsListContent() {
             <p>{t.common.noResults}</p>
           </div>
         ) : (
-          <div className="space-y-2" role="list" aria-label="Список заявок">
-            <div className="flex items-center gap-3 px-1 pb-1 text-xs text-muted-foreground">
-              <input
-                type="checkbox"
-                aria-label="Выбрать все на странице"
-                checked={allOnPageSelected}
-                onChange={toggleSelectAll}
-                className="h-4 w-4 cursor-pointer rounded border-border"
-              />
-              <span>{selectedIds.size > 0 ? `Выбрано: ${selectedIds.size}` : 'Выбрать все'}</span>
-            </div>
-            {tickets.map((ticket, i) => (
-              <div key={ticket.id} className="flex items-center gap-3">
-                <input
-                  type="checkbox"
-                  aria-label={`Выбрать ${ticket.mask}`}
-                  checked={selectedIds.has(ticket.id)}
-                  onChange={() => toggleSelected(ticket.id)}
-                  className="h-4 w-4 flex-shrink-0 cursor-pointer rounded border-border"
-                />
-                <div className="min-w-0 flex-1">
-                  <TicketRow
-                    ticket={ticket}
-                    href={`/staff/tickets/${ticket.id}`}
-                    selected={i === focusedIdx}
-                    onSelect={() => setFocusedIdx(i)}
-                  />
-                </div>
-              </div>
-            ))}
+          <div
+            className="overflow-x-auto rounded-lg border border-border"
+            role="region"
+            aria-label="Список заявок"
+          >
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-border bg-muted/40 text-left text-xs font-medium text-muted-foreground">
+                  <th className="w-8 px-3 py-2">
+                    <input
+                      type="checkbox"
+                      aria-label="Выбрать все на странице"
+                      checked={allOnPageSelected}
+                      onChange={toggleSelectAll}
+                      className="h-4 w-4 cursor-pointer rounded border-border align-middle"
+                    />
+                  </th>
+                  <th className="w-24 px-2 py-2">ID</th>
+                  <th className="hidden w-32 px-2 py-2 sm:table-cell">Тип</th>
+                  <th className="w-28 px-2 py-2">Статус</th>
+                  <th className="w-24 px-2 py-2">Важность</th>
+                  <th className="px-2 py-2">Тема</th>
+                  <th className="hidden w-40 px-2 py-2 md:table-cell">Организация</th>
+                  <th className="hidden w-44 px-2 py-2 lg:table-cell">Ответственный</th>
+                  <th className="hidden w-20 px-2 py-2 text-right xl:table-cell">Активность</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tickets.map((ticket, i) => (
+                  <tr
+                    key={ticket.id}
+                    data-testid="ticket-row"
+                    className={cn(
+                      'border-b border-border/60 transition-colors last:border-0 hover:bg-primary/5',
+                      i === focusedIdx && 'bg-primary/8',
+                      selectedIds.has(ticket.id) && 'bg-primary/5',
+                    )}
+                  >
+                    <td className="px-3 py-2 align-middle">
+                      <input
+                        type="checkbox"
+                        aria-label={`Выбрать ${ticket.mask}`}
+                        checked={selectedIds.has(ticket.id)}
+                        onChange={() => toggleSelected(ticket.id)}
+                        className="h-4 w-4 cursor-pointer rounded border-border align-middle"
+                      />
+                    </td>
+                    <td className="px-2 py-2 align-middle font-mono text-xs text-muted-foreground">
+                      <Link
+                        href={`/staff/tickets/${ticket.id}`}
+                        onClick={() => setFocusedIdx(i)}
+                        className="hover:text-primary hover:underline"
+                      >
+                        {ticket.mask}
+                      </Link>
+                    </td>
+                    <td className="hidden px-2 py-2 align-middle sm:table-cell">
+                      {ticket.typeName ? (
+                        <span className="inline-flex max-w-full items-center gap-1 rounded-full border border-border bg-muted/60 px-2 py-0.5 text-[11px] text-muted-foreground">
+                          <Tag className="h-3 w-3 flex-shrink-0" />
+                          <span className="truncate">{ticket.typeName}</span>
+                        </span>
+                      ) : (
+                        <span className="text-xs text-muted-foreground/40">—</span>
+                      )}
+                    </td>
+                    <td className="px-2 py-2 align-middle">
+                      <StatusBadge status={ticket.status} size="sm" />
+                    </td>
+                    <td className="px-2 py-2 align-middle">
+                      <PriorityChip priority={ticket.priority} />
+                    </td>
+                    <td className="max-w-0 px-2 py-2 align-middle">
+                      <Link
+                        href={`/staff/tickets/${ticket.id}`}
+                        onClick={() => setFocusedIdx(i)}
+                        className="block truncate font-medium hover:text-primary"
+                        title={ticket.subject}
+                      >
+                        {ticket.subject}
+                      </Link>
+                    </td>
+                    <td className="hidden px-2 py-2 align-middle md:table-cell">
+                      <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <Building2 className="h-3.5 w-3.5 flex-shrink-0 opacity-70" />
+                        <span className="truncate">{ticket.organization?.name ?? '—'}</span>
+                      </span>
+                    </td>
+                    <td className="hidden px-2 py-2 align-middle lg:table-cell">
+                      {ticket.assignee ? (
+                        <span className="flex items-center gap-2">
+                          <Avatar className="h-6 w-6 flex-shrink-0">
+                            <AvatarImage src={ticket.assignee.avatar_url} />
+                            <AvatarFallback className="text-[10px]">
+                              {getInitials(ticket.assignee.name)}
+                            </AvatarFallback>
+                          </Avatar>
+                          <span className="truncate text-xs text-foreground/80">{ticket.assignee.name}</span>
+                        </span>
+                      ) : (
+                        <span className="text-xs text-muted-foreground/50">Не назначен</span>
+                      )}
+                    </td>
+                    <td className="hidden px-2 py-2 text-right align-middle xl:table-cell">
+                      <RelativeTime date={ticket.updated_at} className="text-xs text-muted-foreground" />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </div>
