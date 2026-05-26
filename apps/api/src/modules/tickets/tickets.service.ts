@@ -615,7 +615,8 @@ export class TicketsService {
           type: true,
           department: true,
           owner: { select: { id: true, firstName: true, lastName: true, email: true } },
-          user: { select: PUBLIC_USER_SELECT },
+          // Staff list shows the requester's organization on the right — include it.
+          user: { select: { ...PUBLIC_USER_SELECT, organization: { select: { id: true, name: true } } } },
           tags: { select: { name: true } },
         },
       }),
