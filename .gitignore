@@ -36,3 +36,6 @@ npm-debug.log*
 !.vscode/extensions.json
 apps/web/e2e/.auth/
 .env.prod
+
+# Redis snapshot files (e.g. from a local redis-server used for testing)
+*.rdb
