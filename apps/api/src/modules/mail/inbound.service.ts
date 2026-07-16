@@ -1,6 +1,7 @@
 import {
   Injectable,
   Logger,
+  NotFoundException,
   OnModuleDestroy,
   OnModuleInit,
   Inject,
@@ -39,6 +40,16 @@ export interface ParserRuleResult {
 const MASK_RE = /TT-\d{6,}/i;
 
 /**
+ * Per-queue IMAP cursor. `uid` is the highest UID we have fully processed;
+ * `uidValidity` is the mailbox's UIDVALIDITY at the time (0/null = unknown, e.g.
+ * migrated from the legacy bare-number watermark format).
+ */
+interface Watermark {
+  uid: number;
+  uidValidity: number | null;
+}
+
+/**
  * IMAP inbound mail service.
  *
  * When TELECOM_HD_IMAP_ENABLED=true (checked at runtime from the EmailQueue table),
@@ -58,6 +69,16 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(InboundMailService.name);
   private readonly connections: Map<number, ImapFlow> = new Map();
   private pollHandle: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * In-memory per-message failure counter keyed by `queueId:uidValidity:uid`.
+   * A message that keeps throwing is retried on subsequent polls up to
+   * {@link MAX_POISON_ATTEMPTS}, then quarantined (logged and skipped) so a single
+   * poison message can never wedge the whole queue. This is an interim safeguard;
+   * the durable `InboundDelivery` ledger (see docs/api/internal.md) is the target.
+   */
+  private readonly pollAttempts = new Map<string, number>();
+  private static readonly MAX_POISON_ATTEMPTS = 5;
 
   constructor(
     @Inject(APP_CONFIG) private readonly config: AppConfig,
@@ -160,30 +181,100 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
 
     const lock = await client.getMailboxLock('INBOX');
     try {
-      // Only fetch messages newer than the last UID we processed for this queue.
-      // The watermark is persisted in Setting so a restart does not re-create
-      // tickets from the entire mailbox (the old `fetch('1:*')` behaviour).
-      const lastUid = await this.getLastSeenUid(queueId);
-      let maxUid = lastUid;
+      const { uidValidity, uidNext } = this.readMailboxState(client);
+      const watermark = await this.getWatermark(queueId);
 
-      // `<uid>:*` with uid:true selects all messages with UID >= lastUid+1.
-      // (IMAP `*` resolves to the highest UID, so the range always includes at
-      // least the newest message; we guard against re-processing via the > check.)
-      const range = `${lastUid + 1}:*`;
-      for await (const msg of client.fetch(range, { uid: true, envelope: true, source: true })) {
-        // The `<n>:*` range can echo the last message when the mailbox has not
-        // advanced — skip anything we have already seen.
-        if (msg.uid <= lastUid) continue;
-        await this.processMessage(msg, queue.departmentId ?? undefined);
-        if (msg.uid > maxUid) maxUid = msg.uid;
+      // IN-02 / IN-01: bootstrap NOW. On the very first poll (no watermark) — or when
+      // the server has reset its UID space (UIDVALIDITY changed) — do NOT walk the
+      // historical INBOX. Record the current high-water UID and process only mail that
+      // arrives afterwards. This prevents mass historical ticket creation and blasting
+      // autoresponders at old senders after a fresh connect or a UIDVALIDITY rollover.
+      const validityChanged =
+        watermark !== null &&
+        watermark.uidValidity !== null &&
+        uidValidity !== undefined &&
+        watermark.uidValidity !== uidValidity;
+
+      if (watermark === null || validityChanged) {
+        const startUid = uidNext !== undefined ? Math.max(uidNext - 1, 0) : (watermark?.uid ?? 0);
+        await this.setWatermark(queueId, { uid: startUid, uidValidity: uidValidity ?? 0 });
+        this.logger.log(
+          validityChanged
+            ? `IMAP queue ${queueId}: UIDVALIDITY changed → rebootstrap at uid=${startUid}, existing mail skipped`
+            : `IMAP queue ${queueId}: bootstrap NOW at uid=${startUid} (uidValidity=${uidValidity ?? 'n/a'}), existing mail skipped`,
+        );
+        return;
       }
 
-      if (maxUid > lastUid) {
-        await this.setLastSeenUid(queueId, maxUid);
+      const lastUid = watermark.uid;
+      // The stored uidValidity we key retries and the next watermark write against.
+      // Legacy watermarks carry a null uidValidity; adopt the server's on first sight.
+      const effectiveValidity = uidValidity ?? watermark.uidValidity;
+
+      // IN-01: `<uid>:*` is only interpreted as a UID range when `{ uid: true }` is
+      // passed as the THIRD fetch() argument. Placing it in the query object (2nd arg)
+      // leaves the range as a *sequence* range, which drifts from UIDs after EXPUNGE
+      // and can silently stop delivering new mail.
+      const range = `${lastUid + 1}:*`;
+      let cursor = lastUid;
+
+      for await (const msg of client.fetch(range, { envelope: true, source: true }, { uid: true })) {
+        // `<n>:*` always echoes the highest message even when nothing is new — and the
+        // range may include the boundary — so skip anything at or below the cursor.
+        if (msg.uid <= cursor) continue;
+
+        const attemptKey = `${queueId}:${effectiveValidity ?? 0}:${msg.uid}`;
+        try {
+          await this.processMessage(msg, queue.departmentId ?? undefined);
+          this.pollAttempts.delete(attemptKey);
+          cursor = msg.uid;
+        } catch (err) {
+          // IN-03: isolate poison messages. Retry a failing UID a bounded number of
+          // times across polls; once exhausted, quarantine it (log + advance past) so
+          // it stops blocking every later message. Below the limit we stop this poll
+          // WITHOUT advancing the watermark, so ordering is preserved and no message is
+          // skipped — the same UID (and everything after it) is retried next poll.
+          const attempts = (this.pollAttempts.get(attemptKey) ?? 0) + 1;
+          if (attempts >= InboundMailService.MAX_POISON_ATTEMPTS) {
+            this.pollAttempts.delete(attemptKey);
+            this.logger.error(
+              `IMAP queue ${queueId}: quarantining poison message uid=${msg.uid} after ${attempts} attempts — ${String(err)}`,
+            );
+            cursor = msg.uid; // advance past the poison message
+            continue;
+          }
+          this.pollAttempts.set(attemptKey, attempts);
+          this.logger.warn(
+            `IMAP queue ${queueId}: message uid=${msg.uid} failed (attempt ${attempts}/${InboundMailService.MAX_POISON_ATTEMPTS}), will retry — ${String(err)}`,
+          );
+          break;
+        }
+      }
+
+      // Persist when we advanced, or when we just learned the server's UIDVALIDITY for
+      // a legacy (null) watermark — so the next poll can detect a future rollover.
+      const learnedValidity = watermark.uidValidity === null && uidValidity !== undefined;
+      if (cursor > lastUid || learnedValidity) {
+        await this.setWatermark(queueId, { uid: cursor, uidValidity: effectiveValidity ?? 0 });
       }
     } finally {
       lock.release();
     }
+  }
+
+  /**
+   * Read UIDVALIDITY / UIDNEXT from the currently-selected mailbox. ImapFlow exposes
+   * these on `client.mailbox` after a mailbox lock is held (`false` when none open).
+   * UIDVALIDITY is a BigInt on the wire — normalised to a JS number for storage.
+   */
+  private readMailboxState(client: ImapFlow): { uidValidity?: number; uidNext?: number } {
+    const mailbox = (client as { mailbox?: unknown }).mailbox;
+    if (!mailbox || typeof mailbox !== 'object') return {};
+    const mb = mailbox as { uidValidity?: unknown; uidNext?: unknown };
+    const uidValidity =
+      mb.uidValidity != null && Number.isFinite(Number(mb.uidValidity)) ? Number(mb.uidValidity) : undefined;
+    const uidNext = typeof mb.uidNext === 'number' && Number.isFinite(mb.uidNext) ? mb.uidNext : undefined;
+    return { uidValidity, uidNext };
   }
 
   /** Setting section/key under which per-queue IMAP UID watermarks are stored. */
@@ -192,8 +283,13 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     return `lastSeenUid:${queueId}`;
   }
 
-  /** Read the last-processed IMAP UID for a queue (0 if none recorded yet). */
-  private async getLastSeenUid(queueId: number): Promise<number> {
+  /**
+   * Read the persisted watermark for a queue, or `null` if none exists (never polled).
+   * Supports the legacy bare-number format (`value: <uid>`) by returning it with an
+   * unknown (null) uidValidity, so an already-running queue keeps its cursor rather
+   * than re-bootstrapping and skipping mail on the first poll after upgrade.
+   */
+  private async getWatermark(queueId: number): Promise<Watermark | null> {
     const row = await this.prisma.setting.findUnique({
       where: {
         section_key: {
@@ -203,11 +299,23 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       },
     });
     const value = row?.value;
-    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+    if (value == null) return null;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return { uid: value, uidValidity: null };
+    }
+    if (typeof value === 'object' && !Array.isArray(value)) {
+      const v = value as { uid?: unknown; uidValidity?: unknown };
+      const uid = typeof v.uid === 'number' && Number.isFinite(v.uid) ? v.uid : 0;
+      const uidValidity =
+        typeof v.uidValidity === 'number' && Number.isFinite(v.uidValidity) ? v.uidValidity : null;
+      return { uid, uidValidity };
+    }
+    return null;
   }
 
-  /** Persist the last-processed IMAP UID for a queue. */
-  private async setLastSeenUid(queueId: number, uid: number): Promise<void> {
+  /** Persist the watermark (UID cursor + UIDVALIDITY) for a queue. */
+  private async setWatermark(queueId: number, wm: Watermark): Promise<void> {
+    const value = { uid: wm.uid, uidValidity: wm.uidValidity ?? 0 };
     await this.prisma.setting.upsert({
       where: {
         section_key: {
@@ -218,9 +326,9 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       create: {
         section: InboundMailService.UID_SETTING_SECTION,
         key: this.uidSettingKey(queueId),
-        value: uid,
+        value,
       },
-      update: { value: uid },
+      update: { value },
     });
   }
 
@@ -248,6 +356,29 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const textBody = stripQuotedReply(parsed.text ?? '');
     const htmlBody = parsed.html || undefined;
 
+    // RFC threading identifiers
+    const incomingMessageId = parsed.messageId ?? undefined;
+    const inReplyTo = parsed.inReplyTo ?? undefined;
+    const references = (parsed.references as string[] | string | undefined) ?? undefined;
+
+    // IN-03 (idempotency): if this exact Message-ID was already stored on a post, the
+    // message has already been ticketed — skip it. This keeps re-processing safe when a
+    // poll is retried after a transient failure, or the process crashes between the
+    // reply and the watermark write. (Messages without a Message-ID still rely on the
+    // UID watermark; full atomic de-dup is the durable-ledger work in IN-06.)
+    if (incomingMessageId) {
+      const already = await this.prisma.ticketPost.findFirst({
+        where: { messageId: incomingMessageId },
+        select: { id: true },
+      });
+      if (already) {
+        this.logger.log(
+          `IMAP: message ${incomingMessageId} already processed (post ${already.id}) — skipping`,
+        );
+        return;
+      }
+    }
+
     // Persist email attachments if AttachmentsService is available
     let emailAttachmentIds: number[] = [];
     if (this.attachmentsService && parsed.attachments?.length) {
@@ -263,11 +394,6 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       );
       emailAttachmentIds = uploaded.map((a) => a.id);
     }
-
-    // RFC threading identifiers
-    const incomingMessageId = parsed.messageId ?? undefined;
-    const inReplyTo = parsed.inReplyTo ?? undefined;
-    const references = (parsed.references as string[] | string | undefined) ?? undefined;
 
     // Build list of message IDs from In-Reply-To and References to try
     const referencedIds: string[] = [];
@@ -311,9 +437,19 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const maskMatch = MASK_RE.exec(subject);
     if (maskMatch) {
       const mask = maskMatch[0].toUpperCase();
+      // IN-10: only a genuine "ticket not found" (NotFoundException) may fall through to
+      // creating a new ticket. A transient/DB/storage error must NOT be swallowed and
+      // turned into a duplicate new ticket — rethrow so the poll loop retries/quarantines.
+      let maskTicketId: number | null = null;
       try {
         const ticket = await this.ticketsService.getTicketByMask(mask);
-        await this.ticketsService.reply(ticket.id, {
+        maskTicketId = ticket.id;
+      } catch (err) {
+        if (!(err instanceof NotFoundException)) throw err;
+        this.logger.warn(`IMAP: mask ${mask} in subject but ticket not found — creating new`);
+      }
+      if (maskTicketId !== null) {
+        await this.ticketsService.reply(maskTicketId, {
           contents: htmlBody ?? textBody,
           isHtml: !!htmlBody,
           isNote: false,
@@ -324,13 +460,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           attachmentIds: emailAttachmentIds,
         });
         if (incomingMessageId) {
-          await this.storeMessageIdOnLatestPost(ticket.id, incomingMessageId);
+          await this.storeMessageIdOnLatestPost(maskTicketId, incomingMessageId);
         }
         this.logger.log(`IMAP: threaded reply to ${mask} from ${fromEmail}`);
         return;
-      } catch {
-        // Ticket not found → fall through to create new
-        this.logger.warn(`IMAP: mask ${mask} in subject but ticket not found — creating new`);
       }
     }
 

@@ -74,12 +74,12 @@ Public routes (bypass JWT): `POST /auth/login`, `POST /auth/refresh`,
 
 `BullModule.forRoot()` is registered in `AppModule` with Redis connection from `REDIS_URL`.
 
-| Component            | Mechanism                                            | What it does                                                                                                                       |
-| -------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `InboundMailService` | `setInterval` (60 s), `OnModuleInit`                 | Polls enabled IMAP queues; threads replies by `TT-XXXXXX` mask in subject; creates new tickets from unthreaded messages            |
-| `SlaProcessor`       | BullMQ queue `sla`, repeatable `scan` job (60 s)     | Calls `SlaService.runPeriodicCheck()` → breach detection → escalation action execution (notify, priority change, assign, add note) |
-| `AutoCloseProcessor` | BullMQ queue `workflow`, repeatable `auto-close` job | Closes pending tickets idle > `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); sends `autoresponder` mail template                   |
-| `MailProcessor`      | BullMQ queue `mail`, per-job                         | Async outbound mail delivery via `MailService`/nodemailer                                                                          |
+| Component            | Mechanism                                            | What it does                                                                                                                                                                                                                                                                                                 |
+| -------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `InboundMailService` | `setInterval` (60 s), `OnModuleInit`                 | Polls enabled IMAP queues from a persisted `{ uid, uidValidity }` watermark (UID-range `fetch`); bootstraps NOW on first connect / UIDVALIDITY change (no history import); threads replies by RFC `Message-ID` then `TT-XXXXXX` mask; per-message retry→quarantine so a poison message can't wedge the queue |
+| `SlaProcessor`       | BullMQ queue `sla`, repeatable `scan` job (60 s)     | Calls `SlaService.runPeriodicCheck()` → breach detection → escalation action execution (notify, priority change, assign, add note)                                                                                                                                                                           |
+| `AutoCloseProcessor` | BullMQ queue `workflow`, repeatable `auto-close` job | Closes pending tickets idle > `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); sends `autoresponder` mail template                                                                                                                                                                                             |
+| `MailProcessor`      | BullMQ queue `mail`, per-job                         | Async outbound mail delivery via `MailService`/nodemailer                                                                                                                                                                                                                                                    |
 
 ### Implemented — EventEmitter2
 
@@ -92,7 +92,10 @@ via `@OnEvent` decorators.
 - **SLA criteria engine**: plan selection beyond org-based lookup is TODO.
 - **Attachment upload**: `Attachment` model exists; no upload endpoint or storage adapter.
 - **IMAP IDLE**: replace polling with push-based IMAP IDLE.
-- **IMAP password decryption**: `EmailQueue.passwordEnc` stored but decryption not implemented.
+- **Durable inbound ledger**: per-message retry/quarantine state is currently in-memory; the
+  `InboundDelivery` ledger (survives restart, atomic claim) is the target model.
+- **IMAP queue supervisor**: reconnect/reconcile on disconnect, queue disable, or credential change
+  without an API restart.
 - **Public ticket rate-limiting**: `POST /tickets/public` — use `@nestjs/throttler`.
 - **Frontend staff auth**: JWT-only; no cookie session.
 

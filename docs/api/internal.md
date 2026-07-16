@@ -162,12 +162,36 @@ sendTemplate(to: string | string[], templateKey: string, locale: string, vars: R
 
 Implements `OnModuleInit` / `OnModuleDestroy`. No public methods — driven entirely by lifecycle hooks.
 
-- On init: queries `EmailQueue` for enabled IMAP queues, connects via `imapflow`, starts a
-  60-second `setInterval` poll.
-- Per message: threads replies into existing tickets by matching `TT-XXXXXX` mask in the subject
-  line (calls `TicketsService.reply()`); creates new tickets for unthreaded messages.
-- TODO: replace `setInterval` with IMAP IDLE push; implement `passwordEnc` decryption for stored
-  IMAP credentials.
+- On init: queries `EmailQueue` for enabled IMAP queues, decrypts `passwordEnc`, connects via
+  `imapflow`, starts a 60-second `setInterval` poll.
+- **UID cursor (IN-01).** Per queue we persist a watermark in `Setting`
+  (`section='imap'`, `key='lastSeenUid:<queueId>'`) as `{ uid, uidValidity }`. `fetch()` is
+  called as `fetch('<uid+1>:*', { envelope, source }, { uid: true })` — `{ uid: true }` **must**
+  be the third argument so the range is a UID range, not a sequence range (sequence numbers drift
+  from UIDs after `EXPUNGE`). Legacy bare-number watermarks are read and transparently upgraded to
+  the object form on the next poll.
+- **Bootstrap NOW / UIDVALIDITY (IN-02, IN-01).** On the first poll (no watermark) — or when the
+  server's `UIDVALIDITY` differs from the stored one — the cursor is set to `uidNext-1` and the
+  existing mailbox is **not** imported. This prevents mass historical ticket creation and
+  autoresponder storms on a fresh connect or a server-side UID reset.
+- **Poison-message isolation (IN-03).** Messages are processed in strict UID order. A message that
+  throws is retried on subsequent polls up to `MAX_POISON_ATTEMPTS` (5) — the watermark is **not**
+  advanced past it, so ordering is preserved and no message is skipped. Once attempts are
+  exhausted the message is quarantined (logged) and the cursor advances so it can never wedge the
+  queue. Attempt counts live in an in-memory `Map`; the durable `InboundDelivery` ledger is the
+  target model (see the email fix plan) for cross-restart retry/quarantine state.
+- **Idempotency (IN-03).** Before ticketing, `processMessage` skips any message whose RFC
+  `Message-ID` already exists on a `TicketPost`, so a retry (or a crash between the reply and the
+  watermark write) does not double-post. Messages with no `Message-ID` still rely on the UID
+  watermark; fully-atomic de-dup is deferred to the ledger work (IN-06).
+- Per message: threads replies into existing tickets by RFC `In-Reply-To`/`References`
+  (`TicketPost.messageId`), then by `TT-XXXXXX` mask in the subject line (calls
+  `TicketsService.reply()`); creates new tickets for unthreaded messages. A mask that resolves to
+  no ticket falls through to create-new **only** on `NotFoundException` (IN-10) — transient/DB
+  errors are rethrown into the poll loop's retry/quarantine path instead of silently spawning a
+  duplicate ticket.
+- TODO: replace `setInterval` with IMAP IDLE push; durable `InboundDelivery` ledger; queue
+  supervisor for reconnect/reconcile on disable/credential-change.
 
 ---
 

@@ -256,12 +256,20 @@ describe('InboundMailService — parser rule helpers', () => {
     });
   });
 
-  // ─── pollQueue UID watermark ─────────────────────────────────────────────────
+  // ─── pollQueue: UID cursor / bootstrap / poison isolation ────────────────────
 
-  describe('pollQueue — UID watermark', () => {
-    /** A minimal fake ImapFlow that yields the given messages from fetch(). */
-    function makeFakeClient(messages: Array<{ uid: number }>) {
+  describe('pollQueue — UID cursor, bootstrap & poison isolation', () => {
+    /**
+     * A minimal fake ImapFlow: yields the given messages from fetch() and (optionally)
+     * exposes UIDVALIDITY / UIDNEXT on `client.mailbox`, as ImapFlow does once a
+     * mailbox lock is held.
+     */
+    function makeFakeClient(
+      messages: Array<{ uid: number }>,
+      mailbox?: { uidValidity?: number; uidNext?: number },
+    ) {
       return {
+        mailbox,
         getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
         // eslint-disable-next-line @typescript-eslint/require-await
         fetch: vi.fn(function* () {
@@ -270,51 +278,199 @@ describe('InboundMailService — parser rule helpers', () => {
       };
     }
 
-    it('reads the last-seen UID from Setting and fetches only newer messages', async () => {
+    function stubProcess(impl?: (msg: { uid: number }) => Promise<void>) {
+      return vi
+        .spyOn(
+          service as unknown as { processMessage: (m: { uid: number }) => Promise<void> },
+          'processMessage',
+        )
+        .mockImplementation(impl ?? (() => Promise.resolve()));
+    }
+
+    function callPoll(client: unknown): Promise<void> {
+      return (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        client,
+      );
+    }
+
+    beforeEach(() => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 1,
         departmentId: null,
       });
-      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ value: 100 });
-      const client = makeFakeClient([]);
-
-      // Stub processMessage so we only assert fetch/watermark behaviour
-      const processSpy = vi
-        .spyOn(service as unknown as { processMessage: () => Promise<void> }, 'processMessage')
-        .mockResolvedValue(undefined);
-
-      await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
-        1,
-        client,
-      );
-
-      // Range must start just after the watermark
-      expect(client.fetch).toHaveBeenCalledWith('101:*', expect.objectContaining({ uid: true }));
-      processSpy.mockRestore();
     });
 
-    it('persists the new max UID and skips already-seen messages', async () => {
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: 1,
-        departmentId: null,
+    it('IN-01: passes { uid: true } as the THIRD fetch() argument (real UID range)', async () => {
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        value: { uid: 100, uidValidity: 7 },
       });
+      const client = makeFakeClient([], { uidValidity: 7, uidNext: 101 });
+      const spy = stubProcess();
+
+      await callPoll(client);
+
+      // Range starts after the watermark; uid:true is the 3rd arg, not folded into query.
+      expect(client.fetch).toHaveBeenCalledWith('101:*', expect.anything(), { uid: true });
+      spy.mockRestore();
+    });
+
+    it('persists the new max UID (object watermark) and skips already-seen messages', async () => {
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        value: { uid: 100, uidValidity: 7 },
+      });
+      const client = makeFakeClient([{ uid: 100 }, { uid: 101 }, { uid: 102 }], {
+        uidValidity: 7,
+        uidNext: 103,
+      });
+      const spy = stubProcess();
+
+      await callPoll(client);
+
+      expect(spy).toHaveBeenCalledTimes(2); // 100 skipped, 101 + 102 processed
+      expect(prisma.setting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: { value: { uid: 102, uidValidity: 7 } } }),
+      );
+      spy.mockRestore();
+    });
+
+    it('honours a legacy bare-number watermark and upgrades it to the object format', async () => {
       (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ value: 100 });
-      // 100 = already seen (skipped), 101 + 102 = new
-      const client = makeFakeClient([{ uid: 100 }, { uid: 101 }, { uid: 102 }]);
+      const client = makeFakeClient([{ uid: 101 }], { uidValidity: 7, uidNext: 102 });
+      const spy = stubProcess();
 
-      const processSpy = vi
-        .spyOn(service as unknown as { processMessage: () => Promise<void> }, 'processMessage')
-        .mockResolvedValue(undefined);
+      await callPoll(client);
 
-      await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
-        1,
-        client,
+      expect(spy).toHaveBeenCalledTimes(1); // does NOT re-bootstrap / skip mail
+      expect(prisma.setting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: { value: { uid: 101, uidValidity: 7 } } }),
+      );
+      spy.mockRestore();
+    });
+
+    it('IN-02: first connect (no watermark) bootstraps to uidNext-1 WITHOUT importing history', async () => {
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      // Mailbox already holds 500 old messages (uidNext = 501).
+      const client = makeFakeClient([{ uid: 1 }, { uid: 500 }], { uidValidity: 7, uidNext: 501 });
+      const spy = stubProcess();
+
+      await callPoll(client);
+
+      expect(spy).not.toHaveBeenCalled(); // no historical tickets, no autoresponder storm
+      expect(client.fetch).not.toHaveBeenCalled();
+      expect(prisma.setting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: { value: { uid: 500, uidValidity: 7 } } }),
+      );
+      spy.mockRestore();
+    });
+
+    it('IN-01: a UIDVALIDITY change triggers a controlled rebootstrap, not reprocessing', async () => {
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        value: { uid: 100, uidValidity: 7 },
+      });
+      // Server reset its UID space: uidValidity is now 9.
+      const client = makeFakeClient([{ uid: 1 }, { uid: 2 }], { uidValidity: 9, uidNext: 51 });
+      const spy = stubProcess();
+
+      await callPoll(client);
+
+      expect(spy).not.toHaveBeenCalled();
+      expect(client.fetch).not.toHaveBeenCalled();
+      expect(prisma.setting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: { value: { uid: 50, uidValidity: 9 } } }),
+      );
+      spy.mockRestore();
+    });
+
+    it('IN-03: a poison message stops the poll without advancing the watermark (retried next poll)', async () => {
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        value: { uid: 100, uidValidity: 7 },
+      });
+      const client = makeFakeClient([{ uid: 101 }, { uid: 102 }], { uidValidity: 7, uidNext: 103 });
+      const spy = stubProcess((m) =>
+        m.uid === 101 ? Promise.reject(new Error('bad MIME')) : Promise.resolve(),
       );
 
-      // uid 100 skipped; 101 and 102 processed
-      expect(processSpy).toHaveBeenCalledTimes(2);
-      expect(prisma.setting.upsert).toHaveBeenCalledWith(expect.objectContaining({ update: { value: 102 } }));
-      processSpy.mockRestore();
+      await callPoll(client);
+
+      // Stopped at the poison message: 102 not yet reached, watermark NOT advanced.
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(prisma.setting.upsert).not.toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it('IN-03: a poison message is quarantined after MAX attempts so later mail is delivered', async () => {
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        value: { uid: 100, uidValidity: 7 },
+      });
+      const goodSeen: number[] = [];
+      const spy = stubProcess((m) => {
+        if (m.uid === 101) return Promise.reject(new Error('bad MIME'));
+        goodSeen.push(m.uid);
+        return Promise.resolve();
+      });
+
+      // Poll repeatedly; the poison UID is retried then quarantined (MAX_POISON_ATTEMPTS = 5).
+      for (let i = 0; i < 5; i++) {
+        await callPoll(makeFakeClient([{ uid: 101 }, { uid: 102 }], { uidValidity: 7, uidNext: 103 }));
+      }
+
+      // After quarantine, 102 is delivered and the watermark reaches 102.
+      expect(goodSeen).toContain(102);
+      expect(prisma.setting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: { value: { uid: 102, uidValidity: 7 } } }),
+      );
+      spy.mockRestore();
+    });
+  });
+
+  // ─── processMessage: Message-ID idempotency ──────────────────────────────────
+
+  describe('processMessage — Message-ID idempotency (IN-03)', () => {
+    const rawEmail = Buffer.from(
+      [
+        'From: Alice <alice@example.com>',
+        'To: support@23telecom.example',
+        'Subject: Please help',
+        'Message-ID: <dup-123@example.com>',
+        '',
+        'Body text here',
+        '',
+      ].join('\r\n'),
+    );
+
+    function callProcess(msg: unknown): Promise<void> {
+      return (
+        service as unknown as { processMessage: (m: unknown, d?: number) => Promise<void> }
+      ).processMessage(msg, 1);
+    }
+
+    function tickets(): { createTicket: ReturnType<typeof vi.fn>; reply: ReturnType<typeof vi.fn> } {
+      return (
+        service as unknown as {
+          ticketsService: { createTicket: ReturnType<typeof vi.fn>; reply: ReturnType<typeof vi.fn> };
+        }
+      ).ticketsService;
+    }
+
+    it('skips a message whose Message-ID was already stored on a post', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 42 });
+
+      await callProcess({ uid: 5, source: rawEmail });
+
+      expect(prisma.ticketPost.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { messageId: '<dup-123@example.com>' } }),
+      );
+      expect(tickets().createTicket).not.toHaveBeenCalled();
+      expect(tickets().reply).not.toHaveBeenCalled();
+    });
+
+    it('creates a ticket when the Message-ID has not been seen before', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+
+      await callProcess({ uid: 6, source: rawEmail });
+
+      expect(tickets().createTicket).toHaveBeenCalledTimes(1);
     });
   });
 });
