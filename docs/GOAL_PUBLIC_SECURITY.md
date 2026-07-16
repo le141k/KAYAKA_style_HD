@@ -285,7 +285,7 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       cannot accidentally expose them. Resolve the session to a client principal containing `userId`,
       reject expired/revoked sessions, and add logout/revocation. Do not reuse staff JWT/RBAC identity.
       _(Done, commit `ecbec7b`: `@ClientAuthenticated()` = `applyDecorators(Public(), UseGuards(
-  ClientAuthGuard))`; `ClientAuthGuard` resolves the `th_client` cookie to `{ userId }` via
+ClientAuthGuard))`; `ClientAuthGuard` resolves the `th_client` cookie to `{ userId }` via
       `resolveSession` (rejects expired/revoked → 401, fails CLOSED 503 on store outage), and
       `@CurrentClient()` exposes the principal. `logout` revokes the session. No staff JWT/RBAC
       identity is reused. Guard unit-tested (no cookie → 401, invalid → 401, valid → attaches
@@ -297,7 +297,7 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       and `publicReply(id, dto, clientUserId)` authorize strictly via `assertClientOwnsTicket`
       (`Ticket.userId === clientUserId` else 404); the reply's author is taken from the ticket, not
       the request body; no `?email=`/`requesterEmail` inputs remain. Wrong-owner, unmapped (`userId
-  null`) and missing tickets all return the identical 404. Unit-tested incl. the cross-client
+null`) and missing tickets all return the identical 404. Unit-tested incl. the cross-client
       IDOR guard. Frontend enablement is the deferred S2-9.)_
 - [x] **S2-8 Add an owner-scoped client attachment download.** The current client UI links to the
       staff-only `/api/attachments/:id/download` route. Add a separate client-session-protected
@@ -422,11 +422,24 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       branch so login timing no longer leaks account existence (the enumeration oracle that would have
       undermined "discloses nothing about account/lock state"). The optional post-threshold challenge
       is S4 (Turnstile, deferred, needs approval).)_
-- [ ] **S3-8 Test the state transitions.** Prove old access/refresh tokens fail immediately after
-      password change, disable and permission/group change; CSRF requests from missing/wrong origins
-      fail; valid same-origin JSON and multipart requests work; two parallel refreshes produce one
-      winner without revoking it; genuine replay revokes its family; logout-all invalidates every
-      access/refresh token. A DB/auth-state outage must fail closed with a controlled 503.
+- [~] **S3-8 Test the state transitions.** Prove old access/refresh tokens fail immediately after
+  password change, disable and permission/group change; CSRF requests from missing/wrong origins
+  fail; valid same-origin JSON and multipart requests work; two parallel refreshes produce one
+  winner without revoking it; genuine replay revokes its family; logout-all invalidates every
+  access/refresh token. A DB/auth-state outage must fail closed with a controlled 503.
+  _(Unit matrix done — each transition maps to a test: disabled staff → 401
+  (`jwt-auth.guard.spec` "now-disabled"); password/permission/group change bumps `authVersion` so
+  an old access token → 401 ("authVersion no longer matches"), and the `authVersion` bump itself is
+  proven in `auth.service.spec`/`staff.service` (`revokeStaffSessions`); an old refresh with a stale
+  `authVersion` stamp is rejected ("stale authVersion … WITHOUT a replay alarm"); CSRF wrong/missing
+  origin → 403 and same-origin → pass (`csrf.guard.spec`, content-type-agnostic so it covers
+  JSON+multipart); two parallel refreshes → one winner without revoking ("concurrent loser … fails
+  WITHOUT revoking the family"); genuine replay revokes the family ("revoked long ago … revokes the
+  whole family"); logout-all revokes every refresh (`auth.service.spec` "logout"); DB/auth outage →
+  **503** (`jwt-auth.guard.spec` "fails CLOSED with 503", tagged S3-8). **Still open:** the
+  full-HTTP end-to-end layer (real multipart request, a live logout→old-access-token round-trip)
+  needs Testcontainers/e2e, which is blocked in this sandbox (image pulls 403) — it lands with the
+  S6 gate.)_
 
 **S3 acceptance**
 
