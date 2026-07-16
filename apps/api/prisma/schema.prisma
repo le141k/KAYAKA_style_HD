@@ -160,12 +160,18 @@ model RefreshToken {
   id        String   @id @default(uuid())
   staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
   staffId   Int
+  // Opaque rotation identifiers (S3-3): `jti` is the refresh JWT's id, looked up
+  // directly (no Argon2 scan); `familyId` groups a rotation chain so a detected replay
+  // can revoke the whole family.
+  jti       String   @unique
+  familyId  String
   tokenHash String   @unique
   expiresAt DateTime
   revokedAt DateTime?
   createdAt DateTime @default(now())
 
   @@index([staffId])
+  @@index([familyId])
 }
 
 model PasswordReset {

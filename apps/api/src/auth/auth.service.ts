@@ -44,6 +44,14 @@ export interface ResetMailer {
 /** Token used to inject the reset mailer (MailService) into AuthService. */
 export const MAIL_SERVICE_TOKEN = Symbol('MAIL_SERVICE_TOKEN');
 
+/**
+ * Grace window for refresh rotation (S3-3). If a token's jti is found already-revoked
+ * within this window of now, we treat it as a benign concurrent double-submit (the
+ * winner just rotated) and fail the loser without revoking the family. Beyond it, a
+ * presented already-rotated token is a genuine replay → revoke the whole family.
+ */
+const REFRESH_ROTATION_GRACE_MS = 10_000;
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -81,10 +89,12 @@ export class AuthService {
   async login(email: string, password: string): Promise<LoginResult> {
     const staff = await this.validateStaff(email, password);
     const principal = this.buildPrincipal(staff);
-    const tokens = await this.issueTokens(principal, staff.id, staff.authVersion);
+    // A fresh login starts a new rotation family.
+    const familyId = crypto.randomUUID();
+    const tokens = await this.issueTokens(principal, staff.id, staff.authVersion, familyId);
 
     // Persist refresh token hash so we can rotate/revoke it
-    await this.persistRefreshToken(staff.id, tokens.refreshToken);
+    await this.persistRefreshToken(staff.id, tokens.refreshToken, tokens.refreshJti, familyId);
 
     // Update lastLoginAt
     await this.prisma.staff.update({
@@ -93,83 +103,79 @@ export class AuthService {
     });
 
     this.logger.log(`Staff ${staff.email} logged in`);
-    return { ...tokens, staff: principal };
+    return { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, staff: principal };
   }
 
   /**
-   * Rotate refresh token.
-   * Verifies the incoming token, revokes it, and issues a fresh pair.
+   * Rotate refresh token (S3-3).
+   * Looks up EXACTLY ONE stored row by the token's opaque `jti` (no Argon2 scan),
+   * verifies its hash, and rotates it with a conditional CAS. Exactly one concurrent
+   * caller wins; a genuine later replay of an already-rotated token revokes the family.
    */
   async refresh(rawRefreshToken: string): Promise<TokenPair> {
-    // Decode header to get staffId from sub
-    let payload: { sub: number; jti: string };
+    let payload: { sub: number; jti: string; fid?: string };
     try {
-      payload = this.jwt.verify<{ sub: number; jti: string }>(rawRefreshToken, {
+      payload = this.jwt.verify<{ sub: number; jti: string; fid?: string }>(rawRefreshToken, {
         secret: this.config.TELECOM_HD_JWT_REFRESH_SECRET,
       });
     } catch {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
-    // Active (non-revoked) stored tokens — the normal rotation path.
-    const active = await this.prisma.refreshToken.findMany({
-      where: { staffId: payload.sub, revokedAt: null },
-    });
-
-    // Find matching token by verifying argon2 hash
-    let matchedToken: (typeof active)[number] | undefined;
-    for (const t of active) {
-      if (new Date() > t.expiresAt) continue;
-      const matches = await verifyPassword(t.tokenHash, rawRefreshToken);
-      if (matches) {
-        matchedToken = t;
-        break;
-      }
+    // Direct single-row lookup by opaque jti — no candidate scan.
+    const row = await this.prisma.refreshToken.findUnique({ where: { jti: payload.jti } });
+    if (!row) {
+      throw new UnauthorizedException('Refresh token not found');
     }
 
-    if (!matchedToken) {
-      // Reuse detection: if the presented token matches one we already REVOKED
-      // (and that hasn't expired), this is a replay of a rotated/stolen token.
-      // Treat it as a compromise and revoke the entire token family for this staff.
-      const revoked = await this.prisma.refreshToken.findMany({
-        where: { staffId: payload.sub, NOT: { revokedAt: null }, expiresAt: { gt: new Date() } },
-      });
-      for (const t of revoked) {
-        if (await verifyPassword(t.tokenHash, rawRefreshToken)) {
-          await this.prisma.refreshToken.updateMany({
-            where: { staffId: payload.sub, revokedAt: null },
-            data: { revokedAt: new Date() },
-          });
-          this.logger.error(
-            `SECURITY: refresh-token reuse detected for staff ${payload.sub} — all active sessions revoked`,
-          );
-          throw new UnauthorizedException('Refresh token reuse detected; all sessions have been revoked');
-        }
-      }
-      throw new UnauthorizedException('Refresh token not found or expired');
+    // Bind the presented raw token to the stored hash: a forged/guessed jti fails here.
+    if (!(await verifyPassword(row.tokenHash, rawRefreshToken))) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+    if (row.expiresAt < new Date()) {
+      throw new UnauthorizedException('Refresh token expired');
     }
 
-    // Revoke the used token (rotation)
-    await this.prisma.refreshToken.update({
-      where: { id: matchedToken.id },
+    // Atomic rotation via CAS: exactly one caller flips revokedAt NULL→now for this jti.
+    const consumed = await this.prisma.refreshToken.updateMany({
+      where: { jti: row.jti, revokedAt: null },
       data: { revokedAt: new Date() },
     });
 
-    // Load fresh staff record
+    if (consumed.count !== 1) {
+      // The jti was already consumed. Distinguish a benign concurrent double-submit
+      // (winner rotated microseconds ago) from a genuine later replay of a stolen,
+      // already-rotated token — only the latter revokes the whole family.
+      const revokedAtMs = row.revokedAt ? row.revokedAt.getTime() : Date.now();
+      const withinGrace = Date.now() - revokedAtMs <= REFRESH_ROTATION_GRACE_MS;
+      if (!withinGrace) {
+        await this.prisma.refreshToken.updateMany({
+          where: { familyId: row.familyId, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+        this.logger.error(
+          `SECURITY: refresh-token replay detected for staff ${row.staffId} — family revoked`,
+        );
+        throw new UnauthorizedException('Refresh token reuse detected; all sessions have been revoked');
+      }
+      // Concurrent loser: fail WITHOUT revoking the winner's freshly created session.
+      throw new UnauthorizedException('Refresh token already rotated');
+    }
+
+    // Winner: load fresh staff and issue a new pair in the SAME family.
     const staff = await this.prisma.staff.findUnique({
-      where: { id: payload.sub },
+      where: { id: row.staffId },
       include: { staffGroup: true },
     });
-
     if (!staff || !staff.isEnabled) {
       throw new UnauthorizedException('Staff not found or disabled');
     }
 
     const principal = this.buildPrincipal(staff);
-    const tokens = await this.issueTokens(principal, staff.id, staff.authVersion);
-    await this.persistRefreshToken(staff.id, tokens.refreshToken);
+    const tokens = await this.issueTokens(principal, staff.id, staff.authVersion, row.familyId);
+    await this.persistRefreshToken(staff.id, tokens.refreshToken, tokens.refreshJti, row.familyId);
 
-    return tokens;
+    return { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken };
   }
 
   /**
@@ -354,9 +360,14 @@ export class AuthService {
     };
   }
 
-  /** Issue access + refresh JWT pair. */
-  private async issueTokens(principal: AuthStaff, staffId: number, authVersion: number): Promise<TokenPair> {
-    const jti = crypto.randomUUID();
+  /** Issue access + refresh JWT pair. Returns the refresh `jti` so it can be persisted. */
+  private async issueTokens(
+    principal: AuthStaff,
+    staffId: number,
+    authVersion: number,
+    familyId: string,
+  ): Promise<TokenPair & { refreshJti: string }> {
+    const refreshJti = crypto.randomUUID();
 
     const accessToken = await this.jwt.signAsync(
       // Distinct jti on the access token so logout can revoke it via the blocklist.
@@ -370,23 +381,29 @@ export class AuthService {
     );
 
     const refreshToken = await this.jwt.signAsync(
-      { sub: staffId, jti },
+      // `jti` is the opaque row id looked up on rotation; `fid` groups the family (S3-3).
+      { sub: staffId, jti: refreshJti, fid: familyId },
       {
         secret: this.config.TELECOM_HD_JWT_REFRESH_SECRET,
         expiresIn: this.config.TELECOM_HD_JWT_REFRESH_TTL,
       },
     );
 
-    return { accessToken, refreshToken };
+    return { accessToken, refreshToken, refreshJti };
   }
 
-  /** Persist a hashed copy of the raw refresh token. */
-  private async persistRefreshToken(staffId: number, rawToken: string): Promise<void> {
+  /** Persist a hashed copy of the raw refresh token with its opaque jti + family id. */
+  private async persistRefreshToken(
+    staffId: number,
+    rawToken: string,
+    jti: string,
+    familyId: string,
+  ): Promise<void> {
     const tokenHash = await hashPassword(rawToken);
     const expiresAt = new Date(Date.now() + this.config.TELECOM_HD_JWT_REFRESH_TTL * 1000);
 
     await this.prisma.refreshToken.create({
-      data: { staffId, tokenHash, expiresAt },
+      data: { staffId, jti, familyId, tokenHash, expiresAt },
     });
   }
 }

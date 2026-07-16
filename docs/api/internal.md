@@ -23,7 +23,11 @@ login(email: string, password: string): Promise<LoginResult>
 // Validates credentials, issues JWT pair, persists argon2-hashed refresh token, updates lastLoginAt.
 
 refresh(rawRefreshToken: string): Promise<TokenPair>
-// Verifies token, revokes used token (rotation), issues fresh pair.
+// S3-3: looks up EXACTLY ONE row by the token's opaque `jti` (no Argon2 scan), verifies
+// its hash, and rotates via a conditional CAS (updateMany where jti + revokedAt null →
+// count 1). Exactly one concurrent caller wins; a concurrent loser fails without revoking
+// the family; a genuine later replay (already-rotated token presented after the grace
+// window) revokes the whole `familyId`. New pair is issued in the same family.
 
 logout(staffId: number): Promise<void>
 // Authoritative logout-ALL (S3-4): increments Staff.authVersion AND revokes every

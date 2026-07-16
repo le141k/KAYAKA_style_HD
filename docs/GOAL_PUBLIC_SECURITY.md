@@ -77,8 +77,8 @@ and inventory are completed before any production mutation or migration.
       routes + public upload. UI hide still pending (S2-9).)_
 - [ ] **H3 Close staff-auth gaps:** use DB-backed `authVersion`, logout-all revocation, atomic refresh
       rotation and origin + CSRF checks for every cookie-authenticated mutation.
-      _(Done: DB-backed `authVersion` + logout-all revocation (S3-1/2/4). Still open: atomic refresh
-      rotation by jti/familyId (S3-3), CSRF + origin checks (S3-5/6), login-abuse throttle (S3-7).)_
+      _(Done: DB-backed `authVersion` + logout-all revocation (S3-1/2/4) and atomic refresh rotation
+      by jti/familyId (S3-3). Still open: CSRF + origin checks (S3-5/6), login-abuse throttle (S3-7).)_
 - [ ] **H4 Remove known access paths:** soft-disable demo staff, revoke their sessions, then rotate JWT
       and webhook secrets in the order defined by S1. Never delete staff rows as containment.
 - [ ] **H5 Deploy privately and smoke:** use immutable images/config, run the mandatory production
@@ -296,11 +296,17 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       bumps authVersion + revokes refresh on password/group/email/isEnabled change; `disable` and
       `updateGroup` (permission change → all members) do the same. Verified against live Postgres,
       incl. the group-member relation-filter query. `isAdmin` isn't updatable via the group DTO.)_
-- [ ] **S3-3 Replace refresh-token scanning with direct session lookup.** Put opaque `jti` and
+- [x] **S3-3 Replace refresh-token scanning with direct session lookup.** Put opaque `jti` and
       `familyId` identifiers in each refresh JWT/row, look up exactly one row, verify its hash, and
       rotate it with a conditional transaction/CAS. Never scan a capped `take: 20` Argon2 candidate
       set. Exactly one concurrent request wins; the loser cannot mint a token or revoke the winner’s
       newly created session. Detect genuine later replay and revoke that family.
+      _(Done: migration `20260716020000_refresh_token_rotation` adds `jti`/`familyId`; `refresh` does a
+      direct `findUnique({ where: { jti } })`, verifies the hash, and rotates via a conditional
+      `updateMany` CAS. A concurrent loser (CAS count 0 within a 10s grace) fails without touching the
+      family; a replay outside the grace revokes the whole family. Verified end-to-end on live
+      Postgres — parallel double-refresh yields exactly one winner, and a backdated replay revokes the
+      family.)_
 - [x] **S3-4 Use one authoritative logout model.** Make logout a documented logout-all operation:
       increment `authVersion` and revoke every refresh family in one transaction. Protected requests
       validate `authVersion` from DB, so correctness does not depend on a Redis jti blocklist; Redis may
