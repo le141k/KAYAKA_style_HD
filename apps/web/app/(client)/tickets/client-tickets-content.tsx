@@ -1,12 +1,18 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useQueryClient } from '@tanstack/react-query';
 import { Mail, Loader2, CheckCircle2, LogOut } from 'lucide-react';
 import { TicketRow } from '@/components/premium/TicketRow';
 import { TicketListSkeleton } from '@/components/premium/SkeletonLoaders';
 import { useClientTickets } from '@/lib/hooks/use-client-tickets';
-import { useClientSession, useRequestClientLink, useClientLogout } from '@/lib/hooks/use-client-auth';
+import {
+  clientAuthKeys,
+  useClientSession,
+  useRequestClientLink,
+  useClientLogout,
+} from '@/lib/hooks/use-client-auth';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { QueryError } from '@/components/QueryError';
@@ -87,13 +93,24 @@ function SignInPanel() {
 
 /** The signed-in client's own ticket list + sign-out. */
 function SignedInTickets() {
-  const { data, isLoading, isError, refetch } = useClientTickets();
+  const qc = useQueryClient();
+  const { data, isLoading, isError, error, refetch } = useClientTickets();
   const logout = useClientLogout();
   const tickets = data?.data ?? [];
 
   const signOut = () => logout.mutate();
 
+  // If the list 401s (the session was revoked out-of-band while the session query was still
+  // fresh), re-check the session so the page falls back to the sign-in panel instead of a retry.
+  const listStatus = (error as { status?: number } | null)?.status;
+  useEffect(() => {
+    if (isError && listStatus === 401) {
+      void qc.invalidateQueries({ queryKey: clientAuthKeys.session });
+    }
+  }, [isError, listStatus, qc]);
+
   if (isLoading) return <TicketListSkeleton count={5} />;
+  if (isError && listStatus === 401) return <TicketListSkeleton count={5} />; // re-checking session
   if (isError)
     return <QueryError message="Не удалось загрузить ваши обращения." onRetry={() => void refetch()} />;
 

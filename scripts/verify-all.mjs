@@ -52,8 +52,9 @@ await check('admin-custom-fields', '/admin/custom-fields');
 
 // ── CLIENT ───────────────────────────────────────────────────────────────────
 console.log('\n── CLIENT ──');
-// client "my tickets" reads requester email from localStorage.client_email
-await page.addInitScript(() => localStorage.setItem('client_email', 'admin@23telecom.example'));
+// S2-9: client ownership is the verified `th_client` session, not localStorage. Unauthenticated,
+// /tickets correctly renders the magic-link sign-in panel — a valid smoke render (no error). A full
+// magic-link round-trip needs mail interception and belongs in the S2-10/S6 e2e layer.
 await check('client-tickets', '/tickets');
 await check('client-submit', '/submit');
 await check('client-kb', '/kb');

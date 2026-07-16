@@ -1,6 +1,6 @@
 # GOAL — Security fixes before public access
 
-_Created: 2026-07-16. Status: **IN PROGRESS — PUBLIC GO-LIVE BLOCKED**. S1 secret-leakage core (code) landed; S0 ops, S1 cookie-only/rotation and S2–S6 remain._
+_Created: 2026-07-16. Status: **IN PROGRESS — PUBLIC GO-LIVE BLOCKED**. All code-doable, non-breaking application-security work is landed + tested: S1 secret-leakage core, S2 verified client sessions (backend + frontend cutover; DB-UNIQUE + e2e deferred), S3 staff-session correctness/CSRF-origin/login-throttle, and S5-7 preflight/boot guards. **Remaining is gated, not code-doable here:** S4 (needs new deps — Turnstile/ClamAV/scanner), S1-6/7/8 + S3-5-token/S3-6 (the breaking cookie-only auth change), and the S0/S1-9/S5-edge/S6-ops track (needs the live production VM: containment, secret rotation, Cloudflare/firewall edge, backups, prod smoke). The portal stays behind the CIDR/Tailscale allowlist until the full Definition of Done is green._
 
 Run later as an implementation goal: `/goal docs/GOAL_PUBLIC_SECURITY.md`.
 

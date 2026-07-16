@@ -38,6 +38,11 @@ export const clientAuthKeys = {
   session: ['client-auth', 'session'] as const,
 };
 
+// Mirrors `clientTicketKeys.all` in use-client-tickets — kept as a literal here to avoid an
+// import cycle. On any session change we drop the previous principal's ticket cache so no prior
+// user's data can linger in memory across a sign-out / re-sign-in.
+const CLIENT_TICKETS_KEY = ['client-tickets'] as const;
+
 /**
  * Current client session, resolved from the `th_client` cookie via GET /client-auth/me.
  * Returns `null` (not an error) when unauthenticated, so a page can branch cleanly.
@@ -78,7 +83,10 @@ export function useVerifyClientToken() {
         method: 'POST',
         body: JSON.stringify({ token }),
       }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: clientAuthKeys.session }),
+    onSuccess: () => {
+      qc.removeQueries({ queryKey: CLIENT_TICKETS_KEY });
+      void qc.invalidateQueries({ queryKey: clientAuthKeys.session });
+    },
   });
 }
 
@@ -87,6 +95,9 @@ export function useClientLogout() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => clientFetch<void>('/client-auth/logout', { method: 'POST' }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: clientAuthKeys.session }),
+    onSuccess: () => {
+      qc.removeQueries({ queryKey: CLIENT_TICKETS_KEY }); // drop the signed-out user's tickets
+      void qc.invalidateQueries({ queryKey: clientAuthKeys.session });
+    },
   });
 }
