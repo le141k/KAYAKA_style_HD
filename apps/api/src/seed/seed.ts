@@ -63,13 +63,23 @@ async function main(): Promise<void> {
     data: { isAdmin: true, permissions: ALL_PERMISSIONS },
   });
 
+  const managerGroup = await findOrCreateWhere(
+    () => prisma.staffGroup.findFirst({ where: { title: 'Manager' } }),
+    () =>
+      prisma.staffGroup.create({
+        data: { title: 'Manager', isAdmin: false, permissions: ROLE_PRESETS.manager },
+      }),
+  );
+
   const agentGroup = await findOrCreateWhere(
     () => prisma.staffGroup.findFirst({ where: { title: 'Agent' } }),
     () =>
       prisma.staffGroup.create({ data: { title: 'Agent', isAdmin: false, permissions: ROLE_PRESETS.agent } }),
   );
 
-  console.log(`  StaffGroups: Administrator (id=${adminGroup.id}), Agent (id=${agentGroup.id})`);
+  console.log(
+    `  StaffGroups: Administrator (id=${adminGroup.id}), Manager (id=${managerGroup.id}), Agent (id=${agentGroup.id})`,
+  );
 
   // ─────────────────── Staff Members ───────────────────
 
@@ -90,6 +100,21 @@ async function main(): Promise<void> {
     update: { staffGroupId: adminGroup.id },
   });
 
+  const managerHash = await hash('demo1234');
+  const managerStaff = await prisma.staff.upsert({
+    where: { email: 'manager@23telecom.example' },
+    create: {
+      email: 'manager@23telecom.example',
+      username: 'manager1',
+      firstName: 'Maria',
+      lastName: 'Petrenko',
+      passwordHash: managerHash,
+      designation: 'Support Manager',
+      staffGroupId: managerGroup.id,
+    },
+    update: { staffGroupId: managerGroup.id },
+  });
+
   const agentStaff = await prisma.staff.upsert({
     where: { email: 'agent@23telecom.example' },
     create: {
@@ -104,7 +129,7 @@ async function main(): Promise<void> {
     update: { staffGroupId: agentGroup.id },
   });
 
-  console.log(`  Staff: ${adminStaff.email}, ${agentStaff.email}`);
+  console.log(`  Staff: ${adminStaff.email}, ${managerStaff.email}, ${agentStaff.email}`);
 
   // ─────────────────── Departments ───────────────────
 

@@ -3,12 +3,19 @@
 Living status doc for the rewrite. Updated as milestones complete.
 
 ## Done
+
+- [x] **Staff RBAC completion (2026-07-16):** Administrator/Manager/Agent roles + `GET /staff/rbac`
+      catalog; session revocation on role/password/disable & group-permission change (refresh +
+      Redis access cutoff); last-active-admin guard; append-only RBAC audit log (`/staff/audit`);
+      permission-aware frontend (Manager no longer collapsed to Agent); prod bootstrap seeds the
+      standard groups idempotently. API vitest **607** green, api+web typecheck/lint/build green.
+      See ADR-0006.
 - [x] Brand identity (`docs/brand/`): guidelines, palette (telecom blue/cyan/indigo + status),
       typography (Inter / JetBrains Mono), tone of voice ru/en/uk, SVG logo + mark.
 - [x] Theme (`frontend/styles/theme/`): shadcn HSL tokens (light/dark) + status tokens,
       `tailwind-preset.ts`, `theme.json`.
 - [x] Monorepo backbone: npm workspaces, `tsconfig.base.json`, ESLint/Prettier/EditorConfig,
-      `.gitignore`, `.env.example` (TELECOM_HD_*), `docker-compose.yml`, GitHub Actions CI.
+      `.gitignore`, `.env.example` (TELECOM*HD*\*), `docker-compose.yml`, GitHub Actions CI.
 - [x] Prisma schema (`apps/api/prisma/schema.prisma`): normalized domain — staff/RBAC, users,
       orgs, departments, tickets (+posts/notes/attachments/watchers/tags/audit/links/merge),
       statuses/priorities/types, SLA (plans/schedules/holidays/escalation), workflows/macros,
@@ -20,6 +27,7 @@ Living status doc for the rewrite. Updated as milestones complete.
 - [x] Infra up locally: Postgres 16, Redis 7, MailHog (docker compose).
 
 ## Done (verified this session)
+
 - [x] Backend modules: auth (JWT+argon2+RBAC), base (staff/users/orgs/departments), tickets
       (full lifecycle), alaris stub, sla, mail, knowledgebase, news, troubleshooter, reports.
 - [x] Frontend: Next.js 15 app, 17 shadcn + 14 premium components, 3 interfaces, i18n ru/en/uk,
@@ -35,11 +43,13 @@ Living status doc for the rewrite. Updated as milestones complete.
       architecture via docs-keeper). FINAL_REPORT.md.
 
 ## In progress / pending
+
 - [~] `docker compose build` (api+web images) — running under amd64 emulation.
 - [ ] Run integration (Testcontainers) + E2E (Playwright) + k6 suites in CI (specs/scripts provided).
 - [ ] BullMQ wiring (SLA scan), workflow engine executor, attachment upload, full KQL — TODO (see FINAL_REPORT).
 
 ## Known constraints / decisions
+
 - SWIFT framework core dropped; only domain + schema carried over (ADR-0001).
 - Custom fields → JSONB, not EAV (ADR-0002). Attachments by storage key (ADR-0003).
 - Alaris is a stub (ADR-0005): webhook → ticket only.

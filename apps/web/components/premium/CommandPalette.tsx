@@ -24,14 +24,17 @@ import {
 } from '@/components/ui/command';
 import { useTickets } from '@/lib/hooks/use-tickets';
 import { useAuth } from '@/lib/auth/auth-context';
+import { ADMIN_AREA_PERMISSIONS, PERMISSIONS } from '@/lib/auth/permissions';
 
-const NAV_ITEMS = [
-  { label: 'Дашборд', href: '/staff/dashboard', Icon: LayoutDashboard, adminOnly: false },
-  { label: 'Заявки (список)', href: '/staff/tickets', Icon: Ticket, adminOnly: false },
-  { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare, adminOnly: false },
-  { label: 'База знаний', href: '/kb', Icon: BookOpen, adminOnly: false },
-  { label: 'Настройки', href: '/admin', Icon: Settings, adminOnly: true },
-  { label: 'Сотрудники', href: '/admin/staff', Icon: Users, adminOnly: true },
+// `requires` (when set) gates the command behind holding at least one of the
+// listed permissions — matches the permission-aware sidebar/admin nav.
+const NAV_ITEMS: { label: string; href: string; Icon: typeof LayoutDashboard; requires?: string[] }[] = [
+  { label: 'Дашборд', href: '/staff/dashboard', Icon: LayoutDashboard },
+  { label: 'Заявки (список)', href: '/staff/tickets', Icon: Ticket },
+  { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare },
+  { label: 'База знаний', href: '/kb', Icon: BookOpen },
+  { label: 'Настройки', href: '/admin', Icon: Settings, requires: ADMIN_AREA_PERMISSIONS },
+  { label: 'Сотрудники', href: '/admin/staff', Icon: Users, requires: [PERMISSIONS.STAFF_MANAGE] },
 ];
 
 interface CommandPaletteProps {
@@ -41,8 +44,7 @@ interface CommandPaletteProps {
 
 export function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const router = useRouter();
-  const { user } = useAuth();
-  const isAdmin = user?.role === 'admin';
+  const { canAny } = useAuth();
 
   const [inputValue, setInputValue] = useState('');
   // Debounced query sent to the API — updated ~300 ms after the user stops typing.
@@ -89,7 +91,7 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
   }, [open]);
 
   const visibleNavItems = NAV_ITEMS.filter((item) => {
-    if (item.adminOnly && !isAdmin) return false;
+    if (item.requires && !canAny(item.requires)) return false;
     return inputValue ? item.label.toLowerCase().includes(inputValue.toLowerCase()) : true;
   });
 

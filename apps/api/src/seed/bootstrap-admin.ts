@@ -17,9 +17,44 @@
 
 import { PrismaClient } from '@prisma/client';
 import { hashPassword } from '../auth/password.util';
-import { ROLE_PRESETS } from '../auth/permissions';
+import { ROLE_PRESETS, ROLE_TEMPLATES } from '../auth/permissions';
 
 const prisma = new PrismaClient();
+
+/**
+ * Ensure the three built-in role groups (Administrator, Manager, Agent) exist.
+ * Production-safe: creates only missing groups from the role templates and NEVER
+ * overwrites the permissions of a group that already exists — operator tweaks
+ * survive redeploys. Returns the Administrator group (needed for the bootstrap
+ * staff account).
+ */
+async function ensureStandardGroups(): Promise<{ id: number }> {
+  let adminGroup: { id: number } | null = null;
+  for (const tpl of ROLE_TEMPLATES) {
+    const existing = await prisma.staffGroup.findFirst({ where: { title: tpl.title } });
+    if (existing) {
+      console.log(`[bootstrap-admin] StaffGroup "${tpl.title}" already exists (id=${existing.id}).`);
+      if (tpl.key === 'administrator') adminGroup = existing;
+      continue;
+    }
+    const created = await prisma.staffGroup.create({
+      data: { title: tpl.title, isAdmin: tpl.isAdmin, permissions: tpl.permissions },
+    });
+    console.log(`[bootstrap-admin] Created StaffGroup "${tpl.title}" (id=${created.id}).`);
+    if (tpl.key === 'administrator') adminGroup = created;
+  }
+
+  // Defensive: if for some reason an admin group with the template title is
+  // missing (e.g. renamed manually), fall back to any isAdmin group / create one.
+  if (!adminGroup) {
+    adminGroup =
+      (await prisma.staffGroup.findFirst({ where: { isAdmin: true } })) ??
+      (await prisma.staffGroup.create({
+        data: { title: 'Administrator', isAdmin: true, permissions: ROLE_PRESETS.administrator },
+      }));
+  }
+  return adminGroup;
+}
 
 async function main(): Promise<void> {
   const email = process.env.TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL?.trim();
@@ -44,30 +79,13 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log(`[bootstrap-admin] Ensuring admin StaffGroup and staff account for <${email}>…`);
+  console.log(`[bootstrap-admin] Ensuring standard StaffGroups and staff account for <${email}>…`);
 
-  // ── 1. Ensure the admin StaffGroup exists ──────────────────────────────────
+  // ── 1. Ensure the built-in role groups exist ───────────────────────────────
   //
-  // We look for the first group with isAdmin=true and title 'Administrator'.
-  // If absent, we create it. We do NOT update an existing group's permissions
-  // so that manual tweaks made in the UI are preserved.
-
-  let adminGroup = await prisma.staffGroup.findFirst({
-    where: { title: 'Administrator', isAdmin: true },
-  });
-
-  if (!adminGroup) {
-    adminGroup = await prisma.staffGroup.create({
-      data: {
-        title: 'Administrator',
-        isAdmin: true,
-        permissions: ROLE_PRESETS.administrator,
-      },
-    });
-    console.log(`[bootstrap-admin] Created StaffGroup "Administrator" (id=${adminGroup.id}).`);
-  } else {
-    console.log(`[bootstrap-admin] StaffGroup "Administrator" already exists (id=${adminGroup.id}).`);
-  }
+  // Creates any missing Administrator/Manager/Agent group from the role
+  // templates without overwriting existing groups' permissions.
+  const adminGroup = await ensureStandardGroups();
 
   // ── 2. Ensure the staff account exists ────────────────────────────────────
   //

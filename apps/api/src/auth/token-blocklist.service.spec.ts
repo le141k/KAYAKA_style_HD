@@ -8,6 +8,7 @@ const { redisMock } = vi.hoisted(() => ({
     on: vi.fn(),
     set: vi.fn().mockResolvedValue('OK'),
     exists: vi.fn().mockResolvedValue(0),
+    get: vi.fn().mockResolvedValue(null),
     disconnect: vi.fn(),
   },
 }));
@@ -23,6 +24,7 @@ describe('TokenBlocklistService', () => {
     vi.clearAllMocks();
     redisMock.exists.mockResolvedValue(0);
     redisMock.set.mockResolvedValue('OK');
+    redisMock.get.mockResolvedValue(null);
     svc = new TokenBlocklistService(CONFIG);
   });
 
@@ -52,5 +54,49 @@ describe('TokenBlocklistService', () => {
   it('fail-open: Redis error on isBlocked → false (never lock everyone out)', async () => {
     redisMock.exists.mockRejectedValueOnce(new Error('redis down'));
     expect(await svc.isBlocked('jti-1')).toBe(false);
+  });
+
+  // ─── per-staff access cutoff (role/password/disable revocation) ──────────────
+
+  it('revokeStaffAccessBefore() stores a numeric epoch cutoff with an EX ttl', async () => {
+    await svc.revokeStaffAccessBefore(42, 900);
+    expect(redisMock.set).toHaveBeenCalledWith(
+      'th:staffcutoff:42',
+      expect.stringMatching(/^\d+$/),
+      'EX',
+      900,
+    );
+  });
+
+  it('revokeStaffAccessBefore() is a no-op for missing staffId or non-positive ttl', async () => {
+    await svc.revokeStaffAccessBefore(0, 900);
+    await svc.revokeStaffAccessBefore(42, 0);
+    expect(redisMock.set).not.toHaveBeenCalled();
+  });
+
+  it('isStaffTokenStale() true when the token iat predates the cutoff', async () => {
+    redisMock.get.mockResolvedValueOnce('1000');
+    expect(await svc.isStaffTokenStale(42, 999)).toBe(true);
+  });
+
+  it('isStaffTokenStale() false when the token iat is at/after the cutoff', async () => {
+    redisMock.get.mockResolvedValueOnce('1000');
+    expect(await svc.isStaffTokenStale(42, 1000)).toBe(false);
+  });
+
+  it('isStaffTokenStale() false when no cutoff is set', async () => {
+    redisMock.get.mockResolvedValueOnce(null);
+    expect(await svc.isStaffTokenStale(42, 999)).toBe(false);
+  });
+
+  it('isStaffTokenStale() false (no Redis hit) when staffId or iat is missing', async () => {
+    expect(await svc.isStaffTokenStale(undefined, 999)).toBe(false);
+    expect(await svc.isStaffTokenStale(42, undefined)).toBe(false);
+    expect(redisMock.get).not.toHaveBeenCalled();
+  });
+
+  it('fail-open: Redis error on isStaffTokenStale → false', async () => {
+    redisMock.get.mockRejectedValueOnce(new Error('redis down'));
+    expect(await svc.isStaffTokenStale(42, 999)).toBe(false);
   });
 });

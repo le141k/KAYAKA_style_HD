@@ -3,6 +3,7 @@ import Redis from 'ioredis';
 import { AppConfig, APP_CONFIG } from '../config/configuration';
 
 const KEY_PREFIX = 'th:revoked:'; // th:revoked:<jti> = "1" with TTL = remaining token life
+const STAFF_CUTOFF_PREFIX = 'th:staffcutoff:'; // th:staffcutoff:<staffId> = epoch-seconds cutoff
 
 /**
  * Redis-backed access-token revocation (jti blocklist). On logout we add the
@@ -42,6 +43,44 @@ export class TokenBlocklistService implements OnModuleDestroy {
       await this.redis.set(`${KEY_PREFIX}${jti}`, '1', 'EX', Math.ceil(ttlSeconds));
     } catch (err) {
       this.logger.warn(`Failed to blocklist jti ${jti}: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Invalidate every access token issued to `staffId` before "now" — the immediate
+   * counterpart to revoking refresh tokens. We store a per-staff cutoff (epoch
+   * seconds); JwtAuthGuard rejects any access token whose `iat` is older than it.
+   * The key is set with a TTL equal to the access-token lifetime because access
+   * tokens minted before the cutoff have all expired by then anyway, so the marker
+   * is no longer needed. No-op if ttl<=0.
+   */
+  async revokeStaffAccessBefore(staffId: number, ttlSeconds: number): Promise<void> {
+    if (!staffId || ttlSeconds <= 0) return;
+    const nowSec = Math.floor(Date.now() / 1000);
+    try {
+      await this.redis.set(`${STAFF_CUTOFF_PREFIX}${staffId}`, String(nowSec), 'EX', Math.ceil(ttlSeconds));
+    } catch (err) {
+      this.logger.warn(`Failed to set access cutoff for staff ${staffId}: ${String(err)}`);
+    }
+  }
+
+  /**
+   * True if this access token was issued before the staff member's revocation
+   * cutoff (role/password/enabled change, or an explicit "log out everywhere").
+   * Fail-open (false) when Redis is unavailable — the short access TTL and the
+   * refresh-token revocation are the backstops. Reuses the same throttled bypass
+   * alert as {@link isBlocked}.
+   */
+  async isStaffTokenStale(staffId: number | undefined, iat: number | undefined): Promise<boolean> {
+    if (!staffId || !iat) return false;
+    try {
+      const raw = await this.redis.get(`${STAFF_CUTOFF_PREFIX}${staffId}`);
+      if (!raw) return false;
+      const cutoff = Number(raw);
+      return Number.isFinite(cutoff) && iat < cutoff;
+    } catch (err) {
+      this.alertRevocationBypass(err);
+      return false;
     }
   }
 

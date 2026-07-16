@@ -778,12 +778,23 @@ export function useDeleteEscalationRule(planId: number) {
 
 // ─── Staff ───────────────────────────────────────────────────────────────────
 
-export function useAdminStaff() {
+export interface StaffFilter {
+  search?: string;
+  groupId?: number;
+  enabled?: boolean;
+}
+
+export function useAdminStaff(filter: StaffFilter = {}) {
+  const { search, groupId, enabled } = filter;
   return useQuery({
-    queryKey: adminKeys.staff,
+    queryKey: [...adminKeys.staff, { search: search ?? '', groupId: groupId ?? 0, enabled: enabled ?? null }],
     queryFn: async () => {
       // API caps limit at 100 — requesting 200 returns a 400 and the table never loads.
-      const res = await api.get<{ data: ApiStaffMember[]; total: number }>('/staff?limit=100');
+      const params = new URLSearchParams({ limit: '100' });
+      if (search) params.set('search', search);
+      if (groupId) params.set('groupId', String(groupId));
+      if (enabled !== undefined) params.set('enabled', String(enabled));
+      const res = await api.get<{ data: ApiStaffMember[]; total: number }>(`/staff?${params}`);
       return { data: res.data.map(mapStaff), total: res.total };
     },
   });
@@ -833,6 +844,58 @@ export function useAdminStaffGroups() {
       const data = await api.get<ApiStaffGroup[]>('/staff/groups');
       return data.map(mapGroup);
     },
+  });
+}
+
+// ─── RBAC catalog (permissions + role templates) ─────────────────────────────
+
+export interface RbacPermissionMeta {
+  key: string;
+  label: string;
+  category: string;
+}
+
+export interface RbacRoleTemplate {
+  key: 'administrator' | 'manager' | 'agent';
+  title: string;
+  description: string;
+  isAdmin: boolean;
+  permissions: string[];
+}
+
+export interface RbacCatalog {
+  permissions: RbacPermissionMeta[];
+  roles: RbacRoleTemplate[];
+}
+
+export function useRbacCatalog() {
+  return useQuery({
+    queryKey: ['admin', 'rbac'] as const,
+    queryFn: () => api.get<RbacCatalog>('/staff/rbac'),
+    staleTime: 10 * 60_000,
+  });
+}
+
+// ─── RBAC audit log ──────────────────────────────────────────────────────────
+
+export interface RbacAuditEntry {
+  id: number;
+  actorStaffId: number | null;
+  actorEmail: string;
+  action: string;
+  targetType: string;
+  targetId: number | null;
+  targetLabel: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
+export function useRbacAudit(params: { page?: number; limit?: number } = {}) {
+  const { page = 1, limit = 50 } = params;
+  return useQuery({
+    queryKey: ['admin', 'rbac', 'audit', page, limit] as const,
+    queryFn: () =>
+      api.get<{ data: RbacAuditEntry[]; total: number }>(`/staff/audit?page=${page}&limit=${limit}`),
   });
 }
 
