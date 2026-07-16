@@ -10,7 +10,9 @@
  *  - 4 TicketPriorities
  *  - 4 TicketTypes
  *  - 1 SlaPlan + SlaSchedule (Mon–Fri 09:00–18:00)
- *  - 6 EmailTemplates (incl. password_reset; en + ru)
+ *  - 8 EmailTemplate rows: ticket_user_reply + autoresponder (en + ru),
+ *    sla_breach_internal, notify_staff_assigned, notify_staff_user_replied,
+ *    password_reset (en only)
  *  - 2 Organizations + 4 Users
  *  - 5 Demo tickets with posts
  */

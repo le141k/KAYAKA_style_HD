@@ -131,7 +131,11 @@ Denormalized counters (`totalReplies`, `hasAttachments`, `hasNotes`) are updated
 | **EmailQueue**    | `id`, `type EmailQueueType`, `emailAddress`, `host`, `port Int` (default 993), `username`, `passwordEnc` (encrypted at rest), `useTls Bool`, `departmentId?`, `signature`, `isEnabled Bool`, `createdAt` | Optional FK to `Department` |
 | **EmailTemplate** | `id`, `key` (e.g. `ticket_user_reply`, `autoresponder`, `sla_breach_internal`), `locale` (default `en`), `subject`, `htmlBody`, `textBody`, `updatedAt`; unique `(key, locale)`                          | —                           |
 
-Templates use `{{placeholder}}` interpolation (mustache-style). Seeded templates cover `ticket_user_reply` and `autoresponder` in English and Russian, plus `sla_breach_internal` in English.
+Templates use `{{placeholder}}` interpolation (mustache-style). Seeded templates cover
+`ticket_user_reply` and `autoresponder` in English and Russian, plus `sla_breach_internal`,
+`notify_staff_assigned`, `notify_staff_user_replied` and `password_reset` in English.
+`password_reset` is additionally provisioned in production by migration
+`20260716000000_password_reset_template` (the production seed does not run).
 
 ---
 

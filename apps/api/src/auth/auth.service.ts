@@ -295,6 +295,12 @@ export class AuthService {
       throw new BadRequestException('Invalid or expired reset token');
     }
 
+    // Deliberate fail-safe: the token is already consumed above, OUTSIDE this
+    // transaction. If the password write below fails (e.g. the staff row was deleted
+    // between issue and reset), the token stays burned and the user must request a
+    // new link — we never change a password without having consumed the token. This
+    // is the safe direction; the alternative (consume inside the tx) would reopen the
+    // concurrent-double-consume race this change exists to close.
     await this.prisma.$transaction([
       this.prisma.staff.update({
         where: { id: record.staffId },

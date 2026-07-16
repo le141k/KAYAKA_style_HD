@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { Writable } from 'node:stream';
+import { EventEmitter } from 'node:events';
 import pino from 'pino';
+import { pinoHttp } from 'pino-http';
 import { buildPinoHttpOptions } from './logging';
 import type { AppConfig } from './configuration';
 
@@ -77,13 +79,90 @@ describe('buildPinoHttpOptions (log secrecy)', () => {
     expect(out).not.toContain('email=');
   });
 
-  it('never emits an inbound/alaris webhook secret passed as a raw header object', () => {
-    const { logger, read } = makeCapturingLogger();
+  it('redact strips sensitive paths independently of the serializers (defense-in-depth)', () => {
+    // Build a logger with ONLY the redact layer (no serializers) so this test proves
+    // redact alone removes secrets — i.e. if a future change weakens/removes the req/res
+    // serializers, redact is still an independent backstop. (The previous version logged
+    // under the `req` key, where the serializer stripped headers first, making the
+    // assertion pass regardless of redact — vacuous.)
+    let output = '';
+    const stream = new Writable({
+      write(chunk: Buffer, _enc, cb) {
+        output += chunk.toString();
+        cb();
+      },
+    });
+    const opts = buildPinoHttpOptions(CONFIG) as unknown as pino.LoggerOptions;
+    const logger = pino({ level: opts.level, redact: opts.redact }, stream);
 
-    // Defense-in-depth: even if a raw req is logged directly (bypassing the HTTP
-    // serializer path), redact removes the sensitive header paths.
-    logger.info({ req: { headers: { 'x-alaris-secret': `${S}-directsecret` } } });
+    logger.info({
+      req: {
+        headers: {
+          cookie: `th_access=${S}-cookie`,
+          authorization: `Bearer ${S}-bearer`,
+          'proxy-authorization': `Basic ${S}-proxy`,
+          'x-alaris-secret': `${S}-alaris`,
+          'x-inbound-secret': `${S}-inbound`,
+          'x-api-key': `${S}-apikey`,
+        },
+        body: { password: `${S}-password` },
+      },
+      res: { headers: { 'set-cookie': [`th_refresh=${S}-setcookie`] } },
+    });
 
-    expect(read()).not.toContain(S);
+    expect(output).not.toContain(S);
+  });
+
+  it('drives the real pino-http request pipeline and emits no secrets', () => {
+    // Highest-fidelity check: run the actual pino-http middleware built from the
+    // production options and let it auto-log request completion (so customProps/
+    // clientIp, genReqId and the response-completion path are all exercised — not
+    // just the serializers in isolation).
+    let output = '';
+    const stream = new Writable({
+      write(chunk: Buffer, _enc, cb) {
+        output += chunk.toString();
+        cb();
+      },
+    });
+    // pino-http is overloaded (one overload takes a bare stream), which confuses
+    // `Parameters<typeof pinoHttp>`; cast to a minimal middleware-factory signature.
+    type PinoHttpFactory = (
+      opts: object,
+      stream: Writable,
+    ) => (req: object, res: object, next: () => void) => void;
+    const middleware = (pinoHttp as unknown as PinoHttpFactory)(buildPinoHttpOptions(CONFIG) ?? {}, stream);
+
+    const req = Object.assign(new EventEmitter(), {
+      method: 'POST',
+      url: `/api/auth/login?token=${S}-urltoken&email=${S}-urlemail`,
+      headers: {
+        cookie: `th_access=${S}-cookie`,
+        authorization: `Bearer ${S}-bearer`,
+        'x-alaris-secret': `${S}-alaris`,
+      },
+      socket: { remoteAddress: '203.0.113.7' },
+      ip: '203.0.113.7',
+    });
+    const res = Object.assign(new EventEmitter(), {
+      statusCode: 200,
+      getHeader: () => undefined,
+      getHeaders: () => ({ 'set-cookie': [`th_refresh=${S}-setcookie`] }),
+      setHeader: () => undefined,
+      writableEnded: false,
+    });
+
+    middleware(req, res, () => undefined);
+    res.emit('finish');
+
+    // Nothing sensitive leaks through the real middleware…
+    expect(output).not.toContain(S);
+    // …and the allowlist (incl. the trusted client IP via customProps) is present.
+    // (statusCode is emitted via the res serializer; its exact value depends on the
+    // mocked response lifecycle, so we assert the field is present, not a fixed value.)
+    expect(output).toContain('"method":"POST"');
+    expect(output).toContain('"statusCode"');
+    expect(output).toContain('"path":"/api/auth/login"');
+    expect(output).toContain('"clientIp":"203.0.113.7"');
   });
 });
