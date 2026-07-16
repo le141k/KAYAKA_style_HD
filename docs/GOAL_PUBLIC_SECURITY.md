@@ -74,8 +74,9 @@ and inventory are completed before any production mutation or migration.
       temporarily hide/disable those UI actions until the verified client-session flow is complete.
       Untrusted public attachment upload stays disabled until S4 is green.
       _(Done on the API: my/detail/reply now require a verified client session (S2-6/7) bound to
-      `Ticket.userId`; public create + upload stay fail-closed 404 in prod (S2-1). UI hide + client
-      attachment download still pending (S2-8/9).)_
+      `Ticket.userId`, and the owner-scoped client attachment download route is in place (S2-8);
+      public create + upload stay fail-closed 404 in prod (S2-1). Only the UI cutover (hide the old
+      email-only actions, point the mapper at the new routes) remains — the deferred frontend S2-9.)_
 - [ ] **H3 Close staff-auth gaps:** use DB-backed `authVersion`, logout-all revocation, atomic refresh
       rotation and origin + CSRF checks for every cookie-authenticated mutation.
       _(Done: DB-backed `authVersion` + logout-all revocation (S3-1/2/4), atomic refresh rotation by
@@ -248,28 +249,56 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       `UserEmail`, reject/fix case-insensitive duplicates, and enforce a DB-level normalized-email
       uniqueness invariant. Backfill `Ticket.userId` only when one normalized email maps to exactly one
       user; ambiguous or unlinked tickets remain inaccessible and enter a manual-resolution report.
-- [ ] **S2-3 Add client-auth persistence.** Add Prisma models/migration for a single-use hashed login
+- [x] **S2-3 Add client-auth persistence.** Add Prisma models/migration for a single-use hashed login
       token and a hashed client session. Both require a non-null stable `userId`; normalized email is an
       audit snapshot, never the authorization key. Include expiry, `usedAt`/`revokedAt`, created and
       last-seen fields. Store only SHA-256/HMAC hashes of cryptographically random tokens, index active
       lookup/expiry and never persist the raw token.
-- [ ] **S2-4 Implement request-link.** Add a public, tightly throttled endpoint that accepts an email,
+      _(Done, commit `ecbec7b`: `ClientLoginToken` + `ClientSession` models (migration
+      `20260716165721_client_auth`), both keyed on non-null `userId`, `tokenHash` unique, `email` as an
+      audit snapshot, `usedAt`/`revokedAt`/`expiresAt`/`lastSeenAt`. Only SHA-256 hashes of 32-byte
+      random tokens are stored; the raw token is never persisted.)_
+- [x] **S2-4 Implement request-link.** Add a public, tightly throttled endpoint that accepts an email,
       normalizes it, always returns the same 202 response, invalidates older unused tokens and queues
       a short-lived link only when the address maps unambiguously to one `userId` that owns at least one
       ticket. Bind the token to that `userId`. Key limits by trusted client IP and HMAC(normalized
       email); do not expose account existence.
-- [ ] **S2-5 Keep the magic token out of proxy logs.** Preferred browser flow:
-      `/client/verify#token=<raw>` → client JS immediately removes the fragment with
-      `history.replaceState` → POSTs the token in a non-logged body to a verify endpoint. The API
-      atomically consumes the single-use token, creates a client session and sets an `HttpOnly`,
-      `Secure`, host-only cookie. Set `Referrer-Policy: no-referrer` on the verification page.
-- [ ] **S2-6 Add an explicit client auth mode.** Implement `@ClientAuthenticated()` metadata/decorator
+      _(Done, commit `ecbec7b`: `POST /api/client-auth/request-link` (`@Public`, `@Throttle 3/60s`)
+      normalizes the email, always returns the same 202 body, `resolveUnambiguousOwner` issues a
+      15-min token bound to `userId` ONLY when exactly one user owns ≥1 ticket (ambiguous/unknown/
+      no-ticket → silent no-op), and invalidates older unused tokens first. Unit-tested for the
+      one-user, ambiguous, unknown and no-ticket branches.)_
+- [~] **S2-5 Keep the magic token out of proxy logs.** Preferred browser flow:
+  `/client/verify#token=<raw>` → client JS immediately removes the fragment with
+  `history.replaceState` → POSTs the token in a non-logged body to a verify endpoint. The API
+  atomically consumes the single-use token, creates a client session and sets an `HttpOnly`,
+  `Secure`, host-only cookie. Set `Referrer-Policy: no-referrer` on the verification page.
+  _(Backend done, commit `ecbec7b`: the emailed link is `…/client/verify#token=<raw>` (fragment,
+  so the token never reaches proxy/access logs); `POST /api/client-auth/verify` reads the token
+  from the request BODY, atomically single-use-consumes it (conditional `updateMany` on
+  `usedAt IS NULL AND not expired` → exactly one winner) and sets an `HttpOnly` + `Secure`
+  (prod) + host-only (`path=/api`, no `Domain`) `th_client` cookie. **Still open (lands with the
+  frontend S2-9):** the `/client/verify` page's `history.replaceState` fragment strip and its
+  `Referrer-Policy: no-referrer` header — these are client-page concerns, not built yet.)_
+- [x] **S2-6 Add an explicit client auth mode.** Implement `@ClientAuthenticated()` metadata/decorator
       and guard composition so the global staff JWT guard cannot block client routes and `@Public()`
       cannot accidentally expose them. Resolve the session to a client principal containing `userId`,
       reject expired/revoked sessions, and add logout/revocation. Do not reuse staff JWT/RBAC identity.
-- [ ] **S2-7 Remove caller-controlled ownership.** Client list/detail/reply services authorize only by
+      _(Done, commit `ecbec7b`: `@ClientAuthenticated()` = `applyDecorators(Public(), UseGuards(
+    ClientAuthGuard))`; `ClientAuthGuard` resolves the `th_client` cookie to `{ userId }` via
+      `resolveSession` (rejects expired/revoked → 401, fails CLOSED 503 on store outage), and
+      `@CurrentClient()` exposes the principal. `logout` revokes the session. No staff JWT/RBAC
+      identity is reused. Guard unit-tested (no cookie → 401, invalid → 401, valid → attaches
+      `req.client`, store outage → 503).)_
+- [x] **S2-7 Remove caller-controlled ownership.** Client list/detail/reply services authorize only by
       `Ticket.userId === client.userId`; remove `?email=` and `requesterEmail` request fields. Attribute
       replies from the session principal. Wrong-owner, unmapped and missing tickets all return the same 404. Deploy the fail-closed backend before enabling the updated frontend.
+      _(Backend done, commit `ecbec7b`: `listMyTickets(userId)`, `getPublicTicket(id, clientUserId)`
+      and `publicReply(id, dto, clientUserId)` authorize strictly via `assertClientOwnsTicket`
+      (`Ticket.userId === clientUserId` else 404); the reply's author is taken from the ticket, not
+      the request body; no `?email=`/`requesterEmail` inputs remain. Wrong-owner, unmapped (`userId
+    null`) and missing tickets all return the identical 404. Unit-tested incl. the cross-client
+      IDOR guard. Frontend enablement is the deferred S2-9.)_
 - [x] **S2-8 Add an owner-scoped client attachment download.** The current client UI links to the
       staff-only `/api/attachments/:id/download` route. Add a separate client-session-protected
       route requiring `attachment.postId != null`, `post.ticket.userId === client.userId`,
@@ -283,13 +312,25 @@ Current public list/detail/reply routes must not be exposed until this batch is 
 - [ ] **S2-9 Update the client UI.** Replace the free-form “enter any email to see tickets” flow with
       request-link, check-email, verify, session-expired and logout states. Never persist the verified
       email/session token in `localStorage`.
-- [ ] **S2-10 Add ownership and replay tests.** Cover: unknown email response parity; expired token;
-      consumed-token replay; concurrent double-consume (exactly one success); Client A cannot list,
-      read, reply to or download attachments from Client B; aliases in `UserEmail`; session
-      expiry/revocation; ambiguous/unlinked ownership fails closed; internal notes and third-party
-      posts/attachments remain hidden.
-- [ ] **S2-11 Clean expired auth material.** Add an idempotent scheduled cleanup/TTL for used or expired
+- [~] **S2-10 Add ownership and replay tests.** Cover: unknown email response parity; expired token;
+  consumed-token replay; concurrent double-consume (exactly one success); Client A cannot list,
+  read, reply to or download attachments from Client B; aliases in `UserEmail`; session
+  expiry/revocation; ambiguous/unlinked ownership fails closed; internal notes and third-party
+  posts/attachments remain hidden.
+  _(Unit matrix done, commits `ecbec7b`/`26096fb`/`cd434b5`: unknown-email response parity;
+  expired/used/replayed token rejected; single-use consume proven (conditional CAS, exactly one
+  winner); Client A → Client B list/detail/reply all 404 (IDOR guard) and owner-scoped attachment
+  download 404; ambiguous `UserEmail` and unmapped `userId null` fail closed; session
+  expiry/revocation → 401; internal notes and third-party posts/attachments hidden from the client
+  view. **Still open:** a real-DB **integration/e2e** layer proving concurrent double-consume under
+  true parallelism and the full HTTP path — needs Testcontainers/Postgres, which is blocked in this
+  sandbox (image pulls 403); it lands with the S6 gate + frontend S2-9.)_
+- [x] **S2-11 Clean expired auth material.** Add an idempotent scheduled cleanup/TTL for used or expired
       login tokens and expired/revoked client sessions, with aggregate metrics and no secret output.
+      _(Done, commit `ecbec7b`: `ClientAuthService.cleanupExpired()` idempotently `deleteMany`s
+      used/expired login tokens and revoked/expired sessions, returning aggregate counts only (never a
+      token or email). Scheduled hourly via `OnModuleInit` `setInterval` (`unref`-ed; disabled under
+      `NODE_ENV=test`).)_
 
 **S2 acceptance**
 
