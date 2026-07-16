@@ -54,6 +54,14 @@
 
 `User.geoip` is a freeform JSONB blob populated from inbound-email GeoIP lookup (optional).
 
+**Verified client auth (GOAL_PUBLIC_SECURITY S2).** Two models back the magic-link → session
+flow, both bound to a stable `User.id` and storing only SHA-256 hashes (never the raw token):
+
+| Model                | Key columns                                                                                                                                                             | Relations                   |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| **ClientLoginToken** | `id` (uuid), `userId`, `tokenHash` (unique), `email` (audit snapshot), `expiresAt`, `usedAt?`, `createdAt` — single-use magic-link token                                | belongs to `User` (cascade) |
+| **ClientSession**    | `id` (uuid), `userId`, `tokenHash` (unique), `email` (audit snapshot), `expiresAt`, `revokedAt?`, `createdAt`, `lastSeenAt` — the session behind the `th_client` cookie | belongs to `User` (cascade) |
+
 ---
 
 ### 3. Departments
@@ -352,6 +360,8 @@ Migrations live under `apps/api/prisma/migrations/` and are managed by Prisma Mi
 | `20260716000000_password_reset_template` | password_reset_template | Data-only idempotent upsert of the `password_reset` EmailTemplate (en). Ensures the reset flow has a template in **production**, where the seed does not run (GOAL_PUBLIC_SECURITY S1-4) |
 | `20260716010000_staff_auth_version`      | staff_auth_version      | Adds `Staff.authVersion Int NOT NULL DEFAULT 0` for immediate session invalidation — embedded as the access-token `av` claim and checked by the JWT guard (GOAL_PUBLIC_SECURITY S3-1)    |
 | `20260716020000_refresh_token_rotation`  | refresh_token_rotation  | Adds `RefreshToken.jti` (unique) + `familyId` (indexed) for direct rotation lookup; clears pre-existing rows (already invalidated by the S3 cutover) (GOAL_PUBLIC_SECURITY S3-3)         |
+| `20260716165721_client_auth`             | client_auth             | Adds `ClientLoginToken` + `ClientSession` (verified client sessions bound to `User.id`) (GOAL_PUBLIC_SECURITY S2)                                                                        |
+| `20260716170000_client_login_template`   | client_login_template   | Data-only idempotent upsert of the `client_login_link` EmailTemplate (en) for production (GOAL_PUBLIC_SECURITY S2-4)                                                                     |
 
 **Apply migrations (CI / production):**
 

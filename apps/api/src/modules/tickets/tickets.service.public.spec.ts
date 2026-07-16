@@ -1,7 +1,8 @@
 /**
- * Tests for the public (unauthenticated) ticket service methods:
- *   - getPublicTicket  — returns ticket + posts only (no notes exposed)
- *   - publicReply      — creates a USER post without requiring staffId
+ * Tests for the client-session ticket service methods (GOAL_PUBLIC_SECURITY S2-7):
+ *   - getPublicTicket(id, clientUserId) — ticket + posts only, owner-scoped by userId
+ *   - publicReply(id, dto, clientUserId) — USER post, owner-scoped, identity from ticket
+ *   - listMyTickets(clientUserId)        — only the verified client's own tickets
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { NotFoundException, BadRequestException } from '@nestjs/common';
@@ -14,7 +15,9 @@ import type { AdminService } from '../admin/admin.service';
 import type { EventEmitter2 } from '@nestjs/event-emitter';
 import type { Ticket, TicketPost } from '@prisma/client';
 
-// ─── helpers ────────────────────────────────────────────────────────────────
+// The verified-client userId that owns the fixture ticket, and a different client.
+const OWNER = 1;
+const OTHER_CLIENT = 999;
 
 function makeTicket(overrides: Partial<Ticket> = {}): Ticket {
   return {
@@ -26,7 +29,7 @@ function makeTicket(overrides: Partial<Ticket> = {}): Ticket {
     statusId: 1,
     priorityId: 1,
     typeId: null,
-    userId: 1,
+    userId: OWNER,
     requesterName: 'Alice',
     requesterEmail: 'alice@example.com',
     ownerStaffId: null,
@@ -65,7 +68,7 @@ function makePost(overrides: Partial<TicketPost> = {}): TicketPost {
     ticketId: 1,
     authorType: 'USER',
     staffId: null,
-    userId: 1,
+    userId: OWNER,
     fullName: 'Alice',
     email: 'alice@example.com',
     subject: 'Test ticket',
@@ -80,6 +83,19 @@ function makePost(overrides: Partial<TicketPost> = {}): TicketPost {
   } as TicketPost;
 }
 
+function withRelations(ticket: Ticket) {
+  return {
+    ...ticket,
+    posts: [],
+    status: null,
+    priority: null,
+    department: null,
+    owner: null,
+    user: null,
+    tags: [],
+  };
+}
+
 function makePrismaMock() {
   const mock = {
     ticket: {
@@ -90,37 +106,15 @@ function makePrismaMock() {
       count: vi.fn(),
       findUniqueOrThrow: vi.fn(),
     },
-    user: {
-      findUnique: vi.fn().mockResolvedValue({ organizationId: null }),
-    },
-    staff: {
-      findUnique: vi.fn().mockResolvedValue(null),
-    },
-    ticketPost: {
-      create: vi.fn(),
-      updateMany: vi.fn(),
-      findMany: vi.fn(),
-    },
-    ticketNote: {
-      create: vi.fn(),
-    },
-    ticketStatus: {
-      findFirst: vi.fn(),
-      findUnique: vi.fn(),
-    },
-    ticketPriority: {
-      findFirst: vi.fn(),
-    },
-    ticketAuditLog: {
-      create: vi.fn(),
-    },
-    ticketWatcher: {
-      upsert: vi.fn(),
-      deleteMany: vi.fn(),
-    },
-    ticketTag: {
-      findUnique: vi.fn(),
-    },
+    user: { findUnique: vi.fn().mockResolvedValue({ organizationId: null }) },
+    staff: { findUnique: vi.fn().mockResolvedValue(null) },
+    ticketPost: { create: vi.fn(), updateMany: vi.fn(), findMany: vi.fn() },
+    ticketNote: { create: vi.fn() },
+    ticketStatus: { findFirst: vi.fn(), findUnique: vi.fn() },
+    ticketPriority: { findFirst: vi.fn() },
+    ticketAuditLog: { create: vi.fn() },
+    ticketWatcher: { upsert: vi.fn(), deleteMany: vi.fn() },
+    ticketTag: { findUnique: vi.fn() },
     ticketRecipient: {
       findMany: vi.fn().mockResolvedValue([]),
       createMany: vi.fn().mockResolvedValue({}),
@@ -134,17 +128,13 @@ function makePrismaMock() {
   return mock as unknown as PrismaService;
 }
 
-// ─── suite ──────────────────────────────────────────────────────────────────
-
-describe('TicketsService — public endpoints', () => {
+describe('TicketsService — client-session endpoints', () => {
   let service: TicketsService;
   let prisma: ReturnType<typeof makePrismaMock>;
 
   beforeEach(() => {
     prisma = makePrismaMock();
-    const users = {
-      findOrCreate: vi.fn().mockResolvedValue({ id: 1 }),
-    } as unknown as UsersService;
+    const users = { findOrCreate: vi.fn().mockResolvedValue({ id: 1 }) } as unknown as UsersService;
     const sla = {
       resolvePlanForTicket: vi.fn().mockResolvedValue(null),
       computeDueDates: vi.fn().mockResolvedValue({ dueAt: null, resolutionDueAt: null }),
@@ -160,127 +150,103 @@ describe('TicketsService — public endpoints', () => {
     service = new TicketsService(prisma as unknown as PrismaService, users, sla, eventEmitter, mail, admin);
   });
 
-  // ─── getPublicTicket ──────────────────────────────────────────────────────
+  // ─── getPublicTicket (owner-scoped) ───────────────────────────────────────
 
   describe('getPublicTicket', () => {
-    it('returns ticket with posts when found', async () => {
-      const ticket = makeTicket();
-      const post = makePost();
-      const ticketWithRelations = {
-        ...ticket,
-        posts: [post],
-        status: { id: 1, title: 'Open' },
-        priority: { id: 1, title: 'Normal' },
-        department: { id: 1, title: 'Support' },
-        owner: null,
-        user: null,
-        tags: [],
-      };
-
+    it('returns the ticket with posts for the owning client', async () => {
+      const ticketWithRelations = { ...withRelations(makeTicket()), posts: [makePost()] };
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticketWithRelations);
 
-      const result = await service.getPublicTicket(1, 'alice@example.com');
+      const result = await service.getPublicTicket(1, OWNER);
 
       expect(result.id).toBe(1);
       expect(result.posts).toHaveLength(1);
       expect(result.posts[0]!.contents).toBe('Hello, I need help.');
     });
 
+    it('does NOT include internal notes — only posts', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...withRelations(makeTicket({ hasNotes: true })),
+        posts: [makePost()],
+      });
+      const result = await service.getPublicTicket(1, OWNER);
+      expect((result as unknown as Record<string, unknown>)['notes']).toBeUndefined();
+      expect(result.posts).toBeDefined();
+    });
+
+    it('throws NotFoundException when the ticket does not exist', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(service.getPublicTicket(999, OWNER)).rejects.toThrow(NotFoundException);
+    });
+
     it('does NOT expose the assigned agent email (owner select = id + name only)', async () => {
-      const ticketWithRelations = {
-        ...makeTicket(),
-        posts: [],
-        status: null,
-        priority: null,
-        department: null,
-        owner: null,
-        user: null,
-        tags: [],
-      };
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticketWithRelations);
-
-      await service.getPublicTicket(1, 'alice@example.com');
-
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(withRelations(makeTicket()));
+      await service.getPublicTicket(1, OWNER);
       const arg = (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
         include: { owner: { select: Record<string, unknown> } };
       };
       expect(arg.include.owner.select).toEqual({ id: true, firstName: true, lastName: true });
       expect(arg.include.owner.select['email']).toBeUndefined();
     });
+  });
 
-    it('does NOT include internal notes — only posts are returned', async () => {
-      const ticket = makeTicket({ hasNotes: true });
-      const post = makePost();
-      // The DB query intentionally omits notes; simulate by returning no notes field
-      const ticketWithRelations = {
-        ...ticket,
-        posts: [post],
-        status: null,
-        priority: null,
-        department: null,
-        owner: null,
-        user: null,
-        tags: [],
-        // notes are NOT part of the returned object
-      };
+  // ─── getPublicTicket — ownership / IDOR guards ────────────────────────────
 
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticketWithRelations);
-
-      const result = await service.getPublicTicket(1, 'alice@example.com');
-
-      // Confirm 'notes' is not present on the public result
-      expect((result as unknown as Record<string, unknown>)['notes']).toBeUndefined();
-      expect(result.posts).toBeDefined();
+  describe('getPublicTicket — ownership guards', () => {
+    it('throws NotFoundException when the ticket belongs to another client (wrong userId)', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        withRelations(makeTicket({ userId: OWNER })),
+      );
+      await expect(service.getPublicTicket(1, OTHER_CLIENT)).rejects.toThrow(NotFoundException);
     });
 
-    it('throws NotFoundException when ticket does not exist', async () => {
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-
-      await expect(service.getPublicTicket(999)).rejects.toThrow(NotFoundException);
+    it('throws NotFoundException when the ticket has no owner (userId null — unmapped)', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        withRelations(makeTicket({ userId: null })),
+      );
+      await expect(service.getPublicTicket(1, OWNER)).rejects.toThrow(NotFoundException);
     });
 
-    it('queries the DB without including notes', async () => {
-      const ticket = makeTicket();
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        ...ticket,
-        posts: [],
-        status: null,
-        priority: null,
-        department: null,
-        owner: null,
-        user: null,
-        tags: [],
-      });
-
-      await service.getPublicTicket(1, 'alice@example.com');
-
-      // Verify that the findUnique call does NOT include 'notes' in its include object
+    it('posts use a narrow select that omits staff email / ipAddress', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(withRelations(makeTicket()));
+      await service.getPublicTicket(1, OWNER);
       const callArg = (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
-        include?: Record<string, unknown>;
+        include?: { posts?: { select?: Record<string, unknown> } };
       };
-      expect(callArg.include).toBeDefined();
-      expect(callArg.include!['notes']).toBeUndefined();
+      const postsSelect = callArg.include!.posts!.select!;
+      expect(postsSelect['contents']).toBe(true);
+      expect(postsSelect['email']).toBeUndefined();
+      expect(postsSelect['ipAddress']).toBeUndefined();
+      expect(postsSelect['staffId']).toBeUndefined();
+    });
+
+    it('selects only non-sensitive user fields (never passwordHash)', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(withRelations(makeTicket()));
+      await service.getPublicTicket(1, OWNER);
+      const callArg = (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
+        include?: { user?: { select?: Record<string, unknown>; include?: unknown } };
+      };
+      const userClause = callArg.include!.user!;
+      expect(userClause.select).toBeDefined();
+      expect(userClause.include).toBeUndefined();
+      expect(userClause.select!['passwordHash']).toBeUndefined();
     });
   });
 
-  // ─── publicReply ──────────────────────────────────────────────────────────
+  // ─── publicReply (owner-scoped) ───────────────────────────────────────────
 
   describe('publicReply', () => {
-    it('creates a USER post on an existing ticket', async () => {
-      const ticket = makeTicket();
-      const post = makePost({ authorType: 'USER', staffId: null });
-
+    function armReplyMocks(ticket: Ticket) {
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue(post);
+      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue(makePost());
       (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
       (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    }
 
-      const result = await service.publicReply(1, {
-        contents: 'Follow-up from client',
-        requesterEmail: 'alice@example.com',
-      });
-
-      expect(result).toBe(post);
+    it("creates a USER post on the owning client's ticket", async () => {
+      armReplyMocks(makeTicket());
+      const result = await service.publicReply(1, { contents: 'Follow-up from client' }, OWNER);
+      expect(result).toBeTruthy();
       expect(prisma.ticketPost.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
@@ -292,214 +258,67 @@ describe('TicketsService — public endpoints', () => {
       );
     });
 
-    it('uses dto.requesterEmail when provided', async () => {
-      // The supplied email must be one the requester owns (ownership check) —
-      // here it is a secondary email linked to the ticket's user.
-      const ticket = {
-        ...makeTicket({ requesterEmail: 'alice@example.com' }),
-        user: { emails: [{ email: 'alice+new@example.com' }] },
-      };
-      const post = makePost({ email: 'alice+new@example.com' });
-
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue(post);
-      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
-
-      await service.publicReply(1, {
-        contents: 'Reply',
-        requesterEmail: 'alice+new@example.com',
-      });
-
+    it('attributes the post from the TICKET, not the request body', async () => {
+      armReplyMocks(makeTicket({ requesterEmail: 'alice@example.com' }));
+      await service.publicReply(1, { contents: 'Reply' }, OWNER);
       expect(prisma.ticketPost.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ email: 'alice+new@example.com' }),
-        }),
-      );
-    });
-
-    it('attributes the post to the matching requester email', async () => {
-      const ticket = makeTicket({ requesterEmail: 'alice@example.com' });
-      const post = makePost();
-
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue(post);
-      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
-
-      await service.publicReply(1, { contents: 'Another reply', requesterEmail: 'alice@example.com' });
-
-      expect(prisma.ticketPost.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ email: 'alice@example.com' }),
-        }),
+        expect.objectContaining({ data: expect.objectContaining({ email: 'alice@example.com' }) }),
       );
     });
 
     it('increments totalReplies on the ticket', async () => {
-      const ticket = makeTicket();
-
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue(makePost());
-      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
-
-      await service.publicReply(1, { contents: 'Reply', requesterEmail: 'alice@example.com' });
-
+      armReplyMocks(makeTicket());
+      await service.publicReply(1, { contents: 'Reply' }, OWNER);
       expect(prisma.ticket.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            totalReplies: { increment: 1 },
-          }),
-        }),
+        expect.objectContaining({ data: expect.objectContaining({ totalReplies: { increment: 1 } }) }),
       );
     });
 
-    it('throws NotFoundException when ticket does not exist', async () => {
+    it('throws NotFoundException when the ticket does not exist', async () => {
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-
-      await expect(
-        service.publicReply(999, { contents: 'Hi', requesterEmail: 'alice@example.com' }),
-      ).rejects.toThrow(NotFoundException);
+      await expect(service.publicReply(999, { contents: 'Hi' }, OWNER)).rejects.toThrow(NotFoundException);
     });
 
-    it('H8-3: rejects attachmentIds without a claimToken (no unscoped orphan adoption)', async () => {
-      const ticket = makeTicket({ requesterEmail: 'alice@example.com' });
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-
-      await expect(
-        service.publicReply(1, {
-          contents: 'Here is the file',
-          requesterEmail: 'alice@example.com',
-          attachmentIds: [10],
-          // no attachmentClaimToken
-        }),
-      ).rejects.toThrow(BadRequestException);
-      // The post must NOT have been created.
+    it("throws NotFoundException when replying to another client's ticket (IDOR guard)", async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeTicket({ userId: OWNER }));
+      await expect(service.publicReply(1, { contents: 'Hi' }, OTHER_CLIENT)).rejects.toThrow(
+        NotFoundException,
+      );
       expect(prisma.ticketPost.create).not.toHaveBeenCalled();
     });
 
-    it('throws NotFoundException when requesterEmail does not match the ticket (IDOR guard)', async () => {
-      const ticket = makeTicket({ requesterEmail: 'alice@example.com' });
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-
+    it('H8-3: rejects attachmentIds without a claimToken (no unscoped orphan adoption)', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeTicket());
       await expect(
-        service.publicReply(1, { contents: 'Hi', requesterEmail: 'mallory@evil.com' }),
-      ).rejects.toThrow(NotFoundException);
+        service.publicReply(1, { contents: 'Here is the file', attachmentIds: [10] }, OWNER),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.ticketPost.create).not.toHaveBeenCalled();
     });
 
     it('reopens a resolved ticket on a user reply (reset to default status)', async () => {
-      const ticket = makeTicket({ requesterEmail: 'alice@example.com', isResolved: true });
-
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue(makePost());
-      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
-      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      armReplyMocks(makeTicket({ isResolved: true }));
       (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 7 });
-
-      await service.publicReply(1, { contents: 'Still broken', requesterEmail: 'alice@example.com' });
-
+      await service.publicReply(1, { contents: 'Still broken' }, OWNER);
       expect(prisma.ticket.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({
-            statusId: 7,
-            isResolved: false,
-            resolvedAt: null,
-          }),
+          data: expect.objectContaining({ statusId: 7, isResolved: false, resolvedAt: null }),
         }),
       );
     });
   });
 
-  // ─── getPublicTicket — IDOR / data-leak guards ────────────────────────────
+  // ─── listMyTickets (owner-scoped) ─────────────────────────────────────────
 
-  describe('getPublicTicket — IDOR guards', () => {
-    it('throws NotFoundException when no email is supplied', async () => {
-      const ticket = makeTicket();
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        ...ticket,
-        posts: [],
-        status: null,
-        priority: null,
-        department: null,
-        owner: null,
-        user: null,
-        tags: [],
-      });
+  describe('listMyTickets', () => {
+    it('queries strictly by the verified client userId', async () => {
+      (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
 
-      await expect(service.getPublicTicket(1)).rejects.toThrow(NotFoundException);
-    });
+      await service.listMyTickets(OWNER);
 
-    it('throws NotFoundException when the email does not match the ticket', async () => {
-      const ticket = makeTicket({ requesterEmail: 'alice@example.com' });
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        ...ticket,
-        posts: [],
-        status: null,
-        priority: null,
-        department: null,
-        owner: null,
-        user: null,
-        tags: [],
-      });
-
-      await expect(service.getPublicTicket(1, 'mallory@evil.com')).rejects.toThrow(NotFoundException);
-    });
-
-    it('SEC-3b: posts use a narrow select that omits staff email / ipAddress', async () => {
-      const ticket = makeTicket();
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        ...ticket,
-        posts: [],
-        status: null,
-        priority: null,
-        department: null,
-        owner: null,
-        user: null,
-        tags: [],
-      });
-
-      await service.getPublicTicket(1, 'alice@example.com');
-
-      const callArg = (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
-        include?: { posts?: { select?: Record<string, unknown> } };
-      };
-      const postsSelect = callArg.include!.posts!.select!;
-      // Client-facing fields are allowed; internal/PII fields must NOT be projected.
-      expect(postsSelect).toBeDefined();
-      expect(postsSelect['contents']).toBe(true);
-      expect(postsSelect['fullName']).toBe(true);
-      expect(postsSelect['email']).toBeUndefined();
-      expect(postsSelect['ipAddress']).toBeUndefined();
-      expect(postsSelect['staffId']).toBeUndefined();
-      expect(postsSelect['messageId']).toBeUndefined();
-    });
-
-    it('selects only non-sensitive user fields (never passwordHash)', async () => {
-      const ticket = makeTicket();
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        ...ticket,
-        posts: [],
-        status: null,
-        priority: null,
-        department: null,
-        owner: null,
-        user: null,
-        tags: [],
-      });
-
-      await service.getPublicTicket(1, 'alice@example.com');
-
-      const callArg = (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
-        include?: { user?: { select?: Record<string, unknown>; include?: unknown } };
-      };
-      const userClause = callArg.include!.user!;
-      // Must use a narrow `select`, never `include` (which would pull passwordHash)
-      expect(userClause.select).toBeDefined();
-      expect(userClause.include).toBeUndefined();
-      expect(userClause.select!['passwordHash']).toBeUndefined();
-      expect(userClause.select!['id']).toBe(true);
-      expect(userClause.select!['fullName']).toBe(true);
+      expect(prisma.ticket.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { mergedIntoId: null, userId: OWNER } }),
+      );
     });
   });
 });

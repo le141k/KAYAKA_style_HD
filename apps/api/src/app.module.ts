@@ -9,6 +9,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { loadConfig, APP_CONFIG } from './config/configuration';
 import { buildPinoHttpOptions } from './config/logging';
 import { AuthModule } from './auth/auth.module';
+import { ClientAuthModule } from './modules/client-auth/client-auth.module';
 import { StaffModule } from './modules/staff/staff.module';
 import { UsersModule } from './modules/users/users.module';
 import { OrganizationsModule } from './modules/organizations/organizations.module';
@@ -77,6 +78,7 @@ const redisUrl = new URL(config.REDIS_URL);
 
     // Feature modules
     AuthModule,
+    ClientAuthModule,
     StaffModule,
     UsersModule,
     OrganizationsModule,

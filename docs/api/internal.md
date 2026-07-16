@@ -168,6 +168,33 @@ listRules / createRule / updateRule / deleteRule
 
 ---
 
+## ClientAuthService (`apps/api/src/modules/client-auth/client-auth.service.ts`)
+
+Verified client (customer) auth (S2). Consumed by `ClientAuthController` and `ClientAuthGuard`.
+
+```ts
+requestLink(rawEmail: string): Promise<void>
+// Always resolves (no enumeration). Queues a single-use magic-link only when the
+// normalized email maps to EXACTLY ONE User.id that owns ≥1 ticket. Fragment URL;
+// invalidates the token if mail dispatch fails.
+
+verify(rawToken: string): Promise<{ sessionToken: string; expiresAt: Date }>
+// Atomic single-use consume (updateMany count===1) → opens a ClientSession.
+
+resolveSession(rawSession: string): Promise<{ userId: number } | null>
+// Hash-lookup; null if revoked/expired. Used by ClientAuthGuard (fails closed 503 on error).
+
+logout(rawSession): Promise<void>          // revoke the session
+cleanupExpired(): Promise<{tokens; sessions}> // idempotent TTL sweep (scheduled hourly, S2-11)
+```
+
+`@ClientAuthenticated()` = `@Public()` + `@UseGuards(ClientAuthGuard)`; `@CurrentClient()` injects
+`{ userId }`. Client ticket routes authorize by `Ticket.userId === client.userId`.
+
+> **Reset-mail adapter (S1-3).** `AuthModule` does NOT import `MailModule` (that would pull the
+> Mail→Tickets→Sla→Mail module-load cycle at boot). It registers the `mail` queue and provides a
+> local `MailService` bound to `MAIL_SERVICE_TOKEN` — cycle-free; enqueues to the same Redis queue.
+
 ## MailService (`apps/api/src/modules/mail/mail.service.ts`)
 
 ```ts

@@ -306,21 +306,9 @@ export class TicketsService {
    * Matches requesterEmail directly OR any UserEmail linked to a User row.
    * Used by the client-facing "my tickets" page (@Public endpoint).
    */
-  async listMyTickets(requesterEmail: string): Promise<{ data: PublicTicketListItem[]; total: number }> {
-    // Build OR clause: direct requesterEmail OR through the user's emails
-    const where = {
-      mergedIntoId: null,
-      OR: [
-        { requesterEmail: { equals: requesterEmail, mode: 'insensitive' as const } },
-        {
-          user: {
-            emails: {
-              some: { email: { equals: requesterEmail, mode: 'insensitive' as const } },
-            },
-          },
-        },
-      ],
-    };
+  async listMyTickets(clientUserId: number): Promise<{ data: PublicTicketListItem[]; total: number }> {
+    // Authorize strictly by stable ownership — the verified session's userId (S2-7).
+    const where = { mergedIntoId: null, userId: clientUserId };
 
     const [data, total] = await Promise.all([
       this.prisma.ticket.findMany({
@@ -347,7 +335,7 @@ export class TicketsService {
    * NEVER included.  Shape mirrors getTicket() but omits notes/watchers/auditLogs.
    * Used by the @Public GET /tickets/public/:id endpoint.
    */
-  async getPublicTicket(id: number, requesterEmail?: string): Promise<PublicTicketDetail> {
+  async getPublicTicket(id: number, clientUserId: number): Promise<PublicTicketDetail> {
     const ticket = await this.prisma.ticket.findUnique({
       where: { id },
       include: {
@@ -380,9 +368,8 @@ export class TicketsService {
 
     if (!ticket) throw new NotFoundException(`Ticket ${id} not found`);
 
-    // Ownership check: a public ticket is enumerable by integer id, so the caller
-    // must prove they own it by supplying the matching requester email.
-    this.assertRequesterOwnsTicket(ticket, requesterEmail);
+    // Ownership check: authorize only when the ticket belongs to the verified client.
+    this.assertClientOwnsTicket(ticket, clientUserId);
 
     // Redact infra/PII + internal columns before returning to the @Public caller.
     // (findUnique with top-level `include` returns ALL ticket scalars.) Keep only
@@ -415,29 +402,13 @@ export class TicketsService {
   }
 
   /**
-   * Verify the supplied email matches the ticket's requester (direct
-   * requesterEmail OR any of the linked user's emails). Throws NotFoundException
-   * (not Forbidden) so callers cannot distinguish "wrong email" from
-   * "no such ticket" and enumerate valid ids.
+   * Authorize a verified client for a ticket by STABLE ownership (S2-7):
+   * `Ticket.userId` must equal the session's `userId`. Throws NotFoundException (not
+   * Forbidden) so wrong-owner, unmapped (null userId) and missing tickets are all
+   * indistinguishable — no enumeration and no "email as password".
    */
-  private assertRequesterOwnsTicket(
-    ticket: {
-      id: number;
-      requesterEmail: string | null;
-      user?: { emails?: { email: string }[] } | null;
-    },
-    requesterEmail?: string,
-  ): void {
-    if (!requesterEmail) {
-      throw new NotFoundException(`Ticket ${ticket.id} not found`);
-    }
-    const supplied = requesterEmail.trim().toLowerCase();
-    const owned = new Set<string>();
-    if (ticket.requesterEmail) owned.add(ticket.requesterEmail.toLowerCase());
-    for (const e of ticket.user?.emails ?? []) {
-      if (e.email) owned.add(e.email.toLowerCase());
-    }
-    if (!owned.has(supplied)) {
+  private assertClientOwnsTicket(ticket: { id: number; userId: number | null }, clientUserId: number): void {
+    if (ticket.userId === null || ticket.userId !== clientUserId) {
       throw new NotFoundException(`Ticket ${ticket.id} not found`);
     }
   }
@@ -450,19 +421,17 @@ export class TicketsService {
    * own requesterName / requesterEmail fields (or the optional dto fields).
    * Internal notes are never involved.
    */
-  async publicReply(ticketId: number, dto: PublicReplyDto): Promise<TicketPost> {
+  async publicReply(ticketId: number, dto: PublicReplyDto, clientUserId: number): Promise<TicketPost> {
     const ticket = await this.prisma.ticket.findUnique({
       where: { id: ticketId },
       include: {
-        user: { select: { emails: { select: { email: true } } } },
         status: { select: { markAsResolved: true, title: true } },
       },
     });
     if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
 
-    // Ownership check: the requester must supply a matching email so a random
-    // integer id cannot be used to post on someone else's ticket.
-    this.assertRequesterOwnsTicket(ticket, dto.requesterEmail);
+    // Ownership check: only the verified owner of this ticket may reply (S2-7).
+    this.assertClientOwnsTicket(ticket, clientUserId);
 
     // U-medium: block public replies on definitively-closed tickets.
     // Strategy: a ticket is "closed" (not merely "resolved") when its status is
@@ -499,7 +468,8 @@ export class TicketsService {
         staffId: null,
         userId: ticket.userId,
         fullName: ticket.requesterName ?? undefined,
-        email: dto.requesterEmail ?? ticket.requesterEmail ?? undefined,
+        // Identity is taken from the ticket/session, never from the request body.
+        email: ticket.requesterEmail ?? undefined,
         subject: ticket.subject,
         contents: dto.contents,
         isHtml: false,

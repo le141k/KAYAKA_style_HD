@@ -73,8 +73,9 @@ and inventory are completed before any production mutation or migration.
 - [ ] **H2 Close the client IDOR:** API fail-closes list/detail/reply and client attachment access;
       temporarily hide/disable those UI actions until the verified client-session flow is complete.
       Untrusted public attachment upload stays disabled until S4 is green.
-      _(API side done via S2-1 `ClientPortalGuard` — prod returns 404 for the email-as-password
-      routes + public upload. UI hide still pending (S2-9).)_
+      _(Done on the API: my/detail/reply now require a verified client session (S2-6/7) bound to
+      `Ticket.userId`; public create + upload stay fail-closed 404 in prod (S2-1). UI hide + client
+      attachment download still pending (S2-8/9).)_
 - [ ] **H3 Close staff-auth gaps:** use DB-backed `authVersion`, logout-all revocation, atomic refresh
       rotation and origin + CSRF checks for every cookie-authenticated mutation.
       _(Done: DB-backed `authVersion` + logout-all revocation (S3-1/2/4) and atomic refresh rotation
@@ -214,6 +215,20 @@ This batch must deploy before creating any new magic-link/session secret.
 ## 🔴 S2 — Replace “email as password” with a verified client session
 
 Current public list/detail/reply routes must not be exposed until this batch is complete.
+
+> **Progress.** The client-session backend core is **done and verified end-to-end on live
+> Postgres + a full built-app boot smoke**: **S2-1** (fail-closed gate), **S2-3** (`ClientLoginToken`
+>
+> - `ClientSession` models/migration, hashed tokens bound to `User.id`), **S2-4** (request-link:
+>   unambiguous-owner-only, always-202, no enumeration), **S2-5** (verify: atomic single-use consume,
+>   `#token=` fragment, HttpOnly `th_client` cookie), **S2-6** (`@ClientAuthenticated` decorator +
+>   `ClientAuthGuard`, fail-closed 503, logout/revocation), **S2-7** (ownership strictly by
+>   `Ticket.userId === session.userId`; `?email=`/`requesterEmail` removed), **S2-11** (idempotent
+>   scheduled cleanup). Verified: 607 unit tests; live e2e proved cross-client isolation, single-use
+>   replay rejection, logout revocation; built app boots and `tickets/my` → 401 without a session.
+>   **Still open:** S2-2 (UserEmail normalization + `Ticket.userId` backfill — currently null-userId
+>   tickets simply fail closed), S2-8 (owner-scoped client attachment download), S2-9 (client UI),
+>   S2-10 (full replay/enumeration e2e matrix).
 
 - [x] **S2-1 Add a fail-closed interim gate.** While S2 is incomplete, production must return 404/503
       for `GET /api/tickets/my`, `GET /api/tickets/public/:id`, client attachment download and

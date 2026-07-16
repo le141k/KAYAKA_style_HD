@@ -185,6 +185,40 @@ model PasswordReset {
   @@index([staffId])
 }
 
+// ─── Verified client (customer) auth — GOAL_PUBLIC_SECURITY S2 ───
+// Replaces "knowing an email" with a verified, revocable session bound to a stable
+// User.id. Only SHA-256 hashes of cryptographically-random tokens are stored; the raw
+// token is never persisted. `email` is an audit snapshot, NEVER the authorization key.
+
+model ClientLoginToken {
+  id        String    @id @default(uuid())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    Int
+  tokenHash String    @unique // sha256 hex of the single-use raw login token
+  email     String // normalized-email snapshot (audit only)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model ClientSession {
+  id         String    @id @default(uuid())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     Int
+  tokenHash  String    @unique // sha256 hex of the raw session cookie value
+  email      String // normalized-email snapshot (audit only)
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
 // ───────────────────────────── customers / orgs ─────────────────────────────
 
 model UserGroup {
@@ -234,6 +268,8 @@ model User {
   organizationId Int?
   emails         UserEmail[]
   tickets        Ticket[]
+  loginTokens    ClientLoginToken[]
+  sessions       ClientSession[]
   posts          TicketPost[]
   geoip          Json?
   customFields   Json          @default("{}")

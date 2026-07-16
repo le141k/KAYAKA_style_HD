@@ -20,6 +20,8 @@ import { Throttle } from '@nestjs/throttler';
 import { TicketsService } from './tickets.service';
 import { RequirePermissions, CurrentStaff, Public } from '../../auth/auth.decorators';
 import { ClientPortalGuard } from '../../auth/client-portal.guard';
+import { ClientAuthenticated, CurrentClient } from '../client-auth/client-auth.decorators';
+import type { ClientPrincipal } from '../client-auth/client-auth.service';
 import type { AuthStaff } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
@@ -105,47 +107,38 @@ export class TicketsController {
 
   // ─────────────────── Client: my tickets ───────────────────
 
-  @Public()
-  @UseGuards(ClientPortalGuard)
+  @ClientAuthenticated()
   @Get('my')
   @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
-  @ApiOperation({ summary: "List the current requester's tickets by email (client portal)" })
-  listMy(@Query('email') email: string | undefined) {
-    if (!email) {
-      throw new BadRequestException('Query parameter "email" is required');
-    }
-    return this.ticketsService.listMyTickets(email);
+  @ApiOperation({ summary: "List the verified client's own tickets (session-authenticated)" })
+  listMy(@CurrentClient() client: ClientPrincipal) {
+    return this.ticketsService.listMyTickets(client.userId);
   }
 
   // ─────────────────── Client: public ticket detail ───────────────────
 
-  @Public()
-  @UseGuards(ClientPortalGuard)
+  @ClientAuthenticated()
   @Get('public/:id')
   @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
   @ApiOperation({
-    summary:
-      'Get a single ticket (no auth) with public posts only — no internal notes. Requires ?email= matching the ticket requester.',
+    summary: "Get one of the verified client's own tickets (public posts only, no internal notes).",
   })
-  getPublic(@Param('id', ParseIntPipe) id: number, @Query('email') email: string | undefined) {
-    if (!email) {
-      throw new BadRequestException('Query parameter "email" is required');
-    }
-    return this.ticketsService.getPublicTicket(id, email);
+  getPublic(@Param('id', ParseIntPipe) id: number, @CurrentClient() client: ClientPrincipal) {
+    return this.ticketsService.getPublicTicket(id, client.userId);
   }
 
   // ─────────────────── Client: public reply ───────────────────
 
-  @Public()
-  @UseGuards(ClientPortalGuard)
+  @ClientAuthenticated()
   @Post('public/:id/reply')
   @Throttle({ default: { limit: PUBLIC_REPLY_LIMIT, ttl: 60000 } })
-  @ApiOperation({ summary: 'Add a user reply to a ticket from the client portal (no auth required)' })
+  @ApiOperation({ summary: "Add a reply to the verified client's own ticket (session-authenticated)" })
   publicReply(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(PublicReplySchema)) dto: PublicReplyDto,
+    @CurrentClient() client: ClientPrincipal,
   ) {
-    return this.ticketsService.publicReply(id, dto);
+    return this.ticketsService.publicReply(id, dto, client.userId);
   }
 
   // ─────────────────── Staff routes ───────────────────

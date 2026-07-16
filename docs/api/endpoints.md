@@ -28,13 +28,25 @@ All routes are under the `/api` global prefix.
 
 ## Tickets
 
-> **Client-portal gate (GOAL_PUBLIC_SECURITY S2-1).** The anonymous routes
-> `POST /api/tickets/public`, `GET /api/tickets/my`, `GET /api/tickets/public/{id}`,
-> `POST /api/tickets/public/{id}/reply` and `POST /api/attachments/upload/public` authorize
-> by "knowing an email" (an IDOR). They are **fail-closed in production** (`ClientPortalGuard`
-> returns 404) until the verified client-session flow (S2) and abuse controls (S4) land. Set
-> `TELECOM_HD_CLIENT_PORTAL_ENABLED=true` to re-open them — do not do so before S2/S4. Dev/test
-> are unaffected.
+> **Client access (GOAL_PUBLIC_SECURITY S2).** `GET /api/tickets/my`,
+> `GET /api/tickets/public/{id}` and `POST /api/tickets/public/{id}/reply` now require a
+> **verified client session** (`@ClientAuthenticated` → `th_client` cookie); they authorize
+> strictly by `Ticket.userId === session.userId` (no `?email=`), returning 401 without a
+> session and the same 404 for wrong-owner / unmapped / missing tickets. Obtain a session via
+> the `/api/client-auth/*` routes below.
+>
+> `POST /api/tickets/public` (create) and `POST /api/attachments/upload/public` remain gated by
+> `ClientPortalGuard` (fail-closed **404 in production** until S4 abuse controls land; override
+> with `TELECOM_HD_CLIENT_PORTAL_ENABLED=true`, not before S4). Dev/test are unaffected.
+
+## Client auth (verified customer sessions — S2)
+
+| Method | Path                          | Auth              | Body                   | Returns                                           |
+| ------ | ----------------------------- | ----------------- | ---------------------- | ------------------------------------------------- |
+| POST   | /api/client-auth/request-link | 🔓 (throttled)    | `{email}`              | Always 202 `{message}` — no account enumeration   |
+| POST   | /api/client-auth/verify       | 🔓 (throttled)    | `{token}` (from #frag) | 200 `{ok, expiresAt}` + sets HttpOnly `th_client` |
+| POST   | /api/client-auth/logout       | 🔑 client session | —                      | 204; revokes the session + clears the cookie      |
+| GET    | /api/client-auth/me           | 🔑 client session | —                      | `{userId}`                                        |
 
 | Method | Path                                 | Auth               | Body                                                                                                                          | Returns                                                     |
 | ------ | ------------------------------------ | ------------------ | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
