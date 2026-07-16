@@ -69,19 +69,28 @@ All routes are under the `/api` global prefix.
 
 ---
 
-## Staff
+## Staff & RBAC
 
-| Method | Path                   | Auth              | Body                                                   | Returns                               |
-| ------ | ---------------------- | ----------------- | ------------------------------------------------------ | ------------------------------------- |
-| GET    | /api/staff/groups      | 🔒 `staff.manage` | —                                                      | `StaffGroup[]`                        |
-| GET    | /api/staff/groups/{id} | 🔒 `staff.manage` | —                                                      | `StaffGroup`                          |
-| POST   | /api/staff/groups      | 🔒 `staff.manage` | `{title, isAdmin?, permissions?}`                      | Created group                         |
-| PATCH  | /api/staff/groups/{id} | 🔒 `staff.manage` | Partial group fields                                   | Updated group                         |
-| GET    | /api/staff             | 🔒 `staff.manage` | — (query: search, groupId, page, limit)                | `Staff[]`                             |
-| GET    | /api/staff/{id}        | 🔒 `staff.manage` | —                                                      | `Staff`                               |
-| POST   | /api/staff             | 🔒 `staff.manage` | `{email, firstName, lastName, password, staffGroupId}` | Created staff member                  |
-| PATCH  | /api/staff/{id}        | 🔒 `staff.manage` | Partial staff fields                                   | Updated staff member                  |
-| DELETE | /api/staff/{id}        | 🔒 `staff.manage` | —                                                      | Soft-disabled staff (isEnabled=false) |
+| Method | Path                   | Auth              | Body                                                               | Returns                                                                                                             |
+| ------ | ---------------------- | ----------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| GET    | /api/staff/rbac        | 🔒 `staff.manage` | —                                                                  | `{permissions[], roles[]}` catalog + built-in role templates (Administrator/Manager/Agent)                          |
+| GET    | /api/staff/audit       | 🔒 `staff.manage` | — (query: page, limit)                                             | `{data: RbacAuditLog[], total}` (newest first)                                                                      |
+| GET    | /api/staff/groups      | 🔒 `staff.manage` | —                                                                  | `StaffGroup[]`                                                                                                      |
+| GET    | /api/staff/groups/{id} | 🔒 `staff.manage` | —                                                                  | `StaffGroup`                                                                                                        |
+| POST   | /api/staff/groups      | 🔒 `staff.manage` | `{title, isAdmin?, permissions?}` (unknown perm key → 400)         | Created group; a delegated non-admin may grant only permissions they already hold                                   |
+| PATCH  | /api/staff/groups/{id} | 🔒 `staff.manage` | Partial group fields (`isAdmin` immutable; unknown perm key → 400) | Updated group — a permissions change revokes all group members' sessions; delegated authority is subset-only        |
+| DELETE | /api/staff/groups/{id} | 🔒 `staff.manage` | —                                                                  | 204; 409 if members assigned; 403 if protected/last admin group                                                     |
+| GET    | /api/staff             | 🔒 `staff.manage` | — (query: search, groupId, enabled, page, limit)                   | `{data: Staff[], total}`                                                                                            |
+| GET    | /api/staff/{id}        | 🔒 `staff.manage` | —                                                                  | `Staff`                                                                                                             |
+| POST   | /api/staff             | 🔒 `staff.manage` | `{email, username, firstName, lastName, password, staffGroupId}`   | Created staff member; delegated authority is subset-only                                                            |
+| PATCH  | /api/staff/{id}        | 🔒 `staff.manage` | Partial staff fields                                               | Updated staff — role/password/disable change revokes sessions; protected admins and last-active-admin removal → 403 |
+| DELETE | /api/staff/{id}        | 🔒 `staff.manage` | —                                                                  | Soft-disabled staff (isEnabled=false); revokes sessions; protected/last active admin → 403                          |
+
+> **Session revocation.** Changing a staff member's role (group), password, or
+> `isEnabled=false` — and changing a group's permission set — revokes that
+> member's refresh tokens and sets a per-staff access-token cutoff, so existing
+> sessions can no longer act with stale rights (access tokens are rejected
+> immediately; refresh is blocked durably).
 
 ---
 
@@ -107,7 +116,7 @@ All routes are under the `/api` global prefix.
 | GET    | /api/organizations/{id} | 🔒 `org.manage` | —                              | `Organization`       |
 | POST   | /api/organizations      | 🔒 `org.manage` | `{name, website?, slaPlanId?}` | Created organization |
 | PATCH  | /api/organizations/{id} | 🔒 `org.manage` | Partial org fields             | Updated organization |
-| DELETE | /api/organizations/{id} | 🔒 `org.manage` | —                              | 204 No Content       |
+| DELETE | /api/organizations/{id} | 🔒 `org.delete` | —                              | 204 No Content       |
 
 ---
 
@@ -285,15 +294,15 @@ SLA plans, schedules, holidays, and escalation rules. All routes require `admin.
 
 ## Admin / Custom Fields
 
-| Method | Path                                            | Auth                    | Body                                                                          | Returns                                                         |
+| Method | Path | Auth | Body | Returns |
 | ------ | ----------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------- | ------- | ------------------------------- | ------------- |
-| GET    | /api/admin/custom-field-groups                  | 🔒 `admin.customfields` | —                                                                             | `CustomFieldGroup[]` (includes fields, ordered by displayOrder) |
-| POST   | /api/admin/custom-field-groups                  | 🔒 `admin.customfields` | `{title, scope: 'TICKET'                                                      | 'USER'                                                          | 'STAFF' | 'ORGANIZATION', displayOrder?}` | Created group |
-| PATCH  | /api/admin/custom-field-groups/{id}             | 🔒 `admin.customfields` | Partial group fields                                                          | Updated group                                                   |
-| DELETE | /api/admin/custom-field-groups/{id}             | 🔒 `admin.customfields` | —                                                                             | 204 No Content                                                  |
-| POST   | /api/admin/custom-field-groups/{groupId}/fields | 🔒 `admin.customfields` | `{fieldKey, title, type, isRequired?, isEncrypted?, options?, displayOrder?}` | Created field                                                   |
-| PATCH  | /api/admin/custom-fields/{id}                   | 🔒 `admin.customfields` | Partial field fields (fieldKey immutable)                                     | Updated field                                                   |
-| DELETE | /api/admin/custom-fields/{id}                   | 🔒 `admin.customfields` | —                                                                             | 204 No Content                                                  |
+| GET | /api/admin/custom-field-groups | 🔒 `admin.customfields` | — | `CustomFieldGroup[]` (includes fields, ordered by displayOrder) |
+| POST | /api/admin/custom-field-groups | 🔒 `admin.customfields` | `{title, scope: 'TICKET'                                                      | 'USER'                                                          | 'STAFF' | 'ORGANIZATION', displayOrder?}` | Created group |
+| PATCH | /api/admin/custom-field-groups/{id} | 🔒 `admin.customfields` | Partial group fields | Updated group |
+| DELETE | /api/admin/custom-field-groups/{id} | 🔒 `admin.customfields` | — | 204 No Content |
+| POST | /api/admin/custom-field-groups/{groupId}/fields | 🔒 `admin.customfields` | `{fieldKey, title, type, isRequired?, isEncrypted?, options?, displayOrder?}` | Created field |
+| PATCH | /api/admin/custom-fields/{id} | 🔒 `admin.customfields` | Partial field fields (fieldKey immutable) | Updated field |
+| DELETE | /api/admin/custom-fields/{id} | 🔒 `admin.customfields` | — | 204 No Content |
 
 > `type` enum: `TEXT | TEXTAREA | PASSWORD | CHECKBOX | RADIO | SELECT | MULTISELECT | DATE | FILE | CUSTOM`.
 

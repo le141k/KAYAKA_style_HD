@@ -14,8 +14,9 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { StaffService } from './staff.service';
+import { RbacAuditService } from './rbac-audit.service';
 import { CurrentStaff, RequirePermissions, type AuthStaff } from '../../auth/auth.decorators';
-import { PERMISSIONS } from '../../auth/permissions';
+import { PERMISSIONS, RBAC_CATALOG } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
   CreateStaffSchema,
@@ -23,17 +24,42 @@ import {
   CreateStaffGroupSchema,
   UpdateStaffGroupSchema,
   ListStaffQuerySchema,
+  ListAuditQuerySchema,
   type CreateStaffDto,
   type UpdateStaffDto,
   type CreateStaffGroupDto,
   type UpdateStaffGroupDto,
   type ListStaffQueryDto,
+  type ListAuditQueryDto,
 } from './dto';
 
 @ApiTags('staff')
 @Controller('staff')
 export class StaffController {
-  constructor(private readonly staffService: StaffService) {}
+  constructor(
+    private readonly staffService: StaffService,
+    private readonly auditService: RbacAuditService,
+  ) {}
+
+  // ─────────────────── RBAC catalog ───────────────────
+
+  // Single source of truth for the permission catalog + built-in role templates,
+  // consumed by the admin UI so pickers/summaries never drift from the backend.
+  @Get('rbac')
+  @RequirePermissions(PERMISSIONS.STAFF_MANAGE)
+  @ApiOperation({ summary: 'RBAC catalog: permissions + built-in role templates' })
+  rbacCatalog() {
+    return RBAC_CATALOG;
+  }
+
+  // ─────────────────── Audit log ───────────────────
+
+  @Get('audit')
+  @RequirePermissions(PERMISSIONS.STAFF_MANAGE)
+  @ApiOperation({ summary: 'List RBAC audit-log entries (most recent first)' })
+  listAudit(@Query(new ZodValidationPipe(ListAuditQuerySchema)) query: ListAuditQueryDto) {
+    return this.auditService.list(query);
+  }
 
   // ─────────────────── Groups ───────────────────
 
@@ -73,9 +99,9 @@ export class StaffController {
   @Delete('groups/:id')
   @RequirePermissions(PERMISSIONS.STAFF_MANAGE)
   @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Delete a staff group (U9 — 409 if members still assigned)' })
-  deleteGroup(@Param('id', ParseIntPipe) id: number) {
-    return this.staffService.deleteGroup(id);
+  @ApiOperation({ summary: 'Delete a staff group (409 if members still assigned; 403 if last admin group)' })
+  deleteGroup(@Param('id', ParseIntPipe) id: number, @CurrentStaff() actor: AuthStaff) {
+    return this.staffService.deleteGroup(id, actor);
   }
 
   // ─────────────────── Members ───────────────────
@@ -125,7 +151,7 @@ export class StaffController {
   @Delete(':id')
   @RequirePermissions(PERMISSIONS.STAFF_MANAGE)
   @ApiOperation({ summary: 'Disable a staff member (soft delete)' })
-  disable(@Param('id', ParseIntPipe) id: number) {
-    return this.staffService.disable(id);
+  disable(@Param('id', ParseIntPipe) id: number, @CurrentStaff() actor: AuthStaff) {
+    return this.staffService.disable(id, actor);
   }
 }

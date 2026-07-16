@@ -184,6 +184,25 @@ model PasswordReset {
   @@index([staffId])
 }
 
+// Append-only audit trail for RBAC / staff-account changes: who did what to which
+// staff member or group. `actorStaffId` is a plain int (no FK) so rows survive even
+// if the actor is later removed; `metadata` carries a small JSON diff/summary.
+model RbacAuditLog {
+  id           Int      @id @default(autoincrement())
+  actorStaffId Int?     // null for system/bootstrap actions
+  actorEmail   String   @default("")
+  action       String   // e.g. staff.create, staff.role_change, staff.password_reset, staff.disable, group.update
+  targetType   String   // 'staff' | 'group'
+  targetId     Int?
+  targetLabel  String   @default("")
+  metadata     Json     @default("{}")
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorStaffId])
+  @@index([targetType, targetId])
+}
+
 // ───────────────────────────── customers / orgs ─────────────────────────────
 
 model UserGroup {

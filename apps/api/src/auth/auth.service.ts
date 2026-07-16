@@ -11,6 +11,7 @@ import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppConfig, APP_CONFIG } from '../config/configuration';
 import { TokenBlocklistService } from './token-blocklist.service';
+import { SessionRevocationService } from './session-revocation.service';
 import { verifyPassword, hashPassword } from './password.util';
 import { type AuthStaff } from './auth.decorators';
 import type { Permission } from './permissions';
@@ -45,6 +46,7 @@ export class AuthService {
     private readonly jwt: JwtService,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
     @Optional() private readonly blocklist?: TokenBlocklistService,
+    @Optional() private readonly sessions?: SessionRevocationService,
     @Optional()
     @Inject(MAIL_SERVICE_TOKEN)
     private readonly mailService?: { sendTemplate: (...args: unknown[]) => Promise<void> },
@@ -293,36 +295,45 @@ export class AuthService {
   /**
    * Consume a password-reset token and set the new password.
    * Verifies: token sha256 matches a stored hash, not expired, not already used.
-   * On success: updates passwordHash, marks token used, revokes all refresh tokens.
+   * On success: updates passwordHash, marks token used, and revokes every
+   * refresh/access session. The reset token is claimed conditionally inside the
+   * transaction so two concurrent requests cannot both consume the same link.
    */
   async resetPassword(token: string, newPassword: string): Promise<void> {
     const tokenHash = createHash('sha256').update(token).digest('hex');
-
-    const record = await this.prisma.passwordReset.findUnique({ where: { tokenHash } });
-
-    if (!record || record.usedAt !== null || record.expiresAt < new Date()) {
-      throw new BadRequestException('Invalid or expired reset token');
-    }
-
     const passwordHash = await hashPassword(newPassword);
 
-    await this.prisma.$transaction([
-      this.prisma.staff.update({
-        where: { id: record.staffId },
-        data: { passwordHash },
-      }),
-      this.prisma.passwordReset.update({
-        where: { id: record.id },
-        data: { usedAt: new Date() },
-      }),
-      // Revoke all active refresh tokens so existing sessions are invalidated
-      this.prisma.refreshToken.updateMany({
-        where: { staffId: record.staffId, revokedAt: null },
-        data: { revokedAt: new Date() },
-      }),
-    ]);
+    const staffId = await this.prisma.$transaction(async (tx) => {
+      const now = new Date();
+      const record = await tx.passwordReset.findUnique({ where: { tokenHash } });
+      if (!record || record.usedAt !== null || record.expiresAt <= now) {
+        throw new BadRequestException('Invalid or expired reset token');
+      }
 
-    this.logger.log(`Password reset completed for staffId ${record.staffId}`);
+      // Claim the token with a predicate that remains true for exactly one
+      // concurrent consumer. A second request observes count=0 after the first
+      // transaction commits and receives the same generic 400 response.
+      const claimed = await tx.passwordReset.updateMany({
+        where: { id: record.id, usedAt: null, expiresAt: { gt: now } },
+        data: { usedAt: now },
+      });
+      if (claimed.count !== 1) {
+        throw new BadRequestException('Invalid or expired reset token');
+      }
+
+      await tx.staff.update({ where: { id: record.staffId }, data: { passwordHash } });
+      await tx.refreshToken.updateMany({
+        where: { staffId: record.staffId, revokedAt: null },
+        data: { revokedAt: now },
+      });
+      return record.staffId;
+    });
+
+    // Refresh-token rows were updated atomically above. This second, central
+    // revocation step adds the Redis access-token cutoff so an already-issued
+    // access JWT cannot continue working for its remaining TTL.
+    await this.sessions?.revokeAllForStaff(staffId);
+    this.logger.log(`Password reset completed for staffId ${staffId}`);
   }
 
   // ─────────────────────── private helpers ───────────────────────
@@ -349,7 +360,7 @@ export class AuthService {
 
     const accessToken = await this.jwt.signAsync(
       // Distinct jti on the access token so logout can revoke it via the blocklist.
-      { ...principal, sub: staffId, jti: crypto.randomUUID() },
+      { ...principal, sub: staffId, jti: crypto.randomUUID(), issuedAtMs: Date.now() },
       {
         secret: this.config.TELECOM_HD_JWT_ACCESS_SECRET,
         expiresIn: this.config.TELECOM_HD_JWT_ACCESS_TTL,

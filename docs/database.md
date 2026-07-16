@@ -31,13 +31,15 @@
 
 ### 1. Staff & RBAC
 
-| Model            | Key columns                                                                                                                                                                                         | Relations                                                                                                                                                                     |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **StaffGroup**   | `id`, `title`, `isAdmin Bool`, `permissions String[]`                                                                                                                                               | has many `Staff`                                                                                                                                                              |
-| **Staff**        | `id`, `email` (unique), `username` (unique), `firstName`, `lastName`, `passwordHash` (argon2id), `designation`, `signature`, `mobileNumber`, `timezone`, `isEnabled`, `staffGroupId`, `lastLoginAt` | belongs to `StaffGroup`; has many `DepartmentStaff`, `ownedTickets` (Ticket via "TicketOwner"), `TicketPost`, `TicketNote`, `TicketAuditLog`, `RefreshToken`, `TicketWatcher` |
-| **RefreshToken** | `id` (UUID), `staffId`, `tokenHash` (unique), `expiresAt`, `revokedAt?`, `createdAt`                                                                                                                | belongs to `Staff` (cascade delete)                                                                                                                                           |
+| Model             | Key columns                                                                                                                                                                                         | Relations                                                                                                                                                                     |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **StaffGroup**    | `id`, `title`, `isAdmin Bool`, `permissions String[]`                                                                                                                                               | has many `Staff`                                                                                                                                                              |
+| **Staff**         | `id`, `email` (unique), `username` (unique), `firstName`, `lastName`, `passwordHash` (argon2id), `designation`, `signature`, `mobileNumber`, `timezone`, `isEnabled`, `staffGroupId`, `lastLoginAt` | belongs to `StaffGroup`; has many `DepartmentStaff`, `ownedTickets` (Ticket via "TicketOwner"), `TicketPost`, `TicketNote`, `TicketAuditLog`, `RefreshToken`, `TicketWatcher` |
+| **RefreshToken**  | `id` (UUID), `staffId`, `tokenHash` (unique), `expiresAt`, `revokedAt?`, `createdAt`                                                                                                                | belongs to `Staff` (cascade delete)                                                                                                                                           |
+| **PasswordReset** | `id`, `staffId`, `tokenHash` (unique, sha256), `expiresAt`, `usedAt?`, `createdAt`                                                                                                                  | —                                                                                                                                                                             |
+| **RbacAuditLog**  | `id`, `actorStaffId?`, `actorEmail`, `action`, `targetType` (`staff`\|`group`), `targetId?`, `targetLabel`, `metadata Json`, `createdAt`                                                            | append-only; `actorStaffId` is a plain int (no FK) so rows survive actor removal                                                                                              |
 
-`StaffGroup.permissions` is an array of permission-key strings defined in `apps/api/src/auth/permissions.ts`. Admin groups carry `ALL_PERMISSIONS`; agent groups carry a curated `ROLE_PRESETS.agent` subset.
+`StaffGroup.permissions` is an array of permission-key strings defined in `apps/api/src/auth/permissions.ts`. There are three built-in role templates (`ROLE_TEMPLATES`): **Administrator** (`isAdmin`, `ALL_PERMISSIONS`), **Manager** (`ROLE_PRESETS.manager` — tickets/users/orgs/KB/reports, no `staff.manage`/`org.delete`/`admin.*`), and **Agent** (`ROLE_PRESETS.agent`). `GET /api/staff/rbac` serves the catalog + templates.
 
 ---
 
@@ -300,6 +302,8 @@ Staff ──────────────────── ownerStaffId 
 | -------------------- | ----------------------------------------------------------------------------------- |
 | `Staff`              | `staffGroupId`                                                                      |
 | `RefreshToken`       | `staffId`                                                                           |
+| `PasswordReset`      | `staffId`                                                                           |
+| `RbacAuditLog`       | `createdAt`, `actorStaffId`, `(targetType, targetId)`                               |
 | `User`               | `organizationId`                                                                    |
 | `UserEmail`          | `userId`                                                                            |
 | `Ticket`             | `statusId`, `departmentId`, `ownerStaffId`, `userId`, `lastActivityAt`, `createdAt` |
@@ -345,6 +349,7 @@ Migrations live under `apps/api/prisma/migrations/` and are managed by Prisma Mi
 | --------------------------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------- |
 | `20260522130915_init`                   | init                   | Full initial schema — all core tables, enums, indexes                                                     |
 | `20260522131515_troubleshooter_reports` | troubleshooter_reports | Adds `TroubleshooterCategory`, `TroubleshooterStep`, `TroubleshooterStepLink`, `Report`, `ReportSchedule` |
+| `20260716000000_rbac_audit_log`         | rbac_audit_log         | Adds `RbacAuditLog` (append-only RBAC/staff-change audit trail) + its indexes                             |
 
 **Apply migrations (CI / production):**
 
@@ -370,8 +375,8 @@ The seed is **idempotent** (uses upsert / find-or-create; safe to re-run). It cr
 
 | Category         | Items                                                                                                                |
 | ---------------- | -------------------------------------------------------------------------------------------------------------------- |
-| StaffGroups      | `Administrator` (isAdmin, ALL_PERMISSIONS), `Agent` (ROLE_PRESETS.agent)                                             |
-| Staff            | `admin@23telecom.example` / `demo1234`, `agent@23telecom.example` / `demo1234`                                       |
+| StaffGroups      | `Administrator` (isAdmin, ALL_PERMISSIONS), `Manager` (ROLE_PRESETS.manager), `Agent` (ROLE_PRESETS.agent)           |
+| Staff            | `admin@23telecom.example`, `manager@23telecom.example`, `agent@23telecom.example` — all `demo1234`                   |
 | Departments      | `Support` (isDefault), `NOC`                                                                                         |
 | TicketStatuses   | Open (default), Pending, In Progress, Resolved, Closed                                                               |
 | TicketPriorities | Low, Normal, High, Urgent                                                                                            |
@@ -381,10 +386,9 @@ The seed is **idempotent** (uses upsert / find-or-create; safe to re-run). It cr
 | Organizations    | `Acme Corp` (Moscow, RU, slaPlanId set), `Beta LLC` (Saint Petersburg, RU)                                           |
 | Users            | Ivan Petrov, Maria Sidorova (Acme Corp), Dmitry Volkov (Beta LLC), Guest User                                        |
 | Demo Tickets     | 5 tickets covering Support + NOC departments, various priorities/types, first 2 with agent replies                   |
-
 ## Schema changes — audit-fix batches (2026-05)
 
-Applied via Prisma migrations (all apply clean on a fresh DB; 20 migrations total):
+Applied via Prisma migrations (all apply clean on a fresh DB; 21 migrations total including RBAC):
 
 - **Staff** — `failedLoginAttempts Int @default(0)`, `lockedUntil DateTime?` (D2 per-account
   lockout). Excluded from the `SafeStaff` API type. _Migration `…_staff_login_lockout`._
@@ -396,4 +400,6 @@ Applied via Prisma migrations (all apply clean on a fresh DB; 20 migrations tota
 - **GIN trigram indexes (C5)** — `User.fullName`, `Organization.name`, `Staff.firstName`,
   `Staff.lastName`, `KbArticle.title`, `KbArticle.contentsText` (`gin_trgm_ops`, needs `pg_trgm`).
   EXPLAIN-confirmed used for `ILIKE '%term%'`. _Migration `…_search_trgm_indexes_batch_c5`._
+- **RBAC audit** — append-only `RbacAuditLog` plus indexes for time, actor, and target lookups.
+  _Migration `20260716000000_rbac_audit_log`._
 - Per-queue IMAP UID watermarks live in the existing `Setting` table (section `imap`).

@@ -2,13 +2,17 @@ export type TicketStatus = 'open' | 'pending' | 'in_progress' | 'resolved' | 'cl
 
 export type TicketPriority = 'urgent' | 'high' | 'normal' | 'low';
 
-export type UserRole = 'admin' | 'agent' | 'client';
+export type UserRole = 'admin' | 'manager' | 'agent' | 'client';
 
 export interface User {
   id: number;
   name: string;
   email: string;
   role: UserRole;
+  /** True when the member is in an admin group (inherits every permission). */
+  isAdmin?: boolean;
+  /** RBAC permission keys from /auth/me — drives permission-aware UI. */
+  permissions?: string[];
   avatar_url?: string;
   department_id?: number;
 }

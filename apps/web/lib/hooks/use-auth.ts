@@ -3,6 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, hasToken } from '@/lib/api';
 import type { User, LoginResponse } from '@/lib/types';
+import { deriveRole } from '@/lib/auth/permissions';
 
 export const authKeys = {
   me: ['auth', 'me'] as const,
@@ -20,11 +21,16 @@ interface MePrincipal {
 
 function principalToUser(p: MePrincipal): User {
   const name = p.fullName || [p.firstName, p.lastName].filter(Boolean).join(' ') || p.email;
+  const permissions = p.permissions ?? [];
   return {
     id: p.staffId,
     name,
     email: p.email,
-    role: p.isAdmin ? 'admin' : 'agent',
+    // Distinguish Manager from Agent instead of collapsing every non-admin to
+    // 'agent'; carry the raw permissions so the UI can gate by concrete rights.
+    role: deriveRole(p.isAdmin, permissions),
+    isAdmin: p.isAdmin,
+    permissions,
   } as User;
 }
 

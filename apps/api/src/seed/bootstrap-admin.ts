@@ -9,21 +9,71 @@
  *   TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD  — strong password (never demo1234)
  *
  * Behaviour:
- *   - Missing env vars   → log + exit 0 (no-op, does NOT crash boot).
- *   - Admin StaffGroup   → create if absent; leave unchanged if present.
+ *   - Built-in StaffGroups → always ensured before considering bootstrap credentials.
+ *   - Missing env vars   → skip account creation without crashing boot.
  *   - Staff record       → create if email absent; leave unchanged if present
  *                          (password is NEVER reset on subsequent boots).
  */
 
 import { PrismaClient } from '@prisma/client';
 import { hashPassword } from '../auth/password.util';
-import { ROLE_PRESETS } from '../auth/permissions';
+import { ROLE_PRESETS, ROLE_TEMPLATES } from '../auth/permissions';
 
 const prisma = new PrismaClient();
 
-async function main(): Promise<void> {
-  const email = process.env.TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL?.trim();
-  const password = process.env.TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD?.trim();
+type BootstrapDb = Pick<PrismaClient, 'staff' | 'staffGroup'>;
+
+// Serializes idempotent role seeding across simultaneous API container starts.
+const BOOTSTRAP_LOCK_KEY = 23_202_608;
+
+/**
+ * Ensure the three built-in role groups (Administrator, Manager, Agent) exist.
+ * Production-safe: creates only missing groups from the role templates and NEVER
+ * overwrites the permissions of a group that already exists — operator tweaks
+ * survive redeploys. Returns the Administrator group (needed for the bootstrap
+ * staff account).
+ */
+export async function ensureStandardGroups(db: BootstrapDb = prisma): Promise<{ id: number }> {
+  let adminGroup: { id: number } | null = null;
+  for (const tpl of ROLE_TEMPLATES) {
+    // Titles are not unique in the live schema. Matching the expected admin flag
+    // prevents a stray non-admin group named "Administrator" from becoming the
+    // bootstrap account's role.
+    const existing = await db.staffGroup.findFirst({ where: { title: tpl.title, isAdmin: tpl.isAdmin } });
+    if (existing) {
+      console.log(`[bootstrap-admin] StaffGroup "${tpl.title}" already exists (id=${existing.id}).`);
+      if (tpl.key === 'administrator') adminGroup = existing;
+      continue;
+    }
+    const created = await db.staffGroup.create({
+      data: { title: tpl.title, isAdmin: tpl.isAdmin, permissions: tpl.permissions },
+    });
+    console.log(`[bootstrap-admin] Created StaffGroup "${tpl.title}" (id=${created.id}).`);
+    if (tpl.key === 'administrator') adminGroup = created;
+  }
+
+  // Defensive: if for some reason an admin group with the template title is
+  // missing (e.g. renamed manually), fall back to any isAdmin group / create one.
+  if (!adminGroup) {
+    adminGroup =
+      (await db.staffGroup.findFirst({ where: { isAdmin: true } })) ??
+      (await db.staffGroup.create({
+        data: { title: 'Administrator', isAdmin: true, permissions: ROLE_PRESETS.administrator },
+      }));
+  }
+  return adminGroup;
+}
+
+export async function bootstrapAdmin(
+  env: NodeJS.ProcessEnv = process.env,
+  db: BootstrapDb = prisma,
+): Promise<void> {
+  // Standard roles must exist even on a pre-existing deployment where no
+  // bootstrap credentials are configured (or are intentionally removed later).
+  const adminGroup = await ensureStandardGroups(db);
+
+  const email = env.TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL?.trim();
+  const password = env.TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD?.trim();
 
   if (!email || !password) {
     console.log(
@@ -55,30 +105,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log(`[bootstrap-admin] Ensuring admin StaffGroup and staff account for <${email}>…`);
-
-  // ── 1. Ensure the admin StaffGroup exists ──────────────────────────────────
-  //
-  // We look for the first group with isAdmin=true and title 'Administrator'.
-  // If absent, we create it. We do NOT update an existing group's permissions
-  // so that manual tweaks made in the UI are preserved.
-
-  let adminGroup = await prisma.staffGroup.findFirst({
-    where: { title: 'Administrator', isAdmin: true },
-  });
-
-  if (!adminGroup) {
-    adminGroup = await prisma.staffGroup.create({
-      data: {
-        title: 'Administrator',
-        isAdmin: true,
-        permissions: ROLE_PRESETS.administrator,
-      },
-    });
-    console.log(`[bootstrap-admin] Created StaffGroup "Administrator" (id=${adminGroup.id}).`);
-  } else {
-    console.log(`[bootstrap-admin] StaffGroup "Administrator" already exists (id=${adminGroup.id}).`);
-  }
+  console.log(`[bootstrap-admin] Ensuring staff account for <${email}>…`);
 
   // ── 2. Ensure the staff account exists ────────────────────────────────────
   //
@@ -86,7 +113,7 @@ async function main(): Promise<void> {
   // particular we do NOT reset the password, so operator-changed credentials
   // survive a redeploy.
 
-  const existing = await prisma.staff.findUnique({ where: { email } });
+  const existing = await db.staff.findUnique({ where: { email } });
 
   if (existing) {
     console.log(`[bootstrap-admin] Staff <${email}> already exists (id=${existing.id}) — no changes made.`);
@@ -101,12 +128,12 @@ async function main(): Promise<void> {
     .slice(0, 30);
 
   // If that username is already taken, append a short timestamp suffix.
-  const usernameExists = await prisma.staff.findUnique({ where: { username: baseUsername } });
+  const usernameExists = await db.staff.findUnique({ where: { username: baseUsername } });
   const username = usernameExists ? `${baseUsername}_${Date.now().toString(36)}` : baseUsername;
 
   const passwordHash = await hashPassword(password);
 
-  const staff = await prisma.staff.create({
+  const staff = await db.staff.create({
     data: {
       email,
       username,
@@ -124,9 +151,18 @@ async function main(): Promise<void> {
   );
 }
 
-main()
-  .catch((err: unknown) => {
-    console.error('[bootstrap-admin] Fatal error:', err);
-    process.exit(1);
-  })
-  .finally(() => prisma.$disconnect());
+async function main(): Promise<void> {
+  await prisma.$transaction(async (db) => {
+    await db.$executeRaw`SELECT pg_advisory_xact_lock(${BOOTSTRAP_LOCK_KEY})`;
+    await bootstrapAdmin(process.env, db);
+  });
+}
+
+if (require.main === module) {
+  main()
+    .catch((err: unknown) => {
+      console.error('[bootstrap-admin] Fatal error:', err);
+      process.exitCode = 1;
+    })
+    .finally(() => prisma.$disconnect());
+}

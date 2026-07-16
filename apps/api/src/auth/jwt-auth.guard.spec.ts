@@ -22,6 +22,7 @@ function makeGuard(opts: {
   verifyResult?: unknown;
   verifyThrows?: boolean;
   blocked?: boolean;
+  staleSession?: boolean;
 }) {
   const reflector = {
     getAllAndOverride: vi.fn((key: string) => (key === IS_PUBLIC_KEY ? opts.isPublic : undefined)),
@@ -32,7 +33,10 @@ function makeGuard(opts: {
       return opts.verifyResult ?? { sub: 1, email: 'a@b.c', isAdmin: false, permissions: [] };
     }),
   } as unknown as JwtService;
-  const blocklist = { isBlocked: vi.fn(async () => opts.blocked ?? false) };
+  const blocklist = {
+    isBlocked: vi.fn(async () => opts.blocked ?? false),
+    isStaffTokenStale: vi.fn(async () => opts.staleSession ?? false),
+  };
   return {
     guard: new JwtAuthGuard(jwt, reflector, CONFIG, blocklist as never),
     jwt,
@@ -93,6 +97,24 @@ describe('JwtAuthGuard', () => {
     const req = { headers: { authorization: 'Bearer good-but-revoked' } };
     await expect(guard.canActivate(makeContext(req))).rejects.toBeInstanceOf(UnauthorizedException);
     expect(blocklist.isBlocked).toHaveBeenCalledWith('revoked-jti');
+  });
+
+  it('rejects an access token issued before the staff revocation cutoff → 401', async () => {
+    const { guard, blocklist } = makeGuard({
+      isPublic: false,
+      verifyResult: {
+        sub: 7,
+        email: 's@x.com',
+        isAdmin: false,
+        permissions: [],
+        issuedAtMs: 1_000_123,
+        iat: 1000,
+      },
+      staleSession: true,
+    });
+    const req = { headers: { authorization: 'Bearer stale-after-role-change' } };
+    await expect(guard.canActivate(makeContext(req))).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(blocklist.isStaffTokenStale).toHaveBeenCalledWith(7, 1_000_123, 1000);
   });
 
   it('carries jti + exp onto req.user for logout revocation', async () => {

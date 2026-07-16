@@ -5,6 +5,7 @@ import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { PermissionsGuard } from './permissions.guard';
 import { TokenBlocklistService } from './token-blocklist.service';
+import { SessionRevocationService } from './session-revocation.service';
 import { loadConfig, APP_CONFIG } from '../config/configuration';
 
 const config = loadConfig();
@@ -30,12 +31,14 @@ const config = loadConfig();
     JwtAuthGuard,
     PermissionsGuard,
     TokenBlocklistService,
+    SessionRevocationService,
   ],
   exports: [
     AuthService,
     JwtAuthGuard,
     PermissionsGuard,
     TokenBlocklistService,
+    SessionRevocationService,
     JwtModule,
     APP_CONFIG,
     MAIL_SERVICE_TOKEN,
