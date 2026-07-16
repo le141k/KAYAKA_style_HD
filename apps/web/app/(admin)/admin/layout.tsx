@@ -31,6 +31,12 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   // Tabs this principal may actually open, and whether they may be in /admin at all.
   const visibleTabs = ADMIN_TABS.filter((tab) => hasPermission(user, ADMIN_TAB_PERMISSIONS[tab.href]!));
   const canAccessAdmin = hasAnyPermission(user, Object.values(ADMIN_TAB_PERMISSIONS));
+  const firstVisibleTabHref = visibleTabs[0]?.href;
+  const currentTabIsAllowed = ADMIN_TABS.some(
+    (tab) =>
+      (pathname === tab.href || pathname.startsWith(`${tab.href}/`)) &&
+      hasPermission(user, ADMIN_TAB_PERMISSIONS[tab.href]!),
+  );
 
   // `useMe` is disabled during SSR (hasToken() false) but enabled on the
   // authenticated client, so SSR renders null while the first client paint
@@ -53,8 +59,16 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
     // else is bounced to the staff workspace.
     if (user && !canAccessAdmin) {
       router.replace('/staff/dashboard');
+      return;
     }
-  }, [isLoading, isError, user, router, canAccessAdmin]);
+
+    // A direct URL (or stale browser tab) may point to an admin screen the
+    // current principal cannot use. Move them to their first permitted tab
+    // instead of leaving a page whose API requests all 403.
+    if (user && pathname !== '/admin' && !currentTabIsAllowed) {
+      router.replace(firstVisibleTabHref ?? '/staff/dashboard');
+    }
+  }, [isLoading, isError, user, router, canAccessAdmin, currentTabIsAllowed, firstVisibleTabHref, pathname]);
 
   // Brief loading state to avoid flicker.
   // `!mounted` keeps SSR and first client paint identical (see note above).

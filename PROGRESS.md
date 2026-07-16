@@ -8,14 +8,14 @@ Living status doc for the rewrite. Updated as milestones complete.
       catalog; session revocation on role/password/disable & group-permission change (refresh +
       Redis access cutoff); last-active-admin guard; append-only RBAC audit log (`/staff/audit`);
       permission-aware frontend (Manager no longer collapsed to Agent); prod bootstrap seeds the
-      standard groups idempotently. API vitest **607** green, api+web typecheck/lint/build green.
+      standard groups idempotently. API vitest **620** green, api+web typecheck/lint/build green.
       See ADR-0006.
 - [x] Brand identity (`docs/brand/`): guidelines, palette (telecom blue/cyan/indigo + status),
       typography (Inter / JetBrains Mono), tone of voice ru/en/uk, SVG logo + mark.
 - [x] Theme (`frontend/styles/theme/`): shadcn HSL tokens (light/dark) + status tokens,
       `tailwind-preset.ts`, `theme.json`.
 - [x] Monorepo backbone: npm workspaces, `tsconfig.base.json`, ESLint/Prettier/EditorConfig,
-      `.gitignore`, `.env.example` (TELECOM*HD*\*), `docker-compose.yml`, GitHub Actions CI.
+      `.gitignore`, `.env.example` (`TELECOM_HD_*`), `docker-compose.yml`.
 - [x] Prisma schema (`apps/api/prisma/schema.prisma`): normalized domain — staff/RBAC, users,
       orgs, departments, tickets (+posts/notes/attachments/watchers/tags/audit/links/merge),
       statuses/priorities/types, SLA (plans/schedules/holidays/escalation), workflows/macros,

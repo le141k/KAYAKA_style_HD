@@ -24,6 +24,11 @@ export type SafeStaff = Omit<Staff, 'passwordHash'>;
 
 type SafeStaffWithGroup = SafeStaff & { staffGroup: StaffGroup };
 
+// Stable, application-private PostgreSQL advisory-lock key. All staff/RBAC
+// mutations take this lock so the check for the final active administrator (or
+// final admin group) cannot race another request in a different API process.
+const RBAC_MUTATION_LOCK_KEY = 23_202_607;
+
 const SAFE_STAFF_SELECT = {
   id: true,
   email: true,
@@ -64,49 +69,98 @@ export class StaffService {
     return group;
   }
 
-  async createGroup(dto: CreateStaffGroupDto, actor?: AuthStaff): Promise<StaffGroup> {
-    const group = await this.prisma.staffGroup.create({ data: dto });
-    await this.audit?.log({
-      actor,
-      action: 'group.create',
-      targetType: 'group',
-      targetId: group.id,
-      targetLabel: group.title,
-      metadata: { isAdmin: group.isAdmin, permissions: group.permissions },
+  /**
+   * Serialize an RBAC mutation with a transaction-scoped PostgreSQL advisory
+   * lock. The mutation itself deliberately continues to use PrismaService so
+   * existing helpers and their small, focused queries remain unchanged; the
+   * database lock is held until the full operation completes.
+   */
+  private async withRbacMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${RBAC_MUTATION_LOCK_KEY})`;
+      return operation();
     });
-    return group;
+  }
+
+  /**
+   * A delegated `staff.manage` holder may manage only a strict subset of their
+   * own authority. They may not touch an admin group or grant/assign a
+   * permission they do not already hold. Administrators (and internal calls
+   * without an actor, such as bootstrap) retain full authority.
+   */
+  private assertGroupWithinActorAuthority(
+    group: Pick<StaffGroup, 'isAdmin' | 'permissions'>,
+    actor?: AuthStaff,
+  ): void {
+    if (!actor || actor.isAdmin) return;
+
+    if (group.isAdmin) {
+      throw new ForbiddenException('Only an administrator may manage an administrator group');
+    }
+
+    const heldPermissions = new Set<string>(actor.permissions);
+    const unheldPermissions = group.permissions.filter((permission) => !heldPermissions.has(permission));
+    if (unheldPermissions.length > 0) {
+      throw new ForbiddenException(
+        `Cannot grant or manage permissions you do not hold: ${unheldPermissions.join(', ')}`,
+      );
+    }
+  }
+
+  async createGroup(dto: CreateStaffGroupDto, actor?: AuthStaff): Promise<StaffGroup> {
+    return this.withRbacMutationLock(async () => {
+      this.assertGroupWithinActorAuthority(dto, actor);
+      const group = await this.prisma.staffGroup.create({ data: dto });
+      await this.audit?.log({
+        actor,
+        action: 'group.create',
+        targetType: 'group',
+        targetId: group.id,
+        targetLabel: group.title,
+        metadata: { isAdmin: group.isAdmin, permissions: group.permissions },
+      });
+      return group;
+    });
   }
 
   async updateGroup(id: number, dto: UpdateStaffGroupDto, actor?: AuthStaff): Promise<StaffGroup> {
-    const before = await this.getGroup(id);
-    const updated = await this.prisma.staffGroup.update({ where: { id }, data: dto });
+    return this.withRbacMutationLock(async () => {
+      const before = await this.getGroup(id);
+      // A delegated manager may not alter an elevated group, and any newly
+      // requested permission must remain within their own permission ceiling.
+      this.assertGroupWithinActorAuthority(before, actor);
+      if (dto.permissions !== undefined) {
+        this.assertGroupWithinActorAuthority({ isAdmin: false, permissions: dto.permissions }, actor);
+      }
+      const updated = await this.prisma.staffGroup.update({ where: { id }, data: dto });
 
-    // A permission change alters what every member of the group may do — revoke
-    // their sessions so stale permission claims in existing tokens can't linger.
-    const permissionsChanged =
-      dto.permissions !== undefined && !sameStringSet(before.permissions, updated.permissions);
+      // A permission change alters what every member of the group may do — revoke
+      // their sessions so stale permission claims in existing tokens can't linger.
+      const permissionsChanged =
+        dto.permissions !== undefined && !sameStringSet(before.permissions, updated.permissions);
 
-    if (permissionsChanged) {
-      await this.sessions?.revokeAllForGroup(id);
-      await this.audit?.log({
-        actor,
-        action: 'group.permissions_change',
-        targetType: 'group',
-        targetId: id,
-        targetLabel: updated.title,
-        metadata: { before: before.permissions, after: updated.permissions },
-      });
-    } else {
-      await this.audit?.log({
-        actor,
-        action: 'group.update',
-        targetType: 'group',
-        targetId: id,
-        targetLabel: updated.title,
-        metadata: diffFields(before, updated, ['title']),
-      });
-    }
-    return updated;
+      if (permissionsChanged) {
+        await this.sessions?.revokeAllForGroup(id);
+        await this.audit?.log({
+          actor,
+          action: 'group.permissions_change',
+          targetType: 'group',
+          targetId: id,
+          targetLabel: updated.title,
+          metadata: { before: before.permissions, after: updated.permissions },
+        });
+      } else {
+        await this.audit?.log({
+          actor,
+          action: 'group.update',
+          targetType: 'group',
+          targetId: id,
+          targetLabel: updated.title,
+          metadata: diffFields(before, updated, ['title']),
+        });
+      }
+      return updated;
+    });
   }
 
   /**
@@ -117,28 +171,31 @@ export class StaffService {
    *  - 409 if any staff members are still assigned (UI shows a clear message).
    */
   async deleteGroup(id: number, actor?: AuthStaff): Promise<void> {
-    const group = await this.getGroup(id); // 404 if not found
+    await this.withRbacMutationLock(async () => {
+      const group = await this.getGroup(id); // 404 if not found
+      this.assertGroupWithinActorAuthority(group, actor);
 
-    if (group.isAdmin) {
-      const adminGroupCount = await this.prisma.staffGroup.count({ where: { isAdmin: true } });
-      if (adminGroupCount <= 1) {
-        throw new ForbiddenException('Cannot delete the last administrator group');
+      if (group.isAdmin) {
+        const adminGroupCount = await this.prisma.staffGroup.count({ where: { isAdmin: true } });
+        if (adminGroupCount <= 1) {
+          throw new ForbiddenException('Cannot delete the last administrator group');
+        }
       }
-    }
 
-    const memberCount = await this.prisma.staff.count({ where: { staffGroupId: id } });
-    if (memberCount > 0) {
-      throw new ConflictException(
-        `Cannot delete: ${memberCount} staff member${memberCount === 1 ? ' is' : 's are'} still assigned to this group`,
-      );
-    }
-    await this.prisma.staffGroup.delete({ where: { id } });
-    await this.audit?.log({
-      actor,
-      action: 'group.delete',
-      targetType: 'group',
-      targetId: id,
-      targetLabel: group.title,
+      const memberCount = await this.prisma.staff.count({ where: { staffGroupId: id } });
+      if (memberCount > 0) {
+        throw new ConflictException(
+          `Cannot delete: ${memberCount} staff member${memberCount === 1 ? ' is' : 's are'} still assigned to this group`,
+        );
+      }
+      await this.prisma.staffGroup.delete({ where: { id } });
+      await this.audit?.log({
+        actor,
+        action: 'group.delete',
+        targetType: 'group',
+        targetId: id,
+        targetLabel: group.title,
+      });
     });
   }
 
@@ -192,16 +249,18 @@ export class StaffService {
   }
 
   /**
-   * Guard against privilege escalation: only an admin actor may place a staff
-   * member into a group flagged `isAdmin`. Also validates the group exists
-   * (returns 404 instead of a raw FK 500). Pass `actor` from the request.
+   * Validate a target group and make sure a delegated manager cannot use an
+   * assignment to give someone more authority than the manager already has.
    */
   private async assertCanAssignGroup(groupId: number, actor?: AuthStaff): Promise<StaffGroup> {
     const group = await this.getGroup(groupId); // validate exists (404 if not)
-    if (group.isAdmin && actor && !actor.isAdmin) {
-      throw new ForbiddenException('Only an administrator may assign a staff member to an admin group');
-    }
+    this.assertGroupWithinActorAuthority(group, actor);
     return group;
+  }
+
+  /** A delegated manager cannot change, disable, or reset an elevated account. */
+  private assertCanManageStaffTarget(target: SafeStaffWithGroup, actor?: AuthStaff): void {
+    this.assertGroupWithinActorAuthority(target.staffGroup, actor);
   }
 
   /** Count staff members who are both enabled AND in an admin group. */
@@ -232,28 +291,31 @@ export class StaffService {
   }
 
   async create(dto: CreateStaffDto, actor?: AuthStaff): Promise<SafeStaff> {
-    // Check uniqueness
-    const exists = await this.prisma.staff.findFirst({
-      where: { OR: [{ email: dto.email }, { username: dto.username }] },
-    });
-    if (exists) throw new ConflictException('Email or username already in use');
-
-    const group = await this.assertCanAssignGroup(dto.staffGroupId, actor); // validate + escalation guard
-
     const { password, departmentIds, ...rest } = dto;
     const passwordHash = await hashPassword(password);
 
-    const staff = await this.prisma.staff.create({
-      data: {
-        ...rest,
-        passwordHash,
-        departments: departmentIds.length
-          ? {
-              create: departmentIds.map((departmentId) => ({ departmentId })),
-            }
-          : undefined,
-      },
-      select: SAFE_STAFF_SELECT,
+    const { staff, group } = await this.withRbacMutationLock(async () => {
+      // Check uniqueness while the RBAC lock is held, so the verified target
+      // group cannot change between authorization and assignment.
+      const exists = await this.prisma.staff.findFirst({
+        where: { OR: [{ email: dto.email }, { username: dto.username }] },
+      });
+      if (exists) throw new ConflictException('Email or username already in use');
+
+      const group = await this.assertCanAssignGroup(dto.staffGroupId, actor);
+      const staff = await this.prisma.staff.create({
+        data: {
+          ...rest,
+          passwordHash,
+          departments: departmentIds.length
+            ? {
+                create: departmentIds.map((departmentId) => ({ departmentId })),
+              }
+            : undefined,
+        },
+        select: SAFE_STAFF_SELECT,
+      });
+      return { staff, group };
     });
 
     await this.audit?.log({
@@ -269,84 +331,86 @@ export class StaffService {
   }
 
   async update(id: number, dto: UpdateStaffDto, actor?: AuthStaff): Promise<SafeStaff> {
-    const before = await this.get(id); // validate exists (+ current group)
-
-    // Validate the target group exists and block non-admins from promoting a
-    // staff member into an admin group (privilege-escalation guard).
-    let targetGroup: StaffGroup | undefined;
-    if (dto.staffGroupId !== undefined) {
-      targetGroup = await this.assertCanAssignGroup(dto.staffGroupId, actor);
-    }
-
-    const roleChanged = dto.staffGroupId !== undefined && dto.staffGroupId !== before.staffGroupId;
-    const passwordChanged = !!dto.password;
-    const enabledChanged = dto.isEnabled !== undefined && dto.isEnabled !== before.isEnabled;
-    const disabling = enabledChanged && dto.isEnabled === false;
-
-    // Never strand the deployment without an administrator.
-    if (disabling || (roleChanged && targetGroup)) {
-      await this.assertNotRemovingLastAdmin(before, { disabling, targetGroup });
-    }
-
     const { password, departmentIds, ...rest } = dto;
-    const data: Record<string, unknown> = { ...rest };
+    const passwordHash = password ? await hashPassword(password) : undefined;
 
-    if (password) {
-      data['passwordHash'] = await hashPassword(password);
-    }
+    return this.withRbacMutationLock(async () => {
+      const before = await this.get(id); // validate exists (+ current group)
+      this.assertCanManageStaffTarget(before, actor);
 
-    if (departmentIds !== undefined) {
-      // Replace department assignments atomically
-      await this.prisma.departmentStaff.deleteMany({ where: { staffId: id } });
-      if (departmentIds.length) {
-        await this.prisma.departmentStaff.createMany({
-          data: departmentIds.map((departmentId) => ({ staffId: id, departmentId })),
-        });
+      let targetGroup: StaffGroup | undefined;
+      if (dto.staffGroupId !== undefined) {
+        targetGroup = await this.assertCanAssignGroup(dto.staffGroupId, actor);
       }
-    }
 
-    const updated = await this.prisma.staff.update({
-      where: { id },
-      data,
-      select: SAFE_STAFF_SELECT,
+      const roleChanged = dto.staffGroupId !== undefined && dto.staffGroupId !== before.staffGroupId;
+      const passwordChanged = !!passwordHash;
+      const enabledChanged = dto.isEnabled !== undefined && dto.isEnabled !== before.isEnabled;
+      const disabling = enabledChanged && dto.isEnabled === false;
+
+      // Never strand the deployment without an administrator. The advisory lock
+      // makes this count-and-write sequence safe across API processes.
+      if (disabling || (roleChanged && targetGroup)) {
+        await this.assertNotRemovingLastAdmin(before, { disabling, targetGroup });
+      }
+
+      const data: Record<string, unknown> = { ...rest };
+      if (passwordHash) data['passwordHash'] = passwordHash;
+
+      if (departmentIds !== undefined) {
+        // Replace department assignments while the staff/RBAC mutation is serialized.
+        await this.prisma.departmentStaff.deleteMany({ where: { staffId: id } });
+        if (departmentIds.length) {
+          await this.prisma.departmentStaff.createMany({
+            data: departmentIds.map((departmentId) => ({ staffId: id, departmentId })),
+          });
+        }
+      }
+
+      const updated = await this.prisma.staff.update({
+        where: { id },
+        data,
+        select: SAFE_STAFF_SELECT,
+      });
+
+      // Any access-affecting change invalidates existing sessions (role swap,
+      // admin password reset, or disable). Re-enabling does NOT revoke.
+      if (roleChanged || passwordChanged || disabling) {
+        await this.sessions?.revokeAllForStaff(id);
+      }
+
+      await this.auditStaffUpdate({ actor, before, updated, roleChanged, passwordChanged, enabledChanged });
+      return updated;
     });
-
-    // Any access-affecting change invalidates existing sessions (role swap,
-    // admin password reset, or disable). Re-enabling does NOT revoke.
-    if (roleChanged || passwordChanged || disabling) {
-      await this.sessions?.revokeAllForStaff(id);
-    }
-
-    await this.auditStaffUpdate({ actor, before, updated, roleChanged, passwordChanged, enabledChanged });
-
-    return updated;
   }
 
   /** Soft-disable a staff member rather than deleting. */
   async disable(id: number, actor?: AuthStaff): Promise<SafeStaff> {
-    const before = await this.get(id);
-    await this.assertNotRemovingLastAdmin(before, { disabling: true });
+    return this.withRbacMutationLock(async () => {
+      const before = await this.get(id);
+      this.assertCanManageStaffTarget(before, actor);
+      await this.assertNotRemovingLastAdmin(before, { disabling: true });
 
-    const updated = await this.prisma.staff.update({
-      where: { id },
-      data: { isEnabled: false },
-      select: SAFE_STAFF_SELECT,
+      const updated = await this.prisma.staff.update({
+        where: { id },
+        data: { isEnabled: false },
+        select: SAFE_STAFF_SELECT,
+      });
+
+      // Only revoke if this actually transitioned enabled → disabled.
+      if (before.isEnabled) {
+        await this.sessions?.revokeAllForStaff(id);
+      }
+
+      await this.audit?.log({
+        actor,
+        action: 'staff.disable',
+        targetType: 'staff',
+        targetId: id,
+        targetLabel: updated.email,
+      });
+      return updated;
     });
-
-    // Only revoke if this actually transitioned enabled → disabled.
-    if (before.isEnabled) {
-      await this.sessions?.revokeAllForStaff(id);
-    }
-
-    await this.audit?.log({
-      actor,
-      action: 'staff.disable',
-      targetType: 'staff',
-      targetId: id,
-      targetLabel: updated.email,
-    });
-
-    return updated;
   }
 
   /** Emit the appropriate audit entries for an update (role/password/enabled/other). */

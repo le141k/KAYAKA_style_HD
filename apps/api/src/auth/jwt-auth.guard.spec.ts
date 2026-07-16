@@ -102,12 +102,19 @@ describe('JwtAuthGuard', () => {
   it('rejects an access token issued before the staff revocation cutoff → 401', async () => {
     const { guard, blocklist } = makeGuard({
       isPublic: false,
-      verifyResult: { sub: 7, email: 's@x.com', isAdmin: false, permissions: [], iat: 1000 },
+      verifyResult: {
+        sub: 7,
+        email: 's@x.com',
+        isAdmin: false,
+        permissions: [],
+        issuedAtMs: 1_000_123,
+        iat: 1000,
+      },
       staleSession: true,
     });
     const req = { headers: { authorization: 'Bearer stale-after-role-change' } };
     await expect(guard.canActivate(makeContext(req))).rejects.toBeInstanceOf(UnauthorizedException);
-    expect(blocklist.isStaffTokenStale).toHaveBeenCalledWith(7, 1000);
+    expect(blocklist.isStaffTokenStale).toHaveBeenCalledWith(7, 1_000_123, 1000);
   });
 
   it('carries jti + exp onto req.user for logout revocation', async () => {

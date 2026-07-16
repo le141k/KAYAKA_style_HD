@@ -51,7 +51,7 @@ export class JwtAuthGuard implements CanActivate {
       throw new UnauthorizedException('Missing access token');
     }
 
-    let payload: AuthStaff & { sub: number; jti?: string; iat?: number; exp?: number };
+    let payload: AuthStaff & { sub: number; jti?: string; iat?: number; issuedAtMs?: number; exp?: number };
     try {
       payload = await this.jwtService.verifyAsync(token, {
         secret: this.config.TELECOM_HD_JWT_ACCESS_SECRET,
@@ -69,7 +69,10 @@ export class JwtAuthGuard implements CanActivate {
 
     // Reject access tokens minted before a staff-wide revocation cutoff (role,
     // password, or enabled-state change). Fail-open if Redis is down.
-    if (this.blocklist && (await this.blocklist.isStaffTokenStale(staffId, payload.iat))) {
+    if (
+      this.blocklist &&
+      (await this.blocklist.isStaffTokenStale(staffId, payload.issuedAtMs, payload.iat))
+    ) {
       throw new UnauthorizedException('Session has been revoked');
     }
 

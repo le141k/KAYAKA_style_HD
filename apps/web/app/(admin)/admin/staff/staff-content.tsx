@@ -473,7 +473,7 @@ function StaffGroupsSection() {
 
 function RbacAuditSection() {
   const [open, setOpen] = useState(false);
-  const { data, isLoading } = useRbacAudit({ limit: 50 });
+  const { data, isLoading } = useRbacAudit({ limit: 50, enabled: open });
   const entries = data?.data ?? [];
 
   return (
