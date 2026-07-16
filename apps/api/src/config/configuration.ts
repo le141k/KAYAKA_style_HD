@@ -85,6 +85,21 @@ export function assertProductionSecrets(cfg: AppConfig): void {
     problems.push('  - TELECOM_HD_FIELD_ENCRYPTION_KEY: must be 64 hex chars (256-bit) when set');
   }
 
+  // S5-7: the public origin and mail host must be REAL in production — the dev localhost defaults
+  // would silently break the CSRF origin allowlist, the magic-link/reset URLs, and outbound mail.
+  // (These are config values, not secrets, so they use targeted checks rather than the secret
+  // placeholder pattern — which would falsely reject legitimate domains containing "example".)
+  const publicUrl = cfg.TELECOM_HD_PUBLIC_URL ?? '';
+  if (!/^https:\/\//i.test(publicUrl) || /localhost|127\.0\.0\.1|\[::1\]/i.test(publicUrl)) {
+    problems.push(
+      '  - TELECOM_HD_PUBLIC_URL: must be a real https:// origin in production (not the localhost default)',
+    );
+  }
+  const smtpHost = (cfg.TELECOM_HD_SMTP_HOST ?? '').trim();
+  if (smtpHost === '' || /^(localhost|127\.0\.0\.1|\[::1\]|mailhog)$/i.test(smtpHost)) {
+    problems.push('  - TELECOM_HD_SMTP_HOST: must be a real mail host in production (not localhost/MailHog)');
+  }
+
   if (problems.length) {
     throw new Error(
       `Refusing to start in production with insecure secrets:\n${problems.join('\n')}\n` +

@@ -72,4 +72,34 @@ describe('assertProductionSecrets', () => {
       /64 hex/i,
     );
   });
+
+  // S5-7: public URL + SMTP host must be real in production.
+  it('rejects the localhost public URL default in production', () => {
+    expect(() =>
+      assertProductionSecrets(makeConfig({ TELECOM_HD_PUBLIC_URL: 'http://localhost:3000' })),
+    ).toThrow(/TELECOM_HD_PUBLIC_URL/);
+  });
+
+  it('rejects a non-https public URL in production', () => {
+    expect(() =>
+      assertProductionSecrets(makeConfig({ TELECOM_HD_PUBLIC_URL: 'http://help.acme.com' })),
+    ).toThrow(/TELECOM_HD_PUBLIC_URL/);
+  });
+
+  it('rejects a localhost / MailHog SMTP host in production', () => {
+    expect(() => assertProductionSecrets(makeConfig({ TELECOM_HD_SMTP_HOST: 'localhost' }))).toThrow(
+      /TELECOM_HD_SMTP_HOST/,
+    );
+    expect(() => assertProductionSecrets(makeConfig({ TELECOM_HD_SMTP_HOST: 'mailhog' }))).toThrow(
+      /TELECOM_HD_SMTP_HOST/,
+    );
+  });
+
+  it('accepts a real https public URL + external SMTP host', () => {
+    expect(() =>
+      assertProductionSecrets(
+        makeConfig({ TELECOM_HD_PUBLIC_URL: 'https://help.acme.com', TELECOM_HD_SMTP_HOST: 'smtp.acme.com' }),
+      ),
+    ).not.toThrow();
+  });
 });

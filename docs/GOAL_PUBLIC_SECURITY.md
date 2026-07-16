@@ -568,17 +568,20 @@ External service/container/config additions in this batch require approval befor
       generic liveness response or block `/api/health` at the edge. Keep Swagger disabled. Block
       Alaris if unused; put inbound mail behind source restrictions where possible, endpoint-specific
       rate/body limits and its strong secret. Do not expose internal DB/Redis health details.
-- [~] **S5-7 Fix environment/file preflight coverage.** Update `scripts/preflight.sh` and production
-  boot guards to require every secret including inbound webhook auth; reject placeholder/default
-  bootstrap values, URLs, SMTP and domain settings; fail when any secret file is not owner-only
-  `0600`; and never output values. Resolve `NEXT_PUBLIC_API_URL` by explicitly supporting an
-  empty/unset value for same-origin relative `/api`.
-  _(Partially done: `scripts/preflight.sh` now (a) treats `NEXT_PUBLIC_API_URL` empty/unset as
-  valid same-origin `/api` and requires `https://` only when set, and (b) fails when the env file
-  is not owner-only `0600`/`0400`. Verified against sample env files. No inbound-webhook secret
-  exists in this codebase, so none is required. The TS boot guard `assertProductionSecrets`
-  already validates the real JWT/Alaris/field-encryption secrets. Remaining S5-7: broaden the TS
-  guard to SMTP/domain if desired, and the rest of S5 edge work.)_
+- [x] **S5-7 Fix environment/file preflight coverage.** Update `scripts/preflight.sh` and production
+      boot guards to require every secret including inbound webhook auth; reject placeholder/default
+      bootstrap values, URLs, SMTP and domain settings; fail when any secret file is not owner-only
+      `0600`; and never output values. Resolve `NEXT_PUBLIC_API_URL` by explicitly supporting an
+      empty/unset value for same-origin relative `/api`.
+      _(Done: `scripts/preflight.sh` (a) treats `NEXT_PUBLIC_API_URL` empty/unset as valid same-origin
+      `/api` and requires `https://` only when set, and (b) fails when the env file is not owner-only
+      `0600`/`0400`, never printing values. The TS boot guard `assertProductionSecrets` rejects
+      placeholder/default JWT, Alaris and field-encryption secrets AND now (S5-7) rejects a non-`https://`
+      or localhost `TELECOM_HD_PUBLIC_URL` and a localhost/MailHog `TELECOM_HD_SMTP_HOST` in production —
+      so a prod deploy cannot silently boot with the dev localhost origin (which would break the CSRF
+      allowlist + magic-link/reset URLs) or a dev mail host (which would black-hole reset/login mail).
+      Unit-tested; no inbound-webhook secret exists in this codebase, so none is required. The rest of
+      S5 (canonical edge, firewall, edge logging, DB audit, runtime patching) is separate VM/infra work.)_
 - [ ] **S5-8 Add a separate DB-aware go-live audit.** Run only on the VM with read-only DB credentials.
       Fail when any enabled staff hash matches a shipped/default password, when demo identities remain
       enabled, or when bootstrap/reset/session invariants are unsafe. Keep this separate from the
