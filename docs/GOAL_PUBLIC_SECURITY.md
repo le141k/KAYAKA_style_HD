@@ -78,8 +78,10 @@ and inventory are completed before any production mutation or migration.
       attachment download still pending (S2-8/9).)_
 - [ ] **H3 Close staff-auth gaps:** use DB-backed `authVersion`, logout-all revocation, atomic refresh
       rotation and origin + CSRF checks for every cookie-authenticated mutation.
-      _(Done: DB-backed `authVersion` + logout-all revocation (S3-1/2/4) and atomic refresh rotation
-      by jti/familyId (S3-3). Still open: CSRF + origin checks (S3-5/6), login-abuse throttle (S3-7).)_
+      _(Done: DB-backed `authVersion` + logout-all revocation (S3-1/2/4), atomic refresh rotation by
+      jti/familyId (S3-3), and cookie-auth Origin-CSRF via `CsrfGuard` (S3-5 origin half). Still open:
+      the signed double-submit token + `__Host-` cookie hardening (S3-5 token / S3-6, tied to cookie-
+      only S1-6/7) and the login-abuse throttle (S3-7).)_
 - [ ] **H4 Remove known access paths:** soft-disable demo staff, revoke their sessions, then rotate JWT
       and webhook secrets in the order defined by S1. Never delete staff rows as containment.
 - [ ] **H5 Deploy privately and smoke:** use immutable images/config, run the mandatory production
@@ -338,11 +340,18 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       access-token `sid`/session-family design, not mixed revocation mechanisms.
       _(Done: `logout` now delegates to `revokeStaffSessions` (authVersion bump + revoke-all in one tx);
       the jti blocklist is kept only as best-effort defense-in-depth.)_
-- [ ] **S3-5 Add real CSRF protection.** For cookie-authenticated unsafe methods, require both exact
-      `Origin`/target-origin validation (strict allowlist, no wildcard subdomains) and a session-bound
-      signed double-submit/synchronizer token in `X-CSRF-Token`.
-      Exempt only explicitly enumerated non-browser webhooks, which retain their own authentication.
-      Apply the custom header to JSON and multipart frontend calls.
+- [~] **S3-5 Add real CSRF protection.** For cookie-authenticated unsafe methods, require both exact
+  `Origin`/target-origin validation (strict allowlist, no wildcard subdomains) and a session-bound
+  signed double-submit/synchronizer token in `X-CSRF-Token`.
+  Exempt only explicitly enumerated non-browser webhooks, which retain their own authentication.
+  Apply the custom header to JSON and multipart frontend calls.
+  _(Done: global `CsrfGuard` (app.module) rejects cookie-authenticated (`th_access`/`th_client`)
+  unsafe methods whose `Origin`/`Referer` isn't the exact configured app origin — strict, no
+  wildcard subdomains. Bearer-auth and cookieless requests (incl. the shared-secret webhooks) pass.
+  Verified live: cross-origin cookie POST → 403, same-origin → passes. **Still open:** the
+  session-bound signed double-submit `X-CSRF-Token` layer + applying the header on the frontend —
+  these land with the same-origin/cookie-only foundation (S1-6/7). `SameSite=Lax` is an
+  independent second barrier meanwhile.)_
 - [ ] **S3-6 Harden cookies.** Use production `__Host-`/`__Secure-` names compatible with the paths
       defined in S1, always `Secure`, `HttpOnly` for session cookies, no `Domain`, and identical
       attributes when clearing. Keep a separate readable CSRF cookie only if the signed pattern needs

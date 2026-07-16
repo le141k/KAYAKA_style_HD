@@ -33,6 +33,7 @@ import { HealthModule } from './health/health.module';
 import { PrismaExceptionFilter } from './common/prisma-exception.filter';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { PermissionsGuard } from './auth/permissions.guard';
+import { CsrfGuard } from './auth/csrf.guard';
 
 const config = loadConfig();
 const redisUrl = new URL(config.REDIS_URL);
@@ -110,6 +111,12 @@ const redisUrl = new URL(config.REDIS_URL);
     {
       provide: APP_FILTER,
       useClass: PrismaExceptionFilter,
+    },
+    // CSRF: reject cross-origin cookie-authenticated mutations before anything else
+    // (GOAL_PUBLIC_SECURITY S3-5). Safe methods, Bearer-auth and cookieless requests pass.
+    {
+      provide: APP_GUARD,
+      useClass: CsrfGuard,
     },
     // Enforce ThrottlerModule limits globally (coexists with JWT/Permissions guards)
     {
