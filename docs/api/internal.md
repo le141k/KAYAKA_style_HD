@@ -33,6 +33,22 @@ validateStaff(email: string, password: string): Promise<StaffWithGroup>
 
 buildPrincipal(staff: StaffWithGroup): AuthStaff
 // AuthStaff = { staffId, email, isAdmin, permissions: Permission[] }
+
+forgotPassword(email: string): Promise<void>
+// Always resolves (no enumeration). For an enabled staff: invalidates prior unused
+// reset tokens, creates one sha256-hashed token (1 h TTL), then dispatches the
+// `password_reset` template via MailService.sendTemplateStrict (throws on failure).
+// Fail-safe (GOAL_PUBLIC_SECURITY S1-4): on dispatch failure the just-issued token is
+// invalidated and a NON-secret diagnostic is logged — the raw reset link is NEVER
+// logged in any environment. The token is delivered in a URL fragment (#token=…).
+
+resetPassword(token: string, newPassword: string): Promise<void>
+// Atomic single-use consume (S1-5): a conditional updateMany on
+// (tokenHash, usedAt IS NULL, not expired) must affect exactly one row before the
+// password is changed, so concurrent/replayed use changes the password at most once.
+// On success updates passwordHash and revokes all active refresh tokens in one tx.
+// Invariant: MAIL_SERVICE_TOKEN is bound to the real MailService in AuthModule (which
+// imports MailModule); the former `useValue: undefined` placeholder is removed.
 ```
 
 ---
@@ -153,7 +169,12 @@ renderTemplate(key: string, locale: string, vars: Record<string, string>): Promi
 // Loads EmailTemplate from DB by (key, locale); falls back to 'en'. Replaces {{key}} tokens.
 
 sendTemplate(to: string | string[], templateKey: string, locale: string, vars: Record<string, string>): Promise<void>
-// Convenience: renderTemplate() + send().
+// Convenience: renderTemplate() + send(). Best-effort (swallows failures).
+
+sendTemplateStrict(to: string | string[], templateKey: string, locale: string, vars: Record<string, string>): Promise<void>
+// Security-mail path (password reset / magic link): renderTemplate() + enqueue-or-inline,
+// PROPAGATING any enqueue/SMTP failure instead of swallowing it. Callers fail closed on a
+// throw (e.g. invalidate the issued token). Never logs the rendered subject/body.
 ```
 
 ---

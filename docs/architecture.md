@@ -61,7 +61,9 @@ HTTP Request
   → Controller method
   → Service (business logic + Prisma)
   → GlobalExceptionFilter  (normalizes errors to JSON { statusCode, message })
-  → Pino HTTP logger  (structured JSON request logs)
+  → Pino HTTP logger  (structured JSON request logs — strict allowlist: method, path
+     without query, status, duration, request id, trusted client IP only; every header
+     and body dropped so credentials/tokens never leak. See apps/api/src/config/logging.ts)
 ```
 
 Public routes (bypass JWT): `POST /auth/login`, `POST /auth/refresh`,

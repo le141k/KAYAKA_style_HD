@@ -5,6 +5,8 @@ import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { PermissionsGuard } from './permissions.guard';
 import { TokenBlocklistService } from './token-blocklist.service';
+import { MailModule } from '../modules/mail/mail.module';
+import { MailService } from '../modules/mail/mail.service';
 import { loadConfig, APP_CONFIG } from '../config/configuration';
 
 const config = loadConfig();
@@ -16,16 +18,19 @@ const config = loadConfig();
       secret: config.TELECOM_HD_JWT_ACCESS_SECRET,
       signOptions: { expiresIn: config.TELECOM_HD_JWT_ACCESS_TTL },
     }),
+    // Import MailModule so AuthService can dispatch security mail (password reset).
+    // This edge is acyclic: nothing in MailModule's subtree imports AuthModule
+    // (auth guards are provided globally via @Global), so no forwardRef is needed.
+    MailModule,
   ],
   controllers: [AuthController],
   providers: [
     // Provide config locally so AuthService can inject it via APP_CONFIG
     { provide: APP_CONFIG, useValue: config },
-    // MAIL_SERVICE_TOKEN is satisfied by AppModule when MailModule is imported.
-    // Using undefined here means AuthModule itself doesn't import MailModule
-    // (avoiding a circular dependency); AppModule overrides this with the real
-    // MailService via the MAIL_SERVICE_TOKEN provider.
-    { provide: MAIL_SERVICE_TOKEN, useValue: undefined },
+    // Bind the reset-mail port to the real MailService (imported above). Previously
+    // this was `useValue: undefined`, which silently disabled reset mail and forced
+    // the dev fallback that LOGGED the raw reset URL in every environment.
+    { provide: MAIL_SERVICE_TOKEN, useExisting: MailService },
     AuthService,
     JwtAuthGuard,
     PermissionsGuard,

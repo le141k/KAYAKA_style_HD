@@ -27,7 +27,21 @@ export interface LoginResult extends TokenPair {
 /** Full staff record joined with group, used internally. */
 type StaffWithGroup = Staff & { staffGroup: StaffGroup };
 
-/** Token used to inject MailService optionally without creating a circular module dep. */
+/**
+ * Narrow reset-mail port. AuthService only needs to dispatch a security template and
+ * be told (by a thrown error) when the hand-off failed. Bound to the real MailService
+ * in AuthModule; left undefined only in pure unit tests.
+ */
+export interface ResetMailer {
+  sendTemplateStrict(
+    to: string | string[],
+    templateKey: string,
+    locale: string,
+    vars: Record<string, string>,
+  ): Promise<void>;
+}
+
+/** Token used to inject the reset mailer (MailService) into AuthService. */
 export const MAIL_SERVICE_TOKEN = Symbol('MAIL_SERVICE_TOKEN');
 
 @Injectable()
@@ -41,7 +55,7 @@ export class AuthService {
     @Optional() private readonly blocklist?: TokenBlocklistService,
     @Optional()
     @Inject(MAIL_SERVICE_TOKEN)
-    private readonly mailService?: { sendTemplate: (...args: unknown[]) => Promise<void> },
+    private readonly mailService?: ResetMailer,
   ) {}
 
   /** Validate credentials; returns Staff+Group on success, throws otherwise. */
@@ -206,27 +220,47 @@ export class AuthService {
     const tokenHash = createHash('sha256').update(rawToken).digest('hex');
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
-    await this.prisma.passwordReset.create({
+    const reset = await this.prisma.passwordReset.create({
       data: { staffId: staff.id, tokenHash, expiresAt },
     });
 
-    const resetUrl = `${this.config.TELECOM_HD_PUBLIC_URL}/reset-password?token=${rawToken}`;
+    // Deliver the raw token in a URL FRAGMENT (#token=…) so it never lands in proxy
+    // access logs or the Referer header when the reset page loads (S1-5).
+    const resetUrl = `${this.config.TELECOM_HD_PUBLIC_URL}/reset-password#token=${rawToken}`;
 
-    // Non-blocking — if mail fails the user can request again
-    if (this.mailService) {
-      this.mailService
-        .sendTemplate(email, 'password_reset', 'en', {
-          firstName: staff.firstName,
-          resetUrl,
-          expiresInHours: '1',
-        })
-        .catch((err: unknown) =>
-          this.logger.error(`Password-reset email failed for ${email}: ${String(err)}`),
-        );
-    } else {
-      // Fallback: log the reset URL so dev/test environments without mail still work
-      this.logger.log(`[DEV] Password reset link for ${email}: ${resetUrl}`);
+    if (!this.mailService) {
+      // No mailer wired. In the running app MailModule always provides one, so this
+      // is a misconfiguration in production — fail closed by invalidating the token
+      // and logging a diagnostic that NEVER contains the raw link.
+      await this.invalidateReset(reset.id);
+      if (this.config.NODE_ENV === 'production') {
+        this.logger.error('Password-reset mailer is not configured; no email sent');
+      }
+      return;
     }
+
+    try {
+      // Strict dispatch throws if the mail cannot be enqueued/sent.
+      await this.mailService.sendTemplateStrict(email, 'password_reset', 'en', {
+        firstName: staff.firstName ?? '',
+        resetUrl,
+        expiresInHours: '1',
+      });
+    } catch {
+      // Fail closed: invalidate the freshly-issued token so no live token dangles for
+      // an email that never arrived. Keep the response generic (no enumeration) and
+      // never log the raw link.
+      await this.invalidateReset(reset.id);
+      this.logger.error(`Password-reset dispatch failed for staffId ${staff.id}`);
+    }
+  }
+
+  /** Invalidate a single still-unused reset token (idempotent). */
+  private async invalidateReset(id: number): Promise<void> {
+    await this.prisma.passwordReset.updateMany({
+      where: { id, usedAt: null },
+      data: { usedAt: new Date() },
+    });
   }
 
   /**
@@ -237,24 +271,36 @@ export class AuthService {
   async resetPassword(token: string, newPassword: string): Promise<void> {
     const tokenHash = createHash('sha256').update(token).digest('hex');
 
-    const record = await this.prisma.passwordReset.findUnique({ where: { tokenHash } });
+    // Hash the new password BEFORE the race so the atomic consume→apply window stays
+    // tiny (argon2 is deliberately slow).
+    const passwordHash = await hashPassword(newPassword);
 
-    if (!record || record.usedAt !== null || record.expiresAt < new Date()) {
+    // Atomically consume the token: only an unused, unexpired token is claimed, and
+    // exactly one concurrent caller can flip usedAt from NULL to now. A second
+    // (replayed or parallel) request updates zero rows and is rejected, so the
+    // password changes exactly once. Replaces the prior find-then-update, which had
+    // a check-to-write gap that let two requests both pass the check.
+    const consumed = await this.prisma.passwordReset.updateMany({
+      where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
+      data: { usedAt: new Date() },
+    });
+
+    if (consumed.count !== 1) {
       throw new BadRequestException('Invalid or expired reset token');
     }
 
-    const passwordHash = await hashPassword(newPassword);
+    const record = await this.prisma.passwordReset.findUnique({ where: { tokenHash } });
+    if (!record) {
+      // Unreachable — we just consumed this exact hash — but fail safe.
+      throw new BadRequestException('Invalid or expired reset token');
+    }
 
     await this.prisma.$transaction([
       this.prisma.staff.update({
         where: { id: record.staffId },
         data: { passwordHash },
       }),
-      this.prisma.passwordReset.update({
-        where: { id: record.id },
-        data: { usedAt: new Date() },
-      }),
-      // Revoke all active refresh tokens so existing sessions are invalidated
+      // Revoke all active refresh tokens so existing sessions are invalidated.
       this.prisma.refreshToken.updateMany({
         where: { staffId: record.staffId, revokedAt: null },
         data: { revokedAt: new Date() },

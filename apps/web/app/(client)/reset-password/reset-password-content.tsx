@@ -29,7 +29,25 @@ type ResetForm = z.infer<typeof resetSchema>;
 export function ResetPasswordContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const token = searchParams.get('token') ?? '';
+
+  // The reset token arrives in the URL FRAGMENT (#token=…) so it never reaches the
+  // server / proxy access logs. Read it once on mount, then immediately strip it from
+  // the address bar with history.replaceState so it isn't left in the URL, browser
+  // history, or any later Referer. A legacy ?token= query is accepted as a fallback.
+  const [token, setToken] = useState('');
+  const [tokenResolved, setTokenResolved] = useState(false);
+
+  useEffect(() => {
+    const hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '';
+    const fromHash = new URLSearchParams(hash).get('token');
+    const resolved = fromHash ?? searchParams.get('token') ?? '';
+    setToken(resolved);
+    setTokenResolved(true);
+    if (resolved) {
+      // Drop both the fragment and any legacy query token from the visible URL.
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+  }, [searchParams]);
 
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
@@ -42,8 +60,9 @@ export function ResetPasswordContent() {
     formState: { errors, isSubmitting },
   } = useForm<ResetForm>({ resolver: zodResolver(resetSchema) });
 
-  // If there is no token in the URL, show an error immediately.
-  const missingToken = !token;
+  // Only flag a missing token once we've actually parsed the URL (avoids a flash of
+  // the error state before the fragment is read on mount).
+  const missingToken = tokenResolved && !token;
 
   const onSubmit = async (data: ResetForm) => {
     try {
