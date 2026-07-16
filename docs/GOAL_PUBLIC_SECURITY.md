@@ -285,7 +285,7 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       cannot accidentally expose them. Resolve the session to a client principal containing `userId`,
       reject expired/revoked sessions, and add logout/revocation. Do not reuse staff JWT/RBAC identity.
       _(Done, commit `ecbec7b`: `@ClientAuthenticated()` = `applyDecorators(Public(), UseGuards(
-    ClientAuthGuard))`; `ClientAuthGuard` resolves the `th_client` cookie to `{ userId }` via
+  ClientAuthGuard))`; `ClientAuthGuard` resolves the `th_client` cookie to `{ userId }` via
       `resolveSession` (rejects expired/revoked → 401, fails CLOSED 503 on store outage), and
       `@CurrentClient()` exposes the principal. `logout` revokes the session. No staff JWT/RBAC
       identity is reused. Guard unit-tested (no cookie → 401, invalid → 401, valid → attaches
@@ -297,7 +297,7 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       and `publicReply(id, dto, clientUserId)` authorize strictly via `assertClientOwnsTicket`
       (`Ticket.userId === clientUserId` else 404); the reply's author is taken from the ticket, not
       the request body; no `?email=`/`requesterEmail` inputs remain. Wrong-owner, unmapped (`userId
-    null`) and missing tickets all return the identical 404. Unit-tested incl. the cross-client
+  null`) and missing tickets all return the identical 404. Unit-tested incl. the cross-client
       IDOR guard. Frontend enablement is the deferred S2-9.)_
 - [x] **S2-8 Add an owner-scoped client attachment download.** The current client UI links to the
       staff-only `/api/attachments/:id/download` route. Add a separate client-session-protected
@@ -387,9 +387,11 @@ Current public list/detail/reply routes must not be exposed until this batch is 
   signed double-submit/synchronizer token in `X-CSRF-Token`.
   Exempt only explicitly enumerated non-browser webhooks, which retain their own authentication.
   Apply the custom header to JSON and multipart frontend calls.
-  _(Done: global `CsrfGuard` (app.module) rejects cookie-authenticated (`th_access`/`th_client`)
-  unsafe methods whose `Origin`/`Referer` isn't the exact configured app origin — strict, no
-  wildcard subdomains. Bearer-auth and cookieless requests (incl. the shared-secret webhooks) pass.
+  _(Done: global `CsrfGuard` (app.module) rejects cookie-authenticated (`th_access`/`th_client`/
+  `th_refresh`) unsafe methods whose `Origin`/`Referer` isn't the exact configured app origin —
+  strict, no wildcard subdomains. Bearer-auth and cookieless requests (incl. the shared-secret
+  webhooks) pass. `th_refresh` is in the detected set (self-review) so cookie-only `POST /auth/refresh`
+  after `th_access` expiry is still origin-checked, not just `SameSite=Lax`-protected.
   Verified live: cross-origin cookie POST → 403, same-origin → passes. **Still open:** the
   session-bound signed double-submit `X-CSRF-Token` layer + applying the header on the frontend —
   these land with the same-origin/cookie-only foundation (S1-6/7). `SameSite=Lax` is an
@@ -413,7 +415,13 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       per-IP `@Throttle(5/60s)` on `POST /auth/login` is the backstop); a `warn` alert fires when the
       throttle first engages. Verified live against real Redis: fresh key allowed → blocked/429 after
       10 failures → allowed after clear → a second IP for the same email stays allowed (no account
-      lock). The optional post-threshold challenge is S4 (Turnstile, deferred, needs approval).)_
+      lock). **Self-review hardening:** the counter's INCR+EXPIRE is a single atomic Lua eval (a
+      counter can never be left without a TTL → no accidental permanent lock, verified live:
+      count=10/ttl=900s); the HMAC key is HKDF-derived from the JWT secret (purpose-bound subkey, not
+      the raw signing key); and `validateStaff` now runs a decoy argon2 verify on the missing/disabled
+      branch so login timing no longer leaks account existence (the enumeration oracle that would have
+      undermined "discloses nothing about account/lock state"). The optional post-threshold challenge
+      is S4 (Turnstile, deferred, needs approval).)_
 - [ ] **S3-8 Test the state transitions.** Prove old access/refresh tokens fail immediately after
       password change, disable and permission/group change; CSRF requests from missing/wrong origins
       fail; valid same-origin JSON and multipart requests work; two parallel refreshes produce one
@@ -497,6 +505,11 @@ External service/container/config additions in this batch require approval befor
       `remote_ip`; keep API `trust proxy` aligned with the measured hop chain. Verify two external
       clients receive separate application rate-limit buckets and spoofed headers do not change
       identity.
+      _(Security-review dependency: the S3-7 login throttle and the `@Throttle` limiter both key on
+      `req.ip`. Their per-IP scoping — and the "can't poison a victim's counter" property — is only as
+      trustworthy as this edge config. The service code correctly consumes the framework `req.ip` (no
+      raw `X-Forwarded-For` parsing), so no code change is needed; the guarantee is completed HERE by
+      making the API unreachable except through the one hop that overwrites inbound `X-Forwarded-For`.)_
 - [ ] **S5-4 Create a canonical firewall ruleset.** Reconcile `helpdesk.nft` with
       `helpdesk-edge-nat.sh`; document exactly which interface/ports are allowed. With Tunnel, no
       inbound public 80/443 is needed. Keep DB/Redis/API/web container ports internal. Before applying,

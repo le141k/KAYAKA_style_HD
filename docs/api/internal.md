@@ -49,6 +49,10 @@ revokeStaffSessions(staffId: number): Promise<void>
 
 validateStaff(email: string, password: string): Promise<StaffWithGroup>
 // Returns Staff+Group or throws UnauthorizedException.
+// Anti-enumeration (S3-7): a missing/disabled account runs a decoy argon2 verify against a
+// cached throwaway hash before throwing, so it costs the same as a wrong password — closing
+// the login timing oracle for "does this email exist?". Both branches throw one generic
+// "Invalid credentials".
 
 buildPrincipal(staff: StaffWithGroup): AuthStaff
 // AuthStaff = { staffId, email, isAdmin, permissions: Permission[] }
@@ -78,8 +82,10 @@ gracefully):
 
 - `LoginThrottleService` (`auth/login-throttle.service.ts`, S3-7) — Redis failure counter keyed
   `th:login:<HMAC-SHA256(email)>:<ip>`; `assertNotThrottled`/`recordFailure`/`clear`. Generic 429
-  after 10 failures / 15-min sliding window; **fail-open**; never locks an account (per-IP key), and
-  raw emails are never stored (HMAC). Used by `AuthService.login`.
+  once the count reaches 10 in a 15-min sliding window; **fail-open**; never locks an account (per-IP
+  key), and raw emails are never stored (HMAC). The HMAC key is HKDF-derived from the JWT secret
+  (purpose-bound subkey, not the raw signing key), and the INCR+EXPIRE is one atomic Lua eval so a
+  counter can never persist without a TTL. Used by `AuthService.login`.
 - `TokenBlocklistService` (`auth/token-blocklist.service.ts`) — Redis jti blocklist for revoked
   access tokens (defense-in-depth atop the authoritative DB `authVersion` check); **fail-open**.
 

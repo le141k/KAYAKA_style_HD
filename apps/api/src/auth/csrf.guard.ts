@@ -17,6 +17,8 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
  *    header, so header-auth is CSRF-immune.
  *  - Requests carrying NO auth cookie pass — there is no ambient credential to abuse
  *    (this also auto-exempts the shared-secret webhooks, which use headers, not cookies).
+ *    The refresh cookie (`th_refresh`) counts too, so cookie-only `POST /auth/refresh`
+ *    (when `th_access` has expired but `th_refresh` is still valid) is still origin-checked.
  *  - Otherwise the request's `Origin` (or, if absent, `Referer`) must EXACTLY equal the
  *    configured app origin — strict allowlist, no wildcard subdomains. Mismatch → 403.
  *
@@ -43,7 +45,9 @@ export class CsrfGuard implements CanActivate {
 
     // No ambient cookie credential ⇒ nothing for CSRF to abuse (covers webhooks too).
     const cookieHeader = req.headers['cookie'];
-    if (!cookieHeader || !/(?:^|;\s*)(?:th_access|th_client)=/.test(cookieHeader)) return true;
+    if (!cookieHeader || !/(?:^|;\s*)(?:th_access|th_client|th_refresh)=/.test(cookieHeader)) {
+      return true;
+    }
 
     // Cookie-authenticated mutation: require an exact same-origin Origin/Referer.
     if (this.originMatches(req.headers['origin']) || this.originMatches(req.headers['referer'])) {

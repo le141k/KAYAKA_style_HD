@@ -55,8 +55,8 @@ All 16 modules above are registered in `AppModule` and serve live routes (verifi
 ```
 HTTP Request
   → NestJS Router (global prefix: /api)
-  → CsrfGuard  (rejects cookie-authenticated `th_access`/`th_client` unsafe methods whose Origin/
-     Referer ≠ the configured app origin; Bearer-auth + cookieless requests pass — S3-5)
+  → CsrfGuard  (rejects cookie-authenticated `th_access`/`th_client`/`th_refresh` unsafe methods whose
+     Origin/Referer ≠ the configured app origin; Bearer-auth + cookieless requests pass — S3-5)
   → JwtAuthGuard  (checks @Public(); else verifies Bearer/cookie JWT, then loads the CURRENT
      Staff+group from DB and checks isEnabled + authVersion (`av` claim) — so disable/password/
      group changes and logout-all revoke access immediately; fails closed 503 if DB is down.

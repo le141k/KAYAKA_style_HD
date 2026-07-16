@@ -1,6 +1,6 @@
 import { HttpException, HttpStatus, Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import Redis from 'ioredis';
-import { createHmac } from 'crypto';
+import { createHmac, hkdfSync } from 'crypto';
 import { AppConfig, APP_CONFIG } from '../config/configuration';
 
 const KEY_PREFIX = 'th:login:'; // th:login:<hmac(email)>:<ip> = failure count, sliding window
@@ -11,10 +11,20 @@ const FAILURE_THRESHOLD = 10;
 const WINDOW_SECONDS = 15 * 60;
 
 /**
+ * Atomic INCR + (re)EXPIRE in one server round-trip. Doing these as two separate
+ * commands is a correctness bug: `INCR` on a missing key creates it with NO TTL, so if
+ * a transient failure lands between the `INCR` and the `EXPIRE` the counter could be
+ * left without an expiry — which would defeat the "self-expiring, never a permanent
+ * lock" guarantee. Running them in a single Lua script makes the key's TTL an invariant.
+ */
+const INCR_EXPIRE_LUA =
+  "local n = redis.call('INCR', KEYS[1]); redis.call('EXPIRE', KEYS[1], ARGV[1]); return n";
+
+/**
  * Login-abuse throttle (GOAL_PUBLIC_SECURITY S3-7).
  *
  * Counts FAILED logins per (trusted client IP + HMAC(email)) in Redis and returns a
- * generic 429 once the threshold is passed — slowing credential stuffing WITHOUT ever
+ * generic 429 once the failure count reaches the threshold — slowing credential stuffing WITHOUT ever
  * locking an account: the key is scoped to one IP, so a known account stays reachable
  * from other IPs, and the counter self-expires. The email is HMAC-ed so raw addresses
  * are never stored in Redis. Fail-OPEN: a Redis outage never blocks logins (the per-IP
@@ -25,10 +35,15 @@ const WINDOW_SECONDS = 15 * 60;
 export class LoginThrottleService implements OnModuleDestroy {
   private readonly logger = new Logger(LoginThrottleService.name);
   private readonly redis: Redis;
-  private readonly hmacSecret: string;
+  private readonly hmacKey: Buffer;
 
   constructor(@Inject(APP_CONFIG) config: AppConfig) {
-    this.hmacSecret = config.TELECOM_HD_JWT_ACCESS_SECRET;
+    // Derive a purpose-bound subkey from the JWT secret via HKDF rather than reusing the
+    // raw signing key — key separation, so this pseudonymization key is not the JWT
+    // forgery key. Counters are ephemeral (15-min TTL), so re-deriving on rotation is safe.
+    this.hmacKey = Buffer.from(
+      hkdfSync('sha256', config.TELECOM_HD_JWT_ACCESS_SECRET, '', 'th-login-throttle-email-v1', 32),
+    );
     this.redis = new Redis(config.REDIS_URL, {
       lazyConnect: true,
       maxRetriesPerRequest: 1,
@@ -43,7 +58,7 @@ export class LoginThrottleService implements OnModuleDestroy {
   }
 
   private key(email: string, ip: string): string {
-    const emailHash = createHmac('sha256', this.hmacSecret)
+    const emailHash = createHmac('sha256', this.hmacKey)
       .update(email.trim().toLowerCase())
       .digest('hex')
       .slice(0, 32);
@@ -67,14 +82,15 @@ export class LoginThrottleService implements OnModuleDestroy {
     }
   }
 
-  /** Record one failed attempt (INCR + sliding TTL). Best-effort. */
+  /** Record one failed attempt (atomic INCR + sliding TTL). Best-effort. */
   async recordFailure(email: string, ip?: string): Promise<void> {
     if (!ip) return;
     try {
-      const k = this.key(email, ip);
-      const n = await this.redis.incr(k);
-      // (Re)set the window on every failure so sustained abuse keeps the key alive.
-      await this.redis.expire(k, WINDOW_SECONDS);
+      // Single round-trip: INCR then (re)set the window so the counter can never exist
+      // without a TTL, and sustained abuse keeps the key alive.
+      const n = Number(
+        await this.redis.eval(INCR_EXPIRE_LUA, 1, this.key(email, ip), String(WINDOW_SECONDS)),
+      );
       if (n === FAILURE_THRESHOLD) {
         this.logger.warn(`Login throttle engaged for an email/IP pair (${n} failures)`);
       }

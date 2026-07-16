@@ -61,6 +61,14 @@ describe('CsrfGuard (S3-5 origin validation)', () => {
     );
   });
 
+  it('REJECTS a cross-origin refresh carrying ONLY th_refresh (th_access expired)', () => {
+    expect(() =>
+      guard.canActivate(
+        ctx({ method: 'POST', headers: { cookie: 'th_refresh=abc', origin: 'https://evil.test' } }),
+      ),
+    ).toThrow(ForbiddenException);
+  });
+
   it('REJECTS a subdomain origin (no wildcard match)', () => {
     expect(() =>
       guard.canActivate(

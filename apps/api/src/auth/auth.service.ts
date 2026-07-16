@@ -68,6 +68,18 @@ export class AuthService {
     @Optional() private readonly loginThrottle?: LoginThrottleService,
   ) {}
 
+  /**
+   * A throwaway argon2id hash (same cost params as real hashes, since both come from
+   * `hashPassword`) used only to equalize login timing. Cached after first use.
+   */
+  private decoyHash?: string;
+  private async getDecoyHash(): Promise<string> {
+    if (!this.decoyHash) {
+      this.decoyHash = await hashPassword(randomBytes(16).toString('hex'));
+    }
+    return this.decoyHash;
+  }
+
   /** Validate credentials; returns Staff+Group on success, throws otherwise. */
   async validateStaff(email: string, password: string): Promise<StaffWithGroup> {
     const staff = await this.prisma.staff.findUnique({
@@ -76,6 +88,10 @@ export class AuthService {
     });
 
     if (!staff || !staff.isEnabled) {
+      // Anti-enumeration: a missing OR disabled account must cost the same as a wrong
+      // password. Verify against a decoy hash so both branches pay one argon2 verify —
+      // otherwise the argon2 delta is a timing oracle for "does this email exist?".
+      await verifyPassword(await this.getDecoyHash(), password);
       throw new UnauthorizedException('Invalid credentials');
     }
 
