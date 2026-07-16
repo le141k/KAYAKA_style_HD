@@ -11,6 +11,9 @@ import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
 import { MAIL_SERVICE_TOKEN, type ResetMailer } from '../../auth/auth.service';
+// Re-exported for back-compat with existing importers; canonical home is common/email.util.
+export { normalizeEmail } from '../../common/email.util';
+import { normalizeEmail } from '../../common/email.util';
 
 /** Verified client principal resolved from a session cookie. */
 export interface ClientPrincipal {
@@ -21,11 +24,6 @@ export interface ClientPrincipal {
 const LOGIN_TOKEN_TTL_MS = 15 * 60 * 1000;
 /** Client session TTL: 7 days. */
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-
-/** Normalize an email for comparison: trim + lowercase. */
-export function normalizeEmail(email: string): string {
-  return email.trim().toLowerCase();
-}
 
 function sha256(raw: string): string {
   return createHash('sha256').update(raw).digest('hex');

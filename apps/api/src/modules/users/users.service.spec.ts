@@ -315,6 +315,62 @@ describe('UsersService', () => {
     });
   });
 
+  // ─── S2-2 email normalization ─────────────────────────────────────────────────
+  describe('email normalization (S2-2)', () => {
+    it('findByEmail looks up by the normalized (trim + lowercase) address', async () => {
+      (prisma.userEmail.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ user: SAFE_USER });
+      await service.findByEmail('  Jane@Example.COM ');
+      expect(prisma.userEmail.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { email: 'jane@example.com' } }),
+      );
+    });
+
+    it('findOrCreate normalizes for BOTH the lookup and the created UserEmail row', async () => {
+      (prisma.userEmail.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.user.create as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_USER);
+
+      await service.findOrCreate(' NEW@Example.com ', 'New User');
+
+      expect(prisma.userEmail.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { email: 'new@example.com' } }),
+      );
+      const createArg = (prisma.user.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(createArg.data.emails.create[0].email).toBe('new@example.com');
+    });
+
+    it('create normalizes the primary + additional emails and the conflict check', async () => {
+      (prisma.userEmail.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.user.create as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_USER);
+
+      await service.create({
+        fullName: 'Casey',
+        primaryEmail: ' Casey@Work.IO ',
+        additionalEmails: ['Second@Work.IO'],
+      } as Parameters<typeof service.create>[0]);
+
+      expect(prisma.userEmail.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { email: 'casey@work.io' } }),
+      );
+      const createArg = (prisma.user.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const emails = createArg.data.emails.create.map((e: { email: string }) => e.email);
+      expect(emails).toEqual(['casey@work.io', 'second@work.io']);
+    });
+
+    it('addEmail normalizes before the conflict check and the insert', async () => {
+      (prisma.user.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_USER);
+      (prisma.userEmail.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.userEmail.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 9 });
+
+      await service.addEmail(1, { email: '  Extra@Host.NET ', isPrimary: false });
+
+      expect(prisma.userEmail.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { email: 'extra@host.net' } }),
+      );
+      const createArg = (prisma.userEmail.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(createArg.data.email).toBe('extra@host.net');
+    });
+  });
+
   // ─── setPrimaryEmail ─────────────────────────────────────────────────────────
 
   describe('setPrimaryEmail', () => {

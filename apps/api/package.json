@@ -15,7 +15,8 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
-    "seed": "tsx src/seed/seed.ts"
+    "seed": "tsx src/seed/seed.ts",
+    "audit:ownership": "tsx src/seed/audit-user-email-ownership.ts"
   },
   "dependencies": {
     "@nest-lab/throttler-storage-redis": "^1.2.0",

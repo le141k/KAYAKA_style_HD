@@ -245,10 +245,24 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       `POST /attachments/upload/public` unless `TELECOM_HD_CLIENT_PORTAL_ENABLED` is set. There is no
       separate public client attachment download route yet — S2-8 adds one. Frontend hide of the
       matching actions is still to be done as part of S2-9.)_
-- [ ] **S2-2 Establish one stable ownership identity before migrating.** Audit and normalize
-      `UserEmail`, reject/fix case-insensitive duplicates, and enforce a DB-level normalized-email
-      uniqueness invariant. Backfill `Ticket.userId` only when one normalized email maps to exactly one
-      user; ambiguous or unlinked tickets remain inaccessible and enter a manual-resolution report.
+- [~] **S2-2 Establish one stable ownership identity before migrating.** Audit and normalize
+  `UserEmail`, reject/fix case-insensitive duplicates, and enforce a DB-level normalized-email
+  uniqueness invariant. Backfill `Ticket.userId` only when one normalized email maps to exactly one
+  user; ambiguous or unlinked tickets remain inaccessible and enter a manual-resolution report.
+  _(Done: `normalizeEmail` (trim+lowercase) is canonical in `common/email.util.ts`; every
+  `UserEmail` read/write in `UsersService` (`findByEmail`/`findOrCreate`/`create`/`addEmail`) — and
+  thus ticket-create + inbound-mail, which route through `findOrCreate` — now normalizes, so new
+  data stays clean. Migration `20260716180000_normalize_user_email_ownership` normalizes existing
+  non-colliding rows and backfills `Ticket.userId` **only** where a normalized email maps to exactly
+  one user; ambiguous/unlinked tickets are left untouched. The **manual-resolution report** is
+  `npm run audit:ownership -w apps/api` (READ-ONLY): it lists case-insensitive duplicate groups
+  (flagging ambiguous >1-user ones), still-un-normalized rows, and ambiguous/orphan unlinked
+  tickets, with a `clean` gate. Verified live against Postgres (rolled back): non-colliding
+  normalized, ambiguous ci-dup left as-is, unambiguous ticket backfilled, ambiguous+orphan tickets
+  not backfilled, audit classifies all correctly. **Deferred (needs your call + prod data):** the
+  **DB-level case-insensitive `UNIQUE(email)` invariant** — it asserts an email is never shared
+  across users; enforce it only after `audit:ownership` reports `clean` on production (any real
+  duplicate groups must be merged/split first). Doing so on the VM also needs the rule-8 backup.)_
 - [x] **S2-3 Add client-auth persistence.** Add Prisma models/migration for a single-use hashed login
       token and a hashed client session. Both require a non-null stable `userId`; normalized email is an
       audit snapshot, never the authorization key. Include expiry, `usedAt`/`revokedAt`, created and

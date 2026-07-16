@@ -218,6 +218,17 @@ cleanupExpired(): Promise<{tokens; sessions}> // idempotent TTL sweep (scheduled
 `@ClientAuthenticated()` = `@Public()` + `@UseGuards(ClientAuthGuard)`; `@CurrentClient()` injects
 `{ userId }`. Client ticket routes authorize by `Ticket.userId === client.userId`.
 
+> **Email ownership identity (S2-2).** `normalizeEmail` (trim + lowercase) is canonical in
+> `common/email.util.ts` (re-exported from `client-auth.service` for back-compat). `UsersService`
+> normalizes on every `UserEmail` read/write (`findByEmail`/`findOrCreate`/`create`/`addEmail`), so
+> all owner resolution — incl. `resolveUnambiguousOwner` and ticket create/inbound mail routing
+> through `findOrCreate` — keys on one stable identity. Migration
+> `20260716180000_normalize_user_email_ownership` normalizes existing rows (non-colliding) and
+> backfills `Ticket.userId` for unambiguous emails. `auditUserEmailOwnership`
+> (`seed/audit-user-email-ownership.ts`, `npm run audit:ownership`) is a READ-ONLY report of
+> case-insensitive duplicate groups + ambiguous/orphan tickets; its `clean` flag gates enforcing a
+> DB-level case-insensitive `UNIQUE(email)` (deferred until prod data is audited).
+
 > **Reset-mail adapter (S1-3).** `AuthModule` does NOT import `MailModule` (that would pull the
 > Mail→Tickets→Sla→Mail module-load cycle at boot). It registers the `mail` queue and provides a
 > local `MailService` bound to `MAIL_SERVICE_TOKEN` — cycle-free; enqueues to the same Redis queue.
