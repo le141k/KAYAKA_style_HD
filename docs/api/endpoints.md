@@ -28,6 +28,14 @@ All routes are under the `/api` global prefix.
 
 ## Tickets
 
+> **Client-portal gate (GOAL_PUBLIC_SECURITY S2-1).** The anonymous routes
+> `POST /api/tickets/public`, `GET /api/tickets/my`, `GET /api/tickets/public/{id}`,
+> `POST /api/tickets/public/{id}/reply` and `POST /api/attachments/upload/public` authorize
+> by "knowing an email" (an IDOR). They are **fail-closed in production** (`ClientPortalGuard`
+> returns 404) until the verified client-session flow (S2) and abuse controls (S4) land. Set
+> `TELECOM_HD_CLIENT_PORTAL_ENABLED=true` to re-open them — do not do so before S2/S4. Dev/test
+> are unaffected.
+
 | Method | Path                                 | Auth               | Body                                                                                                                          | Returns                                                     |
 | ------ | ------------------------------------ | ------------------ | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
 | POST   | /api/tickets/public                  | 🔓                 | `{subject, contents, requesterEmail, requesterName?, departmentId?, customFields?}`                                           | Created ticket                                              |

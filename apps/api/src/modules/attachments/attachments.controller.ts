@@ -9,6 +9,7 @@ import {
   Post,
   Res,
   UploadedFiles,
+  UseGuards,
   UseInterceptors,
   BadRequestException,
 } from '@nestjs/common';
@@ -20,6 +21,7 @@ import { randomUUID } from 'crypto';
 import type { Request } from 'express';
 import { APP_CONFIG, AppConfig } from '../../config/configuration';
 import { Public, RequirePermissions } from '../../auth/auth.decorators';
+import { ClientPortalGuard } from '../../auth/client-portal.guard';
 import { PERMISSIONS } from '../../auth/permissions';
 import { AttachmentsService } from './attachments.service';
 import { StorageService } from './storage.service';
@@ -122,6 +124,7 @@ export class AttachmentsController {
    */
   @Post('upload/public')
   @Public()
+  @UseGuards(ClientPortalGuard)
   @Throttle({ default: { limit: PUBLIC_UPLOAD_LIMIT, ttl: 60000 } })
   @UseInterceptors(FilesInterceptor('files', 5, buildMulterOpts(25)))
   async uploadPublic(

@@ -73,6 +73,8 @@ and inventory are completed before any production mutation or migration.
 - [ ] **H2 Close the client IDOR:** API fail-closes list/detail/reply and client attachment access;
       temporarily hide/disable those UI actions until the verified client-session flow is complete.
       Untrusted public attachment upload stays disabled until S4 is green.
+      _(API side done via S2-1 `ClientPortalGuard` — prod returns 404 for the email-as-password
+      routes + public upload. UI hide still pending (S2-9).)_
 - [ ] **H3 Close staff-auth gaps:** use DB-backed `authVersion`, logout-all revocation, atomic refresh
       rotation and origin + CSRF checks for every cookie-authenticated mutation.
 - [ ] **H4 Remove known access paths:** soft-disable demo staff, revoke their sessions, then rotate JWT
@@ -211,11 +213,16 @@ This batch must deploy before creating any new magic-link/session secret.
 
 Current public list/detail/reply routes must not be exposed until this batch is complete.
 
-- [ ] **S2-1 Add a fail-closed interim gate.** While S2 is incomplete, production must return 404/503
+- [x] **S2-1 Add a fail-closed interim gate.** While S2 is incomplete, production must return 404/503
       for `GET /api/tickets/my`, `GET /api/tickets/public/:id`, client attachment download and
       `POST /api/tickets/public/:id/reply`. Remove/hide matching reply, upload and download UI actions.
       Keep public ticket creation only after S4. The API gate defaults closed in production and does
       not depend on frontend behavior.
+      _(Done: `ClientPortalGuard` returns 404 in production for `POST /tickets/public`, `GET
+    /tickets/my`, `GET /tickets/public/:id`, `POST /tickets/public/:id/reply` and
+      `POST /attachments/upload/public` unless `TELECOM_HD_CLIENT_PORTAL_ENABLED` is set. There is no
+      separate public client attachment download route yet — S2-8 adds one. Frontend hide of the
+      matching actions is still to be done as part of S2-9.)_
 - [ ] **S2-2 Establish one stable ownership identity before migrating.** Audit and normalize
       `UserEmail`, reject/fix case-insensitive duplicates, and enforce a DB-level normalized-email
       uniqueness invariant. Backfill `Ticket.userId` only when one normalized email maps to exactly one

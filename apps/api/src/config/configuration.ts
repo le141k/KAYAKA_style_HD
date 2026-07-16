@@ -34,6 +34,17 @@ const schema = z.object({
   // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_FIELD_ENCRYPTION_KEY: z.string().optional(),
+  // Fail-closed gate for the anonymous client portal (GOAL_PUBLIC_SECURITY S2-1).
+  // The legacy "email-as-password" ticket routes and public upload are an IDOR and
+  // must stay unreachable in PRODUCTION until the verified client-session flow (S2)
+  // and public-abuse controls (S4) land. Defaults CLOSED; dev/test are unaffected.
+  // NB: z.coerce.boolean() treats "false" as truthy → parse explicitly.
+  TELECOM_HD_CLIENT_PORTAL_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
 });
 
 export type AppConfig = z.infer<typeof schema>;

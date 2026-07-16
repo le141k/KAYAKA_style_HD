@@ -4,6 +4,7 @@ import { AuthService, MAIL_SERVICE_TOKEN } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { PermissionsGuard } from './permissions.guard';
+import { ClientPortalGuard } from './client-portal.guard';
 import { TokenBlocklistService } from './token-blocklist.service';
 import { MailModule } from '../modules/mail/mail.module';
 import { MailService } from '../modules/mail/mail.service';
@@ -34,12 +35,14 @@ const config = loadConfig();
     AuthService,
     JwtAuthGuard,
     PermissionsGuard,
+    ClientPortalGuard,
     TokenBlocklistService,
   ],
   exports: [
     AuthService,
     JwtAuthGuard,
     PermissionsGuard,
+    ClientPortalGuard,
     TokenBlocklistService,
     JwtModule,
     APP_CONFIG,

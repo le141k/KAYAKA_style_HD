@@ -12,12 +12,14 @@ import {
   Patch,
   Post,
   Query,
+  UseGuards,
   UsePipes,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { TicketsService } from './tickets.service';
 import { RequirePermissions, CurrentStaff, Public } from '../../auth/auth.decorators';
+import { ClientPortalGuard } from '../../auth/client-portal.guard';
 import type { AuthStaff } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
@@ -77,6 +79,7 @@ export class TicketsController {
   // ─────────────────── Public submission (client portal) ───────────────────
 
   @Public()
+  @UseGuards(ClientPortalGuard)
   @Post('public')
   // Per-endpoint throttle (tighter than the global 300/60s) to curb portal spam/DoS.
   @Throttle({ default: { limit: PUBLIC_SUBMIT_LIMIT, ttl: 60000 } })
@@ -103,6 +106,7 @@ export class TicketsController {
   // ─────────────────── Client: my tickets ───────────────────
 
   @Public()
+  @UseGuards(ClientPortalGuard)
   @Get('my')
   @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
   @ApiOperation({ summary: "List the current requester's tickets by email (client portal)" })
@@ -116,6 +120,7 @@ export class TicketsController {
   // ─────────────────── Client: public ticket detail ───────────────────
 
   @Public()
+  @UseGuards(ClientPortalGuard)
   @Get('public/:id')
   @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
   @ApiOperation({
@@ -132,6 +137,7 @@ export class TicketsController {
   // ─────────────────── Client: public reply ───────────────────
 
   @Public()
+  @UseGuards(ClientPortalGuard)
   @Post('public/:id/reply')
   @Throttle({ default: { limit: PUBLIC_REPLY_LIMIT, ttl: 60000 } })
   @ApiOperation({ summary: 'Add a user reply to a ticket from the client portal (no auth required)' })
