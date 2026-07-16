@@ -25,6 +25,24 @@ function clearTokens(): void {
   localStorage.removeItem('auth_token');
   localStorage.removeItem('refresh_token');
   document.cookie = 'auth_token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+
+  // The real credential cookies are HttpOnly and therefore cannot be removed from
+  // here. Once refresh failed, keeping a protected React tree mounted only turns
+  // every data query into a misleading "could not load" error. Move the user to
+  // the login screen instead, where a successful login replaces those cookies.
+  if (/^\/(?:staff|admin)(?:\/|$)/.test(window.location.pathname)) {
+    window.location.replace('/login');
+  }
+}
+
+/**
+ * A failed login is an expected authentication result, not a signal that an old
+ * browser session should be refreshed. Refreshing after `/auth/login` returns
+ * 401 can replay a stale refresh cookie and trigger server-side reuse detection.
+ * `/auth/me` is the one protected auth endpoint that legitimately may refresh.
+ */
+function canRefreshAfterUnauthorized(path: string): boolean {
+  return !path.startsWith('/auth/') || path === '/auth/me';
 }
 
 /** Attempt a token refresh using the HttpOnly th_refresh cookie. */
@@ -78,7 +96,7 @@ async function request<T>(path: string, options: RequestInit = {}, _retry = fals
   // No Authorization header — the JWT is never read into JS.
   const res = await fetch(`${API_URL}${path}`, { ...options, headers, credentials: 'include' });
 
-  if (res.status === 401 && !_retry) {
+  if (res.status === 401 && !_retry && canRefreshAfterUnauthorized(path)) {
     const refreshed = await tryRefresh();
     if (refreshed) {
       // Retry the original request once with the new token
