@@ -1,6 +1,7 @@
 'use client';
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { usePathname } from 'next/navigation';
 import { api, hasToken } from '@/lib/api';
 import type { User, LoginResponse } from '@/lib/types';
 import { deriveRole } from '@/lib/auth/permissions';
@@ -35,6 +36,16 @@ function principalToUser(p: MePrincipal): User {
 }
 
 export function useMe() {
+  const pathname = usePathname();
+  // AuthProvider is mounted around the whole app. Avoid trying to recover a
+  // stale staff session on public pages (especially /login), where a failed
+  // login must remain a normal form error rather than trigger refresh rotation.
+  const isStaffArea =
+    pathname === '/staff' ||
+    pathname?.startsWith('/staff/') ||
+    pathname === '/admin' ||
+    pathname?.startsWith('/admin/');
+
   return useQuery({
     queryKey: authKeys.me,
     queryFn: async (): Promise<User> => {
@@ -45,7 +56,7 @@ export function useMe() {
     staleTime: 5 * 60_000,
     // Don't fire /auth/me when unauthenticated — avoids the noisy 401 on every
     // public/unauthenticated page load. Layout guards check hasToken separately.
-    enabled: hasToken(),
+    enabled: hasToken() && isStaffArea,
   });
 }
 
