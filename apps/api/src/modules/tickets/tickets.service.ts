@@ -120,9 +120,17 @@ export class TicketsService {
   // ─────────────────────────── Create ───────────────────────────
 
   async createTicket(
-    dto: CreateTicketDto & { attachmentClaimToken?: string },
+    // creationMode/ipAddress are not on the public DTO (mass-assignment guard) — only
+    // trusted callers (controllers, alaris/inbound services) set them here.
+    dto: CreateTicketDto & {
+      attachmentClaimToken?: string;
+      creationMode?: CreationMode;
+      ipAddress?: string;
+    },
     creatorStaffId?: number,
   ): Promise<Ticket> {
+    const creationMode: CreationMode = dto.creationMode ?? 'STAFF';
+    const ipAddress = dto.ipAddress ?? '0.0.0.0';
     // Validate custom fields against TICKET scope definitions, then encrypt any
     // fields flagged isEncrypted before they are persisted to the JSONB column.
     let customFields = dto.customFields as Record<string, unknown> | undefined;
@@ -185,9 +193,9 @@ export class TicketsService {
           slaPlanId,
           dueAt,
           resolutionDueAt,
-          creationMode: dto.creationMode as CreationMode,
+          creationMode,
           creator: creatorActor,
-          ipAddress: dto.ipAddress,
+          ipAddress,
           customFields: (customFields ?? {}) as object,
           // First post
           posts: {
@@ -200,8 +208,8 @@ export class TicketsService {
               subject: dto.subject,
               contents: dto.contents,
               isHtml: dto.isHtml,
-              creationMode: dto.creationMode as CreationMode,
-              ipAddress: dto.ipAddress,
+              creationMode,
+              ipAddress,
             },
           },
           // Tags
@@ -270,12 +278,12 @@ export class TicketsService {
     // Send autoresponder email to requester (non-blocking).
     // Skip for system-generated tickets (e.g. Alaris) — their requesterEmail is a
     // non-deliverable internal address and should not receive an autoresponder.
-    const isSystemTicket = dto.creationMode === 'ALARIS';
+    const isSystemTicket = creationMode === 'ALARIS';
     // Per-queue autoresponder (Kayako): for inbound EMAIL tickets, only send the
     // autoresponder when the receiving queue opts in (noc@/rates@ are OFF). Web/
     // staff/API tickets keep the previous always-send behaviour.
     let suppressAutoresponder = false;
-    if (dto.creationMode === 'EMAIL') {
+    if (creationMode === 'EMAIL') {
       const queue = await this.prisma.emailQueue.findFirst({
         where: { departmentId: dto.departmentId },
         select: { sendAutoresponder: true },
@@ -361,6 +369,10 @@ export class TicketsService {
         // Only posts (USER/STAFF replies) — notes are intentionally excluded.
         // Narrow select: NEVER expose staff email/ipAddress or internal audit fields.
         posts: {
+          // Third-party/vendor correspondence (isThirdParty) is internal-facing in
+          // the Kayako model (hidden from the customer by default) — never expose it
+          // on the public ticket view.
+          where: { isThirdParty: false },
           orderBy: { createdAt: 'asc' },
           select: {
             id: true,
@@ -603,13 +615,16 @@ export class TicketsService {
           type: true,
           department: true,
           owner: { select: { id: true, firstName: true, lastName: true, email: true } },
-          user: { select: PUBLIC_USER_SELECT },
+          // Staff list shows the requester's organization on the right — include it.
+          user: { select: { ...PUBLIC_USER_SELECT, organization: { select: { id: true, name: true } } } },
           tags: { select: { name: true } },
         },
       }),
       this.prisma.ticket.count({ where }),
     ]);
 
+    // D9: decrypt encrypted customFields so ciphertext never reaches the staff UI.
+    await this.adminService.decryptCustomFieldsMany('TICKET', data);
     return { data, total };
   }
 
@@ -690,7 +705,13 @@ export class TicketsService {
 
   // ─────────────────────────── Reply ───────────────────────────
 
-  async reply(ticketId: number, dto: ReplyTicketDto, staffId?: number): Promise<TicketPost | TicketNote> {
+  async reply(
+    ticketId: number,
+    // creationMode/ipAddress are not on the public DTO (mass-assignment guard) — the
+    // controller forces STAFF + real ip; inbound mail passes EMAIL explicitly.
+    dto: ReplyTicketDto & { creationMode?: CreationMode; ipAddress?: string },
+    staffId?: number,
+  ): Promise<TicketPost | TicketNote> {
     const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
     if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
 
@@ -698,6 +719,8 @@ export class TicketsService {
       return this.addNote(ticketId, dto.contents, staffId ?? undefined);
     }
 
+    const replyCreationMode: CreationMode = dto.creationMode ?? 'STAFF';
+    const replyIp = dto.ipAddress ?? '0.0.0.0';
     const now = new Date();
     const isStaffReply = !!staffId;
     const firstResponse = isStaffReply && ticket.firstResponseAt === null;
@@ -729,8 +752,8 @@ export class TicketsService {
         isHtml: dto.isHtml,
         isEmailed: dto.isEmailed,
         isThirdParty: dto.isThirdParty,
-        creationMode: dto.creationMode as CreationMode,
-        ipAddress: dto.ipAddress,
+        creationMode: replyCreationMode,
+        ipAddress: replyIp,
       },
     });
 
@@ -912,6 +935,10 @@ export class TicketsService {
       });
       if (!status) throw new NotFoundException(`Status ${dto.statusId} not found`);
     }
+    // E3: validate the bulk assignee once before the transaction (clean 404 vs FK 500).
+    if (dto.action === 'assignee' && dto.ownerStaffId != null) {
+      await this.assertAssignableStaff(dto.ownerStaffId);
+    }
 
     const now = new Date();
     await this.prisma.$transaction(async (tx) => {
@@ -961,6 +988,12 @@ export class TicketsService {
 
   async assign(ticketId: number, dto: AssignTicketDto, staffId: number): Promise<Ticket> {
     const ticket = await this.findOrThrow(ticketId);
+
+    // E3: validate the assignee exists (and is enabled) up front — a bad id would
+    // otherwise surface as an opaque FK 500 from the update below.
+    if (dto.ownerStaffId != null) {
+      await this.assertAssignableStaff(dto.ownerStaffId);
+    }
 
     const updated = await this.prisma.ticket.update({
       where: { id: ticketId },
@@ -1204,51 +1237,51 @@ export class TicketsService {
       resolutionDueAt = dueDates.resolutionDueAt;
     }
 
-    // Create new ticket
-    const newTicket = await this.prisma.ticket.create({
-      data: {
-        mask: 'TT-PENDING',
-        subject: dto.subject,
-        departmentId,
-        statusId,
-        priorityId,
-        typeId: source.typeId,
-        userId: source.userId,
-        requesterName: source.requesterName,
-        requesterEmail: source.requesterEmail,
-        ownerStaffId: source.ownerStaffId,
-        slaPlanId: source.slaPlanId,
-        dueAt,
-        resolutionDueAt,
-        creationMode: source.creationMode,
-        creator: 'STAFF',
-        customFields: source.customFields as object,
-        totalReplies: posts.length,
-      },
-    });
-
-    const newMask = formatTicketMask(newTicket.id);
-
-    await this.prisma.$transaction([
-      // Update mask on new ticket
-      this.prisma.ticket.update({
-        where: { id: newTicket.id },
-        data: { mask: newMask },
-      }),
-      // Move posts to new ticket
-      this.prisma.ticketPost.updateMany({
-        where: { id: { in: dto.postIds } },
-        data: { ticketId: newTicket.id },
-      }),
-      // Decrement source reply count
-      this.prisma.ticket.update({
-        where: { id: sourceTicketId },
+    // Create the new ticket, assign its mask, move the posts, and decrement the
+    // source — all in ONE interactive transaction. Previously the create ran
+    // outside the transaction, so a failure left an orphan TT-PENDING ticket with
+    // no posts. The post move is also scoped to `ticketId: sourceTicketId` so a
+    // concurrent split/merge can't let us yank posts that no longer belong to the
+    // source (TOCTOU between the verify above and the move).
+    const { newTicket, newMask } = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.ticket.create({
         data: {
-          totalReplies: { decrement: posts.length },
-          lastActivityAt: now,
+          mask: 'TT-PENDING',
+          subject: dto.subject,
+          departmentId,
+          statusId,
+          priorityId,
+          typeId: source.typeId,
+          userId: source.userId,
+          requesterName: source.requesterName,
+          requesterEmail: source.requesterEmail,
+          ownerStaffId: source.ownerStaffId,
+          slaPlanId: source.slaPlanId,
+          dueAt,
+          resolutionDueAt,
+          creationMode: source.creationMode,
+          creator: 'STAFF',
+          customFields: source.customFields as object,
+          totalReplies: posts.length,
         },
-      }),
-    ]);
+      });
+      const mask = formatTicketMask(created.id);
+      await tx.ticket.update({ where: { id: created.id }, data: { mask } });
+      const moved = await tx.ticketPost.updateMany({
+        where: { id: { in: dto.postIds }, ticketId: sourceTicketId },
+        data: { ticketId: created.id },
+      });
+      // Defend the invariant: if a concurrent op moved some posts away between the
+      // verify and here, abort the whole transaction rather than split-brain.
+      if (moved.count !== dto.postIds.length) {
+        throw new BadRequestException('Posts changed during split; please retry');
+      }
+      await tx.ticket.update({
+        where: { id: sourceTicketId },
+        data: { totalReplies: { decrement: posts.length }, lastActivityAt: now },
+      });
+      return { newTicket: created, newMask: mask };
+    });
 
     // Audit on both
     await this.writeAudit(sourceTicketId, 'SPLIT', staffId, 'STAFF', {
@@ -1645,6 +1678,17 @@ export class TicketsService {
     const t = await this.prisma.ticket.findUnique({ where: { id } });
     if (!t) throw new NotFoundException(`Ticket ${id} not found`);
     return t;
+  }
+
+  /** E3: a ticket can only be assigned to an existing, enabled staff member. */
+  private async assertAssignableStaff(staffId: number): Promise<void> {
+    const staff = await this.prisma.staff.findUnique({
+      where: { id: staffId },
+      select: { id: true, isEnabled: true },
+    });
+    if (!staff) throw new NotFoundException(`Staff ${staffId} not found`);
+    if (!staff.isEnabled)
+      throw new BadRequestException(`Staff ${staffId} is disabled and cannot be assigned`);
   }
 
   private async defaultStatusId(): Promise<number> {

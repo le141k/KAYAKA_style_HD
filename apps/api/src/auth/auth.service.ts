@@ -31,6 +31,12 @@ type StaffWithGroup = Staff & { staffGroup: StaffGroup };
 /** Token used to inject MailService optionally without creating a circular module dep. */
 export const MAIL_SERVICE_TOKEN = Symbol('MAIL_SERVICE_TOKEN');
 
+// D2 — per-account lockout thresholds (env-overridable). The per-IP throttler
+// stops a single host hammering login; this stops a distributed brute-force from
+// many IPs against one account.
+const LOGIN_MAX_ATTEMPTS = Number(process.env['TELECOM_HD_LOGIN_MAX_ATTEMPTS']) || 5;
+const LOGIN_LOCK_MINUTES = Number(process.env['TELECOM_HD_LOGIN_LOCK_MINUTES']) || 15;
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -57,12 +63,56 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
+    // D2: reject while the account is locked, regardless of whether the supplied
+    // password is correct — this is what blunts a distributed brute-force.
+    if (staff.lockedUntil && staff.lockedUntil.getTime() > Date.now()) {
+      throw new UnauthorizedException(
+        'Account temporarily locked due to repeated failed login attempts. Try again later.',
+      );
+    }
+
     const ok = await verifyPassword(staff.passwordHash, password);
     if (!ok) {
+      await this.registerFailedLogin(staff);
       throw new UnauthorizedException('Invalid credentials');
     }
 
+    // Successful auth clears any accumulated failure state.
+    if (staff.failedLoginAttempts > 0 || staff.lockedUntil) {
+      await this.prisma.staff.update({
+        where: { id: staff.id },
+        data: { failedLoginAttempts: 0, lockedUntil: null },
+      });
+    }
+
     return staff;
+  }
+
+  /**
+   * D2 — record a failed login: increment the counter and, once it crosses the
+   * threshold, set `lockedUntil` and reset the counter so the next window starts
+   * fresh after the lock expires. Best-effort: a DB hiccup here must not turn a
+   * wrong password into a 500.
+   */
+  private async registerFailedLogin(staff: { id: number; failedLoginAttempts: number }): Promise<void> {
+    const attempts = staff.failedLoginAttempts + 1;
+    const locking = attempts >= LOGIN_MAX_ATTEMPTS;
+    try {
+      await this.prisma.staff.update({
+        where: { id: staff.id },
+        data: locking
+          ? {
+              failedLoginAttempts: 0,
+              lockedUntil: new Date(Date.now() + LOGIN_LOCK_MINUTES * 60_000),
+            }
+          : { failedLoginAttempts: attempts },
+      });
+      if (locking) {
+        this.logger.warn(`Staff ${staff.id} locked for ${LOGIN_LOCK_MINUTES}m after ${attempts} failures`);
+      }
+    } catch (err) {
+      this.logger.error(`Failed to record login failure for staff ${staff.id}`, err as Error);
+    }
   }
 
   /** Log in, issue tokens, persist hashed refresh token. */
@@ -99,9 +149,18 @@ export class AuthService {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
-    // Active (non-revoked) stored tokens — the normal rotation path.
+    // Opportunistic cleanup of this staff's expired tokens (bounded, indexed) so the
+    // scan below stays small. Fire-and-forget; failure must not block a valid refresh.
+    void this.prisma.refreshToken
+      .deleteMany({ where: { staffId: payload.sub, expiresAt: { lt: new Date() } } })
+      .catch(() => undefined);
+
+    // Active (non-revoked) stored tokens — the normal rotation path. Cap the scan
+    // (newest first) so a staff with many sessions can't blow up the argon2 loop.
     const active = await this.prisma.refreshToken.findMany({
       where: { staffId: payload.sub, revokedAt: null },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
     });
 
     // Find matching token by verifying argon2 hash
@@ -121,6 +180,8 @@ export class AuthService {
       // Treat it as a compromise and revoke the entire token family for this staff.
       const revoked = await this.prisma.refreshToken.findMany({
         where: { staffId: payload.sub, NOT: { revokedAt: null }, expiresAt: { gt: new Date() } },
+        orderBy: { createdAt: 'desc' },
+        take: 20,
       });
       for (const t of revoked) {
         if (await verifyPassword(t.tokenHash, rawRefreshToken)) {

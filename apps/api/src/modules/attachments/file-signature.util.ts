@@ -56,3 +56,81 @@ export function verifyFileSignature(declaredMime: string, buffer: Buffer): boole
   if (!check) return false; // unknown/disallowed type
   return check(buffer);
 }
+
+/**
+ * Executable / script extensions that must never be stored, even when the bytes
+ * look textual and the declared MIME is an allowed text type. The MIME allowlist
+ * alone doesn't catch a `payload.php` sent as `text/plain` — `looksTextual()`
+ * happily accepts it. A defence-in-depth denylist on the final extension closes
+ * that gap (the file would still need a server misconfig to *execute*, but we
+ * refuse to store it regardless).
+ */
+export const BLOCKED_UPLOAD_EXTENSIONS: ReadonlySet<string> = new Set([
+  // shells / scripts
+  'sh',
+  'bash',
+  'zsh',
+  'ksh',
+  'csh',
+  'php',
+  'phtml',
+  'php3',
+  'php4',
+  'php5',
+  'phar',
+  'py',
+  'pyc',
+  'rb',
+  'pl',
+  'js',
+  'mjs',
+  'cjs',
+  'jsx',
+  'ts',
+  'cgi',
+  'asp',
+  'aspx',
+  'jsp',
+  // windows executables / scripts
+  'exe',
+  'dll',
+  'com',
+  'bat',
+  'cmd',
+  'msi',
+  'scr',
+  'ps1',
+  'psm1',
+  'vbs',
+  'vbe',
+  'wsf',
+  'hta',
+  'cpl',
+  // unix executables / libraries
+  'bin',
+  'run',
+  'so',
+  'dylib',
+  'app',
+  'command',
+  // jvm / other
+  'jar',
+  'class',
+  'apk',
+  'deb',
+  'rpm',
+]);
+
+/**
+ * Reject dangerous file extensions regardless of declared MIME / content.
+ * Returns true when the name's final extension is safe to store.
+ */
+export function isExtensionAllowed(fileName: string): boolean {
+  const dot = fileName.lastIndexOf('.');
+  if (dot === -1) return true; // no extension → nothing to block here
+  const ext = fileName
+    .slice(dot + 1)
+    .trim()
+    .toLowerCase();
+  return !BLOCKED_UPLOAD_EXTENSIONS.has(ext);
+}

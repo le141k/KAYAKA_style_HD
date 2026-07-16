@@ -146,10 +146,16 @@ model Staff {
   followUps       FollowUp[]
   savedViews      SavedView[]
   lastLoginAt     DateTime?
+  // D2 — per-account brute-force lockout (complements the per-IP rate limiter).
+  failedLoginAttempts Int    @default(0)
+  lockedUntil     DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
   @@index([staffGroupId])
+  // C5: trigram GIN for ILIKE staff name search.
+  @@index([firstName(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([lastName(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model RefreshToken {
@@ -162,6 +168,9 @@ model RefreshToken {
   createdAt DateTime @default(now())
 
   @@index([staffId])
+  // Load: bound the refresh-rotation scan + support expired-token cleanup.
+  @@index([staffId, revokedAt])
+  @@index([staffId, expiresAt])
 }
 
 model PasswordReset {
@@ -224,6 +233,9 @@ model Organization {
   customFields Json    @default("{}")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+
+  // C5: trigram GIN for ILIKE org name search (OrganizationsService.list).
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model User {
@@ -250,6 +262,8 @@ model User {
   updatedAt      DateTime      @updatedAt
 
   @@index([organizationId])
+  // C5: trigram GIN for ILIKE user search (UsersService.list). Needs pg_trgm (enabled).
+  @@index([fullName(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model UserEmail {
@@ -516,6 +530,7 @@ model TicketAuditLog {
   createdAt DateTime  @default(now())
 
   @@index([ticketId])
+  @@index([createdAt])
 }
 
 model TicketLink {
@@ -630,6 +645,9 @@ model Workflow {
   sortOrder Int      @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // Load: every ticket event queries enabled workflows ordered by sortOrder.
+  @@index([isEnabled, sortOrder])
 }
 
 // ───────────────────────────── mail ─────────────────────────────
@@ -637,7 +655,7 @@ model Workflow {
 model EmailQueue {
   id             Int            @id @default(autoincrement())
   type           EmailQueueType @default(IMAP)
-  emailAddress   String
+  emailAddress   String         @unique
   host           String         @default("")
   port           Int            @default(993)
   username       String         @default("")
@@ -734,6 +752,9 @@ model KbArticle {
   updatedAt     DateTime           @updatedAt
 
   @@index([categoryId])
+  // C5: trigram GIN for KB article search over title + plaintext body.
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([contentsText(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 model KbArticleRevision {
@@ -854,6 +875,8 @@ model ReportSchedule {
   nextRunAt   DateTime?
 
   @@index([reportId])
+  // Load: the schedule scanner polls due+enabled schedules every 5 min.
+  @@index([isEnabled, nextRunAt])
 }
 
 model ReportRun {

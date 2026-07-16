@@ -386,3 +386,20 @@ The seed is **idempotent** (uses upsert / find-or-create; safe to re-run). It cr
 | Organizations    | `Acme Corp` (Moscow, RU, slaPlanId set), `Beta LLC` (Saint Petersburg, RU)                                           |
 | Users            | Ivan Petrov, Maria Sidorova (Acme Corp), Dmitry Volkov (Beta LLC), Guest User                                        |
 | Demo Tickets     | 5 tickets covering Support + NOC departments, various priorities/types, first 2 with agent replies                   |
+## Schema changes — audit-fix batches (2026-05)
+
+Applied via Prisma migrations (all apply clean on a fresh DB; 21 migrations total including RBAC):
+
+- **Staff** — `failedLoginAttempts Int @default(0)`, `lockedUntil DateTime?` (D2 per-account
+  lockout). Excluded from the `SafeStaff` API type. _Migration `…_staff_login_lockout`._
+- **EmailQueue** — `emailAddress` now `@unique` so the importer upserts atomically.
+  _Migration `…_emailqueue_unique_email`._
+- **Load indexes (C1/C5)** — `RefreshToken @@index([staffId, revokedAt])` + `([staffId, expiresAt])`;
+  `Workflow @@index([isEnabled, sortOrder])`; `TicketAuditLog @@index([createdAt])`;
+  `ReportSchedule @@index([isEnabled, nextRunAt])`. _Migration `…_load_indexes_batch_c`._
+- **GIN trigram indexes (C5)** — `User.fullName`, `Organization.name`, `Staff.firstName`,
+  `Staff.lastName`, `KbArticle.title`, `KbArticle.contentsText` (`gin_trgm_ops`, needs `pg_trgm`).
+  EXPLAIN-confirmed used for `ILIKE '%term%'`. _Migration `…_search_trgm_indexes_batch_c5`._
+- **RBAC audit** — append-only `RbacAuditLog` plus indexes for time, actor, and target lookups.
+  _Migration `20260716000000_rbac_audit_log`._
+- Per-queue IMAP UID watermarks live in the existing `Setting` table (section `imap`).

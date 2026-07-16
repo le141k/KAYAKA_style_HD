@@ -68,7 +68,21 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async onModuleInit(): Promise<void> {
-    // Only start if at least one IMAP queue is enabled
+    // A1: surface enabled queues whose transport we don't poll (e.g. PIPE) instead
+    // of silently ignoring them — their mail would otherwise be dropped on the
+    // floor. PIPE/MTA queues are fed via POST /api/inbound/pipe (see controller).
+    const enabledNonImap = await this.prisma.emailQueue.findMany({
+      where: { isEnabled: true, type: { not: 'IMAP' } },
+      select: { id: true, emailAddress: true, type: true },
+    });
+    for (const q of enabledNonImap) {
+      this.logger.warn(
+        `EmailQueue ${q.id} (${q.emailAddress}, type=${q.type}) is enabled but not IMAP — ` +
+          `the poller will not fetch it. Use the inbound webhook (POST /api/inbound/pipe) for PIPE/MTA delivery.`,
+      );
+    }
+
+    // Only start polling if at least one IMAP queue is enabled
     const queues = await this.prisma.emailQueue.findMany({
       where: { isEnabled: true, type: 'IMAP' },
     });
@@ -232,16 +246,91 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    *   3. Apply parser rules (PRE_PARSE) — may discard or override routing
    *   4. Fall back to creating a new ticket
    */
+  /**
+   * A5(ii): true when an inbound message looks machine-generated or self-sent, so
+   * we must not auto-reply to it. Checks RFC 3834 Auto-Submitted, Precedence:bulk/
+   * list/junk, any X-Loop, and a From that matches our own MAIL_FROM / a configured
+   * queue address (self-loop).
+   */
+  private isLoopMessage(parsed: { headers?: Map<string, unknown> }, fromEmail: string): boolean {
+    const headers = parsed.headers;
+    // A header can arrive as a string, an array (repeated header lines), or a
+    // structured object (mailparser parses params). Flatten all to a lowercased
+    // string so a multi-valued `Precedence: list` + `Precedence: bulk` (array) or
+    // a parameterised value can't slip past the checks below.
+    const get = (k: string): string => {
+      if (!headers || typeof headers.get !== 'function') return '';
+      const raw = headers.get(k);
+      if (raw == null) return '';
+      const flat = Array.isArray(raw)
+        ? raw.map((v) => (typeof v === 'object' && v ? JSON.stringify(v) : String(v))).join(' ')
+        : typeof raw === 'object'
+          ? JSON.stringify(raw)
+          : String(raw);
+      return flat.toLowerCase();
+    };
+    // True if any whitespace/comma-separated token of the header equals one of `tokens`.
+    const hasToken = (headerVal: string, tokens: string[]): boolean => {
+      const parts = headerVal.split(/[\s,;]+/).filter(Boolean);
+      return parts.some((p) => tokens.includes(p));
+    };
+
+    const autoSubmitted = get('auto-submitted');
+    // Anything other than an explicit "no" (incl. multi/parameterised) is a loop.
+    if (autoSubmitted && !hasToken(autoSubmitted, ['no'])) return true;
+
+    const precedence = get('precedence');
+    if (hasToken(precedence, ['bulk', 'list', 'junk', 'auto_reply'])) return true;
+
+    if (get('x-loop') || get('x-autoreply') || get('x-autorespond')) return true;
+
+    // Self-from: never react to mail we ourselves sent.
+    const own = (this.config.TELECOM_HD_MAIL_FROM ?? '').toLowerCase();
+    if (own && fromEmail.toLowerCase() === own) return true;
+
+    return false;
+  }
+
   private async processMessage(msg: FetchMessageObject, departmentId: number | undefined): Promise<void> {
-    const { simpleParser } = await import('mailparser');
     const source = msg.source;
     if (!source) return;
+    await this.ingestRawMessage(source, departmentId);
+  }
 
+  /**
+   * Parse a raw RFC822 message and route it (thread / new ticket). Shared by the
+   * IMAP poller and the inbound webhook (A1) so both transports behave identically.
+   */
+  async ingestRawMessage(source: Buffer | string, departmentId: number | undefined): Promise<void> {
+    const { simpleParser } = await import('mailparser');
     const parsed = await simpleParser(source);
     const subject = parsed.subject ?? '(no subject)';
     const from = parsed.from?.value?.[0];
     const fromEmail = from?.address ?? 'unknown@example.com';
     const fromName = from?.name ?? fromEmail;
+
+    // A5(ii): drop machine-generated / looping mail before it can create a ticket
+    // or reply (which would trigger our autoresponder and ping-pong).
+    if (this.isLoopMessage(parsed, fromEmail)) {
+      this.logger.log(`IMAP: skipped auto/loop message from ${fromEmail} — "${subject}"`);
+      return;
+    }
+
+    // A3 dedup: if we've already ingested a post bearing this exact Message-ID,
+    // this is a re-delivery (re-poll, or the same mail arriving via IMAP + webhook)
+    // — skip it so no duplicate ticket/reply is created. Empty IDs are never matched.
+    const incomingMessageId = parsed.messageId ?? undefined;
+    if (incomingMessageId) {
+      const existing = await this.prisma.ticketPost.findFirst({
+        where: { messageId: incomingMessageId },
+        select: { id: true },
+      });
+      if (existing) {
+        this.logger.log(`IMAP: duplicate message ${incomingMessageId} from ${fromEmail} — skipped`);
+        return;
+      }
+    }
+
     // Strip the quoted reply history so a threaded reply stores only the new text
     // (Kayako keeps the whole quoted chain on every message). HTML is left as-is —
     // the plain-text body is what we persist when there is no HTML part.
@@ -264,26 +353,27 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       emailAttachmentIds = uploaded.map((a) => a.id);
     }
 
-    // RFC threading identifiers
-    const incomingMessageId = parsed.messageId ?? undefined;
+    // RFC threading identifiers (incomingMessageId already resolved above for dedup).
     const inReplyTo = parsed.inReplyTo ?? undefined;
     const references = (parsed.references as string[] | string | undefined) ?? undefined;
 
-    // Build list of message IDs from In-Reply-To and References to try
+    // Build list of message IDs from In-Reply-To and References to try.
+    // Filter empties so a blank id can never match the '' default on legacy posts.
     const referencedIds: string[] = [];
     if (inReplyTo) referencedIds.push(inReplyTo);
     if (references) {
       if (Array.isArray(references)) {
         referencedIds.push(...references);
       } else {
-        referencedIds.push(...String(references).split(/\s+/).filter(Boolean));
+        referencedIds.push(...String(references).split(/\s+/));
       }
     }
+    const cleanReferencedIds = referencedIds.filter((id) => id && id.trim().length > 0);
 
     // 1. Try RFC threading by In-Reply-To / References
-    if (referencedIds.length > 0) {
+    if (cleanReferencedIds.length > 0) {
       const linkedPost = await this.prisma.ticketPost.findFirst({
-        where: { messageId: { in: referencedIds } },
+        where: { messageId: { in: cleanReferencedIds } },
         include: { ticket: true },
       });
 
@@ -313,6 +403,17 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       const mask = maskMatch[0].toUpperCase();
       try {
         const ticket = await this.ticketsService.getTicketByMask(mask);
+        // Ownership guard: unlike the RFC path (which requires possessing a real
+        // Message-ID), a subject mask is guessable. Only thread onto the ticket if
+        // the sender is its requester — otherwise anyone could append to (and
+        // reopen) an arbitrary or another customer's ticket by quoting "TT-NNNNNN".
+        const senderOwns = (ticket.requesterEmail ?? '').trim().toLowerCase() === fromEmail.toLowerCase();
+        if (!senderOwns) {
+          this.logger.warn(
+            `IMAP: mask ${mask} in subject but sender ${fromEmail} is not the requester — creating new ticket`,
+          );
+          throw new Error('sender-not-requester');
+        }
         await this.ticketsService.reply(ticket.id, {
           contents: htmlBody ?? textBody,
           isHtml: !!htmlBody,

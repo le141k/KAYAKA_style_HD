@@ -27,6 +27,7 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_MAIL_FROM: 'support@test.example',
   TELECOM_HD_LOG_LEVEL: 'silent',
   TELECOM_HD_ALARIS_WEBHOOK_SECRET: 'test-secret',
+  TELECOM_HD_INBOUND_WEBHOOK_SECRET: 'test-inbound-secret',
   TELECOM_HD_UPLOAD_DIR: '/tmp/uploads',
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: 25,
   TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined,
@@ -315,6 +316,120 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(processSpy).toHaveBeenCalledTimes(2);
       expect(prisma.setting.upsert).toHaveBeenCalledWith(expect.objectContaining({ update: { value: 102 } }));
       processSpy.mockRestore();
+    });
+  });
+
+  // ─── A3: dedup by Message-ID ─────────────────────────────────────────────────
+  describe('processMessage dedup (A3)', () => {
+    const rawEmail = [
+      'From: customer@acme.example',
+      'To: support@test.example',
+      'Subject: Need help',
+      'Message-ID: <dup-123@acme.example>',
+      '',
+      'Body text',
+      '',
+    ].join('\r\n');
+
+    const callProcess = (prismaArg: PrismaService) =>
+      makeInboundService(prismaArg) as unknown as {
+        processMessage: (m: unknown, d: number | undefined) => Promise<void>;
+        ticketsService: { createTicket: ReturnType<typeof vi.fn>; reply: ReturnType<typeof vi.fn> };
+      };
+
+    it('skips a message whose Message-ID already exists on a post', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 99 });
+      const svc = callProcess(prisma as unknown as PrismaService);
+      await svc.processMessage({ source: Buffer.from(rawEmail) }, 1);
+      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+      expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+    });
+
+    it('creates a ticket when the Message-ID is new', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = callProcess(prisma as unknown as PrismaService);
+      await svc.processMessage({ source: Buffer.from(rawEmail) }, 1);
+      expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
+    });
+
+    // Subject-mask threading ownership guard.
+    const maskEmail = (from: string) =>
+      [
+        `From: ${from}`,
+        'To: support@test.example',
+        'Subject: Re: TT-000005 still broken',
+        `Message-ID: <mask-${Math.random()}@x.example>`,
+        '',
+        'still broken',
+        '',
+      ].join('\r\n');
+
+    it('does NOT thread by subject mask when the sender is not the ticket requester', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = callProcess(prisma as unknown as PrismaService);
+      (svc.ticketsService as unknown as { getTicketByMask: ReturnType<typeof vi.fn> }).getTicketByMask = vi
+        .fn()
+        .mockResolvedValue({ id: 5, mask: 'TT-000005', requesterEmail: 'owner@acme.example' });
+
+      await svc.processMessage({ source: Buffer.from(maskEmail('attacker@evil.example')) }, 1);
+
+      // Not threaded onto ticket 5; a new ticket is created instead.
+      expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+      expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
+    });
+
+    it('threads by subject mask when the sender IS the ticket requester', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = callProcess(prisma as unknown as PrismaService);
+      (svc.ticketsService as unknown as { getTicketByMask: ReturnType<typeof vi.fn> }).getTicketByMask = vi
+        .fn()
+        .mockResolvedValue({ id: 5, mask: 'TT-000005', requesterEmail: 'owner@acme.example' });
+
+      await svc.processMessage({ source: Buffer.from(maskEmail('Owner <owner@acme.example>')) }, 1);
+
+      expect(svc.ticketsService.reply).toHaveBeenCalledTimes(1);
+      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── A5(ii): loop / auto-reply detection ─────────────────────────────────────
+  describe('isLoopMessage', () => {
+    const call = (headers: Record<string, string>, fromEmail = 'someone@external.example') =>
+      (service as unknown as { isLoopMessage: (p: unknown, f: string) => boolean }).isLoopMessage(
+        { headers: new Map(Object.entries(headers)) },
+        fromEmail,
+      );
+
+    it('skips Auto-Submitted other than "no"', () => {
+      expect(call({ 'auto-submitted': 'auto-replied' })).toBe(true);
+      expect(call({ 'auto-submitted': 'auto-generated' })).toBe(true);
+      expect(call({ 'auto-submitted': 'no' })).toBe(false);
+    });
+
+    it('skips Precedence bulk/list/junk', () => {
+      expect(call({ precedence: 'bulk' })).toBe(true);
+      expect(call({ precedence: 'list' })).toBe(true);
+    });
+
+    it('skips a multi-valued (array) Precedence header', () => {
+      // mailparser returns repeated header lines as an array — must still match.
+      const headers = new Map<string, unknown>([['precedence', ['list', 'bulk']]]);
+      const svc = service as unknown as { isLoopMessage: (p: unknown, f: string) => boolean };
+      expect(svc.isLoopMessage({ headers }, 'someone@external.example')).toBe(true);
+    });
+
+    it('skips X-Loop / X-Autoreply', () => {
+      expect(call({ 'x-loop': 'support@test.example' })).toBe(true);
+      expect(call({ 'x-autoreply': 'yes' })).toBe(true);
+    });
+
+    it('skips mail from our own MAIL_FROM (self-loop)', () => {
+      expect(call({}, 'support@test.example')).toBe(true);
+      expect(call({}, 'SUPPORT@TEST.EXAMPLE')).toBe(true);
+    });
+
+    it('accepts an ordinary external message', () => {
+      expect(call({ from: 'x' }, 'customer@acme.example')).toBe(false);
     });
   });
 });

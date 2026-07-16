@@ -106,7 +106,11 @@ export class KnowledgebaseService {
     });
     if (!article || !article.isPublished) throw new NotFoundException('Article not found');
     await this.prisma.kbArticle.update({ where: { id: article.id }, data: { views: { increment: 1 } } });
-    return article;
+    // E4: this is the public (unauthenticated) article view — don't leak the
+    // internal author staff id.
+    const { authorStaffId: _authorStaffId, ...pub } = article;
+    void _authorStaffId;
+    return pub;
   }
 
   async createArticle(dto: CreateArticleDto, authorStaffId?: number) {

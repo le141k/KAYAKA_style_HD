@@ -61,6 +61,9 @@ async function bootstrap(): Promise<void> {
     SwaggerModule.setup('api/docs', app, document);
   }
 
+  // Clean up Prisma / Redis / BullMQ on SIGTERM/SIGINT (graceful shutdown).
+  app.enableShutdownHooks();
+
   const port = config.TELECOM_HD_API_PORT;
   await app.listen(port);
 

@@ -18,7 +18,20 @@ export interface SendMailOptions {
   inReplyTo?: string;
   /** RFC threading: the References chain. */
   references?: string | string[];
+  /**
+   * A5(i): RFC 3834 Auto-Submitted header. Set for machine-generated mail
+   * (autoresponders, notifications) so a remote auto-responder won't ping-pong
+   * with us. Human staff replies leave this unset.
+   */
+  autoSubmitted?: 'auto-replied' | 'auto-generated';
 }
+
+/**
+ * Template keys that are NOT machine-generated (a human composed them) — these
+ * must NOT carry an Auto-Submitted header. Everything else sent via sendTemplate
+ * is automated and is marked auto-generated for loop protection.
+ */
+const HUMAN_TEMPLATE_KEYS = new Set<string>(['ticket_user_reply']);
 
 export interface RenderedTemplate {
   subject: string;
@@ -79,7 +92,7 @@ export class MailService {
    * critical path) or inline as a fallback. Logs and swallows errors so a send
    * failure never crashes the ticket flow.
    */
-  async deliver(opts: SendMailOptions): Promise<void> {
+  async deliver(opts: SendMailOptions, throwOnError = false): Promise<void> {
     try {
       const toStr = Array.isArray(opts.to) ? opts.to.join(', ') : opts.to;
       const ccStr = opts.cc ? (Array.isArray(opts.cc) ? opts.cc.join(', ') : opts.cc) : undefined;
@@ -94,10 +107,15 @@ export class MailService {
         ...(bccStr ? { bcc: bccStr } : {}),
         ...(opts.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}),
         ...(opts.references ? { references: opts.references } : {}),
+        ...(opts.autoSubmitted ? { headers: { 'Auto-Submitted': opts.autoSubmitted } } : {}),
       });
       this.logger.debug(`Mail sent to ${opts.to}: ${opts.subject}`);
     } catch (err) {
       this.logger.error(`Failed to send mail to ${opts.to}: ${String(err)}`);
+      // When delivering from the BullMQ processor, rethrow so the job's retry/backoff
+      // (attempts:3) actually fires. Inline fallback callers pass false so a send
+      // failure never crashes the ticket flow.
+      if (throwOnError) throw err instanceof Error ? err : new Error(String(err));
     }
   }
 
@@ -151,11 +169,19 @@ export class MailService {
     opts?: { cc?: string[]; bcc?: string[]; inReplyTo?: string; references?: string | string[] },
   ): Promise<void> {
     const rendered = await this.renderTemplate(templateKey, locale, vars);
+    // A5(i): autoresponder is an auto-reply; other templated mail (notifications,
+    // SLA breach, auto-close) is auto-generated; human staff replies are neither.
+    const autoSubmitted = HUMAN_TEMPLATE_KEYS.has(templateKey)
+      ? undefined
+      : templateKey === 'autoresponder'
+        ? ('auto-replied' as const)
+        : ('auto-generated' as const);
     await this.send({
       to,
       subject: rendered.subject,
       html: rendered.html,
       text: rendered.text,
+      ...(autoSubmitted ? { autoSubmitted } : {}),
       ...(opts?.cc?.length ? { cc: opts.cc } : {}),
       ...(opts?.bcc?.length ? { bcc: opts.bcc } : {}),
       ...(opts?.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}),

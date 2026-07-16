@@ -136,6 +136,31 @@ describe('AttachmentsService', () => {
       ).rejects.toThrow(/does not match its declared type/);
       expect(prisma.attachment.create).not.toHaveBeenCalled();
     });
+
+    // D6 — a script with textual content sent as text/plain passes the MIME +
+    // magic-byte checks; the extension denylist must still refuse it.
+    it('rejects a blocked extension even when content is textual (D6)', async () => {
+      await expect(
+        service.uploadFiles([
+          {
+            originalname: 'shell.php',
+            mimetype: 'text/plain',
+            size: 30,
+            buffer: Buffer.from('<?php system($_GET["c"]); ?>'),
+          },
+        ]),
+      ).rejects.toThrow(/blocked file type/);
+      expect(prisma.attachment.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a .sh disguised as text/plain (D6)', async () => {
+      await expect(
+        service.uploadFiles([
+          { originalname: 'pwn.sh', mimetype: 'text/plain', size: 10, buffer: Buffer.from('rm -rf /') },
+        ]),
+      ).rejects.toThrow(/blocked file type/);
+      expect(prisma.attachment.create).not.toHaveBeenCalled();
+    });
   });
 
   // ─── linkToPost ────────────────────────────────────────────────────────────

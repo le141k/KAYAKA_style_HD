@@ -103,6 +103,10 @@ function makePrismaMock() {
     ticketAuditLog: {
       create: vi.fn(),
     },
+    staff: {
+      // E3: assign/bulkAction validate the assignee exists + is enabled.
+      findUnique: vi.fn().mockResolvedValue({ id: 5, isEnabled: true }),
+    },
     ticketWatcher: {
       upsert: vi.fn(),
       deleteMany: vi.fn(),
@@ -153,6 +157,9 @@ describe('TicketsService', () => {
       validateCustomFields: vi.fn().mockResolvedValue(undefined),
       encryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
       decryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
+      decryptCustomFieldsMany: vi
+        .fn()
+        .mockImplementation((_s: unknown, rows: unknown) => Promise.resolve(rows)),
     } as unknown as AdminService;
     service = new TicketsService(
       prisma as unknown as PrismaService,

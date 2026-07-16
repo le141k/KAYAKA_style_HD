@@ -25,7 +25,9 @@ function advanceNextRunAt(cron: string, from: Date): Date {
   }
 }
 
-@Processor('reports')
+// concurrency:1 + a long lockDuration so two scans can't overlap and double-send
+// a scheduled report (the nextRunAt "claim" is written only after the email send).
+@Processor('reports', { concurrency: 1, lockDuration: 300_000 })
 export class ReportScheduleProcessor extends WorkerHost {
   private readonly logger = new Logger(ReportScheduleProcessor.name);
 

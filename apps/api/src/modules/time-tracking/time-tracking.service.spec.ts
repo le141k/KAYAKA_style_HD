@@ -11,6 +11,8 @@ function makePrismaMock() {
       create: vi.fn(),
       delete: vi.fn(),
     },
+    // E3: create() now verifies the ticket exists first.
+    ticket: { findUnique: vi.fn().mockResolvedValue({ id: 10 }) },
   } as unknown as PrismaService;
 }
 

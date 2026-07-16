@@ -74,6 +74,8 @@ export interface Ticket {
   typeName?: string;
   requester: User;
   assignee?: User;
+  /** Requester's organization (shown in the staff ticket list). */
+  organization?: { id: number; name: string };
   department?: Department;
   sla_plan?: SLAPlan;
   sla_due_at?: string;

@@ -7,6 +7,7 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  Ip,
   Param,
   ParseIntPipe,
   Patch,
@@ -16,6 +17,7 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import { z } from 'zod';
 import { TicketsService } from './tickets.service';
 import { RequirePermissions, CurrentStaff, Public } from '../../auth/auth.decorators';
 import type { AuthStaff } from '../../auth/auth.decorators';
@@ -88,7 +90,7 @@ export class TicketsController {
     if (dto.attachmentIds?.length && !dto.attachmentClaimToken) {
       throw new BadRequestException('attachmentClaimToken is required when attachmentIds are provided');
     }
-    return this.ticketsService.createTicket({
+    const ticket = await this.ticketsService.createTicket({
       ...dto,
       contents: dto.contents,
       departmentId: dto.departmentId ?? 1,
@@ -98,6 +100,16 @@ export class TicketsController {
       tags: [],
       customFields: dto.customFields,
     });
+    // D7: never echo the raw Ticket to an unauthenticated submitter — it carries
+    // ipAddress, creationMode, slaPlanId, internal SLA timestamps and (encrypted)
+    // customFields. Return only what the portal needs to confirm the submission.
+    return {
+      id: ticket.id,
+      mask: ticket.mask,
+      subject: ticket.subject,
+      statusId: ticket.statusId,
+      createdAt: ticket.createdAt,
+    };
   }
 
   // ─────────────────── Client: my tickets ───────────────────
@@ -107,10 +119,16 @@ export class TicketsController {
   @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
   @ApiOperation({ summary: "List the current requester's tickets by email (client portal)" })
   listMy(@Query('email') email: string | undefined) {
-    if (!email) {
-      throw new BadRequestException('Query parameter "email" is required');
+    return this.ticketsService.listMyTickets(this.requireEmailParam(email));
+  }
+
+  /** E1: validate the `email` query param as a real (bounded) email address. */
+  private requireEmailParam(email: string | undefined): string {
+    const parsed = z.string().trim().email().max(320).safeParse(email);
+    if (!parsed.success) {
+      throw new BadRequestException('Query parameter "email" must be a valid email address');
     }
-    return this.ticketsService.listMyTickets(email);
+    return parsed.data.toLowerCase();
   }
 
   // ─────────────────── Client: public ticket detail ───────────────────
@@ -123,10 +141,7 @@ export class TicketsController {
       'Get a single ticket (no auth) with public posts only — no internal notes. Requires ?email= matching the ticket requester.',
   })
   getPublic(@Param('id', ParseIntPipe) id: number, @Query('email') email: string | undefined) {
-    if (!email) {
-      throw new BadRequestException('Query parameter "email" is required');
-    }
-    return this.ticketsService.getPublicTicket(id, email);
+    return this.ticketsService.getPublicTicket(id, this.requireEmailParam(email));
   }
 
   // ─────────────────── Client: public reply ───────────────────
@@ -135,11 +150,20 @@ export class TicketsController {
   @Post('public/:id/reply')
   @Throttle({ default: { limit: PUBLIC_REPLY_LIMIT, ttl: 60000 } })
   @ApiOperation({ summary: 'Add a user reply to a ticket from the client portal (no auth required)' })
-  publicReply(
+  async publicReply(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(PublicReplySchema)) dto: PublicReplyDto,
   ) {
-    return this.ticketsService.publicReply(id, dto);
+    const post = await this.ticketsService.publicReply(id, dto);
+    // D7: the raw TicketPost carries ipAddress, creationMode, staffId and the
+    // author email — strip them. The portal only needs the created post's identity.
+    return {
+      id: post.id,
+      ticketId: post.ticketId,
+      contents: post.contents,
+      isHtml: post.isHtml,
+      createdAt: post.createdAt,
+    };
   }
 
   // ─────────────────── Staff routes ───────────────────
@@ -169,8 +193,9 @@ export class TicketsController {
   @RequirePermissions(PERMISSIONS.TICKET_CREATE)
   @UsePipes(new ZodValidationPipe(CreateTicketSchema))
   @ApiOperation({ summary: 'Create a ticket (staff)' })
-  create(@Body() dto: CreateTicketDto, @CurrentStaff() staff: AuthStaff) {
-    return this.ticketsService.createTicket(dto, staff.staffId);
+  create(@Body() dto: CreateTicketDto, @CurrentStaff() staff: AuthStaff, @Ip() ip: string) {
+    // Force a trusted creationMode + real client IP — never from the request body.
+    return this.ticketsService.createTicket({ ...dto, creationMode: 'STAFF', ipAddress: ip }, staff.staffId);
   }
 
   @Post('bulk')
@@ -198,8 +223,10 @@ export class TicketsController {
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(ReplyTicketSchema)) dto: ReplyTicketDto,
     @CurrentStaff() staff: AuthStaff,
+    @Ip() ip: string,
   ) {
-    return this.ticketsService.reply(id, dto, staff.staffId);
+    // Trusted creationMode + real client IP — never from the request body.
+    return this.ticketsService.reply(id, { ...dto, creationMode: 'STAFF', ipAddress: ip }, staff.staffId);
   }
 
   @Post(':id/notes')

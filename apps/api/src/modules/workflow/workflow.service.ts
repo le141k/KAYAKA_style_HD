@@ -1,5 +1,7 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
+import { WORKFLOW_CHANGED_EVENT } from './workflow.executor';
 import type { Workflow, Macro, MacroCategory } from '@prisma/client';
 import type {
   CreateWorkflowDto,
@@ -14,7 +16,15 @@ import type {
 export class WorkflowService {
   private readonly logger = new Logger(WorkflowService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly events: EventEmitter2,
+  ) {}
+
+  /** C3: tell the WorkflowExecutor to drop its cached enabled-workflows list. */
+  private emitWorkflowChanged(): void {
+    this.events.emit(WORKFLOW_CHANGED_EVENT);
+  }
 
   // ─────────────────── Workflow CRUD ───────────────────
 
@@ -29,7 +39,7 @@ export class WorkflowService {
   }
 
   async createWorkflow(dto: CreateWorkflowDto): Promise<Workflow> {
-    return this.prisma.workflow.create({
+    const created = await this.prisma.workflow.create({
       data: {
         title: dto.title,
         criteria: dto.criteria as object,
@@ -38,11 +48,13 @@ export class WorkflowService {
         sortOrder: dto.sortOrder,
       },
     });
+    this.emitWorkflowChanged();
+    return created;
   }
 
   async updateWorkflow(id: number, dto: UpdateWorkflowDto): Promise<Workflow> {
     await this.getWorkflow(id);
-    return this.prisma.workflow.update({
+    const updated = await this.prisma.workflow.update({
       where: { id },
       data: {
         ...(dto.title !== undefined && { title: dto.title }),
@@ -52,11 +64,14 @@ export class WorkflowService {
         ...(dto.sortOrder !== undefined && { sortOrder: dto.sortOrder }),
       },
     });
+    this.emitWorkflowChanged();
+    return updated;
   }
 
   async deleteWorkflow(id: number): Promise<void> {
     await this.getWorkflow(id);
     await this.prisma.workflow.delete({ where: { id } });
+    this.emitWorkflowChanged();
   }
 
   // ─────────────────── MacroCategory CRUD ───────────────────

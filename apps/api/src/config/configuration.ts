@@ -29,6 +29,10 @@ const schema = z.object({
   // enough entropy to resist guessing; the default below is a 32-char dev value.
   // Generate a strong one: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_ALARIS_WEBHOOK_SECRET: z.string().min(32).default('alaris-dev-secret-change-me-0000'),
+  // Shared-secret for the inbound mail webhook (POST /api/inbound/pipe) used by an
+  // MTA/PIPE delivery script. Same entropy requirement as the Alaris secret.
+  // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+  TELECOM_HD_INBOUND_WEBHOOK_SECRET: z.string().min(32).default('inbound-dev-secret-change-me-0000'),
   TELECOM_HD_UPLOAD_DIR: z.string().default('/app/uploads'),
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: z.coerce.number().default(25),
   // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
@@ -66,6 +70,7 @@ export function assertProductionSecrets(cfg: AppConfig): void {
   if (cfg.TELECOM_HD_ALARIS_WEBHOOK_SECRET === ALARIS_DEFAULT_SECRET) {
     problems.push('  - TELECOM_HD_ALARIS_WEBHOOK_SECRET: must not be the shipped default');
   }
+  checkSecret('TELECOM_HD_INBOUND_WEBHOOK_SECRET', cfg.TELECOM_HD_INBOUND_WEBHOOK_SECRET);
   if (cfg.TELECOM_HD_JWT_ACCESS_SECRET === cfg.TELECOM_HD_JWT_REFRESH_SECRET) {
     problems.push('  - TELECOM_HD_JWT_REFRESH_SECRET: must differ from the access secret');
   }

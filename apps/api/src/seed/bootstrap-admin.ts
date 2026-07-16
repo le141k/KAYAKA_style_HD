@@ -94,6 +94,17 @@ export async function bootstrapAdmin(
     return;
   }
 
+  // E4: refuse weak/demo bootstrap passwords — this account is a real production
+  // administrator, never the seed demo credential.
+  const WEAK = new Set(['demo1234', 'password', 'admin', 'changeme', 'change-me']);
+  if (password.length < 12 || WEAK.has(password.toLowerCase())) {
+    console.warn(
+      '[bootstrap-admin] Skipping — TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD is too weak ' +
+        '(min 12 chars, not a known default like demo1234). Set a strong password and redeploy.',
+    );
+    return;
+  }
+
   console.log(`[bootstrap-admin] Ensuring staff account for <${email}>…`);
 
   // ── 2. Ensure the staff account exists ────────────────────────────────────

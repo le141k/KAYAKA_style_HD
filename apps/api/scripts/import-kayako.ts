@@ -191,9 +191,13 @@ async function importEmailConfig(
       // Import disabled (no password) so the poller doesn't try to connect.
       isEnabled: false,
     };
-    const existing = await prisma.emailQueue.findFirst({ where: { emailAddress } });
-    if (existing) await prisma.emailQueue.update({ where: { id: existing.id }, data });
-    else await prisma.emailQueue.create({ data });
+    // D5: atomic upsert on the unique emailAddress (was a non-atomic
+    // findFirst+create that could race / double-insert on re-run).
+    await prisma.emailQueue.upsert({
+      where: { emailAddress },
+      update: data,
+      create: data,
+    });
     qCount++;
   }
 

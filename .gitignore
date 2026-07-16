@@ -36,3 +36,15 @@ npm-debug.log*
 !.vscode/extensions.json
 apps/web/e2e/.auth/
 .env.prod
+
+# Operator deploy notes + secrets for the 10.0.0.20 VM rollout — never commit
+deploy.md
+secrets.md
+
+# temp KB article payload
+.kb-api-article.html
+# temp seed scripts
+.gen-tickets.py
+.port-macros.py
+.macros.json
+.macros-cats.json

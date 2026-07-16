@@ -9,7 +9,7 @@ import { useKBCategories, useKBArticles } from '@/lib/hooks/use-kb';
 import { QueryError } from '@/components/QueryError';
 import { formatDate } from '@/lib/utils';
 
-export function KBContent() {
+export function KBContent({ basePath = '/kb' }: { basePath?: string } = {}) {
   const [inputValue, setInputValue] = useState('');
   // Debounced value sent to the API — updated ~300 ms after the user stops typing.
   const [query, setQuery] = useState('');
@@ -143,7 +143,7 @@ export function KBContent() {
             {articles?.map((article) => (
               <Link
                 key={article.id}
-                href={`/kb/${article.slug}`}
+                href={`${basePath}/${article.slug}`}
                 className="block rounded-xl border border-border bg-card p-4 transition-all hover:border-primary/30 hover:shadow-sm"
                 data-testid="kb-article-link"
               >

@@ -37,7 +37,7 @@ const NAV_ITEMS: {
   },
   { label: 'Заявки', href: '/staff/tickets', Icon: Ticket, requires: [PERMISSIONS.TICKET_VIEW] },
   { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare, requires: [PERMISSIONS.TICKET_VIEW] },
-  { label: 'База знаний', href: '/kb', Icon: BookOpen },
+  { label: 'База знаний', href: '/staff/kb', Icon: BookOpen },
   { label: 'Настройки', href: '/admin', Icon: Settings, requires: ADMIN_AREA_PERMISSIONS },
 ];
 

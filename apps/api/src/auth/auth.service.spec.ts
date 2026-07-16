@@ -55,6 +55,7 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_MAIL_FROM: 'test@test.example',
   TELECOM_HD_LOG_LEVEL: 'silent',
   TELECOM_HD_ALARIS_WEBHOOK_SECRET: 'test-secret',
+  TELECOM_HD_INBOUND_WEBHOOK_SECRET: 'test-inbound-secret',
   TELECOM_HD_UPLOAD_DIR: '/tmp/uploads',
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: 25,
 };
@@ -83,6 +84,8 @@ const MOCK_STAFF = {
   staffGroupId: 1,
   staffGroup: MOCK_STAFF_GROUP,
   lastLoginAt: null,
+  failedLoginAttempts: 0,
+  lockedUntil: null,
   createdAt: new Date(),
   updatedAt: new Date(),
 };
@@ -138,6 +141,68 @@ describe('AuthService', () => {
 
       await expect(service.validateStaff('test@23telecom.example', 'wrong-password')).rejects.toThrow(
         UnauthorizedException,
+      );
+    });
+
+    // ─── D2: per-account lockout ───────────────────────────────────────────────
+
+    it('increments failedLoginAttempts on a wrong password (below threshold)', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_STAFF,
+        failedLoginAttempts: 2,
+      });
+      vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(false);
+
+      await expect(service.validateStaff('test@23telecom.example', 'nope')).rejects.toThrow(
+        UnauthorizedException,
+      );
+      expect(prisma.staff.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { failedLoginAttempts: 3 } }),
+      );
+    });
+
+    it('locks the account once attempts reach the threshold', async () => {
+      // 4 prior failures + this one = 5 (default LOGIN_MAX_ATTEMPTS) → lock.
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_STAFF,
+        failedLoginAttempts: 4,
+      });
+      vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(false);
+
+      await expect(service.validateStaff('test@23telecom.example', 'nope')).rejects.toThrow(
+        UnauthorizedException,
+      );
+      const call = (prisma.staff.update as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+      expect(call.data.failedLoginAttempts).toBe(0);
+      expect(call.data.lockedUntil).toBeInstanceOf(Date);
+      expect((call.data.lockedUntil as Date).getTime()).toBeGreaterThan(Date.now());
+    });
+
+    it('rejects while locked even with the correct password (no verify)', async () => {
+      const verifySpy = vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(true);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_STAFF,
+        lockedUntil: new Date(Date.now() + 10 * 60_000),
+      });
+
+      await expect(service.validateStaff('test@23telecom.example', 'demo1234')).rejects.toThrow(
+        /temporarily locked/,
+      );
+      expect(verifySpy).not.toHaveBeenCalled();
+    });
+
+    it('allows login once the lock has expired and clears failure state', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_STAFF,
+        failedLoginAttempts: 3,
+        lockedUntil: new Date(Date.now() - 60_000), // expired
+      });
+      vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(true);
+
+      const result = await service.validateStaff('test@23telecom.example', 'demo1234');
+      expect(result.email).toBe('test@23telecom.example');
+      expect(prisma.staff.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { failedLoginAttempts: 0, lockedUntil: null } }),
       );
     });
   });

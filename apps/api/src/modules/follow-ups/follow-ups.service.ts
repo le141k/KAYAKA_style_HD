@@ -7,7 +7,10 @@ export class FollowUpsService {
   constructor(private readonly prisma: PrismaService) {}
 
   /** Create a follow-up reminder on a ticket for the given staff member. */
-  create(ticketId: number, staffId: number, dto: CreateFollowUpDto) {
+  async create(ticketId: number, staffId: number, dto: CreateFollowUpDto) {
+    // E3: 404 on a non-existent ticket instead of an opaque FK 500.
+    const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId }, select: { id: true } });
+    if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
     return this.prisma.followUp.create({
       data: {
         ticketId,

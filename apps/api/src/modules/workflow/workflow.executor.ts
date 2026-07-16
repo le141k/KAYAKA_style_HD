@@ -5,6 +5,14 @@ import { MailService } from '../mail/mail.service';
 import { NotificationService } from '../tickets/notification.service';
 import type { Workflow, Ticket } from '@prisma/client';
 
+/** Domain event WorkflowService emits after any workflow write, to bust the cache below. */
+export const WORKFLOW_CHANGED_EVENT = 'workflow.changed';
+/** Short TTL: bounds staleness if an invalidation event is ever missed. */
+const WORKFLOW_CACHE_TTL_MS = 10_000;
+/** A5(iii): hard cap on re-entrant evaluations for one ticket — stops a
+ *  status→status (or future event-emitting) workflow from looping forever. */
+const MAX_WORKFLOW_DEPTH = 5;
+
 /** The shape of a domain event emitted by TicketsService */
 interface TicketEvent {
   ticketId: number;
@@ -42,6 +50,28 @@ export class WorkflowExecutor {
     @Optional() private readonly notifications?: NotificationService,
   ) {}
 
+  // C3: cache the enabled-workflows list — it was queried on EVERY ticket event.
+  // Invalidated on any workflow write (event below) with a short TTL as a backstop.
+  private workflowCache: { data: Workflow[]; expiresAt: number } | null = null;
+
+  @OnEvent(WORKFLOW_CHANGED_EVENT)
+  invalidateWorkflowCache(): void {
+    this.workflowCache = null;
+  }
+
+  private async getEnabledWorkflows(): Promise<Workflow[]> {
+    const now = Date.now();
+    if (this.workflowCache && this.workflowCache.expiresAt > now) {
+      return this.workflowCache.data;
+    }
+    const data = await this.prisma.workflow.findMany({
+      where: { isEnabled: true },
+      orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+    });
+    this.workflowCache = { data, expiresAt: now + WORKFLOW_CACHE_TTL_MS };
+    return data;
+  }
+
   @OnEvent('ticket.created')
   async onTicketCreated(payload: TicketEvent): Promise<void> {
     await this.evaluate(payload.ticketId, 'ticket.created');
@@ -57,19 +87,40 @@ export class WorkflowExecutor {
     await this.evaluate(payload.ticketId, 'ticket.status_changed');
   }
 
+  // A5(iii): per-ticket re-entrancy depth. Guards against a workflow chain that
+  // (now or via a future event-emitting action) re-triggers evaluation of the
+  // same ticket without bound.
+  private readonly inFlightDepth = new Map<number, number>();
+
   private async evaluate(ticketId: number, _eventName: string): Promise<void> {
-    const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
-    if (!ticket) return;
+    const depth = this.inFlightDepth.get(ticketId) ?? 0;
+    if (depth >= MAX_WORKFLOW_DEPTH) {
+      this.logger.warn(`Workflow recursion guard: ticket ${ticketId} hit depth ${depth} — stopping`);
+      return;
+    }
+    this.inFlightDepth.set(ticketId, depth + 1);
+    try {
+      let ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
+      if (!ticket) return;
 
-    const workflows = await this.prisma.workflow.findMany({
-      where: { isEnabled: true },
-      orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
-    });
+      const workflows = await this.getEnabledWorkflows();
 
-    for (const workflow of workflows) {
-      if (this.matchesCriteria(ticket, workflow)) {
-        await this.applyActions(ticket, workflow);
+      for (const workflow of workflows) {
+        if (this.matchesCriteria(ticket, workflow)) {
+          const changed = await this.applyActions(ticket, workflow);
+          // A5: re-fetch between evaluations so the next workflow matches against
+          // the UPDATED ticket, not the stale snapshot taken at the top.
+          if (changed) {
+            const fresh = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
+            if (!fresh) return;
+            ticket = fresh;
+          }
+        }
       }
+    } finally {
+      const d = (this.inFlightDepth.get(ticketId) ?? 1) - 1;
+      if (d <= 0) this.inFlightDepth.delete(ticketId);
+      else this.inFlightDepth.set(ticketId, d);
     }
   }
 
@@ -106,13 +157,16 @@ export class WorkflowExecutor {
     });
   }
 
-  private async applyActions(ticket: Ticket, workflow: Workflow): Promise<void> {
+  /** Returns true if the ticket's matchable state changed (so the caller re-fetches). */
+  private async applyActions(ticket: Ticket, workflow: Workflow): Promise<boolean> {
     const actions = workflow.actions as unknown as WorkflowAction[];
-    if (!Array.isArray(actions)) return;
+    if (!Array.isArray(actions)) return false;
 
     const ticketUpdate: Partial<Record<string, unknown>> = {};
     // Track a real owner assignment so we can notify + audit after the update.
     let assignedOwnerId: number | null = null;
+    // Tag mutations also change matchable state even though they bypass ticketUpdate.
+    let mutated = false;
 
     for (const action of actions) {
       try {
@@ -158,6 +212,7 @@ export class WorkflowExecutor {
                 where: { id: ticket.id },
                 data: { tags: { connectOrCreate: { where: { name: tag }, create: { name: tag } } } },
               });
+              mutated = true;
             }
             break;
           }
@@ -168,6 +223,7 @@ export class WorkflowExecutor {
                 where: { id: ticket.id },
                 data: { tags: { disconnect: { name: tag } } },
               });
+              mutated = true;
             }
             break;
           }
@@ -191,6 +247,7 @@ export class WorkflowExecutor {
               to,
               subject: `[${ticket.mask}] ${ticket.subject}`,
               text: body,
+              autoSubmitted: 'auto-generated', // A5(i): workflow mail is machine-generated
             });
             break;
           }
@@ -206,6 +263,7 @@ export class WorkflowExecutor {
 
     if (Object.keys(ticketUpdate).length > 0) {
       await this.prisma.ticket.update({ where: { id: ticket.id }, data: ticketUpdate });
+      mutated = true;
     }
 
     // A workflow assignment must notify the assignee + leave an audit trail, just
@@ -230,5 +288,7 @@ export class WorkflowExecutor {
           );
       }
     }
+
+    return mutated;
   }
 }

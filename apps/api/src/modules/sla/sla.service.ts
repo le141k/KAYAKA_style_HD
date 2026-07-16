@@ -225,46 +225,68 @@ export class SlaService {
    */
   async runPeriodicCheck(): Promise<void> {
     const breaches = await this.checkBreaches();
+
+    // C4 — batch-load all escalation rules for the breached plans ONCE (was a
+    // per-ticket query inside the loop = N+1 over up to 1000 tickets).
+    const planIds = [...new Set(breaches.map((b) => b.ticket.slaPlanId).filter((id): id is number => !!id))];
+    const allRules = planIds.length
+      ? await this.prisma.escalationRule.findMany({
+          where: { slaPlanId: { in: planIds }, isEnabled: true },
+          orderBy: { thresholdSeconds: 'asc' },
+        })
+      : [];
+    const rulesByPlan = new Map<number, EscalationRule[]>();
+    for (const r of allRules) {
+      const list = rulesByPlan.get(r.slaPlanId) ?? [];
+      list.push(r);
+      rulesByPlan.set(r.slaPlanId, list);
+    }
+
     for (const { ticket, breachType, minutesOverdue } of breaches) {
       this.logger.warn(`SLA ${breachType} breach on ${ticket.mask}: ${minutesOverdue}m overdue`);
 
-      // Mark as escalated
+      // Mark as escalated. A ticket that breaches BOTH first-response and
+      // resolution in the same scan appears twice in `breaches` sharing one
+      // in-memory object; flip the local flag after the update so the second
+      // entry doesn't increment escalationLevel a second time (D8 dual-breach).
       if (!ticket.isEscalated) {
         await this.prisma.ticket.update({
           where: { id: ticket.id },
           data: { isEscalated: true, escalationLevel: { increment: 1 } },
         });
+        ticket.isEscalated = true;
       }
 
       // Execute EscalationRule.actions for this ticket's SLA plan
       if (ticket.slaPlanId) {
-        await this.executeEscalationRules(ticket, breachType, minutesOverdue);
+        await this.executeEscalationRules(
+          ticket,
+          breachType,
+          minutesOverdue,
+          rulesByPlan.get(ticket.slaPlanId) ?? [],
+        );
       }
     }
   }
 
   /**
    * Execute EscalationRule.actions for a ticket that has breached its SLA.
+   * `planRules` is the pre-loaded, enabled rule set for the ticket's SLA plan.
    */
   private async executeEscalationRules(
     ticket: Ticket,
     breachType: 'FIRST_RESPONSE' | 'RESOLUTION',
     minutesOverdue: number,
+    planRules: EscalationRule[],
   ): Promise<void> {
     if (!ticket.slaPlanId) return;
 
     const slaTargetType = breachType === 'FIRST_RESPONSE' ? 'FIRST_RESPONSE' : 'RESOLUTION';
     const thresholdSeconds = minutesOverdue * 60;
 
-    const rules = await this.prisma.escalationRule.findMany({
-      where: {
-        slaPlanId: ticket.slaPlanId,
-        targetType: slaTargetType,
-        isEnabled: true,
-        thresholdSeconds: { lte: thresholdSeconds },
-      },
-      orderBy: { thresholdSeconds: 'asc' },
-    });
+    const rules = planRules.filter(
+      (r) => r.targetType === slaTargetType && r.thresholdSeconds <= thresholdSeconds,
+    );
 
     for (const rule of rules) {
       const actions = rule.actions as unknown as EscalationAction[];
@@ -326,9 +348,11 @@ export class SlaService {
           break;
         }
         case 'mark_escalated': {
+          // D8: do NOT increment escalationLevel here — runPeriodicCheck already
+          // bumped it once when it flagged the breach (double-increment otherwise).
           await this.prisma.ticket.update({
             where: { id: ticket.id },
-            data: { isEscalated: true, escalationLevel: { increment: 1 } },
+            data: { isEscalated: true },
           });
           break;
         }

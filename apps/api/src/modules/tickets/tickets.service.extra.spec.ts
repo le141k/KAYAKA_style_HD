@@ -72,7 +72,9 @@ function makePrismaMock() {
       findUnique: vi.fn().mockResolvedValue({ organizationId: null }),
     },
     staff: {
-      findUnique: vi.fn().mockResolvedValue({ id: 1, firstName: 'A', lastName: 'B', email: 'a@b.c' }),
+      findUnique: vi
+        .fn()
+        .mockResolvedValue({ id: 1, firstName: 'A', lastName: 'B', email: 'a@b.c', isEnabled: true }),
     },
     ticketPost: {
       create: vi.fn(),
@@ -157,6 +159,9 @@ describe('TicketsService (extra coverage)', () => {
       validateCustomFields: vi.fn().mockResolvedValue(undefined),
       encryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
       decryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
+      decryptCustomFieldsMany: vi
+        .fn()
+        .mockImplementation((_s: unknown, rows: unknown) => Promise.resolve(rows)),
     } as unknown as AdminService;
     service = new TicketsService(
       prisma as unknown as PrismaService,
@@ -933,7 +938,10 @@ describe('TicketsService (extra coverage)', () => {
       (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
       (prisma.ticketPriority.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
       (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue(newTicket);
-      (prisma.$transaction as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      // Split now runs an interactive $transaction(async tx => …); the default mock
+      // passthrough executes the callback. The post-move must report it moved both.
+      (prisma.ticketPost.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 2 });
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(updatedNewTicket);
       (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
       (prisma.ticket.findUniqueOrThrow as ReturnType<typeof vi.fn>).mockResolvedValue(updatedNewTicket);
 
@@ -941,6 +949,10 @@ describe('TicketsService (extra coverage)', () => {
       expect(result.mask).toBe('TT-000099');
       expect(prisma.ticket.create).toHaveBeenCalled();
       expect(prisma.$transaction).toHaveBeenCalled();
+      // The post-move is scoped to the source ticket (TOCTOU/IDOR guard).
+      expect(prisma.ticketPost.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ ticketId: 1 }) }),
+      );
     });
   });
 

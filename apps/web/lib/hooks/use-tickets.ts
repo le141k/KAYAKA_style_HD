@@ -72,7 +72,12 @@ interface ApiTicket {
   type?: ApiRef | null;
   department?: ApiRef;
   owner?: ApiStaffRef | null;
-  user?: { id: number; fullName: string; emails?: { email: string; isPrimary: boolean }[] } | null;
+  user?: {
+    id: number;
+    fullName: string;
+    emails?: { email: string; isPrimary: boolean }[];
+    organization?: { id: number; name: string } | null;
+  } | null;
   posts?: ApiPost[];
   notes?: ApiNote[];
   tags?: { name: string }[];
@@ -174,6 +179,9 @@ function mapTicket(t: ApiTicket): Ticket {
     typeName: t.type?.title ?? undefined,
     requester,
     assignee,
+    organization: t.user?.organization
+      ? { id: t.user.organization.id, name: t.user.organization.name }
+      : undefined,
     department,
     sla_due_at: t.dueAt ?? undefined,
     created_at: t.createdAt,

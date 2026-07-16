@@ -29,8 +29,8 @@ export type UpdateMacroCategoryDto = z.infer<typeof UpdateMacroCategorySchema>;
 
 export const CreateMacroSchema = z.object({
   title: z.string().min(1).max(200),
-  replyText: z.string().default(''),
-  actions: z.array(z.unknown()).default([]),
+  replyText: z.string().max(50_000).default(''),
+  actions: z.array(z.unknown()).max(50).default([]),
   isShared: z.boolean().default(true),
   categoryId: z.number().int().positive().nullable().optional(),
 });

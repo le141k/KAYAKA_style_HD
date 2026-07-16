@@ -395,4 +395,68 @@ describe('WorkflowExecutor', () => {
       expect(notifications.notifyOnAssign).not.toHaveBeenCalled();
     });
   });
+
+  // ─── C3: enabled-workflows cache ───────────────────────────────────────────
+  describe('workflow cache (C3)', () => {
+    it('queries workflows once across multiple ticket events, then re-queries after invalidation', async () => {
+      const ticket = makeTicket();
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      await executor.onTicketCreated({ ticketId: 1 });
+      await executor.onTicketReplied({ ticketId: 1 });
+      await executor.onTicketStatusChanged({ ticketId: 1 });
+      // Three events, one workflow query (the ticket itself is still fetched each time).
+      expect(prisma.workflow.findMany).toHaveBeenCalledTimes(1);
+
+      // A workflow write busts the cache → next event re-queries.
+      executor.invalidateWorkflowCache();
+      await executor.onTicketCreated({ ticketId: 1 });
+      expect(prisma.workflow.findMany).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ─── A5(iii): re-entrancy depth guard ──────────────────────────────────────
+  describe('recursion guard (A5)', () => {
+    it('stops re-entrant evaluation of the same ticket past the depth cap', async () => {
+      const ticket = makeTicket();
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+
+      // A self-re-entrant workflow: its action re-enters evaluation for the same
+      // ticket. Without the guard this recurses forever; with it, it terminates.
+      let evaluations = 0;
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        evaluations++;
+        // Re-enter synchronously (simulating an action that re-fires the event).
+        await executor.onTicketStatusChanged({ ticketId: ticket.id });
+        return [];
+      });
+
+      await executor.onTicketStatusChanged({ ticketId: ticket.id });
+
+      // Bounded by MAX_WORKFLOW_DEPTH (5) — not unbounded.
+      expect(evaluations).toBeLessThanOrEqual(5);
+      expect(evaluations).toBeGreaterThan(0);
+    });
+
+    it('re-fetches the ticket after a mutating workflow (no stale snapshot)', async () => {
+      const ticket = makeTicket({ statusId: 1 });
+      const fresh = makeTicket({ statusId: 3 });
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(ticket)
+        .mockResolvedValueOnce(fresh);
+      // One workflow that changes status (mutates) → triggers a re-fetch.
+      const wf = makeWorkflow({
+        criteria: [] as any,
+        actions: [{ type: 'change_status', statusId: 3 }] as any,
+      });
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([wf]);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(fresh);
+
+      await executor.onTicketStatusChanged({ ticketId: 1 });
+
+      // findUnique called twice: initial snapshot + re-fetch after the mutation.
+      expect(prisma.ticket.findUnique).toHaveBeenCalledTimes(2);
+    });
+  });
 });

@@ -49,6 +49,9 @@ function makeAdminMock(): AdminService {
     validateCustomFields: vi.fn().mockResolvedValue(undefined),
     encryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
     decryptCustomFields: vi.fn().mockImplementation((_s: unknown, v: unknown) => Promise.resolve(v)),
+    decryptCustomFieldsMany: vi
+      .fn()
+      .mockImplementation((_s: unknown, rows: unknown) => Promise.resolve(rows)),
   } as unknown as AdminService;
 }
 
