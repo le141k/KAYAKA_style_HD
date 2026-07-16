@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { StaffService } from './staff.service';
 import type { PrismaService } from '../../prisma/prisma.service';
+import type { SessionRevocationService } from '../../auth/session-revocation.service';
+import type { RbacAuditService } from './rbac-audit.service';
 
 // We need to spy on hashPassword so we don't need argon2 in tests.
 vi.mock('../../auth/password.util', () => ({
@@ -10,10 +12,11 @@ vi.mock('../../auth/password.util', () => ({
 }));
 
 function makePrismaMock() {
-  return {
+  const prisma = {
     staffGroup: {
       findMany: vi.fn(),
       findUnique: vi.fn(),
+      count: vi.fn().mockResolvedValue(2),
       create: vi.fn(),
       update: vi.fn(),
       delete: vi.fn(),
@@ -30,8 +33,40 @@ function makePrismaMock() {
       deleteMany: vi.fn(),
       createMany: vi.fn(),
     },
-  } as unknown as PrismaService;
+    $executeRaw: vi.fn().mockResolvedValue([]),
+    $transaction: vi.fn(),
+  };
+  // The production service takes a PostgreSQL advisory lock inside an
+  // interactive transaction. Unit tests use one shared mock client so the
+  // callback can exercise the same query stubs without a real database.
+  prisma.$transaction.mockImplementation(async (callback: (tx: typeof prisma) => Promise<unknown>) =>
+    callback(prisma),
+  );
+  return prisma as unknown as PrismaService;
 }
+
+function makeSessionsMock() {
+  return {
+    revokeAllForStaff: vi.fn().mockResolvedValue(undefined),
+    revokeAllForGroup: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+function makeAuditMock() {
+  return {
+    log: vi.fn().mockResolvedValue(undefined),
+    list: vi.fn().mockResolvedValue({ data: [], total: 0 }),
+  };
+}
+
+const ADMIN_GROUP = {
+  id: 2,
+  title: 'Administrator',
+  isAdmin: true,
+  permissions: [],
+  createdAt: new Date(),
+  updatedAt: new Date(),
+};
 
 const MOCK_GROUP = {
   id: 1,
@@ -40,6 +75,13 @@ const MOCK_GROUP = {
   permissions: [],
   createdAt: new Date(),
   updatedAt: new Date(),
+};
+
+const DELEGATED_STAFF_MANAGER = {
+  staffId: 7,
+  email: 'delegated@example.com',
+  isAdmin: false,
+  permissions: ['staff.manage', 'ticket.view'],
 };
 
 const SAFE_STAFF = {
@@ -62,10 +104,18 @@ const SAFE_STAFF = {
 describe('StaffService', () => {
   let service: StaffService;
   let prisma: ReturnType<typeof makePrismaMock>;
+  let sessions: ReturnType<typeof makeSessionsMock>;
+  let audit: ReturnType<typeof makeAuditMock>;
 
   beforeEach(() => {
     prisma = makePrismaMock();
-    service = new StaffService(prisma as unknown as PrismaService);
+    sessions = makeSessionsMock();
+    audit = makeAuditMock();
+    service = new StaffService(
+      prisma as unknown as PrismaService,
+      sessions as unknown as SessionRevocationService,
+      audit as unknown as RbacAuditService,
+    );
   });
 
   // ─── listGroups ───────────────────────────────────────────────────────────────
@@ -102,6 +152,36 @@ describe('StaffService', () => {
       const result = await service.createGroup({ title: 'Support' } as any);
       expect(result.title).toBe('Support');
     });
+
+    it('allows a delegated staff manager to grant only permissions they already hold', async () => {
+      (prisma.staffGroup.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_GROUP,
+        permissions: ['ticket.view'],
+      });
+
+      await expect(
+        service.createGroup(
+          { title: 'Ticket viewers', isAdmin: false, permissions: ['ticket.view'] } as any,
+          DELEGATED_STAFF_MANAGER as any,
+        ),
+      ).resolves.toBeDefined();
+    });
+
+    it('refuses a delegated staff manager creating an elevated or admin group', async () => {
+      await expect(
+        service.createGroup(
+          { title: 'Escalation', isAdmin: false, permissions: ['admin.settings'] } as any,
+          DELEGATED_STAFF_MANAGER as any,
+        ),
+      ).rejects.toThrow(ForbiddenException);
+      await expect(
+        service.createGroup(
+          { title: 'Fake admin', isAdmin: true, permissions: [] } as any,
+          DELEGATED_STAFF_MANAGER as any,
+        ),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.staffGroup.create).not.toHaveBeenCalled();
+    });
   });
 
   // ─── updateGroup ──────────────────────────────────────────────────────────────
@@ -121,6 +201,23 @@ describe('StaffService', () => {
     it('throws NotFoundException when group not found', async () => {
       (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.updateGroup(99, { title: 'X' } as any)).rejects.toThrow(NotFoundException);
+    });
+
+    it('refuses a delegated manager changing an elevated group or adding unheld permissions', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
+      await expect(
+        service.updateGroup(1, { permissions: ['admin.settings'] } as any, DELEGATED_STAFF_MANAGER as any),
+      ).rejects.toThrow(ForbiddenException);
+
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ADMIN_GROUP);
+      await expect(
+        service.updateGroup(
+          ADMIN_GROUP.id,
+          { title: 'Renamed admin' } as any,
+          DELEGATED_STAFF_MANAGER as any,
+        ),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.staffGroup.update).not.toHaveBeenCalled();
     });
   });
 
@@ -147,6 +244,14 @@ describe('StaffService', () => {
       (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
       await expect(service.deleteGroup(99)).rejects.toThrow(NotFoundException);
+    });
+
+    it('refuses a delegated manager deleting an administrator group', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ADMIN_GROUP);
+      await expect(service.deleteGroup(ADMIN_GROUP.id, DELEGATED_STAFF_MANAGER as any)).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.staffGroup.delete).not.toHaveBeenCalled();
     });
   });
 
@@ -270,6 +375,30 @@ describe('StaffService', () => {
       ).rejects.toThrow(NotFoundException);
     });
 
+    it('refuses assigning a new staff member to a group above a delegated manager', async () => {
+      (prisma.staff.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_GROUP,
+        permissions: ['admin.settings'],
+      });
+
+      await expect(
+        service.create(
+          {
+            email: 'elevated@example.com',
+            username: 'elevated',
+            password: 'secret123',
+            staffGroupId: 1,
+            departmentIds: [],
+            firstName: 'Elevated',
+            lastName: 'User',
+          } as any,
+          DELEGATED_STAFF_MANAGER as any,
+        ),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.staff.create).not.toHaveBeenCalled();
+    });
+
     it('creates with department associations when departmentIds provided', async () => {
       (prisma.staff.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
@@ -379,6 +508,19 @@ describe('StaffService', () => {
       (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.update(999, { firstName: 'X' } as any)).rejects.toThrow(NotFoundException);
     });
+
+    it('refuses a delegated manager resetting or changing an administrator account', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        staffGroupId: ADMIN_GROUP.id,
+        staffGroup: ADMIN_GROUP,
+      });
+
+      await expect(
+        service.update(1, { password: 'newpassword' } as any, DELEGATED_STAFF_MANAGER as any),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.staff.update).not.toHaveBeenCalled();
+    });
   });
 
   // ─── disable ─────────────────────────────────────────────────────────────────
@@ -404,6 +546,153 @@ describe('StaffService', () => {
     it('throws NotFoundException when staff not found', async () => {
       (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.disable(999)).rejects.toThrow(NotFoundException);
+    });
+
+    it('refuses a delegated manager disabling an administrator account', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        staffGroupId: ADMIN_GROUP.id,
+        staffGroup: ADMIN_GROUP,
+      });
+
+      await expect(service.disable(1, DELEGATED_STAFF_MANAGER as any)).rejects.toThrow(ForbiddenException);
+      expect(prisma.staff.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── last-active-administrator protection ──────────────────────────────────
+
+  describe('last-admin guard', () => {
+    function mockAdminTarget(enabledAdmins: number) {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        staffGroupId: ADMIN_GROUP.id,
+        isEnabled: true,
+        staffGroup: ADMIN_GROUP,
+      });
+      (prisma.staff.count as ReturnType<typeof vi.fn>).mockResolvedValue(enabledAdmins);
+    }
+
+    it('refuses to disable the last active administrator (403)', async () => {
+      mockAdminTarget(1);
+      await expect(service.disable(1)).rejects.toThrow(ForbiddenException);
+      expect(prisma.staff.update).not.toHaveBeenCalled();
+    });
+
+    it('allows disabling an administrator when others remain', async () => {
+      mockAdminTarget(2);
+      (prisma.staff.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        isEnabled: false,
+      });
+      await expect(service.disable(1)).resolves.toBeDefined();
+      expect(prisma.staff.update).toHaveBeenCalled();
+    });
+
+    it('refuses to demote the last active administrator into a non-admin group (403)', async () => {
+      mockAdminTarget(1);
+      // target group is a non-admin group
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
+      await expect(
+        service.update(1, { staffGroupId: MOCK_GROUP.id } as any, { isAdmin: true } as any),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.staff.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── session revocation on access changes ──────────────────────────────────
+
+  describe('session revocation', () => {
+    beforeEach(() => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        staffGroup: MOCK_GROUP,
+      });
+      (prisma.staff.update as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_STAFF);
+    });
+
+    it('revokes sessions when the password is changed', async () => {
+      await service.update(1, { password: 'newpassword' } as any);
+      expect(sessions.revokeAllForStaff).toHaveBeenCalledWith(1);
+    });
+
+    it('revokes sessions when the role (group) changes', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_GROUP,
+        id: 9,
+      });
+      await service.update(1, { staffGroupId: 9 } as any, { isAdmin: true } as any);
+      expect(sessions.revokeAllForStaff).toHaveBeenCalledWith(1);
+      expect(audit.log).toHaveBeenCalledWith(expect.objectContaining({ action: 'staff.role_change' }));
+    });
+
+    it('does NOT revoke sessions on a cosmetic field change', async () => {
+      await service.update(1, { firstName: 'Renamed' } as any);
+      expect(sessions.revokeAllForStaff).not.toHaveBeenCalled();
+    });
+
+    it('revokes sessions for all group members when permissions change', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_GROUP,
+        permissions: ['ticket.view'],
+      });
+      (prisma.staffGroup.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_GROUP,
+        permissions: ['ticket.view', 'ticket.reply'],
+      });
+      await service.updateGroup(1, { permissions: ['ticket.view', 'ticket.reply'] } as any);
+      expect(sessions.revokeAllForGroup).toHaveBeenCalledWith(1);
+      expect(audit.log).toHaveBeenCalledWith(expect.objectContaining({ action: 'group.permissions_change' }));
+    });
+
+    it('does NOT revoke group sessions when only the title changes', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
+      (prisma.staffGroup.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_GROUP,
+        title: 'Renamed',
+      });
+      await service.updateGroup(1, { title: 'Renamed' } as any);
+      expect(sessions.revokeAllForGroup).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── audit writes ──────────────────────────────────────────────────────────
+
+  describe('audit', () => {
+    it('records staff.create', async () => {
+      (prisma.staff.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
+      (prisma.staff.create as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_STAFF);
+      await service.create({
+        email: 'alice@example.com',
+        username: 'alice',
+        password: 'secret123',
+        staffGroupId: 1,
+        departmentIds: [],
+        firstName: 'Alice',
+        lastName: 'Smith',
+      } as any);
+      expect(audit.log).toHaveBeenCalledWith(expect.objectContaining({ action: 'staff.create' }));
+    });
+  });
+
+  // ─── deleteGroup: last admin group ─────────────────────────────────────────
+
+  describe('deleteGroup last-admin-group guard', () => {
+    it('refuses to delete the last remaining administrator group (403)', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ADMIN_GROUP);
+      (prisma.staffGroup.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+      await expect(service.deleteGroup(ADMIN_GROUP.id)).rejects.toThrow(ForbiddenException);
+      expect(prisma.staffGroup.delete).not.toHaveBeenCalled();
+    });
+
+    it('allows deleting an admin group when another admin group exists', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ADMIN_GROUP);
+      (prisma.staffGroup.count as ReturnType<typeof vi.fn>).mockResolvedValue(2);
+      (prisma.staff.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+      (prisma.staffGroup.delete as ReturnType<typeof vi.fn>).mockResolvedValue(ADMIN_GROUP);
+      await expect(service.deleteGroup(ADMIN_GROUP.id)).resolves.toBeUndefined();
+      expect(prisma.staffGroup.delete).toHaveBeenCalled();
     });
   });
 });

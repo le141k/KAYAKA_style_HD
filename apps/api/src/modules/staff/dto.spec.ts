@@ -18,3 +18,29 @@ describe('UpdateStaffGroupSchema (privilege-escalation guard)', () => {
     expect(parsed.isAdmin).toBe(true);
   });
 });
+
+describe('permission-key validation', () => {
+  it('accepts a group with only known permission keys', () => {
+    const parsed = CreateStaffGroupSchema.parse({
+      title: 'Support',
+      permissions: ['ticket.view', 'ticket.reply', 'report.run'],
+    });
+    expect(parsed.permissions).toContain('ticket.view');
+  });
+
+  it('rejects a CREATE with an unknown permission key (→ 400 surface)', () => {
+    const result = CreateStaffGroupSchema.safeParse({
+      title: 'Bad',
+      permissions: ['ticket.view', 'not.a.real.permission'],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]!.message).toMatch(/Unknown permission key/);
+    }
+  });
+
+  it('rejects an UPDATE with an unknown permission key', () => {
+    const result = UpdateStaffGroupSchema.safeParse({ permissions: ['totally.made.up'] });
+    expect(result.success).toBe(false);
+  });
+});

@@ -7,8 +7,12 @@ import { Loader2 } from 'lucide-react';
 import { ThemeToggle } from '@/components/premium/ThemeToggle';
 import { hasToken } from '@/lib/api';
 import { useMe } from '@/lib/hooks/use-auth';
+import { ADMIN_TAB_PERMISSIONS, hasPermission, hasAnyPermission } from '@/lib/auth/permissions';
 
-const ADMIN_TABS = [
+// Each tab is gated by the permission that its screen's API requires. A Manager
+// (no admin.* / staff.manage) therefore sees none of these and is redirected to
+// the staff workspace; an admin sees all.
+const ADMIN_TABS: { label: string; href: string }[] = [
   { label: 'Отделы', href: '/admin/departments' },
   { label: 'Статусы и приоритеты', href: '/admin/statuses' },
   { label: 'Типы заявок', href: '/admin/ticket-types' },
@@ -23,6 +27,16 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   const router = useRouter();
   const pathname = usePathname();
   const { data: user, isLoading, isError } = useMe();
+
+  // Tabs this principal may actually open, and whether they may be in /admin at all.
+  const visibleTabs = ADMIN_TABS.filter((tab) => hasPermission(user, ADMIN_TAB_PERMISSIONS[tab.href]!));
+  const canAccessAdmin = hasAnyPermission(user, Object.values(ADMIN_TAB_PERMISSIONS));
+  const firstVisibleTabHref = visibleTabs[0]?.href;
+  const currentTabIsAllowed = ADMIN_TABS.some(
+    (tab) =>
+      (pathname === tab.href || pathname.startsWith(`${tab.href}/`)) &&
+      hasPermission(user, ADMIN_TAB_PERMISSIONS[tab.href]!),
+  );
 
   // `useMe` is disabled during SSR (hasToken() false) but enabled on the
   // authenticated client, so SSR renders null while the first client paint
@@ -40,10 +54,21 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
       return;
     }
 
-    if (user && user.role !== 'admin') {
+    // Permission-aware gate: anyone holding at least one admin-area permission
+    // (admins, or a Manager granted a specific admin right) may enter; everyone
+    // else is bounced to the staff workspace.
+    if (user && !canAccessAdmin) {
       router.replace('/staff/dashboard');
+      return;
     }
-  }, [isLoading, isError, user, router]);
+
+    // A direct URL (or stale browser tab) may point to an admin screen the
+    // current principal cannot use. Move them to their first permitted tab
+    // instead of leaving a page whose API requests all 403.
+    if (user && pathname !== '/admin' && !currentTabIsAllowed) {
+      router.replace(firstVisibleTabHref ?? '/staff/dashboard');
+    }
+  }, [isLoading, isError, user, router, canAccessAdmin, currentTabIsAllowed, firstVisibleTabHref, pathname]);
 
   // Brief loading state to avoid flicker.
   // `!mounted` keeps SSR and first client paint identical (see note above).
@@ -56,7 +81,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   }
 
   // While redirecting, render nothing
-  if (isError || !user || user.role !== 'admin') {
+  if (isError || !user || !canAccessAdmin) {
     return null;
   }
 
@@ -81,7 +106,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
           className="flex overflow-x-auto border-t border-border px-6"
           aria-label="Разделы администрирования"
         >
-          {ADMIN_TABS.map((tab) => {
+          {visibleTabs.map((tab) => {
             const active = pathname === tab.href || pathname.startsWith(`${tab.href}/`);
             return (
               <Link

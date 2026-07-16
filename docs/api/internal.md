@@ -37,6 +37,58 @@ buildPrincipal(staff: StaffWithGroup): AuthStaff
 
 ---
 
+## SessionRevocationService (`apps/api/src/auth/session-revocation.service.ts`)
+
+Consumed by: `StaffService`. Exported by `AuthModule` (`@Global`).
+
+```ts
+revokeAllForStaff(staffId: number): Promise<void>
+// Marks all active RefreshTokens revoked AND sets a per-staff access-token cutoff
+// (TokenBlocklistService.revokeStaffAccessBefore) so already-issued access tokens
+// are rejected immediately. Used on role/password/disable changes.
+
+revokeAllForGroup(groupId: number): Promise<void>
+// Same, for every member of a group — used when the group's permission set changes.
+```
+
+Backed by `TokenBlocklistService.revokeStaffAccessBefore(staffId, ttl)` /
+`isStaffTokenStale(staffId, iat)` (Redis key `th:staffcutoff:<staffId>` = epoch
+seconds, TTL = access-token lifetime). `JwtAuthGuard` rejects any access token
+whose `iat` predates the cutoff. Fail-open if Redis is down (short access TTL +
+durable refresh revocation are the backstops).
+
+**Invariant:** an access-affecting staff change (role, password, `isEnabled→false`)
+or a group permission change MUST revoke the affected sessions.
+
+## RbacAuditService (`apps/api/src/modules/staff/rbac-audit.service.ts`)
+
+Consumed by: `StaffService`, `StaffController` (read). Writes an append-only
+`RbacAuditLog` row for every staff/group RBAC change.
+
+```ts
+log(entry): Promise<void>
+// action ∈ staff.create | staff.update | staff.role_change | staff.password_reset |
+//          staff.enable | staff.disable | group.create | group.update |
+//          group.permissions_change | group.delete
+// Best-effort: a failed insert is logged, never propagated (won't roll back the change).
+
+list({ page, limit }): Promise<{ data: RbacAuditLog[]; total }>  // newest first
+```
+
+## StaffService (`apps/api/src/modules/staff/staff.service.ts`)
+
+Key invariants beyond CRUD:
+
+- **Privilege escalation:** a non-admin actor cannot assign/move a staff member
+  into an `isAdmin` group (403).
+- **Last active administrator:** cannot disable or demote the last enabled admin
+  (403); cannot delete the last `isAdmin` group (403).
+- **Session revocation + audit:** role/password/disable changes call
+  `SessionRevocationService` and write an `RbacAuditLog` entry; group permission
+  changes revoke all members' sessions.
+
+---
+
 ## TicketsService (`apps/api/src/modules/tickets/tickets.service.ts`)
 
 Consumed by: `TicketsController`, `AlarisService`, `InboundMailService`.

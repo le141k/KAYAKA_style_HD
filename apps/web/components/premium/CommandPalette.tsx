@@ -24,14 +24,29 @@ import {
 } from '@/components/ui/command';
 import { useTickets } from '@/lib/hooks/use-tickets';
 import { useAuth } from '@/lib/auth/auth-context';
+import { ADMIN_AREA_PERMISSIONS, PERMISSIONS } from '@/lib/auth/permissions';
 
-const NAV_ITEMS = [
-  { label: 'Дашборд', href: '/staff/dashboard', Icon: LayoutDashboard, adminOnly: false },
-  { label: 'Заявки (список)', href: '/staff/tickets', Icon: Ticket, adminOnly: false },
-  { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare, adminOnly: false },
-  { label: 'База знаний', href: '/kb', Icon: BookOpen, adminOnly: false },
-  { label: 'Настройки', href: '/admin', Icon: Settings, adminOnly: true },
-  { label: 'Сотрудники', href: '/admin/staff', Icon: Users, adminOnly: true },
+// `requires` (when set) gates the command behind holding at least one of the
+// listed permissions — matches the permission-aware sidebar/admin nav.
+const NAV_ITEMS: {
+  label: string;
+  href: string;
+  Icon: typeof LayoutDashboard;
+  requires?: string[];
+  requiresAll?: boolean;
+}[] = [
+  {
+    label: 'Дашборд',
+    href: '/staff/dashboard',
+    Icon: LayoutDashboard,
+    requires: [PERMISSIONS.TICKET_VIEW, PERMISSIONS.REPORT_RUN],
+    requiresAll: true,
+  },
+  { label: 'Заявки (список)', href: '/staff/tickets', Icon: Ticket, requires: [PERMISSIONS.TICKET_VIEW] },
+  { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare, requires: [PERMISSIONS.TICKET_VIEW] },
+  { label: 'База знаний', href: '/kb', Icon: BookOpen },
+  { label: 'Настройки', href: '/admin', Icon: Settings, requires: ADMIN_AREA_PERMISSIONS },
+  { label: 'Сотрудники', href: '/admin/staff', Icon: Users, requires: [PERMISSIONS.STAFF_MANAGE] },
 ];
 
 interface CommandPaletteProps {
@@ -41,8 +56,7 @@ interface CommandPaletteProps {
 
 export function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const router = useRouter();
-  const { user } = useAuth();
-  const isAdmin = user?.role === 'admin';
+  const { can, canAny } = useAuth();
 
   const [inputValue, setInputValue] = useState('');
   // Debounced query sent to the API — updated ~300 ms after the user stops typing.
@@ -57,7 +71,8 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
     }, 300);
   }, []);
 
-  const { data } = useTickets({ q: query || undefined, per_page: 5, enabled: open });
+  const canViewTickets = can(PERMISSIONS.TICKET_VIEW);
+  const { data } = useTickets({ q: query || undefined, per_page: 5, enabled: open && canViewTickets });
   const tickets = data?.data ?? [];
 
   const navigate = useCallback(
@@ -89,7 +104,8 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
   }, [open]);
 
   const visibleNavItems = NAV_ITEMS.filter((item) => {
-    if (item.adminOnly && !isAdmin) return false;
+    if (item.requires && (item.requiresAll ? !item.requires.every(can) : !canAny(item.requires)))
+      return false;
     return inputValue ? item.label.toLowerCase().includes(inputValue.toLowerCase()) : true;
   });
 

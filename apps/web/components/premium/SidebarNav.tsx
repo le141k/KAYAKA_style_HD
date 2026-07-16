@@ -17,13 +17,28 @@ import {
 import { cn } from '@/lib/utils';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { useAuth } from '@/lib/auth/auth-context';
+import { ADMIN_AREA_PERMISSIONS, PERMISSIONS } from '@/lib/auth/permissions';
 
-const NAV_ITEMS = [
-  { label: 'Дашборд', href: '/staff/dashboard', Icon: LayoutDashboard, adminOnly: false },
-  { label: 'Заявки', href: '/staff/tickets', Icon: Ticket, adminOnly: false },
-  { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare, adminOnly: false },
-  { label: 'База знаний', href: '/kb', Icon: BookOpen, adminOnly: false },
-  { label: 'Настройки', href: '/admin', Icon: Settings, adminOnly: true },
+// `requires` (when set) gates a nav item behind holding at least one of the
+// listed permissions — admins inherit all, so they always see it.
+const NAV_ITEMS: {
+  label: string;
+  href: string;
+  Icon: typeof LayoutDashboard;
+  requires?: string[];
+  requiresAll?: boolean;
+}[] = [
+  {
+    label: 'Дашборд',
+    href: '/staff/dashboard',
+    Icon: LayoutDashboard,
+    requires: [PERMISSIONS.TICKET_VIEW, PERMISSIONS.REPORT_RUN],
+    requiresAll: true,
+  },
+  { label: 'Заявки', href: '/staff/tickets', Icon: Ticket, requires: [PERMISSIONS.TICKET_VIEW] },
+  { label: 'Канбан', href: '/staff/kanban', Icon: KanbanSquare, requires: [PERMISSIONS.TICKET_VIEW] },
+  { label: 'База знаний', href: '/kb', Icon: BookOpen },
+  { label: 'Настройки', href: '/admin', Icon: Settings, requires: ADMIN_AREA_PERMISSIONS },
 ];
 
 interface SidebarNavProps {
@@ -33,10 +48,11 @@ interface SidebarNavProps {
 export function SidebarNav({ onCommandPalette }: SidebarNavProps) {
   const [collapsed, setCollapsed] = useState(false);
   const pathname = usePathname();
-  const { user } = useAuth();
-  const isAdmin = user?.role === 'admin';
+  const { can, canAny } = useAuth();
 
-  const visibleItems = NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin);
+  const visibleItems = NAV_ITEMS.filter(
+    (item) => !item.requires || (item.requiresAll ? item.requires.every(can) : canAny(item.requires)),
+  );
 
   return (
     <TooltipProvider delayDuration={200}>

@@ -432,6 +432,7 @@ export const adminKeys = {
   escalationRules: (planId: number) => ['admin', 'sla', 'escalation-rules', planId] as const,
   staff: ['admin', 'staff'] as const,
   staffGroups: ['admin', 'staff', 'groups'] as const,
+  rbacAudit: ['admin', 'rbac', 'audit'] as const,
   workflows: ['admin', 'workflows'] as const,
   macroCategories: ['admin', 'macro-categories'] as const,
   macros: (categoryId?: number) => ['admin', 'macros', categoryId] as const,
@@ -778,12 +779,23 @@ export function useDeleteEscalationRule(planId: number) {
 
 // ─── Staff ───────────────────────────────────────────────────────────────────
 
-export function useAdminStaff() {
+export interface StaffFilter {
+  search?: string;
+  groupId?: number;
+  enabled?: boolean;
+}
+
+export function useAdminStaff(filter: StaffFilter = {}) {
+  const { search, groupId, enabled } = filter;
   return useQuery({
-    queryKey: adminKeys.staff,
+    queryKey: [...adminKeys.staff, { search: search ?? '', groupId: groupId ?? 0, enabled: enabled ?? null }],
     queryFn: async () => {
       // API caps limit at 100 — requesting 200 returns a 400 and the table never loads.
-      const res = await api.get<{ data: ApiStaffMember[]; total: number }>('/staff?limit=100');
+      const params = new URLSearchParams({ limit: '100' });
+      if (search) params.set('search', search);
+      if (groupId) params.set('groupId', String(groupId));
+      if (enabled !== undefined) params.set('enabled', String(enabled));
+      const res = await api.get<{ data: ApiStaffMember[]; total: number }>(`/staff?${params}`);
       return { data: res.data.map(mapStaff), total: res.total };
     },
   });
@@ -813,7 +825,10 @@ export function useCreateStaff() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (data: StaffInput) => api.post<ApiStaffMember>('/staff', cleanStaff(data)),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staff }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: adminKeys.staff });
+      void qc.invalidateQueries({ queryKey: adminKeys.rbacAudit });
+    },
   });
 }
 
@@ -822,7 +837,10 @@ export function useUpdateStaff() {
   return useMutation({
     mutationFn: ({ id, data }: { id: number; data: Partial<StaffInput> }) =>
       api.patch<ApiStaffMember>(`/staff/${id}`, cleanStaff(data)),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staff }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: adminKeys.staff });
+      void qc.invalidateQueries({ queryKey: adminKeys.rbacAudit });
+    },
   });
 }
 
@@ -836,11 +854,67 @@ export function useAdminStaffGroups() {
   });
 }
 
+// ─── RBAC catalog (permissions + role templates) ─────────────────────────────
+
+export interface RbacPermissionMeta {
+  key: string;
+  label: string;
+  category: string;
+}
+
+export interface RbacRoleTemplate {
+  key: 'administrator' | 'manager' | 'agent';
+  title: string;
+  description: string;
+  isAdmin: boolean;
+  permissions: string[];
+}
+
+export interface RbacCatalog {
+  permissions: RbacPermissionMeta[];
+  roles: RbacRoleTemplate[];
+}
+
+export function useRbacCatalog() {
+  return useQuery({
+    queryKey: ['admin', 'rbac'] as const,
+    queryFn: () => api.get<RbacCatalog>('/staff/rbac'),
+    staleTime: 10 * 60_000,
+  });
+}
+
+// ─── RBAC audit log ──────────────────────────────────────────────────────────
+
+export interface RbacAuditEntry {
+  id: number;
+  actorStaffId: number | null;
+  actorEmail: string;
+  action: string;
+  targetType: string;
+  targetId: number | null;
+  targetLabel: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
+export function useRbacAudit(params: { page?: number; limit?: number; enabled?: boolean } = {}) {
+  const { page = 1, limit = 50, enabled = true } = params;
+  return useQuery({
+    queryKey: [...adminKeys.rbacAudit, page, limit] as const,
+    queryFn: () =>
+      api.get<{ data: RbacAuditEntry[]; total: number }>(`/staff/audit?page=${page}&limit=${limit}`),
+    enabled,
+  });
+}
+
 export function useDisableStaff() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: number) => api.delete<ApiStaffMember>(`/staff/${id}`),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staff }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: adminKeys.staff });
+      void qc.invalidateQueries({ queryKey: adminKeys.rbacAudit });
+    },
   });
 }
 
@@ -854,7 +928,10 @@ export function useCreateStaffGroup() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (data: StaffGroupInput) => api.post<ApiStaffGroup>('/staff/groups', data),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staffGroups }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: adminKeys.staffGroups });
+      void qc.invalidateQueries({ queryKey: adminKeys.rbacAudit });
+    },
   });
 }
 
@@ -863,7 +940,10 @@ export function useUpdateStaffGroup() {
   return useMutation({
     mutationFn: ({ id, data }: { id: number; data: Partial<StaffGroupInput> }) =>
       api.patch<ApiStaffGroup>(`/staff/groups/${id}`, data),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staffGroups }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: adminKeys.staffGroups });
+      void qc.invalidateQueries({ queryKey: adminKeys.rbacAudit });
+    },
   });
 }
 
@@ -871,7 +951,10 @@ export function useDeleteStaffGroup() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: number) => api.delete<void>(`/staff/groups/${id}`),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: adminKeys.staffGroups }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: adminKeys.staffGroups });
+      void qc.invalidateQueries({ queryKey: adminKeys.rbacAudit });
+    },
   });
 }
 

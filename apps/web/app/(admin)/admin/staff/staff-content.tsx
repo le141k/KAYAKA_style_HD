@@ -1,10 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Plus, Pencil, Trash2, UserX } from 'lucide-react';
+import { Plus, Pencil, Trash2, UserX, History } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
@@ -13,6 +13,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { toast } from '@/components/ui/use-toast';
 import { getInitials } from '@/lib/utils';
+import { ApiError } from '@/lib/api';
 import {
   useAdminStaff,
   useCreateStaff,
@@ -22,37 +23,72 @@ import {
   useCreateStaffGroup,
   useUpdateStaffGroup,
   useDeleteStaffGroup,
+  useRbacCatalog,
+  useRbacAudit,
   type AdminStaffMember,
   type AdminStaffGroup,
+  type RbacPermissionMeta,
 } from '@/lib/hooks/use-admin';
 
-// Permission catalog — mirrors apps/api/src/auth/permissions.ts
-const ALL_PERMISSIONS = [
-  { key: 'ticket.view', label: 'Просмотр заявок' },
-  { key: 'ticket.create', label: 'Создание заявок' },
-  { key: 'ticket.reply', label: 'Ответ на заявки' },
-  { key: 'ticket.edit', label: 'Редактирование заявок' },
-  { key: 'ticket.assign', label: 'Назначение заявок' },
-  { key: 'ticket.delete', label: 'Удаление заявок' },
-  { key: 'ticket.merge', label: 'Слияние заявок' },
-  { key: 'ticket.note', label: 'Заметки' },
-  { key: 'kb.view', label: 'База знаний: просмотр' },
-  { key: 'kb.manage', label: 'База знаний: управление' },
-  { key: 'news.manage', label: 'Новости: управление' },
-  { key: 'user.manage', label: 'Управление пользователями' },
-  { key: 'staff.manage', label: 'Управление сотрудниками' },
-  { key: 'org.manage', label: 'Управление организациями' },
-  { key: 'org.delete', label: 'Удаление организаций' },
-  { key: 'report.run', label: 'Запуск отчётов' },
-  { key: 'report.manage', label: 'Управление отчётами' },
-  { key: 'admin.settings', label: 'Настройки (статусы, приоритеты…)' },
-  { key: 'admin.sla', label: 'SLA' },
-  { key: 'admin.workflow', label: 'Правила и макросы' },
-  { key: 'admin.mail', label: 'Email-интеграция' },
-  { key: 'admin.departments', label: 'Отделы' },
-  { key: 'admin.customfields', label: 'Пользовательские поля' },
-  { key: 'admin.alaris', label: 'Интеграция Alaris' },
+// Fallback permission catalog — used only if GET /staff/rbac hasn't loaded yet.
+// The backend catalog (useRbacCatalog) is the source of truth.
+const FALLBACK_PERMISSIONS: RbacPermissionMeta[] = [
+  { key: 'ticket.view', label: 'Просмотр заявок', category: 'tickets' },
+  { key: 'ticket.create', label: 'Создание заявок', category: 'tickets' },
+  { key: 'ticket.reply', label: 'Ответ на заявки', category: 'tickets' },
+  { key: 'ticket.edit', label: 'Редактирование заявок', category: 'tickets' },
+  { key: 'ticket.assign', label: 'Назначение заявок', category: 'tickets' },
+  { key: 'ticket.delete', label: 'Удаление заявок', category: 'tickets' },
+  { key: 'ticket.merge', label: 'Слияние заявок', category: 'tickets' },
+  { key: 'ticket.note', label: 'Заметки', category: 'tickets' },
+  { key: 'kb.view', label: 'База знаний: просмотр', category: 'knowledgebase' },
+  { key: 'kb.manage', label: 'База знаний: управление', category: 'knowledgebase' },
+  { key: 'news.manage', label: 'Новости: управление', category: 'news' },
+  { key: 'user.manage', label: 'Управление пользователями', category: 'people' },
+  { key: 'staff.manage', label: 'Управление сотрудниками', category: 'people' },
+  { key: 'org.manage', label: 'Управление организациями', category: 'people' },
+  { key: 'org.delete', label: 'Удаление организаций', category: 'people' },
+  { key: 'report.run', label: 'Запуск отчётов', category: 'reports' },
+  { key: 'report.manage', label: 'Управление отчётами', category: 'reports' },
+  { key: 'admin.settings', label: 'Настройки (статусы, приоритеты…)', category: 'admin' },
+  { key: 'admin.sla', label: 'SLA', category: 'admin' },
+  { key: 'admin.workflow', label: 'Правила и макросы', category: 'admin' },
+  { key: 'admin.mail', label: 'Email-интеграция', category: 'admin' },
+  { key: 'admin.departments', label: 'Отделы', category: 'admin' },
+  { key: 'admin.customfields', label: 'Пользовательские поля', category: 'admin' },
+  { key: 'admin.alaris', label: 'Интеграция Alaris', category: 'admin' },
 ];
+
+const CATEGORY_LABELS: Record<string, string> = {
+  tickets: 'Заявки',
+  knowledgebase: 'База знаний',
+  news: 'Новости',
+  people: 'Люди',
+  reports: 'Отчёты',
+  admin: 'Администрирование',
+};
+
+const ACTION_LABELS: Record<string, string> = {
+  'staff.create': 'Создан сотрудник',
+  'staff.update': 'Изменён сотрудник',
+  'staff.role_change': 'Смена роли',
+  'staff.password_reset': 'Смена пароля',
+  'staff.enable': 'Аккаунт включён',
+  'staff.disable': 'Аккаунт отключён',
+  'group.create': 'Создана группа',
+  'group.update': 'Изменена группа',
+  'group.permissions_change': 'Изменены права группы',
+  'group.delete': 'Удалена группа',
+};
+
+/** Pull a human-readable message from an API error body (e.g. last-admin 403). */
+function serverMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) {
+    const data = err.data as { message?: string | string[] } | undefined;
+    if (data?.message) return Array.isArray(data.message) ? data.message.join(', ') : data.message;
+  }
+  return fallback;
+}
 
 const staffSchema = z.object({
   email: z.string().email('Некорректный email'),
@@ -61,7 +97,9 @@ const staffSchema = z.object({
   username: z.string().optional(),
   designation: z.string().optional(),
   staffGroupId: z.coerce.number({ invalid_type_error: 'Выберите группу' }).int().positive('Выберите группу'),
-  password: z.string().optional(),
+  // Empty = "no change" (edit) / prompted separately (create); any supplied
+  // password must be ≥ 8 chars, matching the API rule.
+  password: z.union([z.string().min(8, 'Минимум 8 символов'), z.literal('')]).optional(),
   isEnabled: z.boolean().optional(),
 });
 type StaffFormValues = z.infer<typeof staffSchema>;
@@ -76,11 +114,16 @@ type GroupFormValues = z.infer<typeof groupSchema>;
 
 function StaffGroupsSection() {
   const { data: groups = [], isLoading } = useAdminStaffGroups();
+  const { data: catalog } = useRbacCatalog();
   const createGroup = useCreateStaffGroup();
   const updateGroup = useUpdateStaffGroup();
   const deleteGroup = useDeleteStaffGroup();
 
+  const permissionCatalog = catalog?.permissions ?? FALLBACK_PERMISSIONS;
+  const roleTemplates = catalog?.roles ?? [];
+
   const [createOpen, setCreateOpen] = useState(false);
+  const [templateKey, setTemplateKey] = useState<string>('');
   const [editingGroup, setEditingGroup] = useState<AdminStaffGroup | null>(null);
   const [permissionsGroup, setPermissionsGroup] = useState<AdminStaffGroup | null>(null);
   const [selectedPerms, setSelectedPerms] = useState<string[]>([]);
@@ -95,14 +138,37 @@ function StaffGroupsSection() {
     defaultValues: { title: '', isAdmin: false },
   });
 
+  const activeTemplate = roleTemplates.find((r) => r.key === templateKey);
+
+  function openCreate() {
+    setTemplateKey('');
+    createForm.reset({ title: '', isAdmin: false });
+    setCreateOpen(true);
+  }
+
+  function onTemplateChange(key: string) {
+    setTemplateKey(key);
+    const tpl = roleTemplates.find((r) => r.key === key);
+    if (tpl && !createForm.getValues('title')) createForm.setValue('title', tpl.title);
+    if (tpl) createForm.setValue('isAdmin', tpl.isAdmin);
+  }
+
   async function onCreateSubmit(values: GroupFormValues) {
     try {
-      await createGroup.mutateAsync({ ...values, permissions: [] });
+      const payload = activeTemplate
+        ? { title: values.title, isAdmin: activeTemplate.isAdmin, permissions: activeTemplate.permissions }
+        : { title: values.title, isAdmin: values.isAdmin ?? false, permissions: [] };
+      await createGroup.mutateAsync(payload);
       toast({ title: 'Группа создана' });
       setCreateOpen(false);
+      setTemplateKey('');
       createForm.reset({ title: '', isAdmin: false });
-    } catch {
-      toast({ title: 'Ошибка', description: 'Не удалось создать группу', variant: 'destructive' });
+    } catch (err) {
+      toast({
+        title: 'Ошибка',
+        description: serverMessage(err, 'Не удалось создать группу'),
+        variant: 'destructive',
+      });
     }
   }
 
@@ -117,8 +183,12 @@ function StaffGroupsSection() {
       await updateGroup.mutateAsync({ id: editingGroup.id, data: { title: values.title } });
       toast({ title: 'Группа переименована' });
       setEditingGroup(null);
-    } catch {
-      toast({ title: 'Ошибка', description: 'Не удалось обновить группу', variant: 'destructive' });
+    } catch (err) {
+      toast({
+        title: 'Ошибка',
+        description: serverMessage(err, 'Не удалось обновить группу'),
+        variant: 'destructive',
+      });
     }
   }
 
@@ -128,16 +198,14 @@ function StaffGroupsSection() {
       await deleteGroup.mutateAsync(g.id);
       toast({ title: 'Группа удалена' });
     } catch (err: unknown) {
-      const status = (err as { status?: number })?.status;
-      if (status === 409) {
-        toast({
-          title: 'Ошибка',
-          description: 'Нельзя удалить — группа используется сотрудниками',
-          variant: 'destructive',
-        });
-      } else {
-        toast({ title: 'Ошибка', description: 'Не удалось удалить группу', variant: 'destructive' });
-      }
+      const status = err instanceof ApiError ? err.status : undefined;
+      const fallback =
+        status === 409
+          ? 'Нельзя удалить — группа используется сотрудниками'
+          : status === 403
+            ? 'Нельзя удалить последнюю группу администраторов'
+            : 'Не удалось удалить группу';
+      toast({ title: 'Ошибка', description: serverMessage(err, fallback), variant: 'destructive' });
     }
   }
 
@@ -150,10 +218,14 @@ function StaffGroupsSection() {
     if (!permissionsGroup) return;
     try {
       await updateGroup.mutateAsync({ id: permissionsGroup.id, data: { permissions: selectedPerms } });
-      toast({ title: 'Права обновлены' });
+      toast({ title: 'Права обновлены', description: 'Активные сессии участников группы завершены.' });
       setPermissionsGroup(null);
-    } catch {
-      toast({ title: 'Ошибка', description: 'Не удалось сохранить права', variant: 'destructive' });
+    } catch (err) {
+      toast({
+        title: 'Ошибка',
+        description: serverMessage(err, 'Не удалось сохранить права'),
+        variant: 'destructive',
+      });
     }
   }
 
@@ -161,11 +233,22 @@ function StaffGroupsSection() {
     setSelectedPerms((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
   }
 
+  // Group the catalog by category for the permissions dialog.
+  const permsByCategory = useMemo(() => {
+    const map = new Map<string, RbacPermissionMeta[]>();
+    for (const p of permissionCatalog) {
+      const list = map.get(p.category) ?? [];
+      list.push(p);
+      map.set(p.category, list);
+    }
+    return Array.from(map.entries());
+  }, [permissionCatalog]);
+
   return (
     <section className="space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold">Группы сотрудников</h2>
-        <Button size="sm" onClick={() => setCreateOpen(true)}>
+        <Button size="sm" onClick={openCreate}>
           <Plus className="mr-1.5 h-4 w-4" />
           Создать группу
         </Button>
@@ -199,7 +282,9 @@ function StaffGroupsSection() {
                       '—'
                     )}
                   </TableCell>
-                  <TableCell className="text-sm text-muted-foreground">{g.permissions.length}</TableCell>
+                  <TableCell className="text-sm text-muted-foreground">
+                    {g.isAdmin ? 'все' : g.permissions.length}
+                  </TableCell>
                   <TableCell>
                     <div className="flex gap-1">
                       <Button
@@ -238,6 +323,33 @@ function StaffGroupsSection() {
             <DialogTitle>Новая группа сотрудников</DialogTitle>
           </DialogHeader>
           <form onSubmit={createForm.handleSubmit(onCreateSubmit)} className="space-y-4">
+            {roleTemplates.length > 0 && (
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">Шаблон роли</label>
+                <select
+                  className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm"
+                  value={templateKey}
+                  onChange={(e) => onTemplateChange(e.target.value)}
+                >
+                  <option value="">Пустая матрица (настроить вручную)</option>
+                  {roleTemplates.map((r) => (
+                    <option key={r.key} value={r.key}>
+                      {r.title}
+                    </option>
+                  ))}
+                </select>
+                {activeTemplate && (
+                  <p className="text-xs text-muted-foreground">
+                    {activeTemplate.description}{' '}
+                    <span className="font-medium">
+                      (
+                      {activeTemplate.isAdmin ? 'полный доступ' : `${activeTemplate.permissions.length} прав`}
+                      )
+                    </span>
+                  </p>
+                )}
+              </div>
+            )}
             <div className="space-y-1.5">
               <label className="text-sm font-medium">Название</label>
               <Input {...createForm.register('title')} placeholder="Название группы" />
@@ -245,14 +357,18 @@ function StaffGroupsSection() {
                 <p className="text-xs text-destructive">{createForm.formState.errors.title.message}</p>
               )}
             </div>
-            <div className="flex items-center gap-2">
-              <input type="checkbox" id="groupIsAdmin" {...createForm.register('isAdmin')} />
-              <label htmlFor="groupIsAdmin" className="text-sm">
-                Группа администраторов
-              </label>
-            </div>
+            {!activeTemplate && (
+              <div className="flex items-center gap-2">
+                <input type="checkbox" id="groupIsAdmin" {...createForm.register('isAdmin')} />
+                <label htmlFor="groupIsAdmin" className="text-sm">
+                  Группа администраторов
+                </label>
+              </div>
+            )}
             <p className="text-xs text-muted-foreground">
-              После создания группы настройте права через кнопку «Права» в таблице.
+              {activeTemplate
+                ? 'Права из шаблона можно скорректировать позже через кнопку «Права».'
+                : 'После создания группы настройте права через кнопку «Права» в таблице.'}
             </p>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)}>
@@ -298,13 +414,18 @@ function StaffGroupsSection() {
           <DialogHeader>
             <DialogTitle>Права группы «{permissionsGroup?.title}»</DialogTitle>
           </DialogHeader>
-          <div className="space-y-2 py-2">
-            <div className="flex gap-2 mb-3">
+          {permissionsGroup?.isAdmin && (
+            <p className="rounded-md bg-amber-100 px-3 py-2 text-xs text-amber-800 dark:bg-amber-900/30 dark:text-amber-300">
+              Группа администраторов обходит проверки отдельных прав — доступен весь функционал.
+            </p>
+          )}
+          <div className="space-y-3 py-2">
+            <div className="flex gap-2">
               <Button
                 type="button"
                 size="sm"
                 variant="outline"
-                onClick={() => setSelectedPerms(ALL_PERMISSIONS.map((p) => p.key))}
+                onClick={() => setSelectedPerms(permissionCatalog.map((p) => p.key))}
               >
                 Выбрать все
               </Button>
@@ -312,18 +433,25 @@ function StaffGroupsSection() {
                 Снять все
               </Button>
             </div>
-            {ALL_PERMISSIONS.map((p) => (
-              <div key={p.key} className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  id={`perm-${p.key}`}
-                  checked={selectedPerms.includes(p.key)}
-                  onChange={() => togglePerm(p.key)}
-                />
-                <label htmlFor={`perm-${p.key}`} className="text-sm">
-                  <span className="font-mono text-xs text-muted-foreground mr-2">{p.key}</span>
-                  {p.label}
-                </label>
+            {permsByCategory.map(([category, perms]) => (
+              <div key={category} className="space-y-1.5">
+                <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  {CATEGORY_LABELS[category] ?? category}
+                </p>
+                {perms.map((p) => (
+                  <div key={p.key} className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id={`perm-${p.key}`}
+                      checked={selectedPerms.includes(p.key)}
+                      onChange={() => togglePerm(p.key)}
+                    />
+                    <label htmlFor={`perm-${p.key}`} className="text-sm">
+                      <span className="font-mono text-xs text-muted-foreground mr-2">{p.key}</span>
+                      {p.label}
+                    </label>
+                  </div>
+                ))}
               </div>
             ))}
           </div>
@@ -341,17 +469,102 @@ function StaffGroupsSection() {
   );
 }
 
+// ─── RBAC audit section ─────────────────────────────────────────────────────
+
+function RbacAuditSection() {
+  const [open, setOpen] = useState(false);
+  const { data, isLoading } = useRbacAudit({ limit: 50, enabled: open });
+  const entries = data?.data ?? [];
+
+  return (
+    <section className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="flex items-center gap-2 text-lg font-semibold">
+          <History className="h-4 w-4" /> Журнал изменений (аудит)
+        </h2>
+        <Button size="sm" variant="outline" onClick={() => setOpen((v) => !v)}>
+          {open ? 'Скрыть' : 'Показать'}
+        </Button>
+      </div>
+
+      {open && (
+        <div className="rounded-xl border border-border bg-card">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-44">Время</TableHead>
+                <TableHead>Кто</TableHead>
+                <TableHead>Действие</TableHead>
+                <TableHead>Объект</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {isLoading && (
+                <TableRow>
+                  <TableCell colSpan={4} className="py-6 text-center text-muted-foreground">
+                    Загрузка…
+                  </TableCell>
+                </TableRow>
+              )}
+              {!isLoading && entries.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={4} className="py-6 text-center text-muted-foreground">
+                    Записей нет
+                  </TableCell>
+                </TableRow>
+              )}
+              {entries.map((e) => (
+                <TableRow key={e.id}>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {new Date(e.createdAt).toLocaleString('ru-RU')}
+                  </TableCell>
+                  <TableCell className="text-sm">{e.actorEmail || '—'}</TableCell>
+                  <TableCell className="text-sm">
+                    <Badge variant="secondary">{ACTION_LABELS[e.action] ?? e.action}</Badge>
+                  </TableCell>
+                  <TableCell className="text-sm text-muted-foreground">
+                    {e.targetLabel || `${e.targetType}#${e.targetId ?? '?'}`}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </section>
+  );
+}
+
 // ─── Main staff content ───────────────────────────────────────────────────────
 
 export function StaffContent() {
-  const { data, isLoading } = useAdminStaff();
   const { data: groups = [] } = useAdminStaffGroups();
+
+  // Filters (search / status / group). Search is debounced so we don't refetch
+  // on every keystroke.
+  const [searchInput, setSearchInput] = useState('');
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'disabled'>('all');
+  const [groupFilter, setGroupFilter] = useState<number>(0);
+
+  useEffect(() => {
+    const t = setTimeout(() => setSearch(searchInput.trim()), 300);
+    return () => clearTimeout(t);
+  }, [searchInput]);
+
+  const { data, isLoading } = useAdminStaff({
+    search: search || undefined,
+    groupId: groupFilter || undefined,
+    enabled: statusFilter === 'all' ? undefined : statusFilter === 'active',
+  });
   const createStaff = useCreateStaff();
   const updateStaff = useUpdateStaff();
   const disableStaff = useDisableStaff();
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<AdminStaffMember | null>(null);
+
+  const defaultGroupId = useMemo(() => groups.find((g) => g.title === 'Agent')?.id, [groups]);
 
   const form = useForm<StaffFormValues>({
     resolver: zodResolver(staffSchema),
@@ -366,6 +579,8 @@ export function StaffContent() {
   });
 
   const staffList = data?.data ?? [];
+  const selectedGroupId = form.watch('staffGroupId');
+  const selectedGroup = groups.find((g) => g.id === Number(selectedGroupId));
 
   function openCreate() {
     setEditing(null);
@@ -374,7 +589,8 @@ export function StaffContent() {
       firstName: '',
       lastName: '',
       designation: '',
-      staffGroupId: undefined,
+      // Default new staff to the Agent role (least privilege) when it exists.
+      staffGroupId: defaultGroupId,
       password: '',
     });
     setDialogOpen(true);
@@ -413,8 +629,12 @@ export function StaffContent() {
         toast({ title: 'Сотрудник создан' });
       }
       setDialogOpen(false);
-    } catch {
-      toast({ title: 'Ошибка', description: 'Не удалось сохранить сотрудника', variant: 'destructive' });
+    } catch (err) {
+      toast({
+        title: 'Ошибка',
+        description: serverMessage(err, 'Не удалось сохранить сотрудника'),
+        variant: 'destructive',
+      });
     }
   }
 
@@ -422,9 +642,13 @@ export function StaffContent() {
     if (!confirm(`Отключить доступ для «${member.fullName}»? Сотрудник не сможет войти.`)) return;
     try {
       await disableStaff.mutateAsync(member.id);
-      toast({ title: 'Доступ отключён' });
-    } catch {
-      toast({ title: 'Ошибка', description: 'Не удалось отключить сотрудника', variant: 'destructive' });
+      toast({ title: 'Доступ отключён', description: 'Активные сессии сотрудника завершены.' });
+    } catch (err) {
+      toast({
+        title: 'Ошибка',
+        description: serverMessage(err, 'Не удалось отключить сотрудника'),
+        variant: 'destructive',
+      });
     }
   }
 
@@ -454,6 +678,40 @@ export function StaffContent() {
       {/* Staff members table */}
       <section className="space-y-4">
         <h2 className="text-lg font-semibold">Сотрудники</h2>
+
+        {/* Filters */}
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
+            placeholder="Поиск по имени или email…"
+            className="h-9 w-64"
+          />
+          <select
+            className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
+            value={groupFilter}
+            onChange={(e) => setGroupFilter(Number(e.target.value))}
+            aria-label="Фильтр по группе"
+          >
+            <option value={0}>Все роли</option>
+            {groups.map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.title}
+              </option>
+            ))}
+          </select>
+          <select
+            className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value as 'all' | 'active' | 'disabled')}
+            aria-label="Фильтр по статусу"
+          >
+            <option value="all">Все статусы</option>
+            <option value="active">Активные</option>
+            <option value="disabled">Заблокированные</option>
+          </select>
+        </div>
+
         <div className="rounded-xl border border-border bg-card">
           <Table>
             <TableHeader>
@@ -538,6 +796,9 @@ export function StaffContent() {
         </div>
       </section>
 
+      {/* RBAC audit log */}
+      <RbacAuditSection />
+
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent>
           <DialogHeader>
@@ -573,7 +834,7 @@ export function StaffContent() {
             </div>
             {groups.length > 0 && (
               <div className="space-y-1.5">
-                <label className="text-sm font-medium">Группа</label>
+                <label className="text-sm font-medium">Роль / группа</label>
                 <select
                   className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm"
                   {...form.register('staffGroupId')}
@@ -585,6 +846,16 @@ export function StaffContent() {
                     </option>
                   ))}
                 </select>
+                {selectedGroup && (
+                  <p className="text-xs text-muted-foreground">
+                    Доступ:{' '}
+                    <span className="font-medium">
+                      {selectedGroup.isAdmin
+                        ? 'полный (администратор)'
+                        : `${selectedGroup.permissions.length} прав`}
+                    </span>
+                  </p>
+                )}
                 {form.formState.errors.staffGroupId && (
                   <p className="text-xs text-destructive">{form.formState.errors.staffGroupId.message}</p>
                 )}
@@ -595,6 +866,7 @@ export function StaffContent() {
                 {editing ? 'Новый пароль (оставьте пустым, чтобы не менять)' : 'Пароль'}
               </label>
               <Input type="password" {...form.register('password')} placeholder="••••••••" />
+              <p className="text-xs text-muted-foreground">Минимум 8 символов.</p>
               {form.formState.errors.password && (
                 <p className="text-xs text-destructive">{form.formState.errors.password.message}</p>
               )}

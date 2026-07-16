@@ -1,10 +1,29 @@
 import { z } from 'zod';
 import { optionalBoolParam } from '../../common/zod-bool.util';
+import { unknownPermissions } from '../../auth/permissions';
+
+/**
+ * A list of RBAC permission keys, each of which must exist in the catalog
+ * (`apps/api/src/auth/permissions.ts`). An unknown key is a client error (400)
+ * rather than a silently-stored dead permission.
+ */
+const PermissionsArray = z
+  .array(z.string())
+  .default([])
+  .superRefine((keys, ctx) => {
+    const unknown = unknownPermissions(keys);
+    if (unknown.length > 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Unknown permission key(s): ${unknown.join(', ')}`,
+      });
+    }
+  });
 
 export const CreateStaffGroupSchema = z.object({
   title: z.string().min(1).max(100),
   isAdmin: z.boolean().default(false),
-  permissions: z.array(z.string()).default([]),
+  permissions: PermissionsArray,
 });
 export type CreateStaffGroupDto = z.infer<typeof CreateStaffGroupSchema>;
 
@@ -52,3 +71,9 @@ export const ListStaffQuerySchema = z.object({
   enabled: optionalBoolParam(),
 });
 export type ListStaffQueryDto = z.infer<typeof ListStaffQuerySchema>;
+
+export const ListAuditQuerySchema = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().positive().max(100).default(50),
+});
+export type ListAuditQueryDto = z.infer<typeof ListAuditQuerySchema>;

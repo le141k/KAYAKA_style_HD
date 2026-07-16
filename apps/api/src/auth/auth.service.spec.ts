@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, UnauthorizedException } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import * as passwordUtil from './password.util';
 import type { PrismaService } from '../prisma/prisma.service';
@@ -8,7 +8,7 @@ import type { AppConfig } from '../config/configuration';
 // ─── Mocks ────────────────────────────────────────────────────────────────────
 
 function makePrismaMock() {
-  return {
+  const prisma = {
     staff: {
       findUnique: vi.fn(),
       update: vi.fn(),
@@ -19,7 +19,16 @@ function makePrismaMock() {
       update: vi.fn(),
       updateMany: vi.fn(),
     },
-  } as unknown as PrismaService;
+    passwordReset: {
+      findUnique: vi.fn(),
+      updateMany: vi.fn(),
+    },
+    $transaction: vi.fn(),
+  };
+  prisma.$transaction.mockImplementation(async (callback: (tx: typeof prisma) => Promise<unknown>) =>
+    callback(prisma),
+  );
+  return prisma as unknown as PrismaService;
 }
 
 function makeJwtMock() {
@@ -149,6 +158,10 @@ describe('AuthService', () => {
       expect(result).toHaveProperty('refreshToken');
       expect(result.staff.email).toBe('test@23telecom.example');
       expect(result.staff.isAdmin).toBe(true);
+      expect(jwt.signAsync).toHaveBeenCalledWith(
+        expect.objectContaining({ issuedAtMs: expect.any(Number) }),
+        expect.anything(),
+      );
     });
   });
 
@@ -166,6 +179,56 @@ describe('AuthService', () => {
           data: { revokedAt: expect.any(Date) },
         }),
       );
+    });
+  });
+
+  // ─── password reset ───────────────────────────────────────────────────────
+
+  describe('resetPassword', () => {
+    it('claims the reset token once and revokes access sessions after the password changes', async () => {
+      const sessions = { revokeAllForStaff: vi.fn().mockResolvedValue(undefined) };
+      service = new AuthService(
+        prisma as unknown as PrismaService,
+        jwt as unknown as import('@nestjs/jwt').JwtService,
+        TEST_CONFIG,
+        undefined,
+        sessions as never,
+      );
+      (prisma.passwordReset.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 9,
+        staffId: 1,
+        usedAt: null,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      (prisma.passwordReset.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.staff.update as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
+      (prisma.refreshToken.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 2 });
+      vi.spyOn(passwordUtil, 'hashPassword').mockResolvedValue('new-password-hash');
+
+      await service.resetPassword('single-use-token', 'newpassword');
+
+      expect(prisma.passwordReset.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 9, usedAt: null, expiresAt: expect.anything() }),
+        }),
+      );
+      expect(sessions.revokeAllForStaff).toHaveBeenCalledWith(1);
+    });
+
+    it('rejects a reset token that another request has already claimed', async () => {
+      (prisma.passwordReset.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 9,
+        staffId: 1,
+        usedAt: null,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      (prisma.passwordReset.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+      vi.spyOn(passwordUtil, 'hashPassword').mockResolvedValue('new-password-hash');
+
+      await expect(service.resetPassword('already-claimed', 'newpassword')).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(prisma.staff.update).not.toHaveBeenCalled();
     });
   });
 

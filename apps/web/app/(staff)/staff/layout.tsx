@@ -22,6 +22,7 @@ import { getInitials } from '@/lib/utils';
 import { hasToken } from '@/lib/api';
 import { useLogout, useMe } from '@/lib/hooks/use-auth';
 import { useI18n } from '@/lib/i18n';
+import { ADMIN_AREA_PERMISSIONS, ROLE_LABEL, hasAnyPermission } from '@/lib/auth/permissions';
 
 export default function StaffLayout({ children }: { children: React.ReactNode }) {
   const [commandOpen, setCommandOpen] = useState(false);
@@ -79,6 +80,8 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
 
   const displayName = user.name;
   const displayEmail = user.email;
+  const canAccessAdmin = hasAnyPermission(user, ADMIN_AREA_PERMISSIONS);
+  const roleLabel = user.role === 'client' ? undefined : ROLE_LABEL[user.role];
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
@@ -137,12 +140,17 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
               <div className="px-2 py-1.5">
                 <p className="text-xs font-medium">{displayName}</p>
                 <p className="text-xs text-muted-foreground">{displayEmail}</p>
+                {roleLabel && (
+                  <span className="mt-1 inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
+                    {roleLabel}
+                  </span>
+                )}
               </div>
               <DropdownMenuSeparator />
-              {/* Admin-only destinations — agents are bounced by the admin guard, so
-                  showing these to non-admins is a dead link. There is no personal
-                  profile page yet, so the old "Профиль" → /admin/staff item is dropped. */}
-              {user.role === 'admin' && (
+              {/* Settings is permission-gated: shown to admins and any Manager who
+                  holds at least one admin-area permission. Members without one are
+                  bounced by the admin guard, so hiding the dead link is correct. */}
+              {canAccessAdmin && (
                 <>
                   <DropdownMenuItem asChild>
                     <Link href="/admin">Настройки</Link>
