@@ -71,7 +71,15 @@ HTTP Request
 
 Public routes (bypass JWT): `POST /auth/login`, `POST /auth/refresh`,
 `POST /tickets/public`, `POST /alaris/webhook` (but checks shared-secret header),
-`GET /news`, `GET /kb/articles`, `GET /kb/articles/slug/:slug`, `GET /kb/categories`.
+`GET /news`, `GET /kb/articles`, `GET /kb/articles/slug/:slug`, `GET /kb/categories`,
+`POST /client-auth/request-link`, `POST /client-auth/verify`.
+
+**Client (customer) auth mode (S2).** Distinct from staff JWT: a magic-link
+(`request-link` → single-use hashed token → `verify`) opens a hashed `ClientSession`
+behind an HttpOnly `th_client` cookie, bound to a stable `User.id`. Routes decorated
+`@ClientAuthenticated()` (= `@Public()` + `ClientAuthGuard`) resolve `req.client = {userId}`;
+client ticket routes (`/tickets/my`, `/tickets/public/:id`, `.../reply`) authorize strictly
+by `Ticket.userId === client.userId`. Never reuses staff JWT/RBAC identity.
 
 ## 4. Background jobs _(auto)_
 
