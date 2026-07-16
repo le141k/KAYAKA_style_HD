@@ -372,7 +372,11 @@ Migrations live under `apps/api/prisma/migrations/` and are managed by Prisma Mi
 > **DB-level** case-insensitive `UNIQUE(email)` constraint is intentionally **deferred**: it asserts
 > "an email is never shared across users", which must be confirmed against production data first.
 > Run `npm run audit:ownership -w apps/api` (read-only) to list case-insensitive duplicate groups and
-> unlinkable tickets before enforcing it.
+> unlinkable tickets before enforcing it. Until it lands, the app's `create`/`addEmail` conflict
+> checks use the case-sensitive index, so they can't detect a pre-existing row the migration left
+> un-normalized (a member of a collision group) — resolving those groups via the audit is the fix.
+> The migration and audit both `btrim` the same ASCII whitespace set (` \t\n\r\f\x0B`) that JS
+> `String.trim()` strips, so "normalized" means the same thing in SQL and in `normalizeEmail`.
 
 **Apply migrations (CI / production):**
 

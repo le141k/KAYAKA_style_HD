@@ -4,11 +4,11 @@ import type { PrismaClient } from '@prisma/client';
 
 /**
  * The audit issues five $queryRaw calls in this order:
- *   1. duplicate email groups
- *   2. un-normalized row count
- *   3. unlinked-ticket sample rows (split into ambiguous vs orphan)
- *   4. ambiguous-ticket total
- *   5. orphan-ticket total
+ *   1. duplicate email groups (sample)
+ *   2. exact group totals { groups, ambiguous }
+ *   3. un-normalized row count { c }
+ *   4. unlinked-ticket sample rows (split into ambiguous / linkable / orphan)
+ *   5. exact ticket totals { ambiguous, linkable, orphan }
  */
 function mockClient(seq: unknown[]): PrismaClient {
   const q = vi.fn();
@@ -17,13 +17,13 @@ function mockClient(seq: unknown[]): PrismaClient {
 }
 
 describe('auditUserEmailOwnership (S2-2)', () => {
-  it('reports CLEAN when there are no duplicates, un-normalized rows or orphan tickets', async () => {
+  it('reports CLEAN when there are no duplicates, un-normalized rows or unlinked tickets', async () => {
     const client = mockClient([
-      [], // no duplicate groups
+      [], // no duplicate groups (sample)
+      [{ groups: 0n, ambiguous: 0n }], // exact group totals
       [{ c: 0n }], // no un-normalized rows
-      [], // no unlinked tickets
-      [{ c: 0n }], // ambiguous total
-      [{ c: 0n }], // orphan total
+      [], // no unlinked tickets (sample)
+      [{ ambiguous: 0n, linkable: 0n, orphan: 0n }], // exact ticket totals
     ]);
     const a = await auditUserEmailOwnership(client);
     expect(a.clean).toBe(true);
@@ -31,44 +31,51 @@ describe('auditUserEmailOwnership (S2-2)', () => {
       duplicateGroups: 0,
       ambiguousGroups: 0,
       ambiguousTickets: 0,
+      linkableTickets: 0,
       unlinkedTickets: 0,
       unnormalizedRows: 0,
     });
   });
 
-  it('flags an ambiguous duplicate group and splits tickets into ambiguous vs orphan', async () => {
+  it('splits tickets into ambiguous / linkable / orphan and keeps sample consistent with totals', async () => {
     const client = mockClient([
       [
         { norm: 'shared@x.io', row_count: 2n, user_count: 2n, user_ids: [1, 2] }, // ambiguous
         { norm: 'variant@x.io', row_count: 2n, user_count: 1n, user_ids: [3] }, // same user
       ],
-      [{ c: 2n }], // 2 rows still un-normalized (the ambiguous group collided)
+      [{ groups: 2n, ambiguous: 1n }], // exact group totals
+      [{ c: 2n }], // un-normalized rows
       [
         { ticketId: 10, mask: 'TT-000010', email: 'shared@x.io', user_count: 2n }, // ambiguous
-        { ticketId: 11, mask: 'TT-000011', email: 'ghost@x.io', user_count: 0n }, // orphan
+        { ticketId: 11, mask: 'TT-000011', email: 'one@x.io', user_count: 1n }, // linkable
+        { ticketId: 12, mask: 'TT-000012', email: 'ghost@x.io', user_count: 0n }, // orphan
       ],
-      [{ c: 1n }], // ambiguous total
-      [{ c: 1n }], // orphan total
+      [{ ambiguous: 1n, linkable: 1n, orphan: 1n }], // exact ticket totals
     ]);
     const a = await auditUserEmailOwnership(client);
 
     expect(a.totals.duplicateGroups).toBe(2);
     expect(a.totals.ambiguousGroups).toBe(1); // only user_count > 1 counts
-    expect(a.ambiguousTickets).toHaveLength(1);
-    expect(a.ambiguousTickets[0].mask).toBe('TT-000010');
-    expect(a.unlinkedTickets).toHaveLength(1);
-    expect(a.unlinkedTickets[0].mask).toBe('TT-000011');
-    // Not clean: an ambiguous group + un-normalized rows remain.
-    expect(a.clean).toBe(false);
+
+    // Every sampled ticket lands in exactly one bucket, and each bucket's sample size
+    // matches its exact total (the userCount===1 case is no longer silently dropped).
+    expect(a.ambiguousTickets.map((t) => t.mask)).toEqual(['TT-000010']);
+    expect(a.linkableTickets.map((t) => t.mask)).toEqual(['TT-000011']);
+    expect(a.unlinkedTickets.map((t) => t.mask)).toEqual(['TT-000012']);
+    expect(a.totals.ambiguousTickets).toBe(1);
+    expect(a.totals.linkableTickets).toBe(1);
+    expect(a.totals.unlinkedTickets).toBe(1);
+
+    expect(a.clean).toBe(false); // ambiguous group + un-normalized rows remain
   });
 
   it('is NOT clean while un-normalized rows remain even with no ambiguous groups', async () => {
     const client = mockClient([
       [{ norm: 'a@x.io', row_count: 2n, user_count: 1n, user_ids: [5] }], // variants only
+      [{ groups: 1n, ambiguous: 0n }],
       [{ c: 1n }], // one un-normalized row remains
       [],
-      [{ c: 0n }],
-      [{ c: 0n }],
+      [{ ambiguous: 0n, linkable: 0n, orphan: 0n }],
     ]);
     const a = await auditUserEmailOwnership(client);
     expect(a.totals.ambiguousGroups).toBe(0);
