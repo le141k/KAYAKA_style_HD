@@ -7,6 +7,7 @@ import { JwtAuthGuard } from './jwt-auth.guard';
 import { PermissionsGuard } from './permissions.guard';
 import { ClientPortalGuard } from './client-portal.guard';
 import { TokenBlocklistService } from './token-blocklist.service';
+import { LoginThrottleService } from './login-throttle.service';
 import { MailService } from '../modules/mail/mail.service';
 import { loadConfig, APP_CONFIG } from '../config/configuration';
 
@@ -42,6 +43,7 @@ const config = loadConfig();
     PermissionsGuard,
     ClientPortalGuard,
     TokenBlocklistService,
+    LoginThrottleService,
   ],
   exports: [
     AuthService,

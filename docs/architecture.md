@@ -83,6 +83,13 @@ behind an HttpOnly `th_client` cookie, bound to a stable `User.id`. Routes decor
 client ticket routes (`/tickets/my`, `/tickets/public/:id`, `.../reply`) authorize strictly
 by `Ticket.userId === client.userId`. Never reuses staff JWT/RBAC identity.
 
+**Login-abuse throttle (S3-7).** `POST /auth/login` carries the per-IP `@Throttle(5/60s)` plus a
+`LoginThrottleService` Redis counter keyed by trusted client IP + `HMAC-SHA256(email)`: a generic
+**429** after 10 failures in a 15-min sliding window, cleared on success. It never locks an account
+(the key is per-IP, so a known account stays reachable from other IPs) and the raw email is never
+stored. Fail-open — a Redis outage falls back to the per-IP throttle. Both the 429 and the
+credential failure are generic, disclosing nothing about account existence or lock state.
+
 ## 4. Background jobs _(auto)_
 
 ### Implemented — BullMQ queues

@@ -18,9 +18,14 @@
 Consumed by: `AuthController`, `JwtAuthGuard`.
 
 ```ts
-login(email: string, password: string): Promise<LoginResult>
+login(email: string, password: string, ip?: string): Promise<LoginResult>
 // LoginResult = { accessToken, refreshToken, staff: AuthStaff }
 // Validates credentials, issues JWT pair, persists argon2-hashed refresh token, updates lastLoginAt.
+// S3-7: before validating, asserts the caller is under the login-abuse throttle (LoginThrottleService,
+// keyed by trusted client IP + HMAC(email)); records a failure on bad credentials and clears the
+// counter on success. Over the threshold it throws a generic 429 (never an account-lock). Fail-open:
+// a Redis outage does not block logins. Both the throttle 429 and the credential failure are generic
+// so nothing about account existence or lock state is disclosed.
 
 refresh(rawRefreshToken: string): Promise<TokenPair>
 // S3-3: looks up EXACTLY ONE row by the token's opaque `jti` (no Argon2 scan), verifies
@@ -61,9 +66,22 @@ resetPassword(token: string, newPassword: string): Promise<void>
 // (tokenHash, usedAt IS NULL, not expired) must affect exactly one row before the
 // password is changed, so concurrent/replayed use changes the password at most once.
 // On success updates passwordHash and revokes all active refresh tokens in one tx.
-// Invariant: MAIL_SERVICE_TOKEN is bound to the real MailService in AuthModule (which
-// imports MailModule); the former `useValue: undefined` placeholder is removed.
+// Invariant: MAIL_SERVICE_TOKEN is bound to a real MailService in AuthModule via a NARROW
+// acyclic adapter — AuthModule registers only the 'mail' producer queue and provides
+// MailService locally, WITHOUT importing MailModule (that would pull the
+// Mail→Tickets→Sla→Mail module-load cycle at boot). The former `useValue: undefined`
+// placeholder is removed, so reset mail is dispatched instead of the raw link being logged.
 ```
+
+**Auxiliary auth services** (same module, injected `@Optional()` so a Redis outage degrades
+gracefully):
+
+- `LoginThrottleService` (`auth/login-throttle.service.ts`, S3-7) — Redis failure counter keyed
+  `th:login:<HMAC-SHA256(email)>:<ip>`; `assertNotThrottled`/`recordFailure`/`clear`. Generic 429
+  after 10 failures / 15-min sliding window; **fail-open**; never locks an account (per-IP key), and
+  raw emails are never stored (HMAC). Used by `AuthService.login`.
+- `TokenBlocklistService` (`auth/token-blocklist.service.ts`) — Redis jti blocklist for revoked
+  access tokens (defense-in-depth atop the authoritative DB `authVersion` check); **fail-open**.
 
 ---
 

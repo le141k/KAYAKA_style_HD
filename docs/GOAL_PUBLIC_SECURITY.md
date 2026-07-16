@@ -79,9 +79,10 @@ and inventory are completed before any production mutation or migration.
 - [ ] **H3 Close staff-auth gaps:** use DB-backed `authVersion`, logout-all revocation, atomic refresh
       rotation and origin + CSRF checks for every cookie-authenticated mutation.
       _(Done: DB-backed `authVersion` + logout-all revocation (S3-1/2/4), atomic refresh rotation by
-      jti/familyId (S3-3), and cookie-auth Origin-CSRF via `CsrfGuard` (S3-5 origin half). Still open:
-      the signed double-submit token + `__Host-` cookie hardening (S3-5 token / S3-6, tied to cookie-
-      only S1-6/7) and the login-abuse throttle (S3-7).)_
+      jti/familyId (S3-3), cookie-auth Origin-CSRF via `CsrfGuard` (S3-5 origin half), and the
+      login-abuse throttle (S3-7 — per-IP + HMAC(email) Redis throttle, generic 429, fail-open, no
+      account lock). Still open: the signed double-submit token + `__Host-` cookie hardening
+      (S3-5 token / S3-6, tied to cookie-only S1-6/7).)_
 - [ ] **H4 Remove known access paths:** soft-disable demo staff, revoke their sessions, then rotate JWT
       and webhook secrets in the order defined by S1. Never delete staff rows as containment.
 - [ ] **H5 Deploy privately and smoke:** use immutable images/config, run the mandatory production
@@ -356,11 +357,22 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       defined in S1, always `Secure`, `HttpOnly` for session cookies, no `Domain`, and identical
       attributes when clearing. Keep a separate readable CSRF cookie only if the signed pattern needs
       it. Same-origin `/api` is a prerequisite.
-- [ ] **S3-7 Remove externally-triggered hard account DoS.** Replace the distinguishable hard lock
+- [x] **S3-7 Remove externally-triggered hard account DoS.** Replace the distinguishable hard lock
       response with a generic login failure. Do not let anonymous failures permanently lock a known
       account: use progressive Redis-backed delay/throttles keyed by trusted IP + HMAC(email) and
       security alerts. S4 may add a challenge after the threshold. Preserve credential-stuffing
       protection without enumeration.
+      _(Done: there was no hard account-lock to remove — the codebase never had lock columns or a
+      distinguishable lock response, so login already returns one generic `Invalid credentials`
+      regardless of account/lock state. Added `LoginThrottleService` (`auth/login-throttle.service.ts`):
+      a Redis counter keyed `th:login:<HMAC-SHA256(email)>:<ip>` that returns a generic **429** after
+      10 failures in a 15-min sliding window and clears on success. Because the key is scoped to a
+      single IP the counter can NEVER lock a known account out from its own IPs, and the raw email is
+      HMAC-ed so addresses are never stored. **Fail-open:** a Redis outage never blocks a login (the
+      per-IP `@Throttle(5/60s)` on `POST /auth/login` is the backstop); a `warn` alert fires when the
+      throttle first engages. Verified live against real Redis: fresh key allowed → blocked/429 after
+      10 failures → allowed after clear → a second IP for the same email stays allowed (no account
+      lock). The optional post-threshold challenge is S4 (Turnstile, deferred, needs approval).)_
 - [ ] **S3-8 Test the state transitions.** Prove old access/refresh tokens fail immediately after
       password change, disable and permission/group change; CSRF requests from missing/wrong origins
       fail; valid same-origin JSON and multipart requests work; two parallel refreshes produce one

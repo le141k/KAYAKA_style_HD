@@ -24,6 +24,11 @@ All routes are under the `/api` global prefix.
 | POST   | /api/auth/logout  | 🔒 _(any valid JWT)_ | —                   | 204 No Content                       |
 | GET    | /api/auth/me      | 🔒 _(any valid JWT)_ | —                   | Current staff principal              |
 
+> **Login throttle (S3-7).** `POST /api/auth/login` returns a generic **429** after 10 failed
+> attempts in a 15-min window per client IP + `HMAC(email)` (in addition to the per-IP
+> `@Throttle(5/60s)`). It never locks an account and discloses nothing about account/lock state;
+> fail-open on a Redis outage. The success/`401` response shapes are unchanged.
+
 ---
 
 ## Tickets

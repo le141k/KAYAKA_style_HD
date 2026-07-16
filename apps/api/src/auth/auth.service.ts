@@ -11,6 +11,7 @@ import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppConfig, APP_CONFIG } from '../config/configuration';
 import { TokenBlocklistService } from './token-blocklist.service';
+import { LoginThrottleService } from './login-throttle.service';
 import { verifyPassword, hashPassword } from './password.util';
 import { type AuthStaff } from './auth.decorators';
 import type { Permission } from './permissions';
@@ -64,6 +65,7 @@ export class AuthService {
     @Optional()
     @Inject(MAIL_SERVICE_TOKEN)
     private readonly mailService?: ResetMailer,
+    @Optional() private readonly loginThrottle?: LoginThrottleService,
   ) {}
 
   /** Validate credentials; returns Staff+Group on success, throws otherwise. */
@@ -86,8 +88,19 @@ export class AuthService {
   }
 
   /** Log in, issue tokens, persist hashed refresh token. */
-  async login(email: string, password: string): Promise<LoginResult> {
-    const staff = await this.validateStaff(email, password);
+  async login(email: string, password: string, ip?: string): Promise<LoginResult> {
+    // Login-abuse throttle (S3-7): reject over-threshold (IP + email) BEFORE hashing,
+    // record failures, clear on success. Never locks the account (per-IP key, expires).
+    if (this.loginThrottle) await this.loginThrottle.assertNotThrottled(email, ip);
+    let staff: StaffWithGroup;
+    try {
+      staff = await this.validateStaff(email, password);
+    } catch (err) {
+      if (this.loginThrottle) await this.loginThrottle.recordFailure(email, ip);
+      throw err;
+    }
+    if (this.loginThrottle) await this.loginThrottle.clear(email, ip);
+
     const principal = this.buildPrincipal(staff);
     // A fresh login starts a new rotation family.
     const familyId = crypto.randomUUID();
