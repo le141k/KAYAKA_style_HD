@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { UnauthorizedException } from '@nestjs/common';
+import { ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
 import type { ExecutionContext } from '@nestjs/common';
 import type { Reflector } from '@nestjs/core';
 import type { JwtService } from '@nestjs/jwt';
+import type { PrismaService } from '../prisma/prisma.service';
 import { JwtAuthGuard, ACCESS_TOKEN_COOKIE } from './jwt-auth.guard';
 import { IS_PUBLIC_KEY } from './auth.decorators';
 import type { AppConfig } from '../config/configuration';
@@ -17,11 +18,27 @@ function makeContext(req: Record<string, unknown>): ExecutionContext {
   } as unknown as ExecutionContext;
 }
 
+/** A DB Staff row (with joined group) as the guard's findUnique would return it. */
+function staffRow(over: Record<string, unknown> = {}) {
+  return {
+    id: 7,
+    email: 'staff@x.com',
+    firstName: 'S',
+    lastName: 'T',
+    isEnabled: true,
+    authVersion: 0,
+    staffGroup: { isAdmin: false, permissions: ['ticket.view'] },
+    ...over,
+  };
+}
+
 function makeGuard(opts: {
   isPublic?: boolean;
-  verifyResult?: unknown;
+  verifyResult?: Record<string, unknown>;
   verifyThrows?: boolean;
   blocked?: boolean;
+  staff?: unknown; // findUnique result; `undefined` key uses a default enabled staff
+  prismaThrows?: boolean;
 }) {
   const reflector = {
     getAllAndOverride: vi.fn((key: string) => (key === IS_PUBLIC_KEY ? opts.isPublic : undefined)),
@@ -29,36 +46,44 @@ function makeGuard(opts: {
   const jwt = {
     verifyAsync: vi.fn(async () => {
       if (opts.verifyThrows) throw new Error('bad');
-      return opts.verifyResult ?? { sub: 1, email: 'a@b.c', isAdmin: false, permissions: [] };
+      return opts.verifyResult ?? { sub: 7, av: 0, jti: 'j' };
     }),
   } as unknown as JwtService;
   const blocklist = { isBlocked: vi.fn(async () => opts.blocked ?? false) };
+  const findUnique = vi.fn(async () => {
+    if (opts.prismaThrows) throw new Error('db down');
+    return 'staff' in opts ? opts.staff : staffRow();
+  });
+  const prisma = { staff: { findUnique } } as unknown as PrismaService;
   return {
-    guard: new JwtAuthGuard(jwt, reflector, CONFIG, blocklist as never),
+    guard: new JwtAuthGuard(jwt, reflector, CONFIG, prisma, blocklist as never),
     jwt,
     blocklist,
+    findUnique,
   };
 }
 
 describe('JwtAuthGuard', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('allows a @Public() route without any token', async () => {
-    const { guard } = makeGuard({ isPublic: true });
-    const ctx = makeContext({ headers: {} });
-    await expect(guard.canActivate(ctx)).resolves.toBe(true);
+  it('allows a @Public() route without any token (no DB hit)', async () => {
+    const { guard, findUnique } = makeGuard({ isPublic: true });
+    await expect(guard.canActivate(makeContext({ headers: {} }))).resolves.toBe(true);
+    expect(findUnique).not.toHaveBeenCalled();
   });
 
   it('rejects an undecorated (protected) route with no token → 401', async () => {
     const { guard } = makeGuard({ isPublic: false });
-    const ctx = makeContext({ headers: {} });
-    await expect(guard.canActivate(ctx)).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(guard.canActivate(makeContext({ headers: {} }))).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
   });
 
-  it('accepts a valid Bearer token and populates req.user', async () => {
+  it('accepts a valid Bearer token and populates req.user from the DB record', async () => {
     const { guard } = makeGuard({
       isPublic: false,
-      verifyResult: { sub: 7, email: 'staff@x.com', isAdmin: true, permissions: ['ticket.view'] },
+      verifyResult: { sub: 7, av: 0, jti: 'j' },
+      staff: staffRow({ id: 7 }),
     });
     const req: Record<string, unknown> = { headers: { authorization: 'Bearer good-token' } };
     await expect(guard.canActivate(makeContext(req))).resolves.toBe(true);
@@ -68,7 +93,8 @@ describe('JwtAuthGuard', () => {
   it('accepts a token from the HttpOnly cookie when no Bearer header is present', async () => {
     const { guard, jwt } = makeGuard({
       isPublic: false,
-      verifyResult: { sub: 9, email: 'c@x.com', isAdmin: false, permissions: [] },
+      verifyResult: { sub: 9, av: 0, jti: 'j' },
+      staff: staffRow({ id: 9 }),
     });
     const req: Record<string, unknown> = {
       headers: { cookie: `${ACCESS_TOKEN_COOKIE}=cookie-token; other=1` },
@@ -78,16 +104,17 @@ describe('JwtAuthGuard', () => {
     expect((req as { user: { staffId: number } }).user.staffId).toBe(9);
   });
 
-  it('rejects an invalid/expired token → 401', async () => {
-    const { guard } = makeGuard({ isPublic: false, verifyThrows: true });
+  it('rejects an invalid/expired token → 401 (no DB hit)', async () => {
+    const { guard, findUnique } = makeGuard({ isPublic: false, verifyThrows: true });
     const req = { headers: { authorization: 'Bearer rotten' } };
     await expect(guard.canActivate(makeContext(req))).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(findUnique).not.toHaveBeenCalled();
   });
 
   it('rejects a revoked (blocklisted) jti → 401', async () => {
     const { guard, blocklist } = makeGuard({
       isPublic: false,
-      verifyResult: { sub: 7, email: 's@x.com', isAdmin: false, permissions: [], jti: 'revoked-jti' },
+      verifyResult: { sub: 7, av: 0, jti: 'revoked-jti' },
       blocked: true,
     });
     const req = { headers: { authorization: 'Bearer good-but-revoked' } };
@@ -95,10 +122,66 @@ describe('JwtAuthGuard', () => {
     expect(blocklist.isBlocked).toHaveBeenCalledWith('revoked-jti');
   });
 
+  it('rejects a token for a now-disabled staff member → 401', async () => {
+    const { guard } = makeGuard({
+      isPublic: false,
+      verifyResult: { sub: 7, av: 0, jti: 'j' },
+      staff: staffRow({ isEnabled: false }),
+    });
+    const req = { headers: { authorization: 'Bearer t' } };
+    await expect(guard.canActivate(makeContext(req))).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('rejects a token whose authVersion no longer matches the DB → 401 (S3-1)', async () => {
+    const { guard } = makeGuard({
+      isPublic: false,
+      verifyResult: { sub: 7, av: 0, jti: 'j' },
+      staff: staffRow({ authVersion: 1 }), // security change bumped it
+    });
+    const req = { headers: { authorization: 'Bearer stale' } };
+    await expect(guard.canActivate(makeContext(req))).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('rejects a pre-S3 token that carries no av claim → 401', async () => {
+    const { guard } = makeGuard({
+      isPublic: false,
+      verifyResult: { sub: 7, jti: 'j' }, // no `av`
+      staff: staffRow({ authVersion: 0 }),
+    });
+    const req = { headers: { authorization: 'Bearer legacy' } };
+    await expect(guard.canActivate(makeContext(req))).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('fails CLOSED with 503 when the auth store is unreachable (S3-8)', async () => {
+    const { guard } = makeGuard({
+      isPublic: false,
+      verifyResult: { sub: 7, av: 0, jti: 'j' },
+      prismaThrows: true,
+    });
+    const req = { headers: { authorization: 'Bearer t' } };
+    await expect(guard.canActivate(makeContext(req))).rejects.toBeInstanceOf(ServiceUnavailableException);
+  });
+
+  it('derives permissions from the DB group, not the (stale) token claims', async () => {
+    const { guard } = makeGuard({
+      isPublic: false,
+      // Token claims admin + broad perms…
+      verifyResult: { sub: 7, av: 0, jti: 'j', isAdmin: true, permissions: ['everything'] },
+      // …but the live group has been de-privileged.
+      staff: staffRow({ staffGroup: { isAdmin: false, permissions: ['ticket.view'] } }),
+    });
+    const req: Record<string, unknown> = { headers: { authorization: 'Bearer t' } };
+    await guard.canActivate(makeContext(req));
+    const user = (req as { user: { isAdmin: boolean; permissions: string[] } }).user;
+    expect(user.isAdmin).toBe(false);
+    expect(user.permissions).toEqual(['ticket.view']);
+  });
+
   it('carries jti + exp onto req.user for logout revocation', async () => {
     const { guard } = makeGuard({
       isPublic: false,
-      verifyResult: { sub: 7, email: 's@x.com', isAdmin: false, permissions: [], jti: 'jti-1', exp: 999 },
+      verifyResult: { sub: 7, av: 0, jti: 'jti-1', exp: 999 },
+      staff: staffRow(),
     });
     const req: Record<string, unknown> = { headers: { authorization: 'Bearer t' } };
     await guard.canActivate(makeContext(req));

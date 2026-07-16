@@ -26,7 +26,14 @@ refresh(rawRefreshToken: string): Promise<TokenPair>
 // Verifies token, revokes used token (rotation), issues fresh pair.
 
 logout(staffId: number): Promise<void>
-// Revokes all non-revoked refresh tokens for the staff member.
+// Authoritative logout-ALL (S3-4): increments Staff.authVersion AND revokes every
+// active refresh token in one transaction, so all outstanding access tokens fail the
+// JWT guard's `av` check on their next request. Redis jti blocklist kept as defense-
+// in-depth only.
+
+revokeStaffSessions(staffId: number): Promise<void>
+// Shared invalidation (S3-2): increments authVersion + revokes active refresh tokens
+// atomically. Called by logout, password reset, and operator staff changes.
 
 validateStaff(email: string, password: string): Promise<StaffWithGroup>
 // Returns Staff+Group or throws UnauthorizedException.

@@ -132,6 +132,10 @@ model Staff {
   mobileNumber    String    @default("")
   timezone        String    @default("UTC")
   isEnabled       Boolean   @default(true)
+  // Bumped on every security-relevant change (password/disable/group/permission).
+  // Embedded in each access token as the `av` claim; the JWT guard rejects any token
+  // whose `av` no longer matches, so revocation is immediate (GOAL_PUBLIC_SECURITY S3).
+  authVersion     Int       @default(0)
   staffGroup      StaffGroup @relation(fields: [staffGroupId], references: [id])
   staffGroupId    Int
   // departments this agent can act in (empty = all, governed by group)

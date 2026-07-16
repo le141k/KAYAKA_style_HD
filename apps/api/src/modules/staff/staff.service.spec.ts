@@ -25,11 +25,17 @@ function makePrismaMock() {
       count: vi.fn().mockResolvedValue(0),
       create: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
+    refreshToken: {
+      updateMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
     departmentStaff: {
       deleteMany: vi.fn(),
       createMany: vi.fn(),
     },
+    // Mirrors Prisma's $transaction([...]) — awaits the array of operations.
+    $transaction: vi.fn((ops: Promise<unknown>[]) => Promise.all(ops)),
   } as unknown as PrismaService;
 }
 
@@ -396,14 +402,89 @@ describe('StaffService', () => {
 
       const result = await service.disable(1);
       expect(result.isEnabled).toBe(false);
+      // Disable also bumps authVersion and revokes refresh tokens (S3-2).
       expect(prisma.staff.update).toHaveBeenCalledWith(
-        expect.objectContaining({ data: { isEnabled: false } }),
+        expect.objectContaining({ data: { isEnabled: false, authVersion: { increment: 1 } } }),
+      );
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { staffId: 1, revokedAt: null } }),
       );
     });
 
     it('throws NotFoundException when staff not found', async () => {
       (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.disable(999)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  // ─── session invalidation (S3-2) ───────────────────────────────────────────────
+
+  describe('session invalidation on security changes', () => {
+    it('bumps authVersion + revokes refresh when the password changes', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        staffGroup: MOCK_GROUP,
+      });
+      (prisma.staff.update as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_STAFF);
+
+      await service.update(1, { password: 'newpassword' } as any);
+
+      expect(prisma.staff.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ authVersion: { increment: 1 } }) }),
+      );
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { staffId: 1, revokedAt: null } }),
+      );
+    });
+
+    it('does NOT bump authVersion for a non-security field (firstName only)', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        staffGroup: MOCK_GROUP,
+      });
+      (prisma.staff.update as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_STAFF);
+
+      await service.update(1, { firstName: 'Updated' } as any);
+
+      expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+      expect(prisma.staff.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.not.objectContaining({ authVersion: expect.anything() }) }),
+      );
+    });
+
+    it('invalidates every group member when the group permission set changes', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_GROUP,
+        permissions: ['ticket.view'],
+      });
+      (prisma.staffGroup.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_GROUP,
+        permissions: ['ticket.view', 'ticket.edit'],
+      });
+
+      await service.updateGroup(1, { permissions: ['ticket.view', 'ticket.edit'] } as any);
+
+      expect(prisma.staff.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { staffGroupId: 1 }, data: { authVersion: { increment: 1 } } }),
+      );
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { staff: { staffGroupId: 1 }, revokedAt: null } }),
+      );
+    });
+
+    it('does NOT invalidate members when the permission set is unchanged', async () => {
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_GROUP,
+        permissions: ['ticket.view'],
+      });
+      (prisma.staffGroup.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_GROUP,
+        permissions: ['ticket.view'],
+      });
+
+      await service.updateGroup(1, { permissions: ['ticket.view'] } as any);
+
+      expect(prisma.staff.updateMany).not.toHaveBeenCalled();
     });
   });
 });

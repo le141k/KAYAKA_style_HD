@@ -81,7 +81,7 @@ export class AuthService {
   async login(email: string, password: string): Promise<LoginResult> {
     const staff = await this.validateStaff(email, password);
     const principal = this.buildPrincipal(staff);
-    const tokens = await this.issueTokens(principal, staff.id);
+    const tokens = await this.issueTokens(principal, staff.id, staff.authVersion);
 
     // Persist refresh token hash so we can rotate/revoke it
     await this.persistRefreshToken(staff.id, tokens.refreshToken);
@@ -166,7 +166,7 @@ export class AuthService {
     }
 
     const principal = this.buildPrincipal(staff);
-    const tokens = await this.issueTokens(principal, staff.id);
+    const tokens = await this.issueTokens(principal, staff.id, staff.authVersion);
     await this.persistRefreshToken(staff.id, tokens.refreshToken);
 
     return tokens;
@@ -177,19 +177,38 @@ export class AuthService {
    * The staffId comes from the verified JWT principal passed in by the controller.
    */
   async logout(staffId: number, accessJti?: string, accessExp?: number): Promise<void> {
-    await this.prisma.refreshToken.updateMany({
-      where: { staffId, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
-    // Revoke the current access token too (jti blocklist) so it can't be used for
-    // its remaining ~15 min after logout.
+    // Logout is an authoritative logout-all (S3-4): bump authVersion so every
+    // outstanding access token for this staff fails the guard's `av` check on its
+    // next request, and revoke all refresh families — atomically. Correctness no
+    // longer depends on the Redis jti blocklist.
+    await this.revokeStaffSessions(staffId);
+    // Keep the jti blocklist as defense-in-depth / telemetry (best-effort).
     if (accessJti && this.blocklist) {
       const ttl = accessExp
         ? accessExp - Math.floor(Date.now() / 1000)
         : this.config.TELECOM_HD_JWT_ACCESS_TTL;
       await this.blocklist.block(accessJti, ttl);
     }
-    this.logger.log(`Staff ${staffId} logged out (tokens revoked)`);
+    this.logger.log(`Staff ${staffId} logged out (all sessions revoked)`);
+  }
+
+  /**
+   * Immediately invalidate EVERY session for a staff member (S3-2 / S3-4): increment
+   * authVersion — so all outstanding access tokens fail the guard's `av` check on
+   * their next request — and revoke all active refresh tokens, in one transaction.
+   * Callers: logout, password reset, operator password/group/disable changes.
+   */
+  async revokeStaffSessions(staffId: number): Promise<void> {
+    await this.prisma.$transaction([
+      this.prisma.staff.update({
+        where: { id: staffId },
+        data: { authVersion: { increment: 1 } },
+      }),
+      this.prisma.refreshToken.updateMany({
+        where: { staffId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
   }
 
   // ─────────────────────────── Password reset ────────────────────────────────
@@ -304,7 +323,8 @@ export class AuthService {
     await this.prisma.$transaction([
       this.prisma.staff.update({
         where: { id: record.staffId },
-        data: { passwordHash },
+        // Bump authVersion too so any still-valid access token is rejected at once (S3-2).
+        data: { passwordHash, authVersion: { increment: 1 } },
       }),
       // Revoke all active refresh tokens so existing sessions are invalidated.
       this.prisma.refreshToken.updateMany({
@@ -335,12 +355,14 @@ export class AuthService {
   }
 
   /** Issue access + refresh JWT pair. */
-  private async issueTokens(principal: AuthStaff, staffId: number): Promise<TokenPair> {
+  private async issueTokens(principal: AuthStaff, staffId: number, authVersion: number): Promise<TokenPair> {
     const jti = crypto.randomUUID();
 
     const accessToken = await this.jwt.signAsync(
       // Distinct jti on the access token so logout can revoke it via the blocklist.
-      { ...principal, sub: staffId, jti: crypto.randomUUID() },
+      // `av` (authVersion) is checked against the DB on every request so security
+      // changes / logout-all invalidate this token immediately (S3-1).
+      { ...principal, sub: staffId, av: authVersion, jti: crypto.randomUUID() },
       {
         secret: this.config.TELECOM_HD_JWT_ACCESS_SECRET,
         expiresIn: this.config.TELECOM_HD_JWT_ACCESS_TTL,

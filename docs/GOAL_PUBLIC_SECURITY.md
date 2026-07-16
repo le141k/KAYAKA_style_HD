@@ -77,6 +77,8 @@ and inventory are completed before any production mutation or migration.
       routes + public upload. UI hide still pending (S2-9).)_
 - [ ] **H3 Close staff-auth gaps:** use DB-backed `authVersion`, logout-all revocation, atomic refresh
       rotation and origin + CSRF checks for every cookie-authenticated mutation.
+      _(Done: DB-backed `authVersion` + logout-all revocation (S3-1/2/4). Still open: atomic refresh
+      rotation by jti/familyId (S3-3), CSRF + origin checks (S3-5/6), login-abuse throttle (S3-7).)_
 - [ ] **H4 Remove known access paths:** soft-disable demo staff, revoke their sessions, then rotate JWT
       and webhook secrets in the order defined by S1. Never delete staff rows as containment.
 - [ ] **H5 Deploy privately and smoke:** use immutable images/config, run the mandatory production
@@ -219,7 +221,7 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       Keep public ticket creation only after S4. The API gate defaults closed in production and does
       not depend on frontend behavior.
       _(Done: `ClientPortalGuard` returns 404 in production for `POST /tickets/public`, `GET
-  /tickets/my`, `GET /tickets/public/:id`, `POST /tickets/public/:id/reply` and
+/tickets/my`, `GET /tickets/public/:id`, `POST /tickets/public/:id/reply` and
       `POST /attachments/upload/public` unless `TELECOM_HD_CLIENT_PORTAL_ENABLED` is set. There is no
       separate public client attachment download route yet — S2-8 adds one. Frontend hide of the
       matching actions is still to be done as part of S2-9.)_
@@ -278,24 +280,34 @@ Current public list/detail/reply routes must not be exposed until this batch is 
 
 ## 🔴 S3 — Staff-session correctness, CSRF and login abuse
 
-- [ ] **S3-1 Add immediate auth invalidation.** Add `authVersion` to `Staff` and include it in staff
+- [x] **S3-1 Add immediate auth invalidation.** Add `authVersion` to `Staff` and include it in staff
       access tokens. On every protected request, verify the current enabled Staff record,
       `authVersion` and current StaffGroup permissions from the server-side source of truth. Start
       with the indexed DB lookup for correctness; benchmark before introducing any bounded cache.
-- [ ] **S3-2 Revoke on security changes.** In one transaction, increment `authVersion` and revoke all
+      _(Done: migration `20260716010000_staff_auth_version`; access token carries `av`; `JwtAuthGuard`
+      now loads the current Staff+group by indexed PK per request, checks `isEnabled` + `authVersion`,
+      derives fresh permissions from the DB group, and fails closed 503 on DB outage. Bounded cache
+      deferred pending a benchmark, as the plan allows.)_
+- [x] **S3-2 Revoke on security changes.** In one transaction, increment `authVersion` and revoke all
       active refresh tokens when a password changes, staff is disabled, email/group changes, or a
       group’s admin/permission set changes. Group changes must invalidate every affected staff member.
       Password reset and operator password update must use the same invalidation service.
+      _(Done: `AuthService.revokeStaffSessions` (used by logout + password reset); `StaffService.update`
+      bumps authVersion + revokes refresh on password/group/email/isEnabled change; `disable` and
+      `updateGroup` (permission change → all members) do the same. Verified against live Postgres,
+      incl. the group-member relation-filter query. `isAdmin` isn't updatable via the group DTO.)_
 - [ ] **S3-3 Replace refresh-token scanning with direct session lookup.** Put opaque `jti` and
       `familyId` identifiers in each refresh JWT/row, look up exactly one row, verify its hash, and
       rotate it with a conditional transaction/CAS. Never scan a capped `take: 20` Argon2 candidate
       set. Exactly one concurrent request wins; the loser cannot mint a token or revoke the winner’s
       newly created session. Detect genuine later replay and revoke that family.
-- [ ] **S3-4 Use one authoritative logout model.** Make logout a documented logout-all operation:
+- [x] **S3-4 Use one authoritative logout model.** Make logout a documented logout-all operation:
       increment `authVersion` and revoke every refresh family in one transaction. Protected requests
       validate `authVersion` from DB, so correctness does not depend on a Redis jti blocklist; Redis may
       remain only as telemetry/defense in depth. A future current-device logout requires a separate
       access-token `sid`/session-family design, not mixed revocation mechanisms.
+      _(Done: `logout` now delegates to `revokeStaffSessions` (authVersion bump + revoke-all in one tx);
+      the jti blocklist is kept only as best-effort defense-in-depth.)_
 - [ ] **S3-5 Add real CSRF protection.** For cookie-authenticated unsafe methods, require both exact
       `Origin`/target-origin validation (strict allowlist, no wildcard subdomains) and a session-bound
       signed double-submit/synchronizer token in `X-CSRF-Token`.

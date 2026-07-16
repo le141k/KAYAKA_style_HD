@@ -11,8 +11,8 @@ import type {
 } from './dto';
 import type { Staff, StaffGroup } from '@prisma/client';
 
-/** Safe staff shape — never exposes passwordHash. */
-export type SafeStaff = Omit<Staff, 'passwordHash'>;
+/** Safe staff shape — never exposes passwordHash (or the internal authVersion). */
+export type SafeStaff = Omit<Staff, 'passwordHash' | 'authVersion'>;
 
 const SAFE_STAFF_SELECT = {
   id: true,
@@ -52,8 +52,31 @@ export class StaffService {
   }
 
   async updateGroup(id: number, dto: UpdateStaffGroupDto): Promise<StaffGroup> {
-    await this.getGroup(id);
-    return this.prisma.staffGroup.update({ where: { id }, data: dto });
+    const existing = await this.getGroup(id);
+    const group = await this.prisma.staffGroup.update({ where: { id }, data: dto });
+
+    // A permission-set change must invalidate every member's sessions immediately
+    // (S3-2), so de-privileged staff cannot keep acting on a stale token. (isAdmin is
+    // not updatable here — the DTO omits it — so permissions is the only trigger.)
+    const permissionsChanged =
+      dto.permissions !== undefined &&
+      JSON.stringify([...dto.permissions].sort()) !==
+        JSON.stringify([...(existing.permissions as string[])].sort());
+
+    if (permissionsChanged) {
+      await this.prisma.$transaction([
+        this.prisma.staff.updateMany({
+          where: { staffGroupId: id },
+          data: { authVersion: { increment: 1 } },
+        }),
+        this.prisma.refreshToken.updateMany({
+          where: { staff: { staffGroupId: id }, revokedAt: null },
+          data: { revokedAt: new Date() },
+        }),
+      ]);
+    }
+
+    return group;
   }
 
   /**
@@ -185,6 +208,23 @@ export class StaffService {
       }
     }
 
+    // Security-relevant changes must invalidate existing sessions immediately (S3-2):
+    // a new password, a group (permission) change, an email change, or a disable.
+    const securityChange =
+      !!password || dto.staffGroupId !== undefined || dto.email !== undefined || dto.isEnabled !== undefined;
+
+    if (securityChange) {
+      data['authVersion'] = { increment: 1 };
+      const [staff] = await this.prisma.$transaction([
+        this.prisma.staff.update({ where: { id }, data, select: SAFE_STAFF_SELECT }),
+        this.prisma.refreshToken.updateMany({
+          where: { staffId: id, revokedAt: null },
+          data: { revokedAt: new Date() },
+        }),
+      ]);
+      return staff;
+    }
+
     return this.prisma.staff.update({
       where: { id },
       data,
@@ -195,10 +235,19 @@ export class StaffService {
   /** Soft-disable a staff member rather than deleting. */
   async disable(id: number): Promise<SafeStaff> {
     await this.get(id);
-    return this.prisma.staff.update({
-      where: { id },
-      data: { isEnabled: false },
-      select: SAFE_STAFF_SELECT,
-    });
+    // Disable + immediate session invalidation (S3-2): bump authVersion and revoke
+    // refresh tokens in the same transaction, so the account loses access at once.
+    const [staff] = await this.prisma.$transaction([
+      this.prisma.staff.update({
+        where: { id },
+        data: { isEnabled: false, authVersion: { increment: 1 } },
+        select: SAFE_STAFF_SELECT,
+      }),
+      this.prisma.refreshToken.updateMany({
+        where: { staffId: id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+    return staff;
   }
 }

@@ -84,6 +84,7 @@ const MOCK_STAFF = {
   mobileNumber: '',
   timezone: 'UTC',
   isEnabled: true,
+  authVersion: 0,
   staffGroupId: 1,
   staffGroup: MOCK_STAFF_GROUP,
   lastLoginAt: null,

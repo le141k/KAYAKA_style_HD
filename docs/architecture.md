@@ -55,7 +55,10 @@ All 16 modules above are registered in `AppModule` and serve live routes (verifi
 ```
 HTTP Request
   → NestJS Router (global prefix: /api)
-  → JwtAuthGuard  (checks @Public(); if not public, verifies Bearer JWT, attaches AuthStaff to req.user)
+  → JwtAuthGuard  (checks @Public(); else verifies Bearer/cookie JWT, then loads the CURRENT
+     Staff+group from DB and checks isEnabled + authVersion (`av` claim) — so disable/password/
+     group changes and logout-all revoke access immediately; fails closed 503 if DB is down.
+     Derives fresh permissions from the DB group and attaches AuthStaff to req.user — S3-1)
   → PermissionsGuard  (checks @RequirePermissions(...); admins bypass all checks)
   → ZodValidationPipe  (validates + transforms body/query via Zod schema)
   → Controller method
