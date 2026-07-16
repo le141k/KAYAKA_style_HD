@@ -68,7 +68,9 @@ describe('ClientAuthService', () => {
         Record<string, string>,
       ];
       expect(key).toBe('client_login_link');
-      expect(vars.verifyUrl).toContain('/client/verify#token=');
+      // Path is `/verify` (the (client) route group serves at root), token in the fragment.
+      expect(vars.verifyUrl).toContain('/verify#token=');
+      expect(vars.verifyUrl).not.toContain('/client/verify');
       expect(vars.verifyUrl).not.toContain('?token=');
     });
 

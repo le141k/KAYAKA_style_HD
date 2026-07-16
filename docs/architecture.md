@@ -82,6 +82,11 @@ behind an HttpOnly `th_client` cookie, bound to a stable `User.id`. Routes decor
 `@ClientAuthenticated()` (= `@Public()` + `ClientAuthGuard`) resolve `req.client = {userId}`;
 client ticket routes (`/tickets/my`, `/tickets/public/:id`, `.../reply`) authorize strictly
 by `Ticket.userId === client.userId`. Never reuses staff JWT/RBAC identity.
+Frontend (S2-9): the emailed link lands on the `/verify` page (route group `(client)`, served at
+root), which strips the `#token=` fragment via `history.replaceState`, POSTs it, and is rendered
+`referrer: no-referrer`. The customer portal (`use-client-auth` / `use-client-tickets`) talks to
+`/client-auth/*` and the client ticket routes through a raw-fetch `clientFetch` (cookie-included,
+separate from the staff `api` client) — no `?email=` and no `localStorage` identity remain.
 
 **Login-abuse throttle (S3-7).** `POST /auth/login` carries the per-IP `@Throttle(5/60s)` plus a
 `LoginThrottleService` Redis counter keyed by trusted client IP + `HMAC-SHA256(email)`: a generic

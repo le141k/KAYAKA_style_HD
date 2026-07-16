@@ -75,8 +75,9 @@ and inventory are completed before any production mutation or migration.
       Untrusted public attachment upload stays disabled until S4 is green.
       _(Done on the API: my/detail/reply now require a verified client session (S2-6/7) bound to
       `Ticket.userId`, and the owner-scoped client attachment download route is in place (S2-8);
-      public create + upload stay fail-closed 404 in prod (S2-1). Only the UI cutover (hide the old
-      email-only actions, point the mapper at the new routes) remains — the deferred frontend S2-9.)_
+      public create + upload stay fail-closed 404 in prod (S2-1). The UI cutover (S2-9) is also in:
+      the old email-only lookup is removed and the portal uses the magic-link session, attachments
+      point at the owner-scoped route. Only the browser e2e round-trip remains (S2-10/S6).)_
 - [ ] **H3 Close staff-auth gaps:** use DB-backed `authVersion`, logout-all revocation, atomic refresh
       rotation and origin + CSRF checks for every cookie-authenticated mutation.
       _(Done: DB-backed `authVersion` + logout-all revocation (S3-1/2/4), atomic refresh rotation by
@@ -282,18 +283,18 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       15-min token bound to `userId` ONLY when exactly one user owns ≥1 ticket (ambiguous/unknown/
       no-ticket → silent no-op), and invalidates older unused tokens first. Unit-tested for the
       one-user, ambiguous, unknown and no-ticket branches.)_
-- [~] **S2-5 Keep the magic token out of proxy logs.** Preferred browser flow:
-  `/client/verify#token=<raw>` → client JS immediately removes the fragment with
-  `history.replaceState` → POSTs the token in a non-logged body to a verify endpoint. The API
-  atomically consumes the single-use token, creates a client session and sets an `HttpOnly`,
-  `Secure`, host-only cookie. Set `Referrer-Policy: no-referrer` on the verification page.
-  _(Backend done, commit `ecbec7b`: the emailed link is `…/client/verify#token=<raw>` (fragment,
-  so the token never reaches proxy/access logs); `POST /api/client-auth/verify` reads the token
-  from the request BODY, atomically single-use-consumes it (conditional `updateMany` on
-  `usedAt IS NULL AND not expired` → exactly one winner) and sets an `HttpOnly` + `Secure`
-  (prod) + host-only (`path=/api`, no `Domain`) `th_client` cookie. **Still open (lands with the
-  frontend S2-9):** the `/client/verify` page's `history.replaceState` fragment strip and its
-  `Referrer-Policy: no-referrer` header — these are client-page concerns, not built yet.)_
+- [x] **S2-5 Keep the magic token out of proxy logs.** Preferred browser flow:
+      `/verify#token=<raw>` → client JS immediately removes the fragment with
+      `history.replaceState` → POSTs the token in a non-logged body to a verify endpoint. The API
+      atomically consumes the single-use token, creates a client session and sets an `HttpOnly`,
+      `Secure`, host-only cookie. Set `Referrer-Policy: no-referrer` on the verification page.
+      _(Done: the emailed link is `…/verify#token=<raw>` (fragment, so the token never reaches
+      proxy/access logs); `POST /api/client-auth/verify` reads the token from the request BODY,
+      atomically single-use-consumes it (conditional `updateMany` on `usedAt IS NULL AND not expired` →
+      exactly one winner) and sets an `HttpOnly` + `Secure` (prod) + host-only (`path=/api`, no
+      `Domain`) `th_client` cookie. The `/verify` page (S2-9) reads the `#token=` fragment, strips it
+      with `history.replaceState`, and is rendered with `referrer: no-referrer`. Path corrected
+      `/client/verify` → `/verify` to match the `(client)` route group.)_
 - [x] **S2-6 Add an explicit client auth mode.** Implement `@ClientAuthenticated()` metadata/decorator
       and guard composition so the global staff JWT guard cannot block client routes and `@Public()`
       cannot accidentally expose them. Resolve the session to a client principal containing `userId`,
@@ -323,9 +324,26 @@ null`) and missing tickets all return the identical 404. Unit-tested incl. the c
       not-a-note + `post.ticket.userId === client.userId`, same 404 on any failure. Staff route
       unchanged. Verified live (owner OK, other client 404, third-party 404) + boot smoke (401 without
       session). Pointing the client UI mapper at it is part of the deferred frontend S2-9.)_
-- [ ] **S2-9 Update the client UI.** Replace the free-form “enter any email to see tickets” flow with
-      request-link, check-email, verify, session-expired and logout states. Never persist the verified
-      email/session token in `localStorage`.
+- [~] **S2-9 Update the client UI.** Replace the free-form “enter any email to see tickets” flow with
+  request-link, check-email, verify, session-expired and logout states. Never persist the verified
+  email/session token in `localStorage`.
+  _(Done in code: the old "enter any email" lookup and the `client_email` localStorage write
+  (`submit-form`, `client-tickets-content`) are removed. New `use-client-auth.ts` hook
+  (`useClientSession`/`useRequestClientLink`/`useVerifyClientToken`/`useClientLogout`) talks to
+  `/client-auth/*` via a raw-fetch `clientFetch` (credentials-included, deliberately separate from
+  the staff `api` client so a client 401 never triggers a staff refresh). `client-tickets-content`
+  is now session-aware: signed out → a request-link form that always shows the same "check your
+  email" confirmation (no enumeration); signed in → the user's own tickets + a sign-out button. New
+  `/verify` page reads the `#token=` fragment, strips it with `history.replaceState`, POSTs it to
+  `/client-auth/verify`, and shows verifying/success/invalid-or-expired states; the page sets
+  `referrer: no-referrer` (matching `/reset-password`). `use-client-tickets` drops all `?email=`
+  params + the staff-route fallback and points attachments at the owner-scoped
+  `/attachments/client/:id/download` (S2-8). Backend link path fixed `/client/verify` → `/verify`
+  to match the `(client)` route group. Verified: web `tsc --noEmit` + `next lint` clean, API
+  client-auth spec green. **Still open:** browser **e2e** of the full magic-link round-trip (needs
+  the running web+API stack and mail interception to read the emitted token) — lands with the
+  S2-10/S6 e2e layer; it is safe to defer because S2-1 keeps the portal fail-closed (404) in
+  production until then.)_
 - [~] **S2-10 Add ownership and replay tests.** Cover: unknown email response parity; expired token;
   consumed-token replay; concurrent double-consume (exactly one success); Client A cannot list,
   read, reply to or download attachments from Client B; aliases in `UserEmail`; session

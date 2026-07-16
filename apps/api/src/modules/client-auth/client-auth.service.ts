@@ -109,7 +109,9 @@ export class ClientAuthService implements OnModuleInit, OnModuleDestroy {
     });
 
     // Deliver the raw token in a URL fragment so it never reaches proxy/access logs (S2-5).
-    const verifyUrl = `${this.config.TELECOM_HD_PUBLIC_URL}/client/verify#token=${rawToken}`;
+    // Path is `/verify` — the (client) Next.js route group serves at the root, matching the
+    // `/reset-password` precedent (NOT `/client/verify`, which would 404).
+    const verifyUrl = `${this.config.TELECOM_HD_PUBLIC_URL}/verify#token=${rawToken}`;
 
     if (!this.mailService) {
       await this.invalidateToken(created.id);
