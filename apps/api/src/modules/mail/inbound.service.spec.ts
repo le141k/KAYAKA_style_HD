@@ -266,7 +266,7 @@ describe('InboundMailService — parser rule helpers', () => {
      */
     function makeFakeClient(
       messages: Array<{ uid: number }>,
-      mailbox?: { uidValidity?: number; uidNext?: number },
+      mailbox?: { uidValidity?: number; uidNext?: number; exists?: number },
     ) {
       return {
         mailbox,
@@ -422,6 +422,83 @@ describe('InboundMailService — parser rule helpers', () => {
       );
       spy.mockRestore();
     });
+
+    it('does NOT drop an out-of-order lower UID (no silent loss)', async () => {
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        value: { uid: 100, uidValidity: 7 },
+      });
+      // Server returns UIDs out of ascending order (permitted by RFC 3501): 102 then 101.
+      const client = makeFakeClient([{ uid: 102 }, { uid: 101 }], { uidValidity: 7, uidNext: 103 });
+      const seen: number[] = [];
+      const spy = stubProcess((m) => {
+        seen.push(m.uid);
+        return Promise.resolve();
+      });
+
+      await callPoll(client);
+
+      // Both must be processed — the old moving-cursor guard silently skipped 101.
+      expect(seen).toContain(101);
+      expect(seen).toContain(102);
+      expect(prisma.setting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: { value: { uid: 102, uidValidity: 7 } } }),
+      );
+      spy.mockRestore();
+    });
+
+    it('caps the watermark below the lowest failing UID even if a higher UID processed first', async () => {
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        value: { uid: 100, uidValidity: 7 },
+      });
+      // 102 arrives first and succeeds; 101 arrives second and fails transiently.
+      const client = makeFakeClient([{ uid: 102 }, { uid: 101 }], { uidValidity: 7, uidNext: 103 });
+      const spy = stubProcess((m) =>
+        m.uid === 101 ? Promise.reject(new Error('bad MIME')) : Promise.resolve(),
+      );
+
+      await callPoll(client);
+
+      // 102 processed, but the watermark must NOT advance past the still-failing 101.
+      expect(prisma.setting.upsert).not.toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it('IN-02: bootstrap derives the high-water UID via a `*` fetch when UIDNEXT is absent', async () => {
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      // Server does not advertise UIDNEXT; mailbox has messages with a max UID of 5.
+      const client = makeFakeClient([{ uid: 1 }, { uid: 2 }, { uid: 5 }], {
+        uidValidity: 7,
+        exists: 3,
+      });
+      const spy = stubProcess();
+
+      await callPoll(client);
+
+      expect(spy).not.toHaveBeenCalled(); // no history imported
+      expect(prisma.setting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: { value: { uid: 5, uidValidity: 7 } } }),
+      );
+      spy.mockRestore();
+    });
+
+    it('IN-02: bootstrap is DEFERRED (no watermark) when the high-water UID cannot be resolved', async () => {
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      // No UIDNEXT, exists unknown, and the `*` fetch fails — must NOT fail open to 1:*.
+      const client = {
+        mailbox: { uidValidity: 7 },
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        fetch: vi.fn(() => {
+          throw new Error('connection reset');
+        }),
+      };
+      const spy = stubProcess();
+
+      await callPoll(client);
+
+      expect(spy).not.toHaveBeenCalled();
+      expect(prisma.setting.upsert).not.toHaveBeenCalled(); // deferred, retried next poll
+      spy.mockRestore();
+    });
   });
 
   // ─── processMessage: Message-ID idempotency ──────────────────────────────────
@@ -465,12 +542,17 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(tickets().reply).not.toHaveBeenCalled();
     });
 
-    it('creates a ticket when the Message-ID has not been seen before', async () => {
+    it('creates a ticket with the Message-ID written atomically when it has not been seen', async () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
       await callProcess({ uid: 6, source: rawEmail });
 
+      // Message-ID must be passed INTO createTicket (atomic first-post write), not set by
+      // a follow-up update — otherwise a retry would not be de-duplicated.
       expect(tickets().createTicket).toHaveBeenCalledTimes(1);
+      expect(tickets().createTicket).toHaveBeenCalledWith(
+        expect.objectContaining({ messageId: '<dup-123@example.com>' }),
+      );
     });
   });
 });

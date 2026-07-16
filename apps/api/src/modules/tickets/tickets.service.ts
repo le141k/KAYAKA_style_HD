@@ -120,7 +120,7 @@ export class TicketsService {
   // ─────────────────────────── Create ───────────────────────────
 
   async createTicket(
-    dto: CreateTicketDto & { attachmentClaimToken?: string },
+    dto: CreateTicketDto & { attachmentClaimToken?: string; messageId?: string },
     creatorStaffId?: number,
   ): Promise<Ticket> {
     // Validate custom fields against TICKET scope definitions, then encrypt any
@@ -202,6 +202,9 @@ export class TicketsService {
               isHtml: dto.isHtml,
               creationMode: dto.creationMode as CreationMode,
               ipAddress: dto.ipAddress,
+              // RFC Message-ID for inbound threading/idempotency — written atomically with
+              // the first post (same transaction as the ticket) so a retry is de-duplicated.
+              ...(dto.messageId ? { messageId: dto.messageId } : {}),
             },
           },
           // Tags
@@ -690,7 +693,11 @@ export class TicketsService {
 
   // ─────────────────────────── Reply ───────────────────────────
 
-  async reply(ticketId: number, dto: ReplyTicketDto, staffId?: number): Promise<TicketPost | TicketNote> {
+  async reply(
+    ticketId: number,
+    dto: ReplyTicketDto & { messageId?: string },
+    staffId?: number,
+  ): Promise<TicketPost | TicketNote> {
     const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
     if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
 
@@ -731,6 +738,9 @@ export class TicketsService {
         isThirdParty: dto.isThirdParty,
         creationMode: dto.creationMode as CreationMode,
         ipAddress: dto.ipAddress,
+        // RFC Message-ID for inbound threading/idempotency — written atomically with the
+        // post so a retry after a mid-processing failure is de-duplicated, not doubled.
+        ...(dto.messageId ? { messageId: dto.messageId } : {}),
       },
     });
 

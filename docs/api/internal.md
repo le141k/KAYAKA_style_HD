@@ -171,19 +171,27 @@ Implements `OnModuleInit` / `OnModuleDestroy`. No public methods — driven enti
   from UIDs after `EXPUNGE`). Legacy bare-number watermarks are read and transparently upgraded to
   the object form on the next poll.
 - **Bootstrap NOW / UIDVALIDITY (IN-02, IN-01).** On the first poll (no watermark) — or when the
-  server's `UIDVALIDITY` differs from the stored one — the cursor is set to `uidNext-1` and the
-  existing mailbox is **not** imported. This prevents mass historical ticket creation and
-  autoresponder storms on a fresh connect or a server-side UID reset.
-- **Poison-message isolation (IN-03).** Messages are processed in strict UID order. A message that
-  throws is retried on subsequent polls up to `MAX_POISON_ATTEMPTS` (5) — the watermark is **not**
-  advanced past it, so ordering is preserved and no message is skipped. Once attempts are
-  exhausted the message is quarantined (logged) and the cursor advances so it can never wedge the
-  queue. Attempt counts live in an in-memory `Map`; the durable `InboundDelivery` ledger is the
-  target model (see the email fix plan) for cross-restart retry/quarantine state.
+  server's `UIDVALIDITY` differs from the stored one — the cursor is set to the current high-water
+  UID and the existing mailbox is **not** imported. The high-water UID is `uidNext-1` when the
+  server advertises `UIDNEXT`, else the highest existing UID from a `*` UID fetch (or `0` for an
+  empty mailbox). If it cannot be determined, bootstrap is **deferred** to a later poll — it never
+  fails open to `1:*` (which would re-import the whole mailbox). This prevents mass historical
+  ticket creation and autoresponder storms on a fresh connect or a server-side UID reset.
+- **Poison-message isolation + no silent loss (IN-03).** A message that throws is retried on
+  subsequent polls up to `MAX_POISON_ATTEMPTS` (5); the watermark is **not** advanced past the
+  lowest still-failing UID, so no message is skipped. Once attempts are exhausted the message is
+  quarantined (logged) and the cursor advances so it can never wedge the queue. The echo/skip guard
+  is gated on the **fixed** `lastUid` (not a moving cursor), and the watermark is capped at
+  `min(highestProcessed, lowestFailingUid-1)`, so a message the server returns **out of UID order**
+  below a higher one is never silently dropped. Attempt counts live in an in-memory `Map`; the
+  durable `InboundDelivery` ledger is the target model for cross-restart retry/quarantine state.
 - **Idempotency (IN-03).** Before ticketing, `processMessage` skips any message whose RFC
-  `Message-ID` already exists on a `TicketPost`, so a retry (or a crash between the reply and the
-  watermark write) does not double-post. Messages with no `Message-ID` still rely on the UID
-  watermark; fully-atomic de-dup is deferred to the ledger work (IN-06).
+  `Message-ID` already exists on a `TicketPost`. The incoming `Message-ID` is written **atomically**
+  with the created post — `TicketsService.reply()` / `createTicket()` accept an internal `messageId`
+  and set it in the same `create` (not a follow-up `UPDATE`) — so a retry after a mid-processing
+  failure, or a crash before the watermark write, is de-duplicated instead of double-posting.
+  Messages with no `Message-ID` still rely on the UID watermark; fully-atomic cross-poller de-dup
+  (a unique `Message-ID` claim) is deferred to the ledger work (IN-06).
 - Per message: threads replies into existing tickets by RFC `In-Reply-To`/`References`
   (`TicketPost.messageId`), then by `TT-XXXXXX` mask in the subject line (calls
   `TicketsService.reply()`); creates new tickets for unthreaded messages. A mask that resolves to
