@@ -165,6 +165,10 @@ model RefreshToken {
   // can revoke the whole family.
   jti       String   @unique
   familyId  String
+  // The staff authVersion this token was issued under. A refresh whose row.authVersion
+  // no longer matches the staff record is rejected — so logout-all / password / group
+  // changes can't be outrun by a concurrently-rotating session (S3, race fix).
+  authVersion Int    @default(0)
   tokenHash String   @unique
   expiresAt DateTime
   revokedAt DateTime?

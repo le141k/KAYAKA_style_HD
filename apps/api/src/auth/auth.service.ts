@@ -94,7 +94,13 @@ export class AuthService {
     const tokens = await this.issueTokens(principal, staff.id, staff.authVersion, familyId);
 
     // Persist refresh token hash so we can rotate/revoke it
-    await this.persistRefreshToken(staff.id, tokens.refreshToken, tokens.refreshJti, familyId);
+    await this.persistRefreshToken(
+      staff.id,
+      tokens.refreshToken,
+      tokens.refreshJti,
+      familyId,
+      staff.authVersion,
+    );
 
     // Update lastLoginAt
     await this.prisma.staff.update({
@@ -136,6 +142,22 @@ export class AuthService {
       throw new UnauthorizedException('Refresh token expired');
     }
 
+    // Load the current staff BEFORE consuming, so a security change can't be outrun by
+    // a concurrent rotation (S3 race fix). If the token's stamped authVersion no longer
+    // matches the staff record, a logout-all / password / group change happened after
+    // this token was issued → reject quietly (the family is already revoked by that
+    // change; this is NOT a stolen-token replay, so no family-revoke alarm).
+    const staff = await this.prisma.staff.findUnique({
+      where: { id: row.staffId },
+      include: { staffGroup: true },
+    });
+    if (!staff || !staff.isEnabled) {
+      throw new UnauthorizedException('Staff not found or disabled');
+    }
+    if (row.authVersion !== staff.authVersion) {
+      throw new UnauthorizedException('Session has been invalidated');
+    }
+
     // Atomic rotation via CAS: exactly one caller flips revokedAt NULL→now for this jti.
     const consumed = await this.prisma.refreshToken.updateMany({
       where: { jti: row.jti, revokedAt: null },
@@ -162,18 +184,16 @@ export class AuthService {
       throw new UnauthorizedException('Refresh token already rotated');
     }
 
-    // Winner: load fresh staff and issue a new pair in the SAME family.
-    const staff = await this.prisma.staff.findUnique({
-      where: { id: row.staffId },
-      include: { staffGroup: true },
-    });
-    if (!staff || !staff.isEnabled) {
-      throw new UnauthorizedException('Staff not found or disabled');
-    }
-
+    // Winner: issue a new pair in the SAME family, stamped with the current authVersion.
     const principal = this.buildPrincipal(staff);
     const tokens = await this.issueTokens(principal, staff.id, staff.authVersion, row.familyId);
-    await this.persistRefreshToken(staff.id, tokens.refreshToken, tokens.refreshJti, row.familyId);
+    await this.persistRefreshToken(
+      staff.id,
+      tokens.refreshToken,
+      tokens.refreshJti,
+      row.familyId,
+      staff.authVersion,
+    );
 
     return { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken };
   }
@@ -398,12 +418,13 @@ export class AuthService {
     rawToken: string,
     jti: string,
     familyId: string,
+    authVersion: number,
   ): Promise<void> {
     const tokenHash = await hashPassword(rawToken);
     const expiresAt = new Date(Date.now() + this.config.TELECOM_HD_JWT_REFRESH_TTL * 1000);
 
     await this.prisma.refreshToken.create({
-      data: { staffId, jti, familyId, tokenHash, expiresAt },
+      data: { staffId, jti, familyId, tokenHash, expiresAt, authVersion },
     });
   }
 }

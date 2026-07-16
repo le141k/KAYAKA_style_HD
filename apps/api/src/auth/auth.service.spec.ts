@@ -175,6 +175,7 @@ describe('AuthService', () => {
       staffId: 1,
       jti: 'jti-1',
       familyId: 'fam-1',
+      authVersion: 0, // matches MOCK_STAFF.authVersion
       tokenHash: 'argon-hash',
       expiresAt: new Date(Date.now() + 60_000),
       revokedAt: null as Date | null,
@@ -227,6 +228,7 @@ describe('AuthService', () => {
         revokedAt: null,
       });
       vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(true);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
       (prisma.refreshToken.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
 
       await expect(service.refresh('raw-token')).rejects.toThrow('already rotated');
@@ -241,6 +243,7 @@ describe('AuthService', () => {
         revokedAt: new Date(Date.now() - 60_000), // rotated a minute ago
       });
       vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(true);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
       (prisma.refreshToken.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
 
       await expect(service.refresh('raw-token')).rejects.toThrow('reuse detected');
@@ -249,6 +252,22 @@ describe('AuthService', () => {
       expect(prisma.refreshToken.updateMany).toHaveBeenLastCalledWith(
         expect.objectContaining({ where: { familyId: 'fam-1', revokedAt: null } }),
       );
+    });
+
+    it('rejects a refresh whose stamped authVersion is stale — WITHOUT a replay alarm (race fix)', async () => {
+      // The token's row.authVersion (0) no longer matches the staff (bumped to 1 by a
+      // logout-all / password change). Must reject BEFORE the CAS, with no family-revoke.
+      jwt.verify.mockReturnValue({ sub: 1, jti: 'jti-1', fid: 'fam-1' });
+      (prisma.refreshToken.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ ...RT_ROW });
+      vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(true);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_STAFF,
+        authVersion: 1,
+      });
+
+      await expect(service.refresh('raw-token')).rejects.toThrow('invalidated');
+      // No CAS, no family revocation — the security change already revoked the family.
+      expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
     });
   });
 

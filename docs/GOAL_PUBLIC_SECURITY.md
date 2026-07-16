@@ -321,7 +321,10 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       `updateMany` CAS. A concurrent loser (CAS count 0 within a 10s grace) fails without touching the
       family; a replay outside the grace revokes the whole family. Verified end-to-end on live
       Postgres — parallel double-refresh yields exactly one winner, and a backdated replay revokes the
-      family.)_
+      family. **Race fix (self-review M1, migration `20260716030000_refresh_auth_version`):** each
+      refresh row is stamped with its issue-time `authVersion`; a refresh whose stamp no longer matches
+      the staff record is rejected before the CAS (quietly, no replay alarm) — so a concurrently
+      rotating session can't outrun logout-all / password / permission changes. Verified live.)_
 - [x] **S3-4 Use one authoritative logout model.** Make logout a documented logout-all operation:
       increment `authVersion` and revoke every refresh family in one transaction. Protected requests
       validate `authVersion` from DB, so correctness does not depend on a Redis jti blocklist; Redis may

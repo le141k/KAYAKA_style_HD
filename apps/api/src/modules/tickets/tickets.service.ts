@@ -348,7 +348,10 @@ export class TicketsService {
         user: { select: PUBLIC_USER_SELECT },
         // Only posts (USER/STAFF replies) — notes are intentionally excluded.
         // Narrow select: NEVER expose staff email/ipAddress or internal audit fields.
+        // Third-party posts (staff↔supplier correspondence) must stay hidden from the
+        // client (GOAL_PUBLIC_SECURITY S2-10).
         posts: {
+          where: { isThirdParty: false },
           orderBy: { createdAt: 'asc' },
           select: {
             id: true,

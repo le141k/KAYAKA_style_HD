@@ -28,6 +28,9 @@ refresh(rawRefreshToken: string): Promise<TokenPair>
 // count 1). Exactly one concurrent caller wins; a concurrent loser fails without revoking
 // the family; a genuine later replay (already-rotated token presented after the grace
 // window) revokes the whole `familyId`. New pair is issued in the same family.
+// Race fix: each row is stamped with its issue-time authVersion; before the CAS, refresh
+// loads the staff and rejects (quietly) if row.authVersion !== staff.authVersion — so a
+// concurrent rotation cannot outrun logout-all / password / permission changes.
 
 logout(staffId: number): Promise<void>
 // Authoritative logout-ALL (S3-4): increments Staff.authVersion AND revokes every

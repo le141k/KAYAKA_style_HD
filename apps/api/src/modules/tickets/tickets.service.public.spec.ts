@@ -188,6 +188,15 @@ describe('TicketsService — client-session endpoints', () => {
       expect(arg.include.owner.select).toEqual({ id: true, firstName: true, lastName: true });
       expect(arg.include.owner.select['email']).toBeUndefined();
     });
+
+    it('excludes third-party (staff↔supplier) posts from the client view (S2-10)', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(withRelations(makeTicket()));
+      await service.getPublicTicket(1, OWNER);
+      const arg = (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        include: { posts: { where?: Record<string, unknown> } };
+      };
+      expect(arg.include.posts.where).toEqual({ isThirdParty: false });
+    });
   });
 
   // ─── getPublicTicket — ownership / IDOR guards ────────────────────────────
