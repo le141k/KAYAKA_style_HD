@@ -190,4 +190,55 @@ describe('AttachmentsService', () => {
       await expect(service.getAttachmentOrThrow(999)).rejects.toThrow(NotFoundException);
     });
   });
+
+  // ─── getClientDownloadableOrThrow (S2-8) ───────────────────────────────────
+
+  describe('getClientDownloadableOrThrow', () => {
+    const OWNER = 5;
+    // A post attachment on a non-third-party post owned by user 5.
+    function ownedAttachment(over: Record<string, unknown> = {}) {
+      return {
+        ...makeAttachment({ id: 3, postId: 10, ticketId: 1 }),
+        post: { isThirdParty: false, ticket: { userId: OWNER } },
+        ...over,
+      };
+    }
+
+    it('returns the attachment for the owning client', async () => {
+      (prisma.attachment.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ownedAttachment());
+      const result = await service.getClientDownloadableOrThrow(3, OWNER);
+      expect(result.id).toBe(3);
+    });
+
+    it('404s for a different client (wrong owner)', async () => {
+      (prisma.attachment.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ownedAttachment());
+      await expect(service.getClientDownloadableOrThrow(3, 999)).rejects.toThrow(NotFoundException);
+    });
+
+    it('404s for a third-party post attachment', async () => {
+      (prisma.attachment.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        ownedAttachment({ post: { isThirdParty: true, ticket: { userId: OWNER } } }),
+      );
+      await expect(service.getClientDownloadableOrThrow(3, OWNER)).rejects.toThrow(NotFoundException);
+    });
+
+    it('404s for an internal-note attachment (noteId set)', async () => {
+      (prisma.attachment.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        ownedAttachment({ noteId: 7 }),
+      );
+      await expect(service.getClientDownloadableOrThrow(3, OWNER)).rejects.toThrow(NotFoundException);
+    });
+
+    it('404s for a ticket-level orphan (no post)', async () => {
+      (prisma.attachment.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        ownedAttachment({ postId: null, post: null }),
+      );
+      await expect(service.getClientDownloadableOrThrow(3, OWNER)).rejects.toThrow(NotFoundException);
+    });
+
+    it('404s when the attachment does not exist', async () => {
+      (prisma.attachment.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(service.getClientDownloadableOrThrow(999, OWNER)).rejects.toThrow(NotFoundException);
+    });
+  });
 });

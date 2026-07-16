@@ -226,9 +226,10 @@ Current public list/detail/reply routes must not be exposed until this batch is 
 >   `Ticket.userId === session.userId`; `?email=`/`requesterEmail` removed), **S2-11** (idempotent
 >   scheduled cleanup). Verified: 607 unit tests; live e2e proved cross-client isolation, single-use
 >   replay rejection, logout revocation; built app boots and `tickets/my` → 401 without a session.
->   **Still open:** S2-2 (UserEmail normalization + `Ticket.userId` backfill — currently null-userId
->   tickets simply fail closed), S2-8 (owner-scoped client attachment download), S2-9 (client UI),
->   S2-10 (full replay/enumeration e2e matrix).
+>   plus **S2-8** (owner-scoped client attachment download `GET /api/attachments/client/:id/download`,
+>   live-verified). **Still open:** S2-2 (UserEmail normalization + `Ticket.userId` backfill —
+>   currently null-userId tickets simply fail closed), S2-9 (client UI), S2-10 (full
+>   replay/enumeration e2e matrix).
 
 - [x] **S2-1 Add a fail-closed interim gate.** While S2 is incomplete, production must return 404/503
       for `GET /api/tickets/my`, `GET /api/tickets/public/:id`, client attachment download and
@@ -266,11 +267,16 @@ Current public list/detail/reply routes must not be exposed until this batch is 
 - [ ] **S2-7 Remove caller-controlled ownership.** Client list/detail/reply services authorize only by
       `Ticket.userId === client.userId`; remove `?email=` and `requesterEmail` request fields. Attribute
       replies from the session principal. Wrong-owner, unmapped and missing tickets all return the same 404. Deploy the fail-closed backend before enabling the updated frontend.
-- [ ] **S2-8 Add an owner-scoped client attachment download.** The current client UI links to the
+- [x] **S2-8 Add an owner-scoped client attachment download.** The current client UI links to the
       staff-only `/api/attachments/:id/download` route. Add a separate client-session-protected
       route requiring `attachment.postId != null`, `post.ticket.userId === client.userId`,
       `post.isThirdParty === false` and no internal-note relation. Wrong owner/id returns the same 404.
       Point the client mapper at it and keep the staff route unchanged.
+      _(Done on the API: `GET /api/attachments/client/:id/download` (`@ClientAuthenticated`) →
+      `AttachmentsService.getClientDownloadableOrThrow` enforces post-attachment + non-third-party +
+      not-a-note + `post.ticket.userId === client.userId`, same 404 on any failure. Staff route
+      unchanged. Verified live (owner OK, other client 404, third-party 404) + boot smoke (401 without
+      session). Pointing the client UI mapper at it is part of the deferred frontend S2-9.)_
 - [ ] **S2-9 Update the client UI.** Replace the free-form “enter any email to see tickets” flow with
       request-link, check-email, verify, session-expired and logout states. Never persist the verified
       email/session token in `localStorage`.

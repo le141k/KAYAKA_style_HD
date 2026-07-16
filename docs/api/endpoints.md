@@ -41,12 +41,13 @@ All routes are under the `/api` global prefix.
 
 ## Client auth (verified customer sessions — S2)
 
-| Method | Path                          | Auth              | Body                   | Returns                                           |
-| ------ | ----------------------------- | ----------------- | ---------------------- | ------------------------------------------------- |
-| POST   | /api/client-auth/request-link | 🔓 (throttled)    | `{email}`              | Always 202 `{message}` — no account enumeration   |
-| POST   | /api/client-auth/verify       | 🔓 (throttled)    | `{token}` (from #frag) | 200 `{ok, expiresAt}` + sets HttpOnly `th_client` |
-| POST   | /api/client-auth/logout       | 🔑 client session | —                      | 204; revokes the session + clears the cookie      |
-| GET    | /api/client-auth/me           | 🔑 client session | —                      | `{userId}`                                        |
+| Method | Path                                  | Auth              | Body                   | Returns                                                                                                                           |
+| ------ | ------------------------------------- | ----------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | /api/client-auth/request-link         | 🔓 (throttled)    | `{email}`              | Always 202 `{message}` — no account enumeration                                                                                   |
+| POST   | /api/client-auth/verify               | 🔓 (throttled)    | `{token}` (from #frag) | 200 `{ok, expiresAt}` + sets HttpOnly `th_client`                                                                                 |
+| POST   | /api/client-auth/logout               | 🔑 client session | —                      | 204; revokes the session + clears the cookie                                                                                      |
+| GET    | /api/client-auth/me                   | 🔑 client session | —                      | `{userId}`                                                                                                                        |
+| GET    | /api/attachments/client/{id}/download | 🔑 client session | —                      | File stream — owner-scoped (post attachment, non-third-party, `post.ticket.userId === session.userId`); same 404 otherwise (S2-8) |
 
 | Method | Path                                 | Auth               | Body                                                                                                                          | Returns                                                     |
 | ------ | ------------------------------------ | ------------------ | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
