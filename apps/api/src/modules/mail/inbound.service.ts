@@ -325,7 +325,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
               cursor = uid;
               continue;
             }
-            await this.acceptImapMessage(queueId, uidValidity, uid, msg.source);
+            await this.acceptImapMessage(queueId, queue.departmentId ?? null, uidValidity, uid, msg.source);
             cursor = uid; // advance ONLY after durable acceptance
           } catch (err) {
             // Fetch or DB failure → FAIL-CLOSED: stop without advancing past this UID.
@@ -357,6 +357,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    */
   private async acceptImapMessage(
     queueId: number,
+    departmentId: number | null,
     uidValidity: bigint,
     uid: number,
     source: Buffer,
@@ -368,6 +369,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         data: {
           transport: 'IMAP',
           queueId,
+          departmentId, // snapshot at acceptance
           transportKey,
           uidValidity,
           uid,
@@ -434,7 +436,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    */
   async drainDeliveries(): Promise<void> {
     const now = new Date();
-    let due: Array<{ id: number; queueId: number | null }>;
+    let due: Array<{ id: number; departmentId: number | null }>;
     try {
       due = await this.prisma.inboundDelivery.findMany({
         where: {
@@ -449,22 +451,15 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         },
         orderBy: { id: 'asc' },
         take: 50,
-        select: { id: true, queueId: true },
+        select: { id: true, departmentId: true },
       });
     } catch (err) {
       this.logger.error(`Inbound drain query failed: ${String(err)}`);
       return;
     }
     for (const d of due) {
-      let deptId: number | undefined;
-      if (d.queueId != null) {
-        const q = await this.prisma.emailQueue.findUnique({
-          where: { id: d.queueId },
-          select: { departmentId: true },
-        });
-        deptId = q?.departmentId ?? undefined;
-      }
-      await this.processDelivery(d.id, deptId);
+      // Route by the department snapshotted at acceptance, not the queue's current one.
+      await this.processDelivery(d.id, d.departmentId ?? undefined);
     }
   }
 
@@ -515,7 +510,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
-      const outcome = await this.processRawMessage(Buffer.from(delivery.rawMime), departmentId);
+      const outcome = await this.processRawMessage(Buffer.from(delivery.rawMime), departmentId, deliveryId);
       await settle({
         state: outcome.state,
         ticketId: outcome.ticketId ?? null,
@@ -565,6 +560,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   private async processRawMessage(
     source: Buffer | string,
     departmentId: number | undefined,
+    deliveryId?: number,
   ): Promise<ProcessOutcome> {
     const { simpleParser } = await import('mailparser');
     const parsed = await simpleParser(source);
@@ -572,6 +568,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const from = parsed.from?.value?.[0];
     const fromEmail = from?.address ?? 'unknown@example.com';
     const fromName = from?.name ?? fromEmail;
+    const toField = parsed.to;
+    const toAddress = !Array.isArray(toField)
+      ? toField?.value?.[0]?.address
+      : toField?.[0]?.value?.[0]?.address;
 
     // A5(ii): drop machine-generated / looping mail before it can create a ticket/reply.
     if (this.isLoopMessage(parsed, fromEmail)) {
@@ -588,7 +588,32 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const effectiveMessageId =
       realMessageId ?? `<inbound-${createHash('sha256').update(rawBuf).digest('hex')}@23telecom.local>`;
 
-    // A3 dedup: if a post already bears this effective Message-ID it was ingested before.
+    // ATOMIC dedup claim (race-safe): stamp the effective Message-ID + parsed identity on
+    // THIS ledger row. The partial-unique index on `messageId` means only one delivery
+    // can own it — a concurrent IMAP+PIPE (or two-poller) duplicate loses the race with
+    // P2002 and is SKIPPED, instead of both check-then-act creating a ticket.
+    if (deliveryId != null) {
+      try {
+        await this.prisma.inboundDelivery.update({
+          where: { id: deliveryId },
+          data: {
+            messageId: effectiveMessageId,
+            envelopeFrom: fromEmail,
+            envelopeTo: toAddress ?? null,
+            subject: subject.slice(0, 500),
+          },
+        });
+      } catch (err) {
+        if (this.isUniqueViolation(err)) {
+          this.logger.log(`Inbound: duplicate message ${effectiveMessageId} from ${fromEmail} — skipped`);
+          return { state: 'SKIPPED' };
+        }
+        throw err;
+      }
+    }
+
+    // Secondary fast dedup: if a post already bears this Message-ID it was ingested before
+    // (e.g. a retry after the post was created). Returns the existing ids for observability.
     const existing = await this.prisma.ticketPost.findFirst({
       where: { messageId: effectiveMessageId },
       select: { id: true, ticketId: true },
@@ -691,10 +716,6 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     }
 
     // 3. PRE_PARSE parser rules (before creating a new ticket)
-    const toField = parsed.to;
-    const toAddress = !Array.isArray(toField)
-      ? toField?.value?.[0]?.address
-      : toField?.[0]?.value?.[0]?.address;
     const parsedEmail: ParsedEmail = { subject, fromEmail, fromName, toEmail: toAddress, body: textBody };
     const ruleResult = await this.applyParserRules(parsedEmail, departmentId);
     if (ruleResult.skip) {
@@ -809,10 +830,18 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
 
     if (get('x-loop') || get('x-autoreply') || get('x-autorespond')) return true;
 
-    const own = (this.config.TELECOM_HD_MAIL_FROM ?? '').toLowerCase();
-    if (own && fromEmail.toLowerCase() === own) return true;
+    // Self-from: never react to mail we ourselves sent. MAIL_FROM is usually a display
+    // form like `Name <addr>` — compare the bare address, not the whole string.
+    const ownAddr = this.extractAddress(this.config.TELECOM_HD_MAIL_FROM ?? '');
+    if (ownAddr && fromEmail.toLowerCase() === ownAddr) return true;
 
     return false;
+  }
+
+  /** Extract the bare lowercased email address from a `Name <addr>` / `addr` string. */
+  private extractAddress(value: string): string {
+    const angle = /<([^>]+)>/.exec(value);
+    return (angle?.[1] ?? value).trim().toLowerCase();
   }
 
   // ─────────────────── parser rules (unchanged) ───────────────────

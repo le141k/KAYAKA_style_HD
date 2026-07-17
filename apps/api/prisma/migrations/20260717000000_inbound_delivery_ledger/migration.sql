@@ -26,6 +26,7 @@ CREATE TABLE "InboundDelivery" (
     "envelopeFrom" TEXT,
     "envelopeTo" TEXT,
     "subject" TEXT NOT NULL DEFAULT '',
+    "departmentId" INTEGER,
     "rawMime" BYTEA,
     "rawStorageKey" TEXT,
     "sizeBytes" INTEGER NOT NULL DEFAULT 0,
@@ -48,7 +49,10 @@ CREATE TABLE "InboundDelivery" (
 CREATE UNIQUE INDEX "InboundDelivery_transportKey_key" ON "InboundDelivery"("transportKey");
 CREATE INDEX "InboundDelivery_state_nextAttemptAt_idx" ON "InboundDelivery"("state", "nextAttemptAt");
 CREATE INDEX "InboundDelivery_queueId_uidValidity_uid_idx" ON "InboundDelivery"("queueId", "uidValidity", "uid");
-CREATE INDEX "InboundDelivery_messageId_idx" ON "InboundDelivery"("messageId");
+-- Atomic logical-message claim: at most one delivery may own a given non-empty
+-- Message-ID (race-safe dedup — replaces check-then-act). NULL/empty ids are exempt.
+CREATE UNIQUE INDEX "InboundDelivery_messageId_key" ON "InboundDelivery"("messageId")
+    WHERE "messageId" IS NOT NULL;
 
 ALTER TABLE "InboundDelivery"
     ADD CONSTRAINT "InboundDelivery_queueId_fkey"

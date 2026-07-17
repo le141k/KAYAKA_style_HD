@@ -300,6 +300,7 @@ describe('InboundMailService — parser rule helpers', () => {
     processRawMessage: (
       m: Buffer,
       d: number | undefined,
+      deliveryId?: number,
     ) => Promise<{ state: string; ticketId?: number; postId?: number }>;
     ticketsService: {
       createTicket: ReturnType<typeof vi.fn>;
@@ -338,6 +339,32 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(svc.ticketsService.createTicket).toHaveBeenCalledWith(
         expect.objectContaining({ messageId: '<dup-123@acme.example>' }),
       );
+    });
+
+    it('#4: stamps the effective Message-ID + envelope + subject on the ledger row (atomic claim)', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = svcOf();
+      await svc.processRawMessage(Buffer.from(rawEmail), 1, 77);
+      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 77 },
+          data: expect.objectContaining({
+            messageId: '<dup-123@acme.example>',
+            envelopeFrom: 'customer@acme.example',
+            subject: 'Need help',
+          }),
+        }),
+      );
+    });
+
+    it('#4: a concurrent duplicate loses the atomic claim (P2002) → SKIPPED, no ticket', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.inboundDelivery.update as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      const svc = svcOf();
+      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1, 77);
+      expect(out.state).toBe('SKIPPED');
+      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+      expect(svc.ticketsService.reply).not.toHaveBeenCalled();
     });
 
     it('synthesises a deterministic Message-ID from content when the mail carries none', async () => {
@@ -487,6 +514,16 @@ describe('InboundMailService — parser rule helpers', () => {
       );
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: { id: 1, lastSeenUid: { lt: 102 } }, data: { lastSeenUid: 102 } }),
+      );
+    });
+
+    it('#10: snapshots the queue department onto the delivery at acceptance', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        queue({ departmentId: 4 }),
+      );
+      await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ departmentId: 4 }) }),
       );
     });
 
@@ -726,6 +763,21 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(call({ 'auto-submitted': 'auto-replied' })).toBe(true);
       expect(call({ 'auto-submitted': 'auto-generated' })).toBe(true);
       expect(call({ 'auto-submitted': 'no' })).toBe(false);
+    });
+
+    it('#10: self-loop matches even when MAIL_FROM is a `Name <addr>` display form', () => {
+      const svc = new InboundMailService(
+        { ...TEST_CONFIG, TELECOM_HD_MAIL_FROM: 'Support Desk <support@test.example>' },
+        prisma as unknown as PrismaService,
+        { reply: vi.fn(), createTicket: vi.fn(), getTicketByMask: vi.fn() } as unknown as TicketsService,
+        { sendTemplate: vi.fn() } as unknown as MailService,
+        undefined,
+      );
+      const loop = (svc as unknown as { isLoopMessage: (p: unknown, f: string) => boolean }).isLoopMessage(
+        { headers: new Map() },
+        'support@test.example',
+      );
+      expect(loop).toBe(true);
     });
 
     it('skips Precedence bulk/list/junk', () => {

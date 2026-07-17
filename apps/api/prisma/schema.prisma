@@ -729,6 +729,9 @@ model InboundDelivery {
   envelopeFrom  String?
   envelopeTo    String?
   subject       String           @default("")
+  // Department resolved AT acceptance (snapshot) — a later queue change must not
+  // re-route an already-accepted message.
+  departmentId  Int?
 
   // Durable raw MIME so a failed/quarantined delivery can be replayed. Inline for
   // bounded messages; `rawStorageKey` is used when externalised to object storage.
