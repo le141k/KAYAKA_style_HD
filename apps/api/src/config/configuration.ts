@@ -53,6 +53,9 @@ const schema = z.object({
   // Max processing attempts before an inbound delivery is QUARANTINED (raw MIME is
   // always retained for replay — a quarantine never discards a message).
   TELECOM_HD_INBOUND_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  // Max accepted inbound message size (MB) for the PIPE webhook body. Must be >= the
+  // largest real email+attachments; align this with the reverse proxy / MTA limit.
+  TELECOM_HD_INBOUND_MAX_MB: z.coerce.number().int().positive().default(30),
   // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_FIELD_ENCRYPTION_KEY: z.string().optional(),

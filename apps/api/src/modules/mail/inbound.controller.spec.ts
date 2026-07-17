@@ -41,4 +41,17 @@ describe('InboundController (A1 webhook)', () => {
     await ctx.controller.pipe(SECRET, '  mta-42  ', { raw: RAW });
     expect(ctx.inbound.ingestRawMessage).toHaveBeenCalledWith(RAW, undefined, 'mta-42');
   });
+
+  it('#8: accepts a raw Buffer body (message/rfc822) byte-for-byte', async () => {
+    const buf = Buffer.from(RAW, 'utf8');
+    const res = await ctx.controller.pipe(SECRET, undefined, buf);
+    expect(res).toEqual({ accepted: true });
+    expect(ctx.inbound.ingestRawMessage).toHaveBeenCalledWith(buf, undefined, undefined);
+  });
+
+  it('#8: rejects an empty raw Buffer body with 400', async () => {
+    await expect(ctx.controller.pipe(SECRET, undefined, Buffer.alloc(0))).rejects.toThrow(
+      BadRequestException,
+    );
+  });
 });

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
@@ -438,6 +439,19 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       deliveryId = created.id;
     } catch (err) {
       if (this.isUniqueViolation(err)) {
+        // A reused delivery id (or content hash) already exists. If the content matches,
+        // this is an idempotent re-delivery — no-op. If it DIFFERS, the caller reused an
+        // `x-inbound-delivery-id` for a DIFFERENT message: reject 409 so the second
+        // message is not silently lost (rather than dropping it).
+        const prior = await this.prisma.inboundDelivery.findUnique({
+          where: { transportKey },
+          select: { contentHash: true },
+        });
+        if (prior && prior.contentHash !== contentHash) {
+          throw new ConflictException(
+            `Inbound delivery id already used for a different message (contentHash mismatch)`,
+          );
+        }
         this.logger.log(`PIPE: duplicate delivery (${transportKey}) — already accepted`);
         return; // idempotent re-delivery
       }
@@ -645,21 +659,28 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const textBody = stripQuotedReply(parsed.text ?? '');
     const htmlBody = parsed.html || undefined;
 
-    // Persist email attachments if AttachmentsService is available
-    let emailAttachmentIds: number[] = [];
-    if (this.attachmentsService && parsed.attachments?.length) {
-      const uploaded = await this.attachmentsService.uploadFiles(
-        parsed.attachments
-          .filter((a) => a.content instanceof Buffer)
-          .map((a) => ({
-            originalname: a.filename ?? 'attachment',
-            mimetype: a.contentType ?? 'application/octet-stream',
-            size: (a.content as Buffer).length,
-            buffer: a.content as Buffer,
-          })),
-      );
-      emailAttachmentIds = uploaded.map((a) => a.id);
-    }
+    // #9: stage attachments LAZILY — only upload when we are actually about to reply or
+    // create a ticket. Loop/duplicate/parser-ignore messages return before this runs, so
+    // they never leave orphan attachment files. Memoised so it uploads at most once.
+    let stagedAttachmentIds: number[] | null = null;
+    const attachmentIds = async (): Promise<number[]> => {
+      if (stagedAttachmentIds) return stagedAttachmentIds;
+      stagedAttachmentIds = [];
+      if (this.attachmentsService && parsed.attachments?.length) {
+        const uploaded = await this.attachmentsService.uploadFiles(
+          parsed.attachments
+            .filter((a) => a.content instanceof Buffer)
+            .map((a) => ({
+              originalname: a.filename ?? 'attachment',
+              mimetype: a.contentType ?? 'application/octet-stream',
+              size: (a.content as Buffer).length,
+              buffer: a.content as Buffer,
+            })),
+        );
+        stagedAttachmentIds = uploaded.map((a) => a.id);
+      }
+      return stagedAttachmentIds;
+    };
 
     // RFC threading identifiers. Filter empties so a blank id can never match the ''
     // default on legacy posts.
@@ -688,7 +709,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           isThirdParty: false,
           creationMode: 'EMAIL',
           ipAddress: '0.0.0.0',
-          attachmentIds: emailAttachmentIds,
+          attachmentIds: await attachmentIds(),
           messageId: effectiveMessageId,
         });
         this.logger.log(`Inbound: RFC-threaded reply to ${linkedPost.ticket.mask} from ${fromEmail}`);
@@ -726,7 +747,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           isThirdParty: false,
           creationMode: 'EMAIL',
           ipAddress: '0.0.0.0',
-          attachmentIds: emailAttachmentIds,
+          attachmentIds: await attachmentIds(),
           messageId: effectiveMessageId,
         });
         this.logger.log(`Inbound: threaded reply to ${mask} from ${fromEmail}`);
@@ -755,7 +776,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       ipAddress: '0.0.0.0',
       tags: ruleResult.tags,
       customFields: {},
-      attachmentIds: emailAttachmentIds,
+      attachmentIds: await attachmentIds(),
       messageId: effectiveMessageId,
       ...(ruleResult.priorityId !== undefined ? { priorityId: ruleResult.priorityId } : {}),
       ...(ruleResult.ownerStaffId !== undefined ? { ownerStaffId: ruleResult.ownerStaffId } : {}),
@@ -879,8 +900,12 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         where: { isEnabled: true, ruleType: 'PRE_PARSE' },
         orderBy: { sortOrder: 'asc' },
       });
-    } catch {
-      return result;
+    } catch (err) {
+      // Table not migrated yet → skip rules gracefully. But a REAL DB error must NOT be
+      // swallowed (that would silently route mail to the default department); rethrow so
+      // the delivery goes to RETRY instead.
+      if (/does not exist/i.test(String(err))) return result;
+      throw err;
     }
 
     for (const rule of rules) {

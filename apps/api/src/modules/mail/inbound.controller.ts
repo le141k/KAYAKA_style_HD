@@ -51,7 +51,7 @@ export class InboundController {
   async pipe(
     @Headers('x-inbound-secret') secret: string | undefined,
     @Headers('x-inbound-delivery-id') deliveryId: string | undefined,
-    @Body() body: InboundPipeBody,
+    @Body() body: InboundPipeBody | Buffer,
   ) {
     const expected = this.config.TELECOM_HD_INBOUND_WEBHOOK_SECRET;
     let secretOk = false;
@@ -64,9 +64,16 @@ export class InboundController {
       throw new ForbiddenException('Invalid inbound webhook secret');
     }
 
-    const raw = typeof body?.raw === 'string' ? body.raw : undefined;
-    if (!raw || raw.trim().length === 0) {
-      throw new BadRequestException('Missing required field: raw (the RFC822 message)');
+    // Accept EITHER raw bytes (Content-Type: message/rfc822 or application/octet-stream —
+    // byte-exact, preferred for real mail + attachments) OR a JSON `{ raw }` body.
+    let raw: Buffer | string | undefined;
+    if (Buffer.isBuffer(body)) {
+      raw = body;
+    } else if (body && typeof (body as InboundPipeBody).raw === 'string') {
+      raw = (body as InboundPipeBody).raw;
+    }
+    if (raw == null || (Buffer.isBuffer(raw) ? raw.length === 0 : raw.trim().length === 0)) {
+      throw new BadRequestException('Missing message body (raw RFC822 bytes or JSON { raw })');
     }
 
     // Department is resolved downstream (parser rules / default); the webhook is a

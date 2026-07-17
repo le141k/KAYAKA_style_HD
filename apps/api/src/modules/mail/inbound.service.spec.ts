@@ -6,7 +6,7 @@
  */
 import { createHash } from 'node:crypto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { InboundMailService } from './inbound.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { TicketsService } from '../tickets/tickets.service';
@@ -53,6 +53,7 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'FROM_NOW',
   TELECOM_HD_IMAP_BACKFILL_LIMIT: 0,
   TELECOM_HD_INBOUND_MAX_ATTEMPTS: 5,
+  TELECOM_HD_INBOUND_MAX_MB: 30,
   TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined,
 };
 
@@ -759,6 +760,35 @@ describe('InboundMailService — parser rule helpers', () => {
           data: expect.objectContaining({ state: 'QUARANTINED' }),
         }),
       );
+    });
+  });
+
+  // ─── PIPE ingress: idempotency-key collision ─────────────────────────────────
+  describe('ingestRawMessage (PIPE) — delivery-id collision', () => {
+    const ingest = (raw: string, extId?: string) =>
+      (
+        service as unknown as {
+          ingestRawMessage: (s: string, d: number | undefined, e?: string) => Promise<void>;
+        }
+      ).ingestRawMessage(raw, undefined, extId);
+
+    it('#8: a reused delivery-id with DIFFERENT content is rejected (409), not silently lost', async () => {
+      (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      // The stored delivery under this key had a different message (different hash).
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        contentHash: 'a-different-hash',
+      });
+      await expect(ingest('a brand new message', 'mta-77')).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('#8: a reused delivery-id with the SAME content is an idempotent no-op', async () => {
+      const raw = 'same message body';
+      const sameHash = createHash('sha256').update(Buffer.from(raw, 'utf8')).digest('hex');
+      (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        contentHash: sameHash,
+      });
+      await expect(ingest(raw, 'mta-77')).resolves.toBeUndefined();
     });
   });
 
