@@ -183,6 +183,9 @@ All routes are under the `/api` global prefix.
 > (`InboundMailService.ingestRawMessage`). For MTA/PIPE delivery (Postfix/Exim pipe
 > transport). Loop-guarded (Auto-Submitted / Precedence / X-Loop / self-from) and
 > deduplicated by `Message-ID`. Returns `202 Accepted`.
+> Optional `x-inbound-delivery-id` header — an explicit idempotency key recorded on the
+> `InboundDelivery` ledger; without it the message is de-duplicated by content hash, so a
+> retry of the identical body never creates a second ticket.
 
 ---
 
@@ -294,15 +297,15 @@ SLA plans, schedules, holidays, and escalation rules. All routes require `admin.
 
 ## Admin / Custom Fields
 
-| Method | Path | Auth | Body | Returns |
+| Method | Path                                            | Auth                    | Body                                                                          | Returns                                                         |
 | ------ | ----------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------- | ------- | ------------------------------- | ------------- |
-| GET | /api/admin/custom-field-groups | 🔒 `admin.customfields` | — | `CustomFieldGroup[]` (includes fields, ordered by displayOrder) |
-| POST | /api/admin/custom-field-groups | 🔒 `admin.customfields` | `{title, scope: 'TICKET'                                                      | 'USER'                                                          | 'STAFF' | 'ORGANIZATION', displayOrder?}` | Created group |
-| PATCH | /api/admin/custom-field-groups/{id} | 🔒 `admin.customfields` | Partial group fields | Updated group |
-| DELETE | /api/admin/custom-field-groups/{id} | 🔒 `admin.customfields` | — | 204 No Content |
-| POST | /api/admin/custom-field-groups/{groupId}/fields | 🔒 `admin.customfields` | `{fieldKey, title, type, isRequired?, isEncrypted?, options?, displayOrder?}` | Created field |
-| PATCH | /api/admin/custom-fields/{id} | 🔒 `admin.customfields` | Partial field fields (fieldKey immutable) | Updated field |
-| DELETE | /api/admin/custom-fields/{id} | 🔒 `admin.customfields` | — | 204 No Content |
+| GET    | /api/admin/custom-field-groups                  | 🔒 `admin.customfields` | —                                                                             | `CustomFieldGroup[]` (includes fields, ordered by displayOrder) |
+| POST   | /api/admin/custom-field-groups                  | 🔒 `admin.customfields` | `{title, scope: 'TICKET'                                                      | 'USER'                                                          | 'STAFF' | 'ORGANIZATION', displayOrder?}` | Created group |
+| PATCH  | /api/admin/custom-field-groups/{id}             | 🔒 `admin.customfields` | Partial group fields                                                          | Updated group                                                   |
+| DELETE | /api/admin/custom-field-groups/{id}             | 🔒 `admin.customfields` | —                                                                             | 204 No Content                                                  |
+| POST   | /api/admin/custom-field-groups/{groupId}/fields | 🔒 `admin.customfields` | `{fieldKey, title, type, isRequired?, isEncrypted?, options?, displayOrder?}` | Created field                                                   |
+| PATCH  | /api/admin/custom-fields/{id}                   | 🔒 `admin.customfields` | Partial field fields (fieldKey immutable)                                     | Updated field                                                   |
+| DELETE | /api/admin/custom-fields/{id}                   | 🔒 `admin.customfields` | —                                                                             | 204 No Content                                                  |
 
 > `type` enum: `TEXT | TEXTAREA | PASSWORD | CHECKBOX | RADIO | SELECT | MULTISELECT | DATE | FILE | CUSTOM`.
 

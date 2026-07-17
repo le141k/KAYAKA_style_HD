@@ -48,7 +48,11 @@ export class InboundController {
   @Post('pipe')
   @HttpCode(HttpStatus.ACCEPTED)
   @ApiOperation({ summary: 'Ingest a raw RFC822 message (MTA/PIPE; shared-secret auth, not JWT)' })
-  async pipe(@Headers('x-inbound-secret') secret: string | undefined, @Body() body: InboundPipeBody) {
+  async pipe(
+    @Headers('x-inbound-secret') secret: string | undefined,
+    @Headers('x-inbound-delivery-id') deliveryId: string | undefined,
+    @Body() body: InboundPipeBody,
+  ) {
     const expected = this.config.TELECOM_HD_INBOUND_WEBHOOK_SECRET;
     let secretOk = false;
     if (secret) {
@@ -66,8 +70,11 @@ export class InboundController {
     }
 
     // Department is resolved downstream (parser rules / default); the webhook is a
-    // single ingress so it does not carry a per-queue department.
-    await this.inbound.ingestRawMessage(raw, undefined);
+    // single ingress so it does not carry a per-queue department. An optional
+    // `x-inbound-delivery-id` header gives the MTA an explicit idempotency key (else
+    // the ledger de-dups by content hash).
+    const externalId = deliveryId && deliveryId.trim().length > 0 ? deliveryId.trim() : undefined;
+    await this.inbound.ingestRawMessage(raw, undefined, externalId);
     return { accepted: true };
   }
 }

@@ -219,6 +219,15 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
 
   // ─────────────────── accept phase (IMAP poll) ───────────────────
 
+  /**
+   * Run one full accept+drain cycle across all connected queues immediately. Exposed
+   * for operator "poll now" actions and live-IMAP (GreenMail/Dovecot) verification;
+   * the 60s interval calls the same path.
+   */
+  async pollNow(): Promise<void> {
+    await this.pollAll();
+  }
+
   private async pollAll(): Promise<void> {
     for (const [queueId, client] of this.connections) {
       try {

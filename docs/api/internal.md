@@ -212,14 +212,40 @@ sendTemplate(to: string | string[], templateKey: string, locale: string, vars: R
 
 ## InboundMailService (`apps/api/src/modules/mail/inbound.service.ts`)
 
-Implements `OnModuleInit` / `OnModuleDestroy`. No public methods — driven entirely by lifecycle hooks.
+Durable, idempotent, fail-closed inbound pipeline backed by the **`InboundDelivery` ledger**.
+Both transports (IMAP poll, `POST /api/inbound/pipe`) record every message in the ledger under a
+UNIQUE `transportKey` before it is processed.
 
-- On init: queries `EmailQueue` for enabled IMAP queues, connects via `imapflow`, starts a
-  60-second `setInterval` poll.
-- Per message: threads replies into existing tickets by matching `TT-XXXXXX` mask in the subject
-  line (calls `TicketsService.reply()`); creates new tickets for unthreaded messages.
-- TODO: replace `setInterval` with IMAP IDLE push; implement `passwordEnc` decryption for stored
-  IMAP credentials.
+- **Public:** `ingestRawMessage(source, departmentId, externalId?)` — PIPE ingress: records a
+  ledger delivery (idempotent by `externalId` or content hash) and processes it inline.
+  `pollNow()` — run one accept+drain cycle now (ops / live-IMAP verification).
+- **Accept phase (IMAP, per queue):** discovers new UIDs uid-only, then `fetchOne` each in
+  ascending order and `create`s an `InboundDelivery` (state `ACCEPTED`, raw MIME stored) —
+  `client.fetch(range, query, { uid: true })` with `{ uid: true }` as the **third** arg (real UID
+  range). The `EmailQueue.lastSeenUid` cursor advances via a **monotonic CAS**
+  (`updateMany where lastSeenUid < cursor`) ONLY after durable acceptance; a fetch/DB error stops
+  the poll without advancing (**fail-closed** — no silent loss). A duplicate `transportKey`
+  (`P2002`) is an idempotent no-op (multi-poller / re-poll safe; a best-effort Postgres advisory
+  lock avoids concurrent fetching but is not required for correctness).
+- **Bootstrap barrier:** the starting cursor is captured **synchronously at connect** (not the
+  first 60 s poll) via `TELECOM_HD_IMAP_BOOTSTRAP_POLICY` `FROM_NOW` (high-water, imports nothing)
+  or `BACKFILL` (rewinds by `TELECOM_HD_IMAP_BACKFILL_LIMIT`). Never fails open to `1:*`.
+- **UIDVALIDITY:** on a server UID-space reset the queue flips to
+  `EmailQueue.syncState = NEEDS_RECONCILIATION` and polling **halts** (fail-closed) until an
+  operator re-bootstraps (clear `uidValidity`).
+- **Drain phase:** processes `ACCEPTED`/`RETRY` deliveries in id order; claims each via CAS
+  (`ACCEPTED|RETRY → PROCESSING`). Success → `PROCESSED` (+`ticketId`/`postId`); transient error →
+  `RETRY` with exponential backoff; attempts ≥ `TELECOM_HD_INBOUND_MAX_ATTEMPTS` (5) →
+  `QUARANTINED`. Raw MIME is **always retained** — a quarantine never discards a message.
+- **Routing / idempotency:** de-dups by effective Message-ID — the RFC id, or a deterministic
+  `<inbound-<sha256>@23telecom.local>` synthesised from the content hash when absent — so a retry
+  or IMAP+PIPE double-delivery never double-posts even without a Message-ID. The Message-ID is
+  written **atomically** with the ticket/post create (`TicketsService.reply()` / `createTicket()`
+  accept an internal `messageId`). Loop/bounce guard (A5) and RFC `References` cleaning preserved.
+  Subject-mask threading is fail-closed: NotFound / sender-not-requester → new ticket; any other
+  error propagates (delivery retried, never a silent duplicate ticket).
+- TODO: IMAP IDLE push; externalise raw MIME for very large messages; per-queue backfill policy;
+  admin queue/ledger diagnostics + replay endpoint.
 
 ---
 
