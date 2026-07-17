@@ -131,6 +131,32 @@ export class AttachmentsService {
     return attachment;
   }
 
+  /**
+   * Fetch an attachment ONLY if the verified client owns the ticket it belongs to, per
+   * the client-download rules (GOAL_PUBLIC_SECURITY S2-8): it must be a POST attachment
+   * (not a ticket-level orphan and not an internal-note attachment), the post must not be
+   * third-party, and the post's ticket must be owned by `clientUserId`. Any failure —
+   * wrong owner, wrong/missing id, third-party, note, unmapped — returns the SAME 404,
+   * so the route neither enumerates ids nor leaks other customers' files.
+   */
+  async getClientDownloadableOrThrow(id: number, clientUserId: number): Promise<Attachment> {
+    const attachment = await this.prisma.attachment.findUnique({
+      where: { id },
+      include: { post: { select: { isThirdParty: true, ticket: { select: { userId: true } } } } },
+    });
+    if (
+      !attachment ||
+      attachment.postId === null ||
+      attachment.noteId !== null ||
+      !attachment.post ||
+      attachment.post.isThirdParty ||
+      attachment.post.ticket.userId !== clientUserId
+    ) {
+      throw new NotFoundException(`Attachment ${id} not found`);
+    }
+    return attachment;
+  }
+
   async deleteAttachment(id: number): Promise<void> {
     const attachment = await this.getAttachmentOrThrow(id);
     await this.storageService.delete(attachment.storageKey);

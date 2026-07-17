@@ -12,6 +12,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AppConfig, APP_CONFIG } from '../config/configuration';
 import { TokenBlocklistService } from './token-blocklist.service';
 import { SessionRevocationService } from './session-revocation.service';
+import { LoginThrottleService } from './login-throttle.service';
 import { verifyPassword, hashPassword } from './password.util';
 import { type AuthStaff } from './auth.decorators';
 import type { Permission } from './permissions';
@@ -28,7 +29,21 @@ export interface LoginResult extends TokenPair {
 /** Full staff record joined with group, used internally. */
 type StaffWithGroup = Staff & { staffGroup: StaffGroup };
 
-/** Token used to inject MailService optionally without creating a circular module dep. */
+/**
+ * Narrow reset-mail port. AuthService only needs to dispatch a security template and
+ * be told (by a thrown error) when the hand-off failed. Bound to the real MailService
+ * in AuthModule; left undefined only in pure unit tests.
+ */
+export interface ResetMailer {
+  sendTemplateStrict(
+    to: string | string[],
+    templateKey: string,
+    locale: string,
+    vars: Record<string, string>,
+  ): Promise<void>;
+}
+
+/** Token used to inject the reset mailer (MailService) into AuthService. */
 export const MAIL_SERVICE_TOKEN = Symbol('MAIL_SERVICE_TOKEN');
 
 // D2 — per-account lockout thresholds (env-overridable). The per-IP throttler
@@ -36,6 +51,14 @@ export const MAIL_SERVICE_TOKEN = Symbol('MAIL_SERVICE_TOKEN');
 // many IPs against one account.
 const LOGIN_MAX_ATTEMPTS = Number(process.env['TELECOM_HD_LOGIN_MAX_ATTEMPTS']) || 5;
 const LOGIN_LOCK_MINUTES = Number(process.env['TELECOM_HD_LOGIN_LOCK_MINUTES']) || 15;
+
+/**
+ * Grace window for refresh rotation (S3-3). If a token's jti is found already-revoked
+ * within this window of now, we treat it as a benign concurrent double-submit (the
+ * winner just rotated) and fail the loser without revoking the family. Beyond it, a
+ * presented already-rotated token is a genuine replay → revoke the whole family.
+ */
+const REFRESH_ROTATION_GRACE_MS = 10_000;
 
 @Injectable()
 export class AuthService {
@@ -49,8 +72,21 @@ export class AuthService {
     @Optional() private readonly sessions?: SessionRevocationService,
     @Optional()
     @Inject(MAIL_SERVICE_TOKEN)
-    private readonly mailService?: { sendTemplate: (...args: unknown[]) => Promise<void> },
+    private readonly mailService?: ResetMailer,
+    @Optional() private readonly loginThrottle?: LoginThrottleService,
   ) {}
+
+  /**
+   * A throwaway argon2id hash (same cost params as real hashes, since both come from
+   * `hashPassword`) used only to equalize login timing. Cached after first use.
+   */
+  private decoyHash?: string;
+  private async getDecoyHash(): Promise<string> {
+    if (!this.decoyHash) {
+      this.decoyHash = await hashPassword(randomBytes(16).toString('hex'));
+    }
+    return this.decoyHash;
+  }
 
   /** Validate credentials; returns Staff+Group on success, throws otherwise. */
   async validateStaff(email: string, password: string): Promise<StaffWithGroup> {
@@ -60,6 +96,10 @@ export class AuthService {
     });
 
     if (!staff || !staff.isEnabled) {
+      // Anti-enumeration: a missing OR disabled account must cost the same as a wrong
+      // password. Verify against a decoy hash so both branches pay one argon2 verify —
+      // otherwise the argon2 delta is a timing oracle for "does this email exist?".
+      await verifyPassword(await this.getDecoyHash(), password);
       throw new UnauthorizedException('Invalid credentials');
     }
 
@@ -116,13 +156,32 @@ export class AuthService {
   }
 
   /** Log in, issue tokens, persist hashed refresh token. */
-  async login(email: string, password: string): Promise<LoginResult> {
-    const staff = await this.validateStaff(email, password);
+  async login(email: string, password: string, ip?: string): Promise<LoginResult> {
+    // Login-abuse throttle (S3-7): reject over-threshold (IP + email) BEFORE hashing,
+    // record failures, clear on success. Never locks the account (per-IP key, expires).
+    if (this.loginThrottle) await this.loginThrottle.assertNotThrottled(email, ip);
+    let staff: StaffWithGroup;
+    try {
+      staff = await this.validateStaff(email, password);
+    } catch (err) {
+      if (this.loginThrottle) await this.loginThrottle.recordFailure(email, ip);
+      throw err;
+    }
+    if (this.loginThrottle) await this.loginThrottle.clear(email, ip);
+
     const principal = this.buildPrincipal(staff);
-    const tokens = await this.issueTokens(principal, staff.id);
+    // A fresh login starts a new rotation family.
+    const familyId = crypto.randomUUID();
+    const tokens = await this.issueTokens(principal, staff.id, staff.authVersion, familyId);
 
     // Persist refresh token hash so we can rotate/revoke it
-    await this.persistRefreshToken(staff.id, tokens.refreshToken);
+    await this.persistRefreshToken(
+      staff.id,
+      tokens.refreshToken,
+      tokens.refreshJti,
+      familyId,
+      staff.authVersion,
+    );
 
     // Update lastLoginAt
     await this.prisma.staff.update({
@@ -131,94 +190,99 @@ export class AuthService {
     });
 
     this.logger.log(`Staff ${staff.email} logged in`);
-    return { ...tokens, staff: principal };
+    return { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, staff: principal };
   }
 
   /**
-   * Rotate refresh token.
-   * Verifies the incoming token, revokes it, and issues a fresh pair.
+   * Rotate refresh token (S3-3).
+   * Looks up EXACTLY ONE stored row by the token's opaque `jti` (no Argon2 scan),
+   * verifies its hash, and rotates it with a conditional CAS. Exactly one concurrent
+   * caller wins; a genuine later replay of an already-rotated token revokes the family.
    */
   async refresh(rawRefreshToken: string): Promise<TokenPair> {
-    // Decode header to get staffId from sub
-    let payload: { sub: number; jti: string };
+    let payload: { sub: number; jti: string; fid?: string };
     try {
-      payload = this.jwt.verify<{ sub: number; jti: string }>(rawRefreshToken, {
+      payload = this.jwt.verify<{ sub: number; jti: string; fid?: string }>(rawRefreshToken, {
         secret: this.config.TELECOM_HD_JWT_REFRESH_SECRET,
       });
     } catch {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
-    // Opportunistic cleanup of this staff's expired tokens (bounded, indexed) so the
-    // scan below stays small. Fire-and-forget; failure must not block a valid refresh.
+    // Opportunistic cleanup of this staff's expired tokens (indexed, fire-and-forget) — DB
+    // hygiene, preserved from main; failure must not block a valid refresh.
     void this.prisma.refreshToken
       .deleteMany({ where: { staffId: payload.sub, expiresAt: { lt: new Date() } } })
       .catch(() => undefined);
 
-    // Active (non-revoked) stored tokens — the normal rotation path. Cap the scan
-    // (newest first) so a staff with many sessions can't blow up the argon2 loop.
-    const active = await this.prisma.refreshToken.findMany({
-      where: { staffId: payload.sub, revokedAt: null },
-      orderBy: { createdAt: 'desc' },
-      take: 20,
-    });
-
-    // Find matching token by verifying argon2 hash
-    let matchedToken: (typeof active)[number] | undefined;
-    for (const t of active) {
-      if (new Date() > t.expiresAt) continue;
-      const matches = await verifyPassword(t.tokenHash, rawRefreshToken);
-      if (matches) {
-        matchedToken = t;
-        break;
-      }
+    // Direct single-row lookup by opaque jti — no candidate scan (S3-3).
+    const row = await this.prisma.refreshToken.findUnique({ where: { jti: payload.jti } });
+    if (!row) {
+      throw new UnauthorizedException('Refresh token not found');
     }
 
-    if (!matchedToken) {
-      // Reuse detection: if the presented token matches one we already REVOKED
-      // (and that hasn't expired), this is a replay of a rotated/stolen token.
-      // Treat it as a compromise and revoke the entire token family for this staff.
-      const revoked = await this.prisma.refreshToken.findMany({
-        where: { staffId: payload.sub, NOT: { revokedAt: null }, expiresAt: { gt: new Date() } },
-        orderBy: { createdAt: 'desc' },
-        take: 20,
-      });
-      for (const t of revoked) {
-        if (await verifyPassword(t.tokenHash, rawRefreshToken)) {
-          await this.prisma.refreshToken.updateMany({
-            where: { staffId: payload.sub, revokedAt: null },
-            data: { revokedAt: new Date() },
-          });
-          this.logger.error(
-            `SECURITY: refresh-token reuse detected for staff ${payload.sub} — all active sessions revoked`,
-          );
-          throw new UnauthorizedException('Refresh token reuse detected; all sessions have been revoked');
-        }
-      }
-      throw new UnauthorizedException('Refresh token not found or expired');
+    // Bind the presented raw token to the stored hash: a forged/guessed jti fails here.
+    if (!(await verifyPassword(row.tokenHash, rawRefreshToken))) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+    if (row.expiresAt < new Date()) {
+      throw new UnauthorizedException('Refresh token expired');
     }
 
-    // Revoke the used token (rotation)
-    await this.prisma.refreshToken.update({
-      where: { id: matchedToken.id },
-      data: { revokedAt: new Date() },
-    });
-
-    // Load fresh staff record
+    // Load the current staff BEFORE consuming, so a security change can't be outrun by
+    // a concurrent rotation (S3 race fix). If the token's stamped authVersion no longer
+    // matches the staff record, a logout-all / password / group change happened after
+    // this token was issued → reject quietly (the family is already revoked by that
+    // change; this is NOT a stolen-token replay, so no family-revoke alarm).
     const staff = await this.prisma.staff.findUnique({
-      where: { id: payload.sub },
+      where: { id: row.staffId },
       include: { staffGroup: true },
     });
-
     if (!staff || !staff.isEnabled) {
       throw new UnauthorizedException('Staff not found or disabled');
     }
+    if (row.authVersion !== staff.authVersion) {
+      throw new UnauthorizedException('Session has been invalidated');
+    }
 
+    // Atomic rotation via CAS: exactly one caller flips revokedAt NULL→now for this jti.
+    const consumed = await this.prisma.refreshToken.updateMany({
+      where: { jti: row.jti, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+
+    if (consumed.count !== 1) {
+      // The jti was already consumed. Distinguish a benign concurrent double-submit
+      // (winner rotated microseconds ago) from a genuine later replay of a stolen,
+      // already-rotated token — only the latter revokes the whole family.
+      const revokedAtMs = row.revokedAt ? row.revokedAt.getTime() : Date.now();
+      const withinGrace = Date.now() - revokedAtMs <= REFRESH_ROTATION_GRACE_MS;
+      if (!withinGrace) {
+        await this.prisma.refreshToken.updateMany({
+          where: { familyId: row.familyId, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+        this.logger.error(
+          `SECURITY: refresh-token replay detected for staff ${row.staffId} — family revoked`,
+        );
+        throw new UnauthorizedException('Refresh token reuse detected; all sessions have been revoked');
+      }
+      // Concurrent loser: fail WITHOUT revoking the winner's freshly created session.
+      throw new UnauthorizedException('Refresh token already rotated');
+    }
+
+    // Winner: issue a new pair in the SAME family, stamped with the current authVersion.
     const principal = this.buildPrincipal(staff);
-    const tokens = await this.issueTokens(principal, staff.id);
-    await this.persistRefreshToken(staff.id, tokens.refreshToken);
+    const tokens = await this.issueTokens(principal, staff.id, staff.authVersion, row.familyId);
+    await this.persistRefreshToken(
+      staff.id,
+      tokens.refreshToken,
+      tokens.refreshJti,
+      row.familyId,
+      staff.authVersion,
+    );
 
-    return tokens;
+    return { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken };
   }
 
   /**
@@ -226,19 +290,42 @@ export class AuthService {
    * The staffId comes from the verified JWT principal passed in by the controller.
    */
   async logout(staffId: number, accessJti?: string, accessExp?: number): Promise<void> {
-    await this.prisma.refreshToken.updateMany({
-      where: { staffId, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
-    // Revoke the current access token too (jti blocklist) so it can't be used for
-    // its remaining ~15 min after logout.
+    // Logout is an authoritative logout-all (S3-4): bump authVersion so every
+    // outstanding access token for this staff fails the guard's `av` check on its
+    // next request, and revoke all refresh families — atomically. Correctness no
+    // longer depends on the Redis jti blocklist.
+    await this.revokeStaffSessions(staffId);
+    // Keep the jti blocklist as defense-in-depth / telemetry (best-effort).
     if (accessJti && this.blocklist) {
       const ttl = accessExp
         ? accessExp - Math.floor(Date.now() / 1000)
         : this.config.TELECOM_HD_JWT_ACCESS_TTL;
       await this.blocklist.block(accessJti, ttl);
     }
-    this.logger.log(`Staff ${staffId} logged out (tokens revoked)`);
+    this.logger.log(`Staff ${staffId} logged out (all sessions revoked)`);
+  }
+
+  /**
+   * Immediately invalidate EVERY session for a staff member (S3-2 / S3-4): increment
+   * authVersion — so all outstanding access tokens fail the guard's `av` check on
+   * their next request — and revoke all active refresh tokens, in one transaction.
+   * Callers: logout, password reset, operator password/group/disable changes.
+   */
+  async revokeStaffSessions(staffId: number): Promise<void> {
+    await this.prisma.$transaction([
+      this.prisma.staff.update({
+        where: { id: staffId },
+        data: { authVersion: { increment: 1 } },
+      }),
+      this.prisma.refreshToken.updateMany({
+        where: { staffId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+    // Also fire main's Redis access-token cutoff (defense-in-depth; the DB authVersion
+    // check is the authoritative guarantee, this makes the already-issued access JWT
+    // stop working immediately rather than lingering for its remaining TTL).
+    await this.sessions?.revokeAllForStaff(staffId);
   }
 
   // ─────────────────────────── Password reset ────────────────────────────────
@@ -269,27 +356,47 @@ export class AuthService {
     const tokenHash = createHash('sha256').update(rawToken).digest('hex');
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
-    await this.prisma.passwordReset.create({
+    const reset = await this.prisma.passwordReset.create({
       data: { staffId: staff.id, tokenHash, expiresAt },
     });
 
-    const resetUrl = `${this.config.TELECOM_HD_PUBLIC_URL}/reset-password?token=${rawToken}`;
+    // Deliver the raw token in a URL FRAGMENT (#token=…) so it never lands in proxy
+    // access logs or the Referer header when the reset page loads (S1-5).
+    const resetUrl = `${this.config.TELECOM_HD_PUBLIC_URL}/reset-password#token=${rawToken}`;
 
-    // Non-blocking — if mail fails the user can request again
-    if (this.mailService) {
-      this.mailService
-        .sendTemplate(email, 'password_reset', 'en', {
-          firstName: staff.firstName,
-          resetUrl,
-          expiresInHours: '1',
-        })
-        .catch((err: unknown) =>
-          this.logger.error(`Password-reset email failed for ${email}: ${String(err)}`),
-        );
-    } else {
-      // Fallback: log the reset URL so dev/test environments without mail still work
-      this.logger.log(`[DEV] Password reset link for ${email}: ${resetUrl}`);
+    if (!this.mailService) {
+      // No mailer wired. In the running app MailModule always provides one, so this
+      // is a misconfiguration in production — fail closed by invalidating the token
+      // and logging a diagnostic that NEVER contains the raw link.
+      await this.invalidateReset(reset.id);
+      if (this.config.NODE_ENV === 'production') {
+        this.logger.error('Password-reset mailer is not configured; no email sent');
+      }
+      return;
     }
+
+    try {
+      // Strict dispatch throws if the mail cannot be enqueued/sent.
+      await this.mailService.sendTemplateStrict(email, 'password_reset', 'en', {
+        firstName: staff.firstName ?? '',
+        resetUrl,
+        expiresInHours: '1',
+      });
+    } catch {
+      // Fail closed: invalidate the freshly-issued token so no live token dangles for
+      // an email that never arrived. Keep the response generic (no enumeration) and
+      // never log the raw link.
+      await this.invalidateReset(reset.id);
+      this.logger.error(`Password-reset dispatch failed for staffId ${staff.id}`);
+    }
+  }
+
+  /** Invalidate a single still-unused reset token (idempotent). */
+  private async invalidateReset(id: number): Promise<void> {
+    await this.prisma.passwordReset.updateMany({
+      where: { id, usedAt: null },
+      data: { usedAt: new Date() },
+    });
   }
 
   /**
@@ -301,39 +408,51 @@ export class AuthService {
    */
   async resetPassword(token: string, newPassword: string): Promise<void> {
     const tokenHash = createHash('sha256').update(token).digest('hex');
+
+    // Hash the new password BEFORE the race so the atomic consume→apply window stays
+    // tiny (argon2 is deliberately slow).
     const passwordHash = await hashPassword(newPassword);
 
-    const staffId = await this.prisma.$transaction(async (tx) => {
-      const now = new Date();
-      const record = await tx.passwordReset.findUnique({ where: { tokenHash } });
-      if (!record || record.usedAt !== null || record.expiresAt <= now) {
-        throw new BadRequestException('Invalid or expired reset token');
-      }
-
-      // Claim the token with a predicate that remains true for exactly one
-      // concurrent consumer. A second request observes count=0 after the first
-      // transaction commits and receives the same generic 400 response.
-      const claimed = await tx.passwordReset.updateMany({
-        where: { id: record.id, usedAt: null, expiresAt: { gt: now } },
-        data: { usedAt: now },
-      });
-      if (claimed.count !== 1) {
-        throw new BadRequestException('Invalid or expired reset token');
-      }
-
-      await tx.staff.update({ where: { id: record.staffId }, data: { passwordHash } });
-      await tx.refreshToken.updateMany({
-        where: { staffId: record.staffId, revokedAt: null },
-        data: { revokedAt: now },
-      });
-      return record.staffId;
+    // Atomically consume the token (S1-5): only an unused, unexpired token is claimed, and
+    // exactly one concurrent caller can flip usedAt from NULL to now. A second (replayed or
+    // parallel) request updates zero rows and is rejected, so the password changes exactly
+    // once — closing the check-to-write gap of the prior find-then-update.
+    const consumed = await this.prisma.passwordReset.updateMany({
+      where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
+      data: { usedAt: new Date() },
     });
 
-    // Refresh-token rows were updated atomically above. This second, central
-    // revocation step adds the Redis access-token cutoff so an already-issued
-    // access JWT cannot continue working for its remaining TTL.
-    await this.sessions?.revokeAllForStaff(staffId);
-    this.logger.log(`Password reset completed for staffId ${staffId}`);
+    if (consumed.count !== 1) {
+      throw new BadRequestException('Invalid or expired reset token');
+    }
+
+    const record = await this.prisma.passwordReset.findUnique({ where: { tokenHash } });
+    if (!record) {
+      // Unreachable — we just consumed this exact hash — but fail safe.
+      throw new BadRequestException('Invalid or expired reset token');
+    }
+
+    // Deliberate fail-safe: the token is already consumed above, OUTSIDE this transaction.
+    // If the password write below fails (e.g. the staff row was deleted between issue and
+    // reset), the token stays burned and the user must request a new link — we never change
+    // a password without having consumed the token.
+    await this.prisma.$transaction([
+      this.prisma.staff.update({
+        where: { id: record.staffId },
+        // Bump authVersion too so any still-valid access token is rejected at once (S3-2).
+        data: { passwordHash, authVersion: { increment: 1 } },
+      }),
+      // Revoke all active refresh tokens so existing sessions are invalidated.
+      this.prisma.refreshToken.updateMany({
+        where: { staffId: record.staffId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+
+    // Add main's central Redis access-token cutoff so an already-issued access JWT cannot
+    // continue working for its remaining TTL (complements the DB authVersion check).
+    await this.sessions?.revokeAllForStaff(record.staffId);
+    this.logger.log(`Password reset completed for staffId ${record.staffId}`);
   }
 
   // ─────────────────────── private helpers ───────────────────────
@@ -354,13 +473,21 @@ export class AuthService {
     };
   }
 
-  /** Issue access + refresh JWT pair. */
-  private async issueTokens(principal: AuthStaff, staffId: number): Promise<TokenPair> {
-    const jti = crypto.randomUUID();
+  /** Issue access + refresh JWT pair. Returns the refresh `jti` so it can be persisted. */
+  private async issueTokens(
+    principal: AuthStaff,
+    staffId: number,
+    authVersion: number,
+    familyId: string,
+  ): Promise<TokenPair & { refreshJti: string }> {
+    const refreshJti = crypto.randomUUID();
 
     const accessToken = await this.jwt.signAsync(
       // Distinct jti on the access token so logout can revoke it via the blocklist.
-      { ...principal, sub: staffId, jti: crypto.randomUUID(), issuedAtMs: Date.now() },
+      // `av` (authVersion) is checked against the DB every request so security changes /
+      // logout-all invalidate this token immediately (S3-1); `issuedAtMs` supports main's
+      // central Redis session-revocation cutoff. Both guard checks run.
+      { ...principal, sub: staffId, av: authVersion, issuedAtMs: Date.now(), jti: crypto.randomUUID() },
       {
         secret: this.config.TELECOM_HD_JWT_ACCESS_SECRET,
         expiresIn: this.config.TELECOM_HD_JWT_ACCESS_TTL,
@@ -368,23 +495,30 @@ export class AuthService {
     );
 
     const refreshToken = await this.jwt.signAsync(
-      { sub: staffId, jti },
+      // `jti` is the opaque row id looked up on rotation; `fid` groups the family (S3-3).
+      { sub: staffId, jti: refreshJti, fid: familyId },
       {
         secret: this.config.TELECOM_HD_JWT_REFRESH_SECRET,
         expiresIn: this.config.TELECOM_HD_JWT_REFRESH_TTL,
       },
     );
 
-    return { accessToken, refreshToken };
+    return { accessToken, refreshToken, refreshJti };
   }
 
-  /** Persist a hashed copy of the raw refresh token. */
-  private async persistRefreshToken(staffId: number, rawToken: string): Promise<void> {
+  /** Persist a hashed copy of the raw refresh token with its opaque jti + family id. */
+  private async persistRefreshToken(
+    staffId: number,
+    rawToken: string,
+    jti: string,
+    familyId: string,
+    authVersion: number,
+  ): Promise<void> {
     const tokenHash = await hashPassword(rawToken);
     const expiresAt = new Date(Date.now() + this.config.TELECOM_HD_JWT_REFRESH_TTL * 1000);
 
     await this.prisma.refreshToken.create({
-      data: { staffId, tokenHash, expiresAt },
+      data: { staffId, jti, familyId, tokenHash, expiresAt, authVersion },
     });
   }
 }

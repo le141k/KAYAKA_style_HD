@@ -69,9 +69,8 @@ describe('TicketsController public projections (D7)', () => {
     const service = { publicReply: async () => rawPost } as unknown as TicketsService;
     const controller = new TicketsController(service);
 
-    const out = await controller.publicReply(7, {
-      contents: 'reply',
-      requesterEmail: 'a@b.com',
+    const out = await controller.publicReply(7, { contents: 'reply' } as never, {
+      userId: 1,
     } as never);
 
     expect(out).toEqual({

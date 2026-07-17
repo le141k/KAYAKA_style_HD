@@ -7,9 +7,9 @@ import { BullModule } from '@nestjs/bullmq';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { PrismaModule } from './prisma/prisma.module';
 import { loadConfig, APP_CONFIG } from './config/configuration';
+import { buildPinoHttpOptions } from './config/logging';
 import { AuthModule } from './auth/auth.module';
-import { MAIL_SERVICE_TOKEN } from './auth/auth.service';
-import { MailService } from './modules/mail/mail.service';
+import { ClientAuthModule } from './modules/client-auth/client-auth.module';
 import { StaffModule } from './modules/staff/staff.module';
 import { UsersModule } from './modules/users/users.module';
 import { OrganizationsModule } from './modules/organizations/organizations.module';
@@ -33,6 +33,7 @@ import { HealthModule } from './health/health.module';
 import { PrismaExceptionFilter } from './common/prisma-exception.filter';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { PermissionsGuard } from './auth/permissions.guard';
+import { CsrfGuard } from './auth/csrf.guard';
 
 const config = loadConfig();
 const redisUrl = new URL(config.REDIS_URL);
@@ -57,16 +58,9 @@ const redisUrl = new URL(config.REDIS_URL);
       storage: new ThrottlerStorageRedisService(config.REDIS_URL),
     }),
 
-    // Structured JSON logging via Pino
-    LoggerModule.forRoot({
-      pinoHttp: {
-        level: config.TELECOM_HD_LOG_LEVEL,
-        transport:
-          config.NODE_ENV === 'development'
-            ? { target: 'pino-pretty', options: { colorize: true } }
-            : undefined,
-      },
-    }),
+    // Structured JSON logging via Pino. Uses a strict allowlist so request logs
+    // never carry credentials — see buildPinoHttpOptions / GOAL_PUBLIC_SECURITY S1-1.
+    LoggerModule.forRoot({ pinoHttp: buildPinoHttpOptions(config) }),
 
     // Background queues (BullMQ) + in-process domain events. Carry the password
     // from REDIS_URL through — prod requires Redis auth (see docker-compose.prod.yml).
@@ -85,6 +79,7 @@ const redisUrl = new URL(config.REDIS_URL);
 
     // Feature modules
     AuthModule,
+    ClientAuthModule,
     StaffModule,
     UsersModule,
     OrganizationsModule,
@@ -112,17 +107,16 @@ const redisUrl = new URL(config.REDIS_URL);
       provide: APP_CONFIG,
       useValue: config,
     },
-    // Wire MailService into AuthService for forgot-password email dispatch.
-    // AuthModule is @Global so it resolves this token; MailModule exports MailService
-    // and is imported here, so the factory has access to the already-registered provider.
-    {
-      provide: MAIL_SERVICE_TOKEN,
-      useExisting: MailService,
-    },
     // Map Prisma known-request errors (P2025/P2003/P2002) to 404/400/409 instead of 500
     {
       provide: APP_FILTER,
       useClass: PrismaExceptionFilter,
+    },
+    // CSRF: reject cross-origin cookie-authenticated mutations before anything else
+    // (GOAL_PUBLIC_SECURITY S3-5). Safe methods, Bearer-auth and cookieless requests pass.
+    {
+      provide: APP_GUARD,
+      useClass: CsrfGuard,
     },
     // Enforce ThrottlerModule limits globally (coexists with JWT/Permissions guards)
     {

@@ -10,9 +10,17 @@ import { SlaModule } from '../sla/sla.module';
 import { MailModule } from '../mail/mail.module';
 import { AdminModule } from '../admin/admin.module';
 import { AttachmentsModule } from '../attachments/attachments.module';
+import { ClientAuthModule } from '../client-auth/client-auth.module';
 
 @Module({
-  imports: [UsersModule, SlaModule, forwardRef(() => MailModule), AdminModule, AttachmentsModule],
+  imports: [
+    UsersModule,
+    SlaModule,
+    forwardRef(() => MailModule),
+    AdminModule,
+    AttachmentsModule,
+    ClientAuthModule,
+  ],
   controllers: [TicketsController, ReferenceController, RecipientsController],
   providers: [TicketsService, ReferenceService, NotificationService],
   exports: [TicketsService],

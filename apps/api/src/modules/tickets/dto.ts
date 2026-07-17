@@ -202,9 +202,9 @@ export type PublicCreateTicketDto = z.infer<typeof PublicCreateTicketSchema>;
 // ─────────────────── public reply ───────────────────
 
 export const PublicReplySchema = z.object({
+  // Keep main's input cap (E1); identity is taken from the verified client session, NOT the
+  // request body (S2-7) — there is intentionally no requesterEmail field here.
   contents: z.string().min(1).max(MAX_BODY),
-  /** The requester's email — used to attribute the post to the right user. */
-  requesterEmail: z.string().email().optional(),
   attachmentIds: z.array(z.number().int().positive()).optional(),
   /** Per-upload secret from POST /attachments/upload/public — scopes orphan adoption. */
   attachmentClaimToken: z.string().uuid().optional(),

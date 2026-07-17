@@ -10,7 +10,9 @@
  *  - 4 TicketPriorities
  *  - 4 TicketTypes
  *  - 1 SlaPlan + SlaSchedule (Mon–Fri 09:00–18:00)
- *  - 5 EmailTemplates (en + ru)
+ *  - 8 EmailTemplate rows: ticket_user_reply + autoresponder (en + ru),
+ *    sla_breach_internal, notify_staff_assigned, notify_staff_user_replied,
+ *    password_reset (en only)
  *  - 2 Organizations + 4 Users
  *  - 5 Demo tickets with posts
  */
@@ -350,6 +352,17 @@ async function main(): Promise<void> {
         '<p>Hello {{name}},</p><p>A customer has replied to ticket <strong>{{mask}}</strong>.</p><p>Subject: {{subject}}</p><p>Please review and respond as needed.</p><p>Best regards,<br>23 Telecom Help Desk</p>',
       textBody:
         'Hello {{name}},\n\nA customer has replied to ticket {{mask}}.\nSubject: {{subject}}\n\nPlease review and respond as needed.\n\n23 Telecom Help Desk',
+    },
+    {
+      // Also provisioned in prod via migration 20260716000000_password_reset_template
+      // (the prod seed does not run). Kept here so dev DBs match.
+      key: 'password_reset',
+      locale: 'en',
+      subject: 'Reset your 23 Telecom Help Desk password',
+      htmlBody:
+        '<p>Hi {{firstName}},</p><p>We received a request to reset the password for your 23 Telecom Help Desk account. Choose a new password using the link below:</p><p><a href="{{resetUrl}}">Reset your password</a></p><p>This link expires in {{expiresInHours}} hour(s). If you did not request a password reset, you can safely ignore this email — your password will not change.</p>',
+      textBody:
+        'Hi {{firstName}},\n\nWe received a request to reset the password for your 23 Telecom Help Desk account.\nChoose a new password using the link below:\n\n{{resetUrl}}\n\nThis link expires in {{expiresInHours}} hour(s). If you did not request a password reset, you can safely ignore this email — your password will not change.',
     },
   ];
 

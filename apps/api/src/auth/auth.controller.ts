@@ -93,7 +93,7 @@ export class AuthController {
   @UsePipes(new ZodValidationPipe(LoginSchema))
   @ApiOperation({ summary: 'Authenticate with email + password; returns JWT pair' })
   async login(@Body() dto: LoginDto, @Res({ passthrough: true }) res: Response) {
-    const result = await this.authService.login(dto.email, dto.password);
+    const result = await this.authService.login(dto.email, dto.password, res.req.ip);
     this.setAuthCookies(res, result.accessToken, result.refreshToken);
     return result;
   }

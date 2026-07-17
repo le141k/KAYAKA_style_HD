@@ -42,6 +42,7 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_INBOUND_WEBHOOK_SECRET: 'test-inbound-secret',
   TELECOM_HD_UPLOAD_DIR: '/tmp/uploads',
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: 25,
+  TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
 };
 
 const MOCK_TEMPLATE = {

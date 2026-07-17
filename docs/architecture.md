@@ -55,18 +55,45 @@ All 16 modules above are registered in `AppModule` and serve live routes (verifi
 ```
 HTTP Request
   → NestJS Router (global prefix: /api)
-  → JwtAuthGuard  (checks @Public(); if not public, verifies Bearer JWT, attaches AuthStaff to req.user)
+  → CsrfGuard  (rejects cookie-authenticated `th_access`/`th_client`/`th_refresh` unsafe methods whose
+     Origin/Referer ≠ the configured app origin; Bearer-auth + cookieless requests pass — S3-5)
+  → JwtAuthGuard  (checks @Public(); else verifies Bearer/cookie JWT, then loads the CURRENT
+     Staff+group from DB and checks isEnabled + authVersion (`av` claim) — so disable/password/
+     group changes and logout-all revoke access immediately; fails closed 503 if DB is down.
+     Derives fresh permissions from the DB group and attaches AuthStaff to req.user — S3-1)
   → PermissionsGuard  (checks @RequirePermissions(...); admins bypass all checks)
   → ZodValidationPipe  (validates + transforms body/query via Zod schema)
   → Controller method
   → Service (business logic + Prisma)
   → GlobalExceptionFilter  (normalizes errors to JSON { statusCode, message })
-  → Pino HTTP logger  (structured JSON request logs)
+  → Pino HTTP logger  (structured JSON request logs — strict allowlist: method, path
+     without query, status, duration, request id, trusted client IP only; every header
+     and body dropped so credentials/tokens never leak. See apps/api/src/config/logging.ts)
 ```
 
 Public routes (bypass JWT): `POST /auth/login`, `POST /auth/refresh`,
 `POST /tickets/public`, `POST /alaris/webhook` (but checks shared-secret header),
-`GET /news`, `GET /kb/articles`, `GET /kb/articles/slug/:slug`, `GET /kb/categories`.
+`GET /news`, `GET /kb/articles`, `GET /kb/articles/slug/:slug`, `GET /kb/categories`,
+`POST /client-auth/request-link`, `POST /client-auth/verify`.
+
+**Client (customer) auth mode (S2).** Distinct from staff JWT: a magic-link
+(`request-link` → single-use hashed token → `verify`) opens a hashed `ClientSession`
+behind an HttpOnly `th_client` cookie, bound to a stable `User.id`. Routes decorated
+`@ClientAuthenticated()` (= `@Public()` + `ClientAuthGuard`) resolve `req.client = {userId}`;
+client ticket routes (`/tickets/my`, `/tickets/public/:id`, `.../reply`) authorize strictly
+by `Ticket.userId === client.userId`. Never reuses staff JWT/RBAC identity.
+Frontend (S2-9): the emailed link lands on the `/verify` page (route group `(client)`, served at
+root), which strips the `#token=` fragment via `history.replaceState`, POSTs it, and is rendered
+`referrer: no-referrer`. The customer portal (`use-client-auth` / `use-client-tickets`) talks to
+`/client-auth/*` and the client ticket routes through a raw-fetch `clientFetch` (cookie-included,
+separate from the staff `api` client) — no `?email=` and no `localStorage` identity remain.
+
+**Login-abuse throttle (S3-7).** `POST /auth/login` carries the per-IP `@Throttle(5/60s)` plus a
+`LoginThrottleService` Redis counter keyed by trusted client IP + `HMAC-SHA256(email)`: a generic
+**429** after 10 failures in a 15-min sliding window, cleared on success. It never locks an account
+(the key is per-IP, so a known account stays reachable from other IPs) and the raw email is never
+stored. Fail-open — a Redis outage falls back to the per-IP throttle. Both the 429 and the
+credential failure are generic, disclosing nothing about account existence or lock state.
 
 ## 4. Background jobs _(auto)_
 

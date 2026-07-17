@@ -130,10 +130,8 @@ export function SubmitTicketForm() {
         ...(Object.keys(cfPayload).length ? { customFields: cfPayload } : {}),
         ...(attachmentIds.length ? { attachmentIds, attachmentClaimToken: claimToken } : {}),
       } as Parameters<typeof createTicket.mutateAsync>[0]);
-      // CL-3: persist the email so "Мои заявки" can filter by it
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('client_email', data.email);
-      }
+      // S2-9: no longer persist the email — "Мои заявки" is gated by the verified th_client
+      // session, not a self-typed/localStorage email (that lookup was an IDOR and is removed).
       setSuccessMask(ticket?.mask ?? generateTicketMask(Date.now() % 99999));
       reset();
       setCfValues({});

@@ -82,7 +82,6 @@ echo "--- 2. Required keys ---"
 
 REQUIRED_KEYS=(
   TELECOM_HD_PUBLIC_URL
-  NEXT_PUBLIC_API_URL
   TELECOM_HD_DB_PASSWORD
   TELECOM_HD_REDIS_PASSWORD
   TELECOM_HD_JWT_ACCESS_SECRET
@@ -117,13 +116,16 @@ if [[ -n "$PUBLIC_URL" ]]; then
   fi
 fi
 
+# NEXT_PUBLIC_API_URL is OPTIONAL (GOAL_PUBLIC_SECURITY S5-7): an empty/unset value is
+# the canonical production setting — the browser then calls the same-origin relative
+# `/api` (no cross-origin, no hard-coded host to rebuild). If it IS set it must be https.
 NEXT_API_URL="$(get_val NEXT_PUBLIC_API_URL)"
-if [[ -n "$NEXT_API_URL" ]]; then
-  if [[ "$NEXT_API_URL" == https://* ]]; then
-    ok "NEXT_PUBLIC_API_URL — starts with https://"
-  else
-    fail "NEXT_PUBLIC_API_URL — must start with https:// (got scheme: ${NEXT_API_URL%%:*})"
-  fi
+if [[ -z "$NEXT_API_URL" ]]; then
+  ok "NEXT_PUBLIC_API_URL — empty/unset (browser uses same-origin relative /api)"
+elif [[ "$NEXT_API_URL" == https://* ]]; then
+  ok "NEXT_PUBLIC_API_URL — starts with https://"
+else
+  fail "NEXT_PUBLIC_API_URL — must be empty (same-origin /api) or start with https:// (got scheme: ${NEXT_API_URL%%:*})"
 fi
 
 # 3b. JWT secrets >= 32 chars
@@ -219,6 +221,27 @@ if [[ -n "$ADMIN_EMAIL" ]]; then
     fail "TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL — looks like a placeholder (.example domain)"
   else
     ok "TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL — does not use .example domain"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Secret-file permissions (GOAL_PUBLIC_SECURITY S5-7)
+#    The env file holds every production secret — it must be owner-only (0600/0400),
+#    never group/world-readable. Never prints the file's contents.
+# ─────────────────────────────────────────────────────────────────────────────
+echo
+echo "--- 4. Secret-file permissions ---"
+# Linux `stat -c` first, BSD/macOS `stat -f` fallback.
+FILE_PERMS="$(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE" 2>/dev/null || echo '')"
+if [[ -z "$FILE_PERMS" ]]; then
+  fail "$ENV_FILE — could not determine file permissions (stat unavailable)"
+else
+  # Owner-only means no group/other bits: the last two octal digits must be 0
+  # (e.g. 600, 400, 700 — but not 640/644/660/…).
+  if [[ "$FILE_PERMS" =~ ^[0-7]+00$ ]]; then
+    ok "$ENV_FILE — owner-only permissions ($FILE_PERMS)"
+  else
+    fail "$ENV_FILE — must be owner-only 0600 (got $FILE_PERMS); run: chmod 600 $ENV_FILE"
   fi
 fi
 

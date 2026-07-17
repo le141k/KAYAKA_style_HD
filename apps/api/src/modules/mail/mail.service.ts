@@ -94,21 +94,7 @@ export class MailService {
    */
   async deliver(opts: SendMailOptions, throwOnError = false): Promise<void> {
     try {
-      const toStr = Array.isArray(opts.to) ? opts.to.join(', ') : opts.to;
-      const ccStr = opts.cc ? (Array.isArray(opts.cc) ? opts.cc.join(', ') : opts.cc) : undefined;
-      const bccStr = opts.bcc ? (Array.isArray(opts.bcc) ? opts.bcc.join(', ') : opts.bcc) : undefined;
-      await this.transporter.sendMail({
-        from: opts.from ?? this.config.TELECOM_HD_MAIL_FROM,
-        to: toStr,
-        subject: opts.subject,
-        html: opts.html,
-        text: opts.text,
-        ...(ccStr ? { cc: ccStr } : {}),
-        ...(bccStr ? { bcc: bccStr } : {}),
-        ...(opts.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}),
-        ...(opts.references ? { references: opts.references } : {}),
-        ...(opts.autoSubmitted ? { headers: { 'Auto-Submitted': opts.autoSubmitted } } : {}),
-      });
+      await this.deliverOrThrow(opts);
       this.logger.debug(`Mail sent to ${opts.to}: ${opts.subject}`);
     } catch (err) {
       this.logger.error(`Failed to send mail to ${opts.to}: ${String(err)}`);
@@ -117,6 +103,62 @@ export class MailService {
       // failure never crashes the ticket flow.
       if (throwOnError) throw err instanceof Error ? err : new Error(String(err));
     }
+  }
+
+  /** SMTP delivery that PROPAGATES failures (used by the strict security path). */
+  private async deliverOrThrow(opts: SendMailOptions): Promise<void> {
+    const toStr = Array.isArray(opts.to) ? opts.to.join(', ') : opts.to;
+    const ccStr = opts.cc ? (Array.isArray(opts.cc) ? opts.cc.join(', ') : opts.cc) : undefined;
+    const bccStr = opts.bcc ? (Array.isArray(opts.bcc) ? opts.bcc.join(', ') : opts.bcc) : undefined;
+    await this.transporter.sendMail({
+      from: opts.from ?? this.config.TELECOM_HD_MAIL_FROM,
+      to: toStr,
+      subject: opts.subject,
+      html: opts.html,
+      text: opts.text,
+      ...(ccStr ? { cc: ccStr } : {}),
+      ...(bccStr ? { bcc: bccStr } : {}),
+      ...(opts.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}),
+      ...(opts.references ? { references: opts.references } : {}),
+      // A5 mail-loop/bounce protection (preserved from main): stamp Auto-Submitted so
+      // downstream mailers don't auto-reply to our own notifications.
+      ...(opts.autoSubmitted ? { headers: { 'Auto-Submitted': opts.autoSubmitted } } : {}),
+    });
+  }
+
+  /**
+   * Render and send a security-critical template (password reset, magic link),
+   * PROPAGATING any enqueue/SMTP failure instead of swallowing it (GOAL_PUBLIC_SECURITY
+   * S1-4). The caller relies on this to fail closed — invalidating the issued token
+   * when the mail cannot be handed off — so a live token whose email silently
+   * vanished never dangles. Never logs the rendered body/subject (they carry the link).
+   */
+  async sendTemplateStrict(
+    to: string | string[],
+    templateKey: string,
+    locale: string,
+    vars: Record<string, string>,
+  ): Promise<void> {
+    const rendered = await this.renderTemplate(templateKey, locale, vars);
+    const opts: SendMailOptions = {
+      to,
+      subject: rendered.subject,
+      html: rendered.html,
+      text: rendered.text,
+    };
+    if (!this.mailQueue) {
+      // No queue wired (dev/test) — deliver inline and let SMTP errors propagate.
+      await this.deliverOrThrow(opts);
+      return;
+    }
+    // Enqueue only. A failure here (e.g. Redis down) PROPAGATES — unlike send(),
+    // we do NOT fall back to swallowing inline delivery for security mail.
+    await this.mailQueue.add('send', opts, {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 2000 },
+      removeOnComplete: true,
+      removeOnFail: 100,
+    });
   }
 
   /**

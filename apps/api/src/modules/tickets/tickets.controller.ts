@@ -13,13 +13,16 @@ import {
   Patch,
   Post,
   Query,
+  UseGuards,
   UsePipes,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { z } from 'zod';
 import { TicketsService } from './tickets.service';
 import { RequirePermissions, CurrentStaff, Public } from '../../auth/auth.decorators';
+import { ClientPortalGuard } from '../../auth/client-portal.guard';
+import { ClientAuthenticated, CurrentClient } from '../client-auth/client-auth.decorators';
+import type { ClientPrincipal } from '../client-auth/client-auth.service';
 import type { AuthStaff } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
@@ -79,6 +82,7 @@ export class TicketsController {
   // ─────────────────── Public submission (client portal) ───────────────────
 
   @Public()
+  @UseGuards(ClientPortalGuard)
   @Post('public')
   // Per-endpoint throttle (tighter than the global 300/60s) to curb portal spam/DoS.
   @Throttle({ default: { limit: PUBLIC_SUBMIT_LIMIT, ttl: 60000 } })
@@ -114,49 +118,40 @@ export class TicketsController {
 
   // ─────────────────── Client: my tickets ───────────────────
 
-  @Public()
+  @ClientAuthenticated()
   @Get('my')
   @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
-  @ApiOperation({ summary: "List the current requester's tickets by email (client portal)" })
-  listMy(@Query('email') email: string | undefined) {
-    return this.ticketsService.listMyTickets(this.requireEmailParam(email));
-  }
-
-  /** E1: validate the `email` query param as a real (bounded) email address. */
-  private requireEmailParam(email: string | undefined): string {
-    const parsed = z.string().trim().email().max(320).safeParse(email);
-    if (!parsed.success) {
-      throw new BadRequestException('Query parameter "email" must be a valid email address');
-    }
-    return parsed.data.toLowerCase();
+  @ApiOperation({ summary: "List the verified client's own tickets (session-authenticated)" })
+  listMy(@CurrentClient() client: ClientPrincipal) {
+    return this.ticketsService.listMyTickets(client.userId);
   }
 
   // ─────────────────── Client: public ticket detail ───────────────────
 
-  @Public()
+  @ClientAuthenticated()
   @Get('public/:id')
   @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
   @ApiOperation({
-    summary:
-      'Get a single ticket (no auth) with public posts only — no internal notes. Requires ?email= matching the ticket requester.',
+    summary: "Get one of the verified client's own tickets (public posts only, no internal notes).",
   })
-  getPublic(@Param('id', ParseIntPipe) id: number, @Query('email') email: string | undefined) {
-    return this.ticketsService.getPublicTicket(id, this.requireEmailParam(email));
+  getPublic(@Param('id', ParseIntPipe) id: number, @CurrentClient() client: ClientPrincipal) {
+    return this.ticketsService.getPublicTicket(id, client.userId);
   }
 
   // ─────────────────── Client: public reply ───────────────────
 
-  @Public()
+  @ClientAuthenticated()
   @Post('public/:id/reply')
   @Throttle({ default: { limit: PUBLIC_REPLY_LIMIT, ttl: 60000 } })
-  @ApiOperation({ summary: 'Add a user reply to a ticket from the client portal (no auth required)' })
+  @ApiOperation({ summary: "Add a reply to the verified client's own ticket (session-authenticated)" })
   async publicReply(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(PublicReplySchema)) dto: PublicReplyDto,
+    @CurrentClient() client: ClientPrincipal,
   ) {
-    const post = await this.ticketsService.publicReply(id, dto);
-    // D7: the raw TicketPost carries ipAddress, creationMode, staffId and the
-    // author email — strip them. The portal only needs the created post's identity.
+    const post = await this.ticketsService.publicReply(id, dto, client.userId);
+    // D7 (preserved from main): the raw TicketPost carries ipAddress, creationMode, staffId
+    // and the author email — strip them; the portal only needs the created post's identity.
     return {
       id: post.id,
       ticketId: post.ticketId,

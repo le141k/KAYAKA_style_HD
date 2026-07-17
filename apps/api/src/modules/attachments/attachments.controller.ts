@@ -9,6 +9,7 @@ import {
   Post,
   Res,
   UploadedFiles,
+  UseGuards,
   UseInterceptors,
   BadRequestException,
 } from '@nestjs/common';
@@ -20,6 +21,10 @@ import { randomUUID } from 'crypto';
 import type { Request } from 'express';
 import { APP_CONFIG, AppConfig } from '../../config/configuration';
 import { Public, RequirePermissions } from '../../auth/auth.decorators';
+import { ClientPortalGuard } from '../../auth/client-portal.guard';
+import { ClientAuthenticated, CurrentClient } from '../client-auth/client-auth.decorators';
+import type { ClientPrincipal } from '../client-auth/client-auth.service';
+import type { Attachment } from '@prisma/client';
 import { PERMISSIONS } from '../../auth/permissions';
 import { AttachmentsService } from './attachments.service';
 import { StorageService } from './storage.service';
@@ -122,6 +127,7 @@ export class AttachmentsController {
    */
   @Post('upload/public')
   @Public()
+  @UseGuards(ClientPortalGuard)
   @Throttle({ default: { limit: PUBLIC_UPLOAD_LIMIT, ttl: 60000 } })
   @UseInterceptors(FilesInterceptor('files', 5, buildMulterOpts(25)))
   async uploadPublic(
@@ -163,14 +169,35 @@ export class AttachmentsController {
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   async download(@Param('id', ParseIntPipe) id: number, @Res() res: Response): Promise<void> {
     const attachment = await this.attachmentsService.getAttachmentOrThrow(id);
+    this.streamAttachment(res, attachment);
+  }
 
+  /**
+   * Owner-scoped client download (GOAL_PUBLIC_SECURITY S2-8). Separate from the staff
+   * route: requires a verified client session and that the attachment belongs to a
+   * non-third-party POST on a ticket the client owns. Wrong owner/id → same 404. The
+   * `<a href>` navigation carries the HttpOnly th_client cookie automatically.
+   */
+  @ClientAuthenticated()
+  @Get('client/:id/download')
+  async clientDownload(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentClient() client: ClientPrincipal,
+    @Res() res: Response,
+  ): Promise<void> {
+    const attachment = await this.attachmentsService.getClientDownloadableOrThrow(id, client.userId);
+    this.streamAttachment(res, attachment);
+  }
+
+  /** Shared attachment streaming (staff + client download). */
+  private streamAttachment(res: Response, attachment: Attachment): void {
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(attachment.fileName)}"`);
     res.setHeader('Content-Type', attachment.mimeType);
     res.setHeader('Content-Length', attachment.size);
 
     const stream = this.storageService.createReadStream(attachment.storageKey);
     stream.on('error', (err) => {
-      this.logger.error(`Stream error for attachment ${id}: ${String(err)}`);
+      this.logger.error(`Stream error for attachment ${attachment.id}: ${String(err)}`);
       if (!res.headersSent) {
         res.status(500).end();
       }

@@ -132,6 +132,10 @@ model Staff {
   mobileNumber    String    @default("")
   timezone        String    @default("UTC")
   isEnabled       Boolean   @default(true)
+  // Bumped on every security-relevant change (password/disable/group/permission).
+  // Embedded in each access token as the `av` claim; the JWT guard rejects any token
+  // whose `av` no longer matches, so revocation is immediate (GOAL_PUBLIC_SECURITY S3).
+  authVersion     Int       @default(0)
   staffGroup      StaffGroup @relation(fields: [staffGroupId], references: [id])
   staffGroupId    Int
   // departments this agent can act in (empty = all, governed by group)
@@ -162,6 +166,15 @@ model RefreshToken {
   id        String   @id @default(uuid())
   staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
   staffId   Int
+  // Opaque rotation identifiers (S3-3): `jti` is the refresh JWT's id, looked up
+  // directly (no Argon2 scan); `familyId` groups a rotation chain so a detected replay
+  // can revoke the whole family.
+  jti       String   @unique
+  familyId  String
+  // The staff authVersion this token was issued under. A refresh whose row.authVersion
+  // no longer matches the staff record is rejected — so logout-all / password / group
+  // changes can't be outrun by a concurrently-rotating session (S3, race fix).
+  authVersion Int    @default(0)
   tokenHash String   @unique
   expiresAt DateTime
   revokedAt DateTime?
@@ -171,6 +184,7 @@ model RefreshToken {
   // Load: bound the refresh-rotation scan + support expired-token cleanup.
   @@index([staffId, revokedAt])
   @@index([staffId, expiresAt])
+  @@index([familyId])
 }
 
 model PasswordReset {
@@ -201,6 +215,40 @@ model RbacAuditLog {
   @@index([createdAt])
   @@index([actorStaffId])
   @@index([targetType, targetId])
+}
+
+// ─── Verified client (customer) auth — GOAL_PUBLIC_SECURITY S2 ───
+// Replaces "knowing an email" with a verified, revocable session bound to a stable
+// User.id. Only SHA-256 hashes of cryptographically-random tokens are stored; the raw
+// token is never persisted. `email` is an audit snapshot, NEVER the authorization key.
+
+model ClientLoginToken {
+  id        String    @id @default(uuid())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    Int
+  tokenHash String    @unique // sha256 hex of the single-use raw login token
+  email     String // normalized-email snapshot (audit only)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model ClientSession {
+  id         String    @id @default(uuid())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     Int
+  tokenHash  String    @unique // sha256 hex of the raw session cookie value
+  email      String // normalized-email snapshot (audit only)
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 // ───────────────────────────── customers / orgs ─────────────────────────────
@@ -255,6 +303,8 @@ model User {
   organizationId Int?
   emails         UserEmail[]
   tickets        Ticket[]
+  loginTokens    ClientLoginToken[]
+  sessions       ClientSession[]
   posts          TicketPost[]
   geoip          Json?
   customFields   Json          @default("{}")

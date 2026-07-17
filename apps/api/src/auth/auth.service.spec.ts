@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { BadRequestException, UnauthorizedException } from '@nestjs/common';
-import { AuthService } from './auth.service';
+import { AuthService, type ResetMailer } from './auth.service';
 import * as passwordUtil from './password.util';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { AppConfig } from '../config/configuration';
@@ -16,19 +16,31 @@ function makePrismaMock() {
     refreshToken: {
       create: vi.fn(),
       findMany: vi.fn(),
+      findUnique: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn(),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
+    passwordReset: {
+      create: vi.fn(),
+      findUnique: vi.fn(),
       update: vi.fn(),
       updateMany: vi.fn(),
     },
-    passwordReset: {
-      findUnique: vi.fn(),
-      updateMany: vi.fn(),
-    },
+    // Support BOTH styles: array form ($transaction([...]) → resolves []) used by the
+    // merged reset/revoke paths, and the legacy callback form ($transaction(fn) → fn(prisma)).
     $transaction: vi.fn(),
   };
-  prisma.$transaction.mockImplementation(async (callback: (tx: typeof prisma) => Promise<unknown>) =>
-    callback(prisma),
+  prisma.$transaction.mockImplementation((arg: unknown) =>
+    typeof arg === 'function'
+      ? (arg as (tx: typeof prisma) => Promise<unknown>)(prisma)
+      : Promise.resolve([]),
   );
   return prisma as unknown as PrismaService;
+}
+
+function makeMailMock() {
+  return { sendTemplateStrict: vi.fn().mockResolvedValue(undefined) };
 }
 
 function makeJwtMock() {
@@ -58,6 +70,7 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_INBOUND_WEBHOOK_SECRET: 'test-inbound-secret',
   TELECOM_HD_UPLOAD_DIR: '/tmp/uploads',
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: 25,
+  TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
 };
 
 const MOCK_STAFF_GROUP = {
@@ -81,6 +94,7 @@ const MOCK_STAFF = {
   mobileNumber: '',
   timezone: 'UTC',
   isEnabled: true,
+  authVersion: 0,
   staffGroupId: 1,
   staffGroup: MOCK_STAFF_GROUP,
   lastLoginAt: null,
@@ -230,6 +244,110 @@ describe('AuthService', () => {
     });
   });
 
+  // ─── refresh (S3-3 rotation) ─────────────────────────────────────────────────
+
+  describe('refresh', () => {
+    const RT_ROW = {
+      id: 'row-1',
+      staffId: 1,
+      jti: 'jti-1',
+      familyId: 'fam-1',
+      authVersion: 0, // matches MOCK_STAFF.authVersion
+      tokenHash: 'argon-hash',
+      expiresAt: new Date(Date.now() + 60_000),
+      revokedAt: null as Date | null,
+      createdAt: new Date(),
+    };
+
+    it('rotates a valid token: direct jti lookup, CAS consume, issues a new pair', async () => {
+      jwt.verify.mockReturnValue({ sub: 1, jti: 'jti-1', fid: 'fam-1' });
+      (prisma.refreshToken.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ ...RT_ROW });
+      vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(true);
+      vi.spyOn(passwordUtil, 'hashPassword').mockResolvedValue('new-hash');
+      (prisma.refreshToken.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
+      (prisma.refreshToken.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      const result = await service.refresh('raw-token');
+
+      expect(prisma.refreshToken.findUnique).toHaveBeenCalledWith({ where: { jti: 'jti-1' } });
+      // CAS consume keyed on jti + revokedAt null.
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { jti: 'jti-1', revokedAt: null } }),
+      );
+      expect(result).toHaveProperty('accessToken');
+      expect(result).toHaveProperty('refreshToken');
+      // The rotated pair must NOT leak the internal refreshJti.
+      expect(result).not.toHaveProperty('refreshJti');
+    });
+
+    it('rejects an unknown jti (no scan)', async () => {
+      jwt.verify.mockReturnValue({ sub: 1, jti: 'ghost', fid: 'fam-1' });
+      (prisma.refreshToken.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+
+      await expect(service.refresh('raw-token')).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('rejects when the raw token does not match the stored hash', async () => {
+      jwt.verify.mockReturnValue({ sub: 1, jti: 'jti-1', fid: 'fam-1' });
+      (prisma.refreshToken.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ ...RT_ROW });
+      vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(false);
+
+      await expect(service.refresh('raw-token')).rejects.toThrow(UnauthorizedException);
+      expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('a concurrent loser (CAS count 0, revoked just now) fails WITHOUT revoking the family', async () => {
+      jwt.verify.mockReturnValue({ sub: 1, jti: 'jti-1', fid: 'fam-1' });
+      // Row read as still-active; the winner revokes it between our read and CAS.
+      (prisma.refreshToken.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...RT_ROW,
+        revokedAt: null,
+      });
+      vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(true);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
+      (prisma.refreshToken.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+
+      await expect(service.refresh('raw-token')).rejects.toThrow('already rotated');
+      // Only the CAS updateMany ran — no family-wide revocation.
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('a genuine later replay (revoked long ago, CAS count 0) revokes the whole family', async () => {
+      jwt.verify.mockReturnValue({ sub: 1, jti: 'jti-1', fid: 'fam-1' });
+      (prisma.refreshToken.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...RT_ROW,
+        revokedAt: new Date(Date.now() - 60_000), // rotated a minute ago
+      });
+      vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(true);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
+      (prisma.refreshToken.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+
+      await expect(service.refresh('raw-token')).rejects.toThrow('reuse detected');
+      // CAS (count 0) + a second updateMany that revokes the family.
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledTimes(2);
+      expect(prisma.refreshToken.updateMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({ where: { familyId: 'fam-1', revokedAt: null } }),
+      );
+    });
+
+    it('rejects a refresh whose stamped authVersion is stale — WITHOUT a replay alarm (race fix)', async () => {
+      // The token's row.authVersion (0) no longer matches the staff (bumped to 1 by a
+      // logout-all / password change). Must reject BEFORE the CAS, with no family-revoke.
+      jwt.verify.mockReturnValue({ sub: 1, jti: 'jti-1', fid: 'fam-1' });
+      (prisma.refreshToken.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ ...RT_ROW });
+      vi.spyOn(passwordUtil, 'verifyPassword').mockResolvedValue(true);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_STAFF,
+        authVersion: 1,
+      });
+
+      await expect(service.refresh('raw-token')).rejects.toThrow('invalidated');
+      // No CAS, no family revocation — the security change already revoked the family.
+      expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
   // ─── logout ────────────────────────────────────────────────────────────────
 
   describe('logout', () => {
@@ -272,9 +390,14 @@ describe('AuthService', () => {
 
       await service.resetPassword('single-use-token', 'newpassword');
 
+      // S1-5 atomic consume is keyed by the token HASH (not id) and claimed outside a tx.
       expect(prisma.passwordReset.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: expect.objectContaining({ id: 9, usedAt: null, expiresAt: expect.anything() }),
+          where: expect.objectContaining({
+            tokenHash: expect.any(String),
+            usedAt: null,
+            expiresAt: expect.anything(),
+          }),
         }),
       );
       expect(sessions.revokeAllForStaff).toHaveBeenCalledWith(1);
@@ -311,6 +434,112 @@ describe('AuthService', () => {
         lastName: 'Staff',
         fullName: 'Test Staff',
       });
+    });
+  });
+
+  // ─── forgotPassword ──────────────────────────────────────────────────────────
+
+  describe('forgotPassword', () => {
+    function makeServiceWithMail(mail: ReturnType<typeof makeMailMock>) {
+      return new AuthService(
+        prisma as unknown as PrismaService,
+        jwt as unknown as import('@nestjs/jwt').JwtService,
+        TEST_CONFIG,
+        undefined, // blocklist
+        undefined, // sessions (SessionRevocationService)
+        mail as unknown as ResetMailer,
+      );
+    }
+
+    it('is a silent no-op for an unknown/disabled email (no token, no mail)', async () => {
+      const mail = makeMailMock();
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+
+      await makeServiceWithMail(mail).forgotPassword('nobody@example.com');
+
+      expect(prisma.passwordReset.create).not.toHaveBeenCalled();
+      expect(mail.sendTemplateStrict).not.toHaveBeenCalled();
+    });
+
+    it('creates a token and dispatches the reset mail with a fragment URL', async () => {
+      const mail = makeMailMock();
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
+      (prisma.passwordReset.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+      (prisma.passwordReset.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 42 });
+
+      await makeServiceWithMail(mail).forgotPassword('test@23telecom.example');
+
+      expect(prisma.passwordReset.create).toHaveBeenCalledTimes(1);
+      expect(mail.sendTemplateStrict).toHaveBeenCalledTimes(1);
+      const [, key, , vars] = mail.sendTemplateStrict.mock.calls[0] as [
+        string,
+        string,
+        string,
+        Record<string, string>,
+      ];
+      expect(key).toBe('password_reset');
+      // Token must be delivered in the URL fragment, never the query string.
+      expect(vars.resetUrl).toContain('/reset-password#token=');
+      expect(vars.resetUrl).not.toContain('?token=');
+    });
+
+    it('invalidates the freshly-issued token and stays silent when dispatch fails', async () => {
+      const mail = makeMailMock();
+      mail.sendTemplateStrict.mockRejectedValue(new Error('redis down'));
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
+      (prisma.passwordReset.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+      (prisma.passwordReset.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 42 });
+
+      // Must NOT throw (generic response / no enumeration).
+      await expect(
+        makeServiceWithMail(mail).forgotPassword('test@23telecom.example'),
+      ).resolves.toBeUndefined();
+
+      // The created token (id 42) is invalidated so no live token dangles.
+      expect(prisma.passwordReset.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 42, usedAt: null } }),
+      );
+    });
+  });
+
+  // ─── resetPassword (atomic consume) ──────────────────────────────────────────
+
+  describe('resetPassword', () => {
+    it('consumes an unused token exactly once and updates the password', async () => {
+      vi.spyOn(passwordUtil, 'hashPassword').mockResolvedValue('new-hash');
+      (prisma.passwordReset.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.passwordReset.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 7,
+        staffId: 1,
+        tokenHash: 'hash',
+        usedAt: new Date(),
+        expiresAt: new Date(Date.now() + 1000),
+      });
+
+      await service.resetPassword('raw-token', 'new-password-123');
+
+      // Conditional consume keyed on usedAt:null AND not expired.
+      expect(prisma.passwordReset.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            usedAt: null,
+            expiresAt: expect.objectContaining({ gt: expect.any(Date) }),
+          }),
+        }),
+      );
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a replayed/used/expired token (zero rows consumed) without changing the password', async () => {
+      vi.spyOn(passwordUtil, 'hashPassword').mockResolvedValue('new-hash');
+      (prisma.passwordReset.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+
+      await expect(service.resetPassword('raw-token', 'new-password-123')).rejects.toThrow(
+        BadRequestException,
+      );
+
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.passwordReset.findUnique).not.toHaveBeenCalled();
     });
   });
 });

@@ -38,6 +38,17 @@ const schema = z.object({
   // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_FIELD_ENCRYPTION_KEY: z.string().optional(),
+  // Fail-closed gate for the anonymous client portal (GOAL_PUBLIC_SECURITY S2-1).
+  // The legacy "email-as-password" ticket routes and public upload are an IDOR and
+  // must stay unreachable in PRODUCTION until the verified client-session flow (S2)
+  // and public-abuse controls (S4) land. Defaults CLOSED; dev/test are unaffected.
+  // NB: z.coerce.boolean() treats "false" as truthy → parse explicitly.
+  TELECOM_HD_CLIENT_PORTAL_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
 });
 
 export type AppConfig = z.infer<typeof schema>;
@@ -77,6 +88,21 @@ export function assertProductionSecrets(cfg: AppConfig): void {
   // Field-encryption key, if provided, must be a real 64-hex (256-bit) key.
   if (cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY && !/^[0-9a-f]{64}$/i.test(cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY)) {
     problems.push('  - TELECOM_HD_FIELD_ENCRYPTION_KEY: must be 64 hex chars (256-bit) when set');
+  }
+
+  // S5-7: the public origin and mail host must be REAL in production — the dev localhost defaults
+  // would silently break the CSRF origin allowlist, the magic-link/reset URLs, and outbound mail.
+  // (These are config values, not secrets, so they use targeted checks rather than the secret
+  // placeholder pattern — which would falsely reject legitimate domains containing "example".)
+  const publicUrl = cfg.TELECOM_HD_PUBLIC_URL ?? '';
+  if (!/^https:\/\//i.test(publicUrl) || /localhost|127\.0\.0\.1|\[::1\]/i.test(publicUrl)) {
+    problems.push(
+      '  - TELECOM_HD_PUBLIC_URL: must be a real https:// origin in production (not the localhost default)',
+    );
+  }
+  const smtpHost = (cfg.TELECOM_HD_SMTP_HOST ?? '').trim();
+  if (smtpHost === '' || /^(localhost|127\.0\.0\.1|\[::1\]|mailhog)$/i.test(smtpHost)) {
+    problems.push('  - TELECOM_HD_SMTP_HOST: must be a real mail host in production (not localhost/MailHog)');
   }
 
   if (problems.length) {

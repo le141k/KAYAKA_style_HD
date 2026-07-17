@@ -1,11 +1,15 @@
 import { Global, Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
+import { BullModule } from '@nestjs/bullmq';
 import { AuthService, MAIL_SERVICE_TOKEN } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { PermissionsGuard } from './permissions.guard';
+import { ClientPortalGuard } from './client-portal.guard';
 import { TokenBlocklistService } from './token-blocklist.service';
 import { SessionRevocationService } from './session-revocation.service';
+import { LoginThrottleService } from './login-throttle.service';
+import { MailService } from '../modules/mail/mail.service';
 import { loadConfig, APP_CONFIG } from '../config/configuration';
 
 const config = loadConfig();
@@ -17,26 +21,37 @@ const config = loadConfig();
       secret: config.TELECOM_HD_JWT_ACCESS_SECRET,
       signOptions: { expiresIn: config.TELECOM_HD_JWT_ACCESS_TTL },
     }),
+    // Narrow acyclic reset-mail adapter (GOAL_PUBLIC_SECURITY S1-3). We register only
+    // the 'mail' producer queue and provide MailService LOCALLY, rather than importing
+    // MailModule. Importing mail.module.ts at the top level would eagerly pull the
+    // Mail→Tickets→Sla→Mail module-load cycle before it is initialized (a JS
+    // "Cannot access 'MailModule' before initialization" at boot); importing only
+    // mail.service.ts is cycle-free. This local MailService enqueues onto the same
+    // Redis 'mail' queue that MailModule's processor consumes.
+    BullModule.registerQueue({ name: 'mail' }),
   ],
   controllers: [AuthController],
   providers: [
     // Provide config locally so AuthService can inject it via APP_CONFIG
     { provide: APP_CONFIG, useValue: config },
-    // MAIL_SERVICE_TOKEN is satisfied by AppModule when MailModule is imported.
-    // Using undefined here means AuthModule itself doesn't import MailModule
-    // (avoiding a circular dependency); AppModule overrides this with the real
-    // MailService via the MAIL_SERVICE_TOKEN provider.
-    { provide: MAIL_SERVICE_TOKEN, useValue: undefined },
+    // Local MailService instance (see the adapter note above) + bind the reset-mail
+    // port to it. Previously the token was `useValue: undefined`, which silently
+    // disabled reset mail and forced the dev fallback that LOGGED the raw reset URL.
+    MailService,
+    { provide: MAIL_SERVICE_TOKEN, useExisting: MailService },
     AuthService,
     JwtAuthGuard,
     PermissionsGuard,
+    ClientPortalGuard,
     TokenBlocklistService,
     SessionRevocationService,
+    LoginThrottleService,
   ],
   exports: [
     AuthService,
     JwtAuthGuard,
     PermissionsGuard,
+    ClientPortalGuard,
     TokenBlocklistService,
     SessionRevocationService,
     JwtModule,

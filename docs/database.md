@@ -31,13 +31,13 @@
 
 ### 1. Staff & RBAC
 
-| Model             | Key columns                                                                                                                                                                                         | Relations                                                                                                                                                                     |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **StaffGroup**    | `id`, `title`, `isAdmin Bool`, `permissions String[]`                                                                                                                                               | has many `Staff`                                                                                                                                                              |
-| **Staff**         | `id`, `email` (unique), `username` (unique), `firstName`, `lastName`, `passwordHash` (argon2id), `designation`, `signature`, `mobileNumber`, `timezone`, `isEnabled`, `staffGroupId`, `lastLoginAt` | belongs to `StaffGroup`; has many `DepartmentStaff`, `ownedTickets` (Ticket via "TicketOwner"), `TicketPost`, `TicketNote`, `TicketAuditLog`, `RefreshToken`, `TicketWatcher` |
-| **RefreshToken**  | `id` (UUID), `staffId`, `tokenHash` (unique), `expiresAt`, `revokedAt?`, `createdAt`                                                                                                                | belongs to `Staff` (cascade delete)                                                                                                                                           |
-| **PasswordReset** | `id`, `staffId`, `tokenHash` (unique, sha256), `expiresAt`, `usedAt?`, `createdAt`                                                                                                                  | —                                                                                                                                                                             |
-| **RbacAuditLog**  | `id`, `actorStaffId?`, `actorEmail`, `action`, `targetType` (`staff`\|`group`), `targetId?`, `targetLabel`, `metadata Json`, `createdAt`                                                            | append-only; `actorStaffId` is a plain int (no FK) so rows survive actor removal                                                                                              |
+| Model             | Key columns                                                                                                                                                                                                                                                                                      | Relations                                                                                                                                                                     |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **StaffGroup**    | `id`, `title`, `isAdmin Bool`, `permissions String[]`                                                                                                                                                                                                                                            | has many `Staff`                                                                                                                                                              |
+| **Staff**         | `id`, `email` (unique), `username` (unique), `firstName`, `lastName`, `passwordHash` (argon2id), `designation`, `signature`, `mobileNumber`, `timezone`, `isEnabled`, `authVersion Int` (default 0 — S3), `failedLoginAttempts Int` (default 0 — D2), `lockedUntil DateTime?` (D2), `staffGroupId`, `lastLoginAt` | belongs to `StaffGroup`; has many `DepartmentStaff`, `ownedTickets` (Ticket via "TicketOwner"), `TicketPost`, `TicketNote`, `TicketAuditLog`, `RefreshToken`, `TicketWatcher` |
+| **RefreshToken**  | `id` (UUID), `staffId`, `jti` (unique — opaque rotation id), `familyId` (indexed — rotation chain), `authVersion Int` (issue-time staff authVersion — stale rows rejected on refresh), `tokenHash` (unique), `expiresAt`, `revokedAt?`, `createdAt`; indexes `[staffId,revokedAt]`, `[staffId,expiresAt]`, `[familyId]` | belongs to `Staff` (cascade delete)                                                                                                                                           |
+| **PasswordReset** | `id`, `staffId`, `tokenHash` (unique, sha256), `expiresAt`, `usedAt?`, `createdAt`                                                                                                                                                                                                                | —                                                                                                                                                                             |
+| **RbacAuditLog**  | `id`, `actorStaffId?`, `actorEmail`, `action`, `targetType` (`staff`\|`group`), `targetId?`, `targetLabel`, `metadata Json`, `createdAt`                                                                                                                                                          | append-only; `actorStaffId` is a plain int (no FK) so rows survive actor removal                                                                                              |
 
 `StaffGroup.permissions` is an array of permission-key strings defined in `apps/api/src/auth/permissions.ts`. There are three built-in role templates (`ROLE_TEMPLATES`): **Administrator** (`isAdmin`, `ALL_PERMISSIONS`), **Manager** (`ROLE_PRESETS.manager` — tickets/users/orgs/KB/reports, no `staff.manage`/`org.delete`/`admin.*`), and **Agent** (`ROLE_PRESETS.agent`). `GET /api/staff/rbac` serves the catalog + templates.
 
@@ -55,6 +55,14 @@
 `User.customFields` and `Organization.customFields` store custom-field values as `{ [fieldKey]: value }` JSONB objects, where keys correspond to `CustomField.fieldKey` records in the matching `CustomFieldGroup` (scope `USER` or `ORGANIZATION`).
 
 `User.geoip` is a freeform JSONB blob populated from inbound-email GeoIP lookup (optional).
+
+**Verified client auth (GOAL_PUBLIC_SECURITY S2).** Two models back the magic-link → session
+flow, both bound to a stable `User.id` and storing only SHA-256 hashes (never the raw token):
+
+| Model                | Key columns                                                                                                                                                             | Relations                   |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| **ClientLoginToken** | `id` (uuid), `userId`, `tokenHash` (unique), `email` (audit snapshot), `expiresAt`, `usedAt?`, `createdAt` — single-use magic-link token                                | belongs to `User` (cascade) |
+| **ClientSession**    | `id` (uuid), `userId`, `tokenHash` (unique), `email` (audit snapshot), `expiresAt`, `revokedAt?`, `createdAt`, `lastSeenAt` — the session behind the `th_client` cookie | belongs to `User` (cascade) |
 
 ---
 
@@ -133,7 +141,11 @@ Denormalized counters (`totalReplies`, `hasAttachments`, `hasNotes`) are updated
 | **EmailQueue**    | `id`, `type EmailQueueType`, `emailAddress`, `host`, `port Int` (default 993), `username`, `passwordEnc` (encrypted at rest), `useTls Bool`, `departmentId?`, `signature`, `isEnabled Bool`, `createdAt` | Optional FK to `Department` |
 | **EmailTemplate** | `id`, `key` (e.g. `ticket_user_reply`, `autoresponder`, `sla_breach_internal`), `locale` (default `en`), `subject`, `htmlBody`, `textBody`, `updatedAt`; unique `(key, locale)`                          | —                           |
 
-Templates use `{{placeholder}}` interpolation (mustache-style). Seeded templates cover `ticket_user_reply` and `autoresponder` in English and Russian, plus `sla_breach_internal` in English.
+Templates use `{{placeholder}}` interpolation (mustache-style). Seeded templates cover
+`ticket_user_reply` and `autoresponder` in English and Russian, plus `sla_breach_internal`,
+`notify_staff_assigned`, `notify_staff_user_replied` and `password_reset` in English.
+`password_reset` is additionally provisioned in production by migration
+`20260716000000_password_reset_template` (the production seed does not run).
 
 ---
 
@@ -301,9 +313,11 @@ Staff ──────────────────── ownerStaffId 
 | Table                | Indexed columns                                                                     |
 | -------------------- | ----------------------------------------------------------------------------------- |
 | `Staff`              | `staffGroupId`                                                                      |
-| `RefreshToken`       | `staffId`                                                                           |
+| `RefreshToken`       | `staffId`, `(staffId, revokedAt)`, `(staffId, expiresAt)`, `familyId`               |
 | `PasswordReset`      | `staffId`                                                                           |
 | `RbacAuditLog`       | `createdAt`, `actorStaffId`, `(targetType, targetId)`                               |
+| `ClientLoginToken`   | `userId`, `expiresAt`                                                               |
+| `ClientSession`      | `userId`, `expiresAt`                                                               |
 | `User`               | `organizationId`                                                                    |
 | `UserEmail`          | `userId`                                                                            |
 | `Ticket`             | `statusId`, `departmentId`, `ownerStaffId`, `userId`, `lastActivityAt`, `createdAt` |
@@ -345,11 +359,35 @@ Staff ──────────────────── ownerStaffId 
 
 Migrations live under `apps/api/prisma/migrations/` and are managed by Prisma Migrate.
 
-| Migration                               | Name                   | Contents                                                                                                  |
-| --------------------------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------- |
-| `20260522130915_init`                   | init                   | Full initial schema — all core tables, enums, indexes                                                     |
-| `20260522131515_troubleshooter_reports` | troubleshooter_reports | Adds `TroubleshooterCategory`, `TroubleshooterStep`, `TroubleshooterStepLink`, `Report`, `ReportSchedule` |
-| `20260716000000_rbac_audit_log`         | rbac_audit_log         | Adds `RbacAuditLog` (append-only RBAC/staff-change audit trail) + its indexes                             |
+| Migration                                       | Name                           | Contents                                                                                                                                                                                                                                                                                                                                                                               |
+| ----------------------------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `20260522130915_init`                           | init                           | Full initial schema — all core tables, enums, indexes                                                                                                                                                                                                                                                                                                                                  |
+| `20260522131515_troubleshooter_reports`         | troubleshooter_reports         | Adds `TroubleshooterCategory`, `TroubleshooterStep`, `TroubleshooterStepLink`, `Report`, `ReportSchedule`                                                                                                                                                                                                                                                                              |
+| `20260525093448_load_indexes_batch_c`           | load_indexes_batch_c           | Load indexes (RefreshToken/Workflow/TicketAuditLog/ReportSchedule) — main Batch C                                                                                                                                                                                                                                                                                                      |
+| `20260525095406_staff_login_lockout`            | staff_login_lockout            | Adds `Staff.failedLoginAttempts` + `lockedUntil` (D2 per-account login lockout) — main                                                                                                                                                                                                                                                                                                 |
+| `20260525100622_search_trgm_indexes_batch_c5`   | search_trgm_indexes_batch_c5   | GIN trigram search indexes (`pg_trgm`) — main Batch C5                                                                                                                                                                                                                                                                                                                                  |
+| `20260525115707_emailqueue_unique_email`        | emailqueue_unique_email        | `EmailQueue.emailAddress @unique` for atomic importer upsert — main                                                                                                                                                                                                                                                                                                                    |
+| `20260716000000_password_reset_template`        | password_reset_template        | Data-only idempotent upsert of the `password_reset` EmailTemplate (en) for **production** (GOAL_PUBLIC_SECURITY S1-4)                                                                                                                                                                                                                                                                 |
+| `20260716000000_rbac_audit_log`                 | rbac_audit_log                 | Adds `RbacAuditLog` (append-only RBAC/staff-change audit trail) + its indexes — main                                                                                                                                                                                                                                                                                                   |
+| `20260716010000_staff_auth_version`             | staff_auth_version             | Adds `Staff.authVersion Int NOT NULL DEFAULT 0` for immediate session invalidation — access-token `av` claim checked by the JWT guard (GOAL_PUBLIC_SECURITY S3-1)                                                                                                                                                                                                                     |
+| `20260716020000_refresh_token_rotation`         | refresh_token_rotation         | Adds `RefreshToken.jti` (unique) + `familyId` (indexed) for direct rotation lookup; clears pre-existing rows (GOAL_PUBLIC_SECURITY S3-3)                                                                                                                                                                                                                                              |
+| `20260716030000_refresh_auth_version`           | refresh_auth_version           | Adds `RefreshToken.authVersion` (issue-time staff authVersion) so a concurrent rotation can't outrun logout-all / password / permission changes (GOAL_PUBLIC_SECURITY S3 race fix)                                                                                                                                                                                                     |
+| `20260716165721_client_auth`                    | client_auth                    | Adds `ClientLoginToken` + `ClientSession` (verified client sessions bound to `User.id`) (GOAL_PUBLIC_SECURITY S2)                                                                                                                                                                                                                                                                      |
+| `20260716170000_client_login_template`          | client_login_template          | Data-only idempotent upsert of the `client_login_link` EmailTemplate (en) for production (GOAL_PUBLIC_SECURITY S2-4)                                                                                                                                                                                                                                                                   |
+| `20260716180000_normalize_user_email_ownership` | normalize_user_email_ownership | Data-only, idempotent: normalizes existing `UserEmail.email` (trim+lowercase) for non-colliding rows, and backfills `Ticket.userId` from the normalized requester email **only when it maps to exactly one user**. Does **not** add the case-insensitive `UNIQUE(email)` invariant yet (GOAL_PUBLIC_SECURITY S2-2) |
+
+> **UserEmail normalization invariant (S2-2).** All write paths (`UsersService.findByEmail`/
+> `findOrCreate`/`create`/`addEmail`, and everything routing through them incl. ticket create and
+> inbound mail) now normalize the address via `common/email.util.ts#normalizeEmail` (trim +
+> lowercase) before lookup or insert, so `Foo@Bar.com` and `foo@bar.com` resolve to one owner. The
+> **DB-level** case-insensitive `UNIQUE(email)` constraint is intentionally **deferred**: it asserts
+> "an email is never shared across users", which must be confirmed against production data first.
+> Run `npm run audit:ownership -w apps/api` (read-only) to list case-insensitive duplicate groups and
+> unlinkable tickets before enforcing it. Until it lands, the app's `create`/`addEmail` conflict
+> checks use the case-sensitive index, so they can't detect a pre-existing row the migration left
+> un-normalized (a member of a collision group) — resolving those groups via the audit is the fix.
+> The migration and audit both `btrim` the same ASCII whitespace set (` \t\n\r\f\x0B`) that JS
+> `String.trim()` strips, so "normalized" means the same thing in SQL and in `normalizeEmail`.
 
 **Apply migrations (CI / production):**
 
@@ -382,7 +420,7 @@ The seed is **idempotent** (uses upsert / find-or-create; safe to re-run). It cr
 | TicketPriorities | Low, Normal, High, Urgent                                                                                            |
 | TicketTypes      | Issue, Question, Incident, Alaris Incident                                                                           |
 | SLA              | `Standard SLA` plan (first response 4 h, resolution 24 h) + `Standard Business Hours` schedule (Mon–Fri 09:00–18:00) |
-| EmailTemplates   | `ticket_user_reply` (en + ru), `autoresponder` (en + ru), `sla_breach_internal` (en) — 5 template versions           |
+| EmailTemplates   | `ticket_user_reply` (en + ru), `autoresponder` (en + ru), `sla_breach_internal` (en), `notify_staff_assigned` (en), `notify_staff_user_replied` (en), `password_reset` (en) — 8 template versions (`password_reset` also provisioned in prod via migration) |
 | Organizations    | `Acme Corp` (Moscow, RU, slaPlanId set), `Beta LLC` (Saint Petersburg, RU)                                           |
 | Users            | Ivan Petrov, Maria Sidorova (Acme Corp), Dmitry Volkov (Beta LLC), Guest User                                        |
 | Demo Tickets     | 5 tickets covering Support + NOC departments, various priorities/types, first 2 with agent replies                   |

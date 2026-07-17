@@ -48,3 +48,6 @@ secrets.md
 .port-macros.py
 .macros.json
 .macros-cats.json
+
+# Redis snapshot files (e.g. from a local redis-server used for testing)
+*.rdb

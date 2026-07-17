@@ -19,8 +19,11 @@ import type {
 } from './dto';
 import type { Staff, StaffGroup } from '@prisma/client';
 
-/** Safe staff shape — never exposes passwordHash or the internal lockout columns. */
-export type SafeStaff = Omit<Staff, 'passwordHash' | 'failedLoginAttempts' | 'lockedUntil'>;
+/** Safe staff shape — never exposes passwordHash or the internal lockout/authVersion columns. */
+export type SafeStaff = Omit<
+  Staff,
+  'passwordHash' | 'failedLoginAttempts' | 'lockedUntil' | 'authVersion'
+>;
 
 type SafeStaffWithGroup = SafeStaff & { staffGroup: StaffGroup };
 
@@ -140,6 +143,13 @@ export class StaffService {
         dto.permissions !== undefined && !sameStringSet(before.permissions, updated.permissions);
 
       if (permissionsChanged) {
+        // Bump authVersion for every member so stale permission claims in existing access
+        // tokens are rejected on their next request (S3-2), then fire main's session
+        // revocation (refresh revoke + Redis access cutoff).
+        await this.prisma.staff.updateMany({
+          where: { staffGroupId: id },
+          data: { authVersion: { increment: 1 } },
+        });
         await this.sessions?.revokeAllForGroup(id);
         await this.audit?.log({
           actor,
@@ -347,6 +357,10 @@ export class StaffService {
       const passwordChanged = !!passwordHash;
       const enabledChanged = dto.isEnabled !== undefined && dto.isEnabled !== before.isEnabled;
       const disabling = enabledChanged && dto.isEnabled === false;
+      const emailChanged = dto.email !== undefined && dto.email !== before.email;
+      // A new password, a role/group swap, an email change, or a disable must invalidate
+      // existing sessions immediately (S3-2 + blocker #5: email change too).
+      const sessionInvalidating = roleChanged || passwordChanged || disabling || emailChanged;
 
       // Never strand the deployment without an administrator. The advisory lock
       // makes this count-and-write sequence safe across API processes.
@@ -356,6 +370,9 @@ export class StaffService {
 
       const data: Record<string, unknown> = { ...rest };
       if (passwordHash) data['passwordHash'] = passwordHash;
+      // Bump authVersion in the same write so every outstanding access token for this
+      // staff fails the guard's `av` check on its next request.
+      if (sessionInvalidating) data['authVersion'] = { increment: 1 };
 
       if (departmentIds !== undefined) {
         // Replace department assignments while the staff/RBAC mutation is serialized.
@@ -373,9 +390,9 @@ export class StaffService {
         select: SAFE_STAFF_SELECT,
       });
 
-      // Any access-affecting change invalidates existing sessions (role swap,
-      // admin password reset, or disable). Re-enabling does NOT revoke.
-      if (roleChanged || passwordChanged || disabling) {
+      // Any access-affecting change invalidates existing sessions (role swap, admin
+      // password reset, email change, or disable). Re-enabling does NOT revoke.
+      if (sessionInvalidating) {
         await this.sessions?.revokeAllForStaff(id);
       }
 
@@ -391,13 +408,15 @@ export class StaffService {
       this.assertCanManageStaffTarget(before, actor);
       await this.assertNotRemovingLastAdmin(before, { disabling: true });
 
+      // Disable + bump authVersion in the same write so the account loses access at once
+      // (S3-2); every outstanding access token fails the guard's `av` check next request.
       const updated = await this.prisma.staff.update({
         where: { id },
-        data: { isEnabled: false },
+        data: { isEnabled: false, authVersion: { increment: 1 } },
         select: SAFE_STAFF_SELECT,
       });
 
-      // Only revoke if this actually transitioned enabled → disabled.
+      // Only revoke refresh/Redis if this actually transitioned enabled → disabled.
       if (before.isEnabled) {
         await this.sessions?.revokeAllForStaff(id);
       }
