@@ -617,9 +617,15 @@ External service/container/config additions in this batch require approval befor
       credentials, parse JWT JSON, assume Swagger or print webhook secrets. Update dev `smoke.sh`,
       diagnostics and e2e separately. Update `scripts/verify.sh` so production verification fails—not
       silently skips—when the target stack/smoke prerequisites are absent.
-- [ ] **S6-3 Apply migrations to a fresh database.** Prove every migration applies from zero and
-      upgrades a restored production-shaped copy. Prefer expand/contract migrations compatible with
-      the previous image; document the forward-fix boundary and never test destructive rollback live.
+- [~] **S6-3 Apply migrations to a fresh database.** Prove every migration applies from zero and
+  upgrades a restored production-shaped copy. Prefer expand/contract migrations compatible with
+  the previous image; document the forward-fix boundary and never test destructive rollback live.
+  _(From-zero proof done locally: `prisma migrate deploy` applied the full chain — including the
+  new `20260716180000_normalize_user_email_ownership` — to a fresh empty DB with "All migrations
+  have been successfully applied", then `npm run seed` populated it and `npm run audit:ownership`
+  reported CLEAN (0 duplicate/un-normalized/ambiguous, 1 expected orphan: the Alaris system ticket
+  `alaris@system.internal`, which has no registered user). **Still open (VM):** upgrading a
+  restored production-shaped copy behind the allowlist + documenting the forward-fix boundary.)_
 - [ ] **S6-4 Run the security repro matrix behind the allowlist.** At minimum, prove anonymous/email-only
       client list/detail/reply/download fail; Client A cannot access/mutate Client B; secrets never
       appear in JSON/logs; old sessions fail after password/role/disable/logout; wrong-origin or
