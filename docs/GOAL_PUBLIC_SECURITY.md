@@ -4,6 +4,20 @@ _Created: 2026-07-16. Status: **IN PROGRESS — PUBLIC GO-LIVE BLOCKED**. All co
 
 Run later as an implementation goal: `/goal docs/GOAL_PUBLIC_SECURITY.md`.
 
+> **Integration (branch `claude/helpdesk-security-integration`).** The security work was merged
+> onto the current `origin/main` (RBAC/Manager, session revocation, last-admin guard, inbound
+> webhook, D2 login lockout, mail retry) — 14 conflicts resolved preserving BOTH sides; migrations
+> apply from zero AND as an upgrade of a main-shaped DB (28 migrations, no drift). A review pass
+> then closed these gaps: **#3** `ClientPortalGuard` now fail-closes the ENTIRE client surface in
+> prod (request-link/verify/list/detail/reply/download → 404 unless enabled; verified live 404↔202);
+> **#5** `User.isEnabled` enforced at link issuance + session resolution; **#6** SMTP-retry
+> (`throwOnError`) preserved with a regression test; **#7** a staff security change (admin reset /
+> disable / logout-all) now burns pending password-reset links, and reset rejects a disabled staff;
+> plus a per-owner magic-link mail-bomb cap, `audit:ownership` non-zero exit on NOT-CLEAN, and the
+> web `fileName` fix. Gate: **API 756 unit tests green, API+web typecheck + lint clean, boot smoke
+> OK.** Still NOT done (unchanged): the browser magic-link/logout e2e (needs mail interception —
+> S6), and the gated S4 / cookie-only / VM tracks.
+
 This plan closes the security bugs found during the 2026-07-16 read-only review. The portal must
 remain behind the current CIDR/Tailscale restriction until the full Definition of Done is green.
 
