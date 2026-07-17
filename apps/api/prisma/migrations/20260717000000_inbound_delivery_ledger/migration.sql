@@ -50,10 +50,11 @@ CREATE TABLE "InboundDelivery" (
 CREATE UNIQUE INDEX "InboundDelivery_transportKey_key" ON "InboundDelivery"("transportKey");
 CREATE INDEX "InboundDelivery_state_nextAttemptAt_idx" ON "InboundDelivery"("state", "nextAttemptAt");
 CREATE INDEX "InboundDelivery_queueId_uidValidity_uid_idx" ON "InboundDelivery"("queueId", "uidValidity", "uid");
--- Atomic logical-message claim: at most one delivery may own a given non-empty
--- Message-ID (race-safe dedup — replaces check-then-act). NULL/empty ids are exempt.
-CREATE UNIQUE INDEX "InboundDelivery_messageId_key" ON "InboundDelivery"("messageId")
-    WHERE "messageId" IS NOT NULL;
+-- Atomic logical-message claim: at most one delivery may own a given Message-ID
+-- (race-safe dedup — replaces check-then-act). Plain UNIQUE on a nullable column —
+-- Postgres treats NULLs as distinct, so unclaimed rows (NULL) don't collide. This
+-- matches Prisma's `messageId String? @unique` so `migrate dev` won't drift.
+CREATE UNIQUE INDEX "InboundDelivery_messageId_key" ON "InboundDelivery"("messageId");
 
 ALTER TABLE "InboundDelivery"
     ADD CONSTRAINT "InboundDelivery_queueId_fkey"
@@ -67,7 +68,7 @@ ALTER TABLE "InboundDelivery"
 UPDATE "EmailQueue" q
 SET "lastSeenUid" = COALESCE(
       (
-        SELECT (s."value")::text::integer
+        SELECT (s."value")::text::bigint
         FROM "Setting" s
         WHERE s."section" = 'imap'
           AND s."key" = 'lastSeenUid:' || q."id"::text

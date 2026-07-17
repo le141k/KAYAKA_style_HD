@@ -727,8 +727,9 @@ model InboundDelivery {
   // PIPE/MTA transport identity (webhook idempotency id / MTA delivery id)
   externalId    String?
 
-  // Message identity
-  messageId     String?
+  // Message identity. UNIQUE (Postgres allows multiple NULLs) = the atomic logical-message
+  // claim: at most one delivery may own a given effective Message-ID (race-safe dedup).
+  messageId     String?          @unique
   contentHash   String
   envelopeFrom  String?
   envelopeTo    String?
@@ -762,7 +763,6 @@ model InboundDelivery {
 
   @@index([state, nextAttemptAt])
   @@index([queueId, uidValidity, uid])
-  @@index([messageId])
 }
 
 model EmailTemplate {

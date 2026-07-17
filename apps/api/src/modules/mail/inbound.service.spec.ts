@@ -715,13 +715,17 @@ describe('InboundMailService — parser rule helpers', () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await drain();
       const dueWhere = (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
-        where: { OR: Array<Record<string, unknown>> };
+        where: { OR: Array<{ state?: unknown; leaseExpiresAt?: unknown }> };
       };
-      expect(JSON.stringify(dueWhere.where)).toContain('PROCESSING');
-      // The claim CAS must accept a PROCESSING row with an expired lease.
+      // The PROCESSING branch of the due-query MUST be gated on an EXPIRED lease — otherwise
+      // the drain would re-select rows under a live lease and double-process them.
+      const dueProcessing = dueWhere.where.OR.find((c) => c.state === 'PROCESSING');
+      expect(dueProcessing?.leaseExpiresAt).toEqual({ lt: expect.any(Date) });
+      // The claim CAS must likewise accept a PROCESSING row only when its lease expired.
       const claimWhere = (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mock
-        .calls[0]?.[0] as { where: { OR: Array<Record<string, unknown>> } };
-      expect(JSON.stringify(claimWhere.where)).toContain('leaseExpiresAt');
+        .calls[0]?.[0] as { where: { OR: Array<{ state?: unknown; leaseExpiresAt?: unknown }> } };
+      const claimProcessing = claimWhere.where.OR.find((c) => c.state === 'PROCESSING');
+      expect(claimProcessing?.leaseExpiresAt).toEqual({ lt: expect.any(Date) });
     });
 
     it('a transient failure below the limit → RETRY with backoff (raw retained)', async () => {

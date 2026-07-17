@@ -74,8 +74,11 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   private drainHandle: ReturnType<typeof setInterval> | null = null;
   /** Throttle repeated "queue halted" logs to once per interval per queue. */
   private readonly haltLogged = new Set<number>();
-  /** This process's lease owner id — stamped on claimed deliveries. */
+  /** This process's id (diagnostics). Lease ownership uses a fresh per-claim token. */
   private readonly instanceId = randomUUID();
+  /** Delivery ids currently being processed IN THIS process — prevents a slow flow whose
+   *  lease expired from being reclaimed and reprocessed concurrently by our own drain. */
+  private readonly inFlight = new Set<number>();
   /** How long a PROCESSING lease is honoured before another worker may reclaim it. */
   private static readonly LEASE_MS = 5 * 60_000;
 
@@ -574,8 +577,24 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    * retained, so a message is never lost, discarded, or stranded in PROCESSING.
    */
   private async processDelivery(deliveryId: number, departmentId: number | undefined): Promise<void> {
+    // In-process guard: never handle the same delivery twice concurrently in this process
+    // (closes the "slow flow, lease expired, drain reclaims it" duplicate window).
+    if (this.inFlight.has(deliveryId)) return;
+    this.inFlight.add(deliveryId);
+    try {
+      await this.processDeliveryClaimed(deliveryId, departmentId);
+    } finally {
+      this.inFlight.delete(deliveryId);
+    }
+  }
+
+  private async processDeliveryClaimed(deliveryId: number, departmentId: number | undefined): Promise<void> {
     const now = new Date();
     const leaseUntil = new Date(now.getTime() + InboundMailService.LEASE_MS);
+    // A FRESH per-claim token (not the process id) so the settle fence distinguishes THIS
+    // claim from a later reclaim: if our lease expired and another claim took over, our
+    // terminal write matches 0 rows instead of clobbering theirs.
+    const leaseToken = randomUUID();
     const claim = await this.prisma.inboundDelivery.updateMany({
       where: {
         id: deliveryId,
@@ -584,18 +603,18 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           { state: 'PROCESSING', leaseExpiresAt: { lt: now } }, // reclaim expired lease
         ],
       },
-      data: { state: 'PROCESSING', leaseOwner: this.instanceId, leaseExpiresAt: leaseUntil },
+      data: { state: 'PROCESSING', leaseOwner: leaseToken, leaseExpiresAt: leaseUntil },
     });
     if (claim.count === 0) return; // another worker holds a live lease, or already terminal
 
     const delivery = await this.prisma.inboundDelivery.findUnique({ where: { id: deliveryId } });
     if (!delivery) return;
 
-    // All terminal/retry writes are CAS-gated on our lease so a worker that reclaimed an
-    // expired lease can't be overwritten by the original stalled worker.
+    // All terminal/retry writes are CAS-gated on OUR lease token so a claim that reclaimed
+    // an expired lease can't be overwritten by the original stalled flow.
     const settle = (data: Record<string, unknown>) =>
       this.prisma.inboundDelivery.updateMany({
-        where: { id: deliveryId, leaseOwner: this.instanceId, state: 'PROCESSING' },
+        where: { id: deliveryId, leaseOwner: leaseToken, state: 'PROCESSING' },
         data,
       });
 

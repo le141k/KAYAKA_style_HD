@@ -345,13 +345,20 @@ describe('TicketsService', () => {
       expect(createArg.data.messageId).toBe('<mid-reply@x>');
     });
 
-    it('LIFE-03: reply runs post + counters + audit in a single $transaction', async () => {
+    it('LIFE-03: reply runs post + counters + audit INSIDE the $transaction (not on the outer client)', async () => {
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeTicket({ id: 9, isResolved: false, firstResponseAt: null }),
       );
-      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 100 });
-      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
-      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      // Distinct tx client so we can prove the writes go through `tx`, not `this.prisma`.
+      const tx = {
+        ticketPost: { create: vi.fn().mockResolvedValue({ id: 100 }) },
+        attachment: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
+        ticket: { update: vi.fn().mockResolvedValue({}) },
+        ticketAuditLog: { create: vi.fn().mockResolvedValue({}) },
+      };
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: (t: unknown) => unknown) =>
+        (cb as (t: unknown) => unknown)(tx),
+      );
 
       await service.reply(9, {
         contents: 'hi',
@@ -363,9 +370,13 @@ describe('TicketsService', () => {
         ipAddress: '0.0.0.0',
       });
 
-      expect(prisma.$transaction).toHaveBeenCalled();
-      const txArg = (prisma.$transaction as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
-      expect(typeof txArg).toBe('function');
+      // Writes ran on the transaction client…
+      expect(tx.ticketPost.create).toHaveBeenCalledTimes(1);
+      expect(tx.ticket.update).toHaveBeenCalledTimes(1);
+      expect(tx.ticketAuditLog.create).toHaveBeenCalledTimes(1);
+      // …and NOT on the outer prisma client (which would be non-atomic).
+      expect(prisma.ticketPost.create).not.toHaveBeenCalled();
+      expect(prisma.ticket.update).not.toHaveBeenCalled();
     });
   });
 
