@@ -128,10 +128,11 @@ Denormalized counters (`totalReplies`, `hasAttachments`, `hasNotes`) are updated
 
 ### 7. Mail
 
-| Model             | Key columns                                                                                                                                                                                              | Relations                   |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
-| **EmailQueue**    | `id`, `type EmailQueueType`, `emailAddress`, `host`, `port Int` (default 993), `username`, `passwordEnc` (encrypted at rest), `useTls Bool`, `departmentId?`, `signature`, `isEnabled Bool`, `createdAt` | Optional FK to `Department` |
-| **EmailTemplate** | `id`, `key` (e.g. `ticket_user_reply`, `autoresponder`, `sla_breach_internal`), `locale` (default `en`), `subject`, `htmlBody`, `textBody`, `updatedAt`; unique `(key, locale)`                          | —                           |
+| Model               | Key columns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Relations                                               |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| **EmailQueue**      | `id`, `type EmailQueueType`, `emailAddress`, `host`, `port Int` (default 993), `username`, `passwordEnc` (encrypted at rest), `useTls Bool`, `departmentId?`, `signature`, `isEnabled Bool`, `createdAt`; **IMAP cursor** `lastSeenUid Int`, `uidValidity BigInt?` (NULL = never bootstrapped), `syncState EmailQueueSyncState`, `lastError?`                                                                                                                                                        | Optional FK to `Department`; has many `InboundDelivery` |
+| **EmailTemplate**   | `id`, `key` (e.g. `ticket_user_reply`, `autoresponder`, `sla_breach_internal`), `locale` (default `en`), `subject`, `htmlBody`, `textBody`, `updatedAt`; unique `(key, locale)`                                                                                                                                                                                                                                                                                                                      | —                                                       |
+| **InboundDelivery** | `id`, `transport InboundTransport`, `queueId?`, `transportKey` **@unique** (atomic claim), `uidValidity BigInt?`, `uid?`, `externalId?`, `messageId?`, `contentHash`, `envelopeFrom?/To?`, `subject`, `rawMime Bytes?` (durable, replayable), `rawStorageKey?`, `sizeBytes`, `state InboundDeliveryState`, `attempts`, `lastError?`, `nextAttemptAt?`, `ticketId?`, `postId?`, `createdAt`, `updatedAt`, `processedAt?`; indexes `(state,nextAttemptAt)`, `(queueId,uidValidity,uid)`, `(messageId)` | FK to `EmailQueue`                                      |
 
 Templates use `{{placeholder}}` interpolation (mustache-style). Seeded templates cover `ticket_user_reply` and `autoresponder` in English and Russian, plus `sla_breach_internal` in English.
 
@@ -260,18 +261,21 @@ Staff ──────────────────── ownerStaffId 
 
 ## Enums
 
-| Enum               | Values                                                                                                 | Used on                                                               |
-| ------------------ | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
-| `DepartmentType`   | `PUBLIC`, `PRIVATE`                                                                                    | `Department.type`                                                     |
-| `UserGroupType`    | `GUEST`, `REGISTERED`                                                                                  | `UserGroup.type`                                                      |
-| `ActorType`        | `STAFF`, `USER`, `SYSTEM`                                                                              | `Ticket.creator`, `TicketPost.authorType`, `TicketAuditLog.actorType` |
-| `CreationMode`     | `WEB`, `EMAIL`, `API`, `STAFF`, `ALARIS`                                                               | `Ticket.creationMode`, `TicketPost.creationMode`                      |
-| `CustomFieldScope` | `TICKET`, `USER`, `STAFF`, `ORGANIZATION`                                                              | `CustomFieldGroup.scope`                                              |
-| `CustomFieldType`  | `TEXT`, `TEXTAREA`, `PASSWORD`, `CHECKBOX`, `RADIO`, `SELECT`, `MULTISELECT`, `DATE`, `FILE`, `CUSTOM` | `CustomField.type`                                                    |
-| `SlaTargetType`    | `FIRST_RESPONSE`, `RESOLUTION`                                                                         | `EscalationRule.targetType`                                           |
-| `EmailQueueType`   | `IMAP`, `POP3`, `PIPE`                                                                                 | `EmailQueue.type`                                                     |
-| `FlagType`         | `NONE`, `PURPLE`, `ORANGE`, `GREEN`, `YELLOW`, `RED`, `BLUE`                                           | `Ticket.flagType`                                                     |
-| `ReportKind`       | `TABULAR`, `SUMMARY`, `MATRIX`                                                                         | `Report.kind`                                                         |
+| Enum                   | Values                                                                                                 | Used on                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| `DepartmentType`       | `PUBLIC`, `PRIVATE`                                                                                    | `Department.type`                                                     |
+| `UserGroupType`        | `GUEST`, `REGISTERED`                                                                                  | `UserGroup.type`                                                      |
+| `ActorType`            | `STAFF`, `USER`, `SYSTEM`                                                                              | `Ticket.creator`, `TicketPost.authorType`, `TicketAuditLog.actorType` |
+| `CreationMode`         | `WEB`, `EMAIL`, `API`, `STAFF`, `ALARIS`                                                               | `Ticket.creationMode`, `TicketPost.creationMode`                      |
+| `CustomFieldScope`     | `TICKET`, `USER`, `STAFF`, `ORGANIZATION`                                                              | `CustomFieldGroup.scope`                                              |
+| `CustomFieldType`      | `TEXT`, `TEXTAREA`, `PASSWORD`, `CHECKBOX`, `RADIO`, `SELECT`, `MULTISELECT`, `DATE`, `FILE`, `CUSTOM` | `CustomField.type`                                                    |
+| `SlaTargetType`        | `FIRST_RESPONSE`, `RESOLUTION`                                                                         | `EscalationRule.targetType`                                           |
+| `EmailQueueType`       | `IMAP`, `POP3`, `PIPE`                                                                                 | `EmailQueue.type`                                                     |
+| `InboundTransport`     | `IMAP`, `PIPE`                                                                                         | `InboundDelivery.transport`                                           |
+| `InboundDeliveryState` | `ACCEPTED`, `PROCESSING`, `PROCESSED`, `RETRY`, `QUARANTINED`, `SKIPPED`                               | `InboundDelivery.state`                                               |
+| `EmailQueueSyncState`  | `OK`, `NEEDS_RECONCILIATION`                                                                           | `EmailQueue.syncState`                                                |
+| `FlagType`             | `NONE`, `PURPLE`, `ORANGE`, `GREEN`, `YELLOW`, `RED`, `BLUE`                                           | `Ticket.flagType`                                                     |
+| `ReportKind`           | `TABULAR`, `SUMMARY`, `MATRIX`                                                                         | `Report.kind`                                                         |
 
 ---
 
@@ -386,6 +390,7 @@ The seed is **idempotent** (uses upsert / find-or-create; safe to re-run). It cr
 | Organizations    | `Acme Corp` (Moscow, RU, slaPlanId set), `Beta LLC` (Saint Petersburg, RU)                                           |
 | Users            | Ivan Petrov, Maria Sidorova (Acme Corp), Dmitry Volkov (Beta LLC), Guest User                                        |
 | Demo Tickets     | 5 tickets covering Support + NOC departments, various priorities/types, first 2 with agent replies                   |
+
 ## Schema changes — audit-fix batches (2026-05)
 
 Applied via Prisma migrations (all apply clean on a fresh DB; 21 migrations total including RBAC):

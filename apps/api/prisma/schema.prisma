@@ -82,6 +82,30 @@ enum EmailQueueType {
   PIPE
 }
 
+// Inbound delivery ledger — durable record of every accepted inbound message so
+// processing failures never lose mail (raw MIME is replayable) and re-delivery is
+// idempotent by a unique transport key.
+enum InboundTransport {
+  IMAP
+  PIPE
+}
+
+enum InboundDeliveryState {
+  ACCEPTED // durably recorded (raw MIME stored); not yet processed
+  PROCESSING // claimed by a drain worker
+  PROCESSED // business op committed (ticket/post created or threaded)
+  RETRY // transient failure; retried with backoff, never discarded
+  QUARANTINED // permanent failure / attempts exhausted; needs operator, raw MIME retained
+  SKIPPED // intentionally not ticketed (loop/bounce/parser-ignore/duplicate)
+}
+
+// Per-queue IMAP sync health. NEEDS_RECONCILIATION halts polling (fail-closed) after a
+// UIDVALIDITY change so an operator explicitly chooses FROM_NOW or a bounded BACKFILL.
+enum EmailQueueSyncState {
+  OK
+  NEEDS_RECONCILIATION
+}
+
 enum FlagType {
   NONE
   PURPLE
@@ -669,6 +693,64 @@ model EmailQueue {
   sendAutoresponder Boolean      @default(false)
   isEnabled      Boolean        @default(false)
   createdAt      DateTime       @default(now())
+
+  // Durable IMAP poll cursor (replaces the legacy Setting `imap/lastSeenUid:<id>`).
+  // `uidValidity` NULL means the queue has never been bootstrapped → the poller sets a
+  // synchronous baseline before its first fetch (no historical import). A UIDVALIDITY
+  // change flips `syncState` to NEEDS_RECONCILIATION and halts polling (fail-closed).
+  lastSeenUid    Int                 @default(0)
+  uidValidity    BigInt?
+  syncState      EmailQueueSyncState @default(OK)
+  lastError      String?
+
+  inboundDeliveries InboundDelivery[]
+}
+
+model InboundDelivery {
+  id            Int              @id @default(autoincrement())
+  transport     InboundTransport
+  queue         EmailQueue?      @relation(fields: [queueId], references: [id])
+  queueId       Int?
+
+  // Canonical idempotency key — the atomic claim. Unique across all deliveries:
+  //   IMAP: `imap:<queueId>:<uidValidity>:<uid>`
+  //   PIPE: `pipe:<queueId|->:<externalId or sha256:hash>`
+  transportKey  String           @unique
+
+  // IMAP transport identity (also stored structured for admin/observability)
+  uidValidity   BigInt?
+  uid           Int?
+  // PIPE/MTA transport identity (webhook idempotency id / MTA delivery id)
+  externalId    String?
+
+  // Message identity
+  messageId     String?
+  contentHash   String
+  envelopeFrom  String?
+  envelopeTo    String?
+  subject       String           @default("")
+
+  // Durable raw MIME so a failed/quarantined delivery can be replayed. Inline for
+  // bounded messages; `rawStorageKey` is used when externalised to object storage.
+  rawMime       Bytes?
+  rawStorageKey String?
+  sizeBytes     Int              @default(0)
+
+  // Lifecycle
+  state         InboundDeliveryState @default(ACCEPTED)
+  attempts      Int              @default(0)
+  lastError     String?
+  nextAttemptAt DateTime?
+  ticketId      Int?
+  postId        Int?
+
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  processedAt   DateTime?
+
+  @@index([state, nextAttemptAt])
+  @@index([queueId, uidValidity, uid])
+  @@index([messageId])
 }
 
 model EmailTemplate {
