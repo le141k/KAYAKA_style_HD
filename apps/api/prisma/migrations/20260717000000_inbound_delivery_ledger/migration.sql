@@ -33,6 +33,8 @@ CREATE TABLE "InboundDelivery" (
     "attempts" INTEGER NOT NULL DEFAULT 0,
     "lastError" TEXT,
     "nextAttemptAt" TIMESTAMP(3),
+    "leaseOwner" TEXT,
+    "leaseExpiresAt" TIMESTAMP(3),
     "ticketId" INTEGER,
     "postId" INTEGER,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -51,3 +53,23 @@ CREATE INDEX "InboundDelivery_messageId_idx" ON "InboundDelivery"("messageId");
 ALTER TABLE "InboundDelivery"
     ADD CONSTRAINT "InboundDelivery_queueId_fkey"
     FOREIGN KEY ("queueId") REFERENCES "EmailQueue"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- Safe upgrade / cutover: any already-enabled IMAP queue is halted until an operator
+-- explicitly reconciles (FROM_NOW or a bounded BACKFILL). This prevents the new
+-- ledger from FROM_NOW-bootstrapping over an in-flight legacy cursor and silently
+-- skipping mail that arrived during the deploy. The legacy Setting UID cursor
+-- (`imap/lastSeenUid:<queueId>`) is copied into `lastSeenUid` as a resume hint.
+UPDATE "EmailQueue" q
+SET "lastSeenUid" = COALESCE(
+      (
+        SELECT (s."value")::text::integer
+        FROM "Setting" s
+        WHERE s."section" = 'imap'
+          AND s."key" = 'lastSeenUid:' || q."id"::text
+          AND jsonb_typeof(s."value") = 'number'
+      ),
+      0
+    ),
+    "syncState" = 'NEEDS_RECONCILIATION',
+    "lastError" = 'Upgraded to InboundDelivery ledger; reconcile (FROM_NOW or bounded BACKFILL) required'
+WHERE q."isEnabled" = true AND q."type" = 'IMAP';

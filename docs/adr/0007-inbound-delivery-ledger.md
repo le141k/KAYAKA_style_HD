@@ -31,9 +31,14 @@ Introduce a durable **`InboundDelivery` ledger** and split ingestion into **acce
   explicit `FROM_NOW` / `BACKFILL` policy; it never fails open to `1:*`.
 - **`UIDVALIDITY`** changes are **fail-closed**: the queue halts (`syncState =
 NEEDS_RECONCILIATION`) for an explicit operator `FROM_NOW` / bounded `BACKFILL` decision.
-- **Drain** processes `ACCEPTED`/`RETRY` deliveries with a CAS claim; success → `PROCESSED`,
-  transient error → `RETRY` (backoff), attempts exhausted → `QUARANTINED`. A quarantine **never
-  discards** — the raw MIME stays for replay.
+- **Drain** processes `ACCEPTED`/`RETRY` deliveries with a **leased** CAS claim (`leaseOwner` +
+  `leaseExpiresAt`); an expired lease is reclaimed, and terminal writes are lease-gated, so a
+  crash mid-processing never strands a delivery in `PROCESSING`. Success → `PROCESSED`, transient
+  error → `RETRY` (backoff), attempts exhausted → `QUARANTINED`. A quarantine **never discards** —
+  the raw MIME stays for replay.
+- **Upgrade/cutover** is safe: the migration halts every already-enabled IMAP queue
+  (`NEEDS_RECONCILIATION`, legacy cursor copied) so the deploy can't FROM_NOW over an in-flight
+  cursor; an operator reconciles explicitly (FROM_NOW or bounded BACKFILL).
 - **Idempotency** is primarily the transport key; processing additionally de-dups by an _effective_
   Message-ID (the RFC id, else a deterministic `<inbound-<sha256>@23telecom.local>` from the
   content hash), written **atomically** with the ticket/post create — so retries never double-post

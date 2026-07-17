@@ -631,12 +631,16 @@ describe('InboundMailService — parser rule helpers', () => {
       });
     }
 
-    it('marks a delivery PROCESSED after successful routing', async () => {
+    it('marks a delivery PROCESSED after successful routing (lease-gated settle)', async () => {
       stageDelivery();
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await drain();
-      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { id: 55 }, data: expect.objectContaining({ state: 'PROCESSED' }) }),
+      // Settle is a lease-gated updateMany (where leaseOwner=us, state=PROCESSING).
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ state: 'PROCESSED', leaseOwner: null }),
+        }),
       );
     });
 
@@ -647,6 +651,30 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(prisma.inboundDelivery.findUnique).not.toHaveBeenCalled();
     });
 
+    it('reclaims a stale PROCESSING delivery whose lease has expired', async () => {
+      // The due query must include expired-lease PROCESSING rows.
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, queueId: null },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 55,
+        rawMime: raw,
+        attempts: 1,
+        queueId: null,
+      });
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await drain();
+      const dueWhere = (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        where: { OR: Array<Record<string, unknown>> };
+      };
+      expect(JSON.stringify(dueWhere.where)).toContain('PROCESSING');
+      // The claim CAS must accept a PROCESSING row with an expired lease.
+      const claimWhere = (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mock
+        .calls[0]?.[0] as { where: { OR: Array<Record<string, unknown>> } };
+      expect(JSON.stringify(claimWhere.where)).toContain('leaseExpiresAt');
+    });
+
     it('a transient failure below the limit → RETRY with backoff (raw retained)', async () => {
       stageDelivery({ attempts: 0 });
       (
@@ -654,9 +682,9 @@ describe('InboundMailService — parser rule helpers', () => {
       ).ticketsService.createTicket = vi.fn();
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('db blip'));
       await drain();
-      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 55 },
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
           data: expect.objectContaining({ state: 'RETRY', attempts: 1 }),
         }),
       );
@@ -666,9 +694,9 @@ describe('InboundMailService — parser rule helpers', () => {
       stageDelivery({ attempts: 4 }); // maxAttempts = 5 → this attempt quarantines
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('still bad'));
       await drain();
-      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 55 },
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
           data: expect.objectContaining({ state: 'QUARANTINED', attempts: 5 }),
         }),
       );
@@ -677,9 +705,9 @@ describe('InboundMailService — parser rule helpers', () => {
     it('a delivery with missing rawMime is QUARANTINED, not silently dropped', async () => {
       stageDelivery({ rawMime: null });
       await drain();
-      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 55 },
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
           data: expect.objectContaining({ state: 'QUARANTINED' }),
         }),
       );

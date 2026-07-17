@@ -233,10 +233,18 @@ UNIQUE `transportKey` before it is processed.
 - **UIDVALIDITY:** on a server UID-space reset the queue flips to
   `EmailQueue.syncState = NEEDS_RECONCILIATION` and polling **halts** (fail-closed) until an
   operator re-bootstraps (clear `uidValidity`).
-- **Drain phase:** processes `ACCEPTED`/`RETRY` deliveries in id order; claims each via CAS
-  (`ACCEPTED|RETRY → PROCESSING`). Success → `PROCESSED` (+`ticketId`/`postId`); transient error →
-  `RETRY` with exponential backoff; attempts ≥ `TELECOM_HD_INBOUND_MAX_ATTEMPTS` (5) →
-  `QUARANTINED`. Raw MIME is **always retained** — a quarantine never discards a message.
+- **Drain phase:** processes `ACCEPTED`/`RETRY` deliveries in id order; claims each with a
+  **lease** (CAS: `ACCEPTED|RETRY`, or a `PROCESSING` whose `leaseExpiresAt` passed → `PROCESSING`
+  - `leaseOwner`/`leaseExpiresAt`). Every terminal/retry write is itself lease-gated
+    (`leaseOwner = us`), so a crashed worker's stalled write can't clobber the one that reclaimed it,
+    and a delivery is **never stranded in `PROCESSING`** (a stale lease is reclaimed on the next drain;
+    a startup drain kicks recovery immediately). Success → `PROCESSED` (+`ticketId`/`postId`);
+    transient error → `RETRY` (exponential backoff); attempts ≥ `TELECOM_HD_INBOUND_MAX_ATTEMPTS` (5)
+    → `QUARANTINED`. Raw MIME is **always retained** — a quarantine never discards a message.
+- **Upgrade/cutover:** the ledger migration halts every already-enabled IMAP queue
+  (`syncState = NEEDS_RECONCILIATION`, legacy `Setting` UID cursor copied into `lastSeenUid`) so a
+  deploy can't FROM_NOW-bootstrap over an in-flight legacy cursor and skip mail. `bootstrapQueue`
+  refuses to run on a halted queue — an operator must reconcile explicitly.
 - **Routing / idempotency:** de-dups by effective Message-ID — the RFC id, or a deterministic
   `<inbound-<sha256>@23telecom.local>` synthesised from the content hash when absent — so a retry
   or IMAP+PIPE double-delivery never double-posts even without a Message-ID. The Message-ID is

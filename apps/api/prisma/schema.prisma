@@ -741,6 +741,11 @@ model InboundDelivery {
   attempts      Int              @default(0)
   lastError     String?
   nextAttemptAt DateTime?
+  // Lease: a worker sets leaseOwner + leaseExpiresAt when it claims PROCESSING. An
+  // expired lease is reclaimed by any worker, so a crash mid-processing can never strand
+  // a delivery in PROCESSING forever.
+  leaseOwner    String?
+  leaseExpiresAt DateTime?
   ticketId      Int?
   postId        Int?
 

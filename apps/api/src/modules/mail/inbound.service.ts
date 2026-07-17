@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   Injectable,
   Logger,
@@ -73,6 +73,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   private drainHandle: ReturnType<typeof setInterval> | null = null;
   /** Throttle repeated "queue halted" logs to once per interval per queue. */
   private readonly haltLogged = new Set<number>();
+  /** This process's lease owner id — stamped on claimed deliveries. */
+  private readonly instanceId = randomUUID();
+  /** How long a PROCESSING lease is honoured before another worker may reclaim it. */
+  private static readonly LEASE_MS = 5 * 60_000;
 
   private get maxAttempts(): number {
     return this.config.TELECOM_HD_INBOUND_MAX_ATTEMPTS;
@@ -101,11 +105,16 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     }
 
     // The drain runs regardless of IMAP so PIPE RETRY deliveries always make progress.
+    // Kick once now so any deliveries left PROCESSING by a previous crash are reclaimed
+    // as soon as their lease expires (startup recovery), then every 30 s.
     this.drainHandle = setInterval(() => {
       void this.drainDeliveries().catch((err: unknown) =>
         this.logger.error(`Inbound drain error: ${String(err)}`),
       );
     }, 30_000);
+    void this.drainDeliveries().catch((err: unknown) =>
+      this.logger.error(`Inbound startup drain error: ${String(err)}`),
+    );
 
     if (!this.config.TELECOM_HD_IMAP_ENABLED) {
       this.logger.log('IMAP polling disabled (TELECOM_HD_IMAP_ENABLED=false) — drain active for PIPE');
@@ -192,6 +201,14 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   private async bootstrapQueue(queueId: number, client: ImapFlow): Promise<void> {
     const queue = await this.prisma.emailQueue.findUnique({ where: { id: queueId } });
     if (!queue || queue.uidValidity !== null) return; // already bootstrapped
+    if (queue.syncState === 'NEEDS_RECONCILIATION') {
+      // Halted (e.g. upgraded from a legacy cursor) — never auto-FROM_NOW over it; an
+      // operator must reconcile explicitly (choose FROM_NOW or a bounded BACKFILL).
+      this.logger.warn(
+        `IMAP queue ${queueId}: NEEDS_RECONCILIATION — bootstrap skipped (operator action required)`,
+      );
+      return;
+    }
     const lock = await client.getMailboxLock('INBOX');
     try {
       const { uidValidity, uidNext, exists } = this.readMailboxState(client);
@@ -410,15 +427,25 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
 
   // ─────────────────── drain (process ledger) ───────────────────
 
-  /** Process due ACCEPTED/RETRY deliveries in id order. */
+  /**
+   * Process due deliveries in id order: fresh `ACCEPTED`/`RETRY` work, plus any
+   * `PROCESSING` whose lease has expired (a worker crashed mid-processing) — so a
+   * delivery can never be stranded in `PROCESSING` forever.
+   */
   async drainDeliveries(): Promise<void> {
     const now = new Date();
     let due: Array<{ id: number; queueId: number | null }>;
     try {
       due = await this.prisma.inboundDelivery.findMany({
         where: {
-          state: { in: ['ACCEPTED', 'RETRY'] },
-          OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }],
+          OR: [
+            {
+              state: { in: ['ACCEPTED', 'RETRY'] },
+              OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }],
+            },
+            // Reclaim expired leases (stale PROCESSING from a crashed worker).
+            { state: 'PROCESSING', leaseExpiresAt: { lt: now } },
+          ],
         },
         orderBy: { id: 'asc' },
         take: 50,
@@ -442,24 +469,46 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Process a single ledger delivery: claim it (CAS ACCEPTED/RETRY → PROCESSING), run the
-   * routing pipeline, then transition to PROCESSED/SKIPPED. Any error moves it to RETRY
-   * (with backoff) or, once attempts are exhausted, QUARANTINED — the raw MIME is always
-   * retained, so a message is never lost or discarded.
+   * Process a single ledger delivery. Claims it with a LEASE (CAS: ACCEPTED/RETRY, or a
+   * PROCESSING whose lease has expired → PROCESSING + our lease), runs the routing
+   * pipeline, then transitions to PROCESSED/SKIPPED — but every terminal/retry write is
+   * itself lease-gated (`leaseOwner = us`), so if our lease expired and another worker
+   * took over mid-processing we drop our result instead of clobbering theirs. Any error
+   * → RETRY (backoff) or, once attempts are exhausted, QUARANTINED — raw MIME is always
+   * retained, so a message is never lost, discarded, or stranded in PROCESSING.
    */
   private async processDelivery(deliveryId: number, departmentId: number | undefined): Promise<void> {
+    const now = new Date();
+    const leaseUntil = new Date(now.getTime() + InboundMailService.LEASE_MS);
     const claim = await this.prisma.inboundDelivery.updateMany({
-      where: { id: deliveryId, state: { in: ['ACCEPTED', 'RETRY'] } },
-      data: { state: 'PROCESSING' },
+      where: {
+        id: deliveryId,
+        OR: [
+          { state: { in: ['ACCEPTED', 'RETRY'] } },
+          { state: 'PROCESSING', leaseExpiresAt: { lt: now } }, // reclaim expired lease
+        ],
+      },
+      data: { state: 'PROCESSING', leaseOwner: this.instanceId, leaseExpiresAt: leaseUntil },
     });
-    if (claim.count === 0) return; // another worker owns it, or already terminal
+    if (claim.count === 0) return; // another worker holds a live lease, or already terminal
 
     const delivery = await this.prisma.inboundDelivery.findUnique({ where: { id: deliveryId } });
     if (!delivery) return;
+
+    // All terminal/retry writes are CAS-gated on our lease so a worker that reclaimed an
+    // expired lease can't be overwritten by the original stalled worker.
+    const settle = (data: Record<string, unknown>) =>
+      this.prisma.inboundDelivery.updateMany({
+        where: { id: deliveryId, leaseOwner: this.instanceId, state: 'PROCESSING' },
+        data,
+      });
+
     if (!delivery.rawMime) {
-      await this.prisma.inboundDelivery.update({
-        where: { id: deliveryId },
-        data: { state: 'QUARANTINED', lastError: 'missing rawMime' },
+      await settle({
+        state: 'QUARANTINED',
+        lastError: 'missing rawMime',
+        leaseOwner: null,
+        leaseExpiresAt: null,
       });
       this.logger.error(`Inbound delivery ${deliveryId}: missing rawMime — quarantined`);
       return;
@@ -467,36 +516,37 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
 
     try {
       const outcome = await this.processRawMessage(Buffer.from(delivery.rawMime), departmentId);
-      await this.prisma.inboundDelivery.update({
-        where: { id: deliveryId },
-        data: {
-          state: outcome.state,
-          ticketId: outcome.ticketId ?? null,
-          postId: outcome.postId ?? null,
-          processedAt: new Date(),
-          lastError: null,
-        },
+      await settle({
+        state: outcome.state,
+        ticketId: outcome.ticketId ?? null,
+        postId: outcome.postId ?? null,
+        processedAt: new Date(),
+        lastError: null,
+        leaseOwner: null,
+        leaseExpiresAt: null,
       });
     } catch (err) {
       const attempts = delivery.attempts + 1;
       if (attempts >= this.maxAttempts) {
-        await this.prisma.inboundDelivery.update({
-          where: { id: deliveryId },
-          data: { state: 'QUARANTINED', attempts, lastError: String(err) },
+        await settle({
+          state: 'QUARANTINED',
+          attempts,
+          lastError: String(err),
+          leaseOwner: null,
+          leaseExpiresAt: null,
         });
         this.logger.error(
           `Inbound delivery ${deliveryId}: QUARANTINED after ${attempts} attempts (raw MIME retained for replay) — ${String(err)}`,
         );
       } else {
         const backoffMs = 60_000 * 2 ** (attempts - 1);
-        await this.prisma.inboundDelivery.update({
-          where: { id: deliveryId },
-          data: {
-            state: 'RETRY',
-            attempts,
-            nextAttemptAt: new Date(Date.now() + backoffMs),
-            lastError: String(err),
-          },
+        await settle({
+          state: 'RETRY',
+          attempts,
+          nextAttemptAt: new Date(Date.now() + backoffMs),
+          lastError: String(err),
+          leaseOwner: null,
+          leaseExpiresAt: null,
         });
         this.logger.warn(
           `Inbound delivery ${deliveryId}: retry ${attempts}/${this.maxAttempts} in ${backoffMs}ms — ${String(err)}`,
