@@ -478,6 +478,7 @@ describe('InboundMailService — parser rule helpers', () => {
         uidValidity: 7n,
         syncState: 'OK',
         lastError: null,
+        cursorGeneration: 0,
         ...over,
       };
     }
@@ -513,7 +514,15 @@ describe('InboundMailService — parser rule helpers', () => {
         }),
       );
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { id: 1, lastSeenUid: { lt: 102 } }, data: { lastSeenUid: 102 } }),
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: 1,
+            lastSeenUid: { lt: 102 },
+            cursorGeneration: 0,
+            syncState: 'OK',
+          }),
+          data: { lastSeenUid: 102 },
+        }),
       );
     });
 
@@ -611,9 +620,10 @@ describe('InboundMailService — parser rule helpers', () => {
         mailbox: { uidValidity: 7n, uidNext: 501, exists: 500 },
         getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
       });
-      expect(prisma.emailQueue.update).toHaveBeenCalledWith(
+      // Bootstrap is a CAS on `uidValidity IS NULL` (two-pod safe) → updateMany.
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 1 },
+          where: { id: 1, uidValidity: null },
           data: expect.objectContaining({ lastSeenUid: 500, uidValidity: 7n, syncState: 'OK' }),
         }),
       );
@@ -624,8 +634,9 @@ describe('InboundMailService — parser rule helpers', () => {
         id: 1,
         uidValidity: 7n,
       });
+      (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mockClear();
       await bootstrap({ getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }) });
-      expect(prisma.emailQueue.update).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
     });
 
     it('P0-2: connectQueue captures the baseline DURING connect (not the first poll)', async () => {
@@ -641,9 +652,9 @@ describe('InboundMailService — parser rule helpers', () => {
         { host: 'h', port: 993, secure: true, auth: { user: 'u', pass: 'p' } },
       );
 
-      expect(prisma.emailQueue.update).toHaveBeenCalledWith(
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 1 },
+          where: { id: 1, uidValidity: null },
           data: expect.objectContaining({ lastSeenUid: 9, uidValidity: 7n, syncState: 'OK' }),
         }),
       );

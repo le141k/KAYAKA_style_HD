@@ -226,10 +226,16 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           ? this.config.TELECOM_HD_IMAP_BACKFILL_LIMIT
           : 0;
       const baseline = Math.max(highWater - backfill, 0);
-      await this.prisma.emailQueue.update({
-        where: { id: queueId },
+      // CAS on uidValidity IS NULL so two pods bootstrapping the same fresh queue can't
+      // write different baselines — the first wins, the loser's updateMany matches 0 rows.
+      const cas = await this.prisma.emailQueue.updateMany({
+        where: { id: queueId, uidValidity: null },
         data: { lastSeenUid: baseline, uidValidity, syncState: 'OK', lastError: null },
       });
+      if (cas.count === 0) {
+        this.logger.log(`IMAP queue ${queueId}: bootstrap already done by another worker`);
+        return;
+      }
       this.logger.log(
         `IMAP queue ${queueId}: bootstrap ${this.config.TELECOM_HD_IMAP_BOOTSTRAP_POLICY} at uid=${baseline} ` +
           `(highWater=${highWater}, uidValidity=${uidValidity})`,
@@ -335,11 +341,24 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         }
 
         if (cursor > lastUid) {
-          // Monotonic CAS: only advance, never regress (multi-poller safe).
-          await this.prisma.emailQueue.updateMany({
-            where: { id: queueId, lastSeenUid: { lt: cursor } },
+          // Monotonic, generation-guarded CAS: advance only if nothing reconciled the
+          // queue underneath us (same cursorGeneration + uidValidity, still OK+enabled).
+          // A stale poller that finishes after a reconcile writes 0 rows — it can't push
+          // a cursor from the old UID space into the new one.
+          const cas = await this.prisma.emailQueue.updateMany({
+            where: {
+              id: queueId,
+              lastSeenUid: { lt: cursor },
+              cursorGeneration: queue.cursorGeneration,
+              uidValidity: queue.uidValidity,
+              syncState: 'OK',
+              isEnabled: true,
+            },
             data: { lastSeenUid: cursor },
           });
+          if (cas.count === 0) {
+            this.logger.warn(`IMAP queue ${queueId}: cursor CAS skipped (queue reconciled mid-poll)`);
+          }
         }
       } finally {
         lock.release();

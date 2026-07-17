@@ -702,6 +702,9 @@ model EmailQueue {
   uidValidity    BigInt?
   syncState      EmailQueueSyncState @default(OK)
   lastError      String?
+  // Bumped on every reconcile/rebootstrap. The cursor CAS is gated on this so a stale
+  // poller (finishing after a reconcile) can't write a cursor from the old UID space.
+  cursorGeneration Int               @default(0)
 
   inboundDeliveries InboundDelivery[]
 }

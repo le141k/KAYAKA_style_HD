@@ -11,6 +11,7 @@ ALTER TABLE "EmailQueue" ADD COLUMN "lastSeenUid" INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE "EmailQueue" ADD COLUMN "uidValidity" BIGINT;
 ALTER TABLE "EmailQueue" ADD COLUMN "syncState" "EmailQueueSyncState" NOT NULL DEFAULT 'OK';
 ALTER TABLE "EmailQueue" ADD COLUMN "lastError" TEXT;
+ALTER TABLE "EmailQueue" ADD COLUMN "cursorGeneration" INTEGER NOT NULL DEFAULT 0;
 
 -- Ledger table
 CREATE TABLE "InboundDelivery" (
