@@ -4,6 +4,7 @@
  *   - applyParserRules (skip / route / stop-processing)
  *   - processMessage discard path (via applyParserRules mock)
  */
+import { createHash } from 'node:crypto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { NotFoundException } from '@nestjs/common';
 import { InboundMailService } from './inbound.service';
@@ -11,6 +12,23 @@ import type { PrismaService } from '../../prisma/prisma.service';
 import type { TicketsService } from '../tickets/tickets.service';
 import type { MailService } from './mail.service';
 import type { AppConfig } from '../../config/configuration';
+
+// Fake ImapFlow so connectQueue() can be exercised without a real IMAP server. The
+// mailbox advertises UIDVALIDITY/UIDNEXT so the connect-time bootstrap barrier runs.
+vi.mock('imapflow', () => ({
+  ImapFlow: class {
+    mailbox = { uidValidity: 7n, uidNext: 10, exists: 9 };
+    connect() {
+      return Promise.resolve();
+    }
+    getMailboxLock() {
+      return Promise.resolve({ release: () => undefined });
+    }
+    logout() {
+      return Promise.resolve();
+    }
+  },
+}));
 
 const TEST_CONFIG: AppConfig = {
   NODE_ENV: 'test',
@@ -31,6 +49,7 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_INBOUND_WEBHOOK_SECRET: 'test-inbound-secret',
   TELECOM_HD_UPLOAD_DIR: '/tmp/uploads',
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: 25,
+  TELECOM_HD_IMAP_ENABLED: false,
   TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'FROM_NOW',
   TELECOM_HD_IMAP_BACKFILL_LIMIT: 0,
   TELECOM_HD_INBOUND_MAX_ATTEMPTS: 5,
@@ -393,14 +412,17 @@ describe('InboundMailService — parser rule helpers', () => {
   // ─── durable ledger: accept (poll) + drain ───────────────────────────────────
 
   describe('pollQueue — durable accept (no silent loss, fail-closed)', () => {
+    /** Deterministic raw bytes for a UID — reused by tests to assert stored rawMime/hash. */
+    const imapSrc = (uid: number) =>
+      Buffer.from(`From: a@b.example\r\nMessage-ID: <m-${uid}@x>\r\n\r\nhi ${uid}`);
+
     /** Fake ImapFlow: uid-only `fetch` yields the ids; `fetchOne` returns the source. */
     function makeLedgerClient(
       uids: number[],
       mailbox: { uidValidity: bigint; uidNext?: number; exists?: number },
       opts: { vanish?: number[]; fetchOneThrowsAt?: number } = {},
     ) {
-      const src = (uid: number) =>
-        Buffer.from(`From: a@b.example\r\nMessage-ID: <m-${uid}@x>\r\n\r\nhi ${uid}`);
+      const src = imapSrc;
       return {
         mailbox,
         getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
@@ -440,12 +462,27 @@ describe('InboundMailService — parser rule helpers', () => {
 
     it('accepts new UIDs into the ledger and advances the cursor via monotonic CAS', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
-      await poll(makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 }));
+      const client = makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 });
+      await poll(client);
+
+      // IN-01: the discovery fetch is a real UID range — `{ uid: true }` is the THIRD arg
+      // (folding it into the query object leaves it a *sequence* range).
+      expect(client.fetch).toHaveBeenCalledWith('101:*', expect.anything(), { uid: true });
+      expect(client.fetchOne).toHaveBeenCalledWith('102', expect.anything(), { uid: true });
 
       expect(prisma.inboundDelivery.create).toHaveBeenCalledTimes(2);
+      // The ACTUAL raw bytes / hash / size must be persisted (durable, replayable) — not
+      // just the transport key.
+      const src102 = imapSrc(102);
       expect(prisma.inboundDelivery.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ transport: 'IMAP', transportKey: 'imap:1:7:102' }),
+          data: expect.objectContaining({
+            transport: 'IMAP',
+            transportKey: 'imap:1:7:102',
+            rawMime: new Uint8Array(src102),
+            contentHash: createHash('sha256').update(src102).digest('hex'),
+            sizeBytes: src102.length,
+          }),
         }),
       );
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
@@ -552,6 +589,27 @@ describe('InboundMailService — parser rule helpers', () => {
       });
       await bootstrap({ getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }) });
       expect(prisma.emailQueue.update).not.toHaveBeenCalled();
+    });
+
+    it('P0-2: connectQueue captures the baseline DURING connect (not the first poll)', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        uidValidity: null,
+      });
+      // Uses the mocked ImapFlow (uidNext=10 → high-water 9). If connectQueue did not call
+      // bootstrapQueue, no baseline would be written and mail arriving before the first
+      // poll would be skipped.
+      await (service as unknown as { connectQueue: (q: number, o: unknown) => Promise<void> }).connectQueue(
+        1,
+        { host: 'h', port: 993, secure: true, auth: { user: 'u', pass: 'p' } },
+      );
+
+      expect(prisma.emailQueue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 1 },
+          data: expect.objectContaining({ lastSeenUid: 9, uidValidity: 7n, syncState: 'OK' }),
+        }),
+      );
     });
   });
 

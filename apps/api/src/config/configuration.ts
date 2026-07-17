@@ -35,6 +35,15 @@ const schema = z.object({
   TELECOM_HD_INBOUND_WEBHOOK_SECRET: z.string().min(32).default('inbound-dev-secret-change-me-0000'),
   TELECOM_HD_UPLOAD_DIR: z.string().default('/app/uploads'),
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: z.coerce.number().default(25),
+  // Global IMAP poller switch. When false (default) the poller never connects; the
+  // inbound webhook (POST /api/inbound/pipe) and the ledger drain still run. Turn on
+  // ONLY once at least one IMAP EmailQueue is configured and reconciled.
+  TELECOM_HD_IMAP_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
   // IMAP first-connect baseline policy. FROM_NOW (default) records the current
   // high-water UID and imports nothing; BACKFILL additionally ingests up to
   // TELECOM_HD_IMAP_BACKFILL_LIMIT most-recent existing messages. Chosen explicitly

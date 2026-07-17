@@ -107,6 +107,11 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       );
     }, 30_000);
 
+    if (!this.config.TELECOM_HD_IMAP_ENABLED) {
+      this.logger.log('IMAP polling disabled (TELECOM_HD_IMAP_ENABLED=false) — drain active for PIPE');
+      return;
+    }
+
     const queues = await this.prisma.emailQueue.findMany({
       where: { isEnabled: true, type: 'IMAP' },
     });
@@ -261,12 +266,11 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    // Best-effort per-queue advisory lock so two instances don't fetch the same queue
-    // concurrently. Correctness does NOT depend on it — the unique transport-key claim
-    // guarantees each UID is accepted at most once regardless.
-    const locked = await this.tryAdvisoryLock(queueId);
-    if (!locked) return;
-    try {
+    // Concurrency is safe WITHOUT a poll lock: each UID is accepted at most once via the
+    // unique transport-key claim, and the cursor advances only by monotonic CAS. (A
+    // pool-based `pg_advisory_lock` was removed — lock/unlock could land on different
+    // pooled sessions and leak the lock forever.)
+    {
       const lock = await client.getMailboxLock('INBOX');
       try {
         const { uidValidity } = this.readMailboxState(client);
@@ -323,8 +327,6 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       } finally {
         lock.release();
       }
-    } finally {
-      await this.releaseAdvisoryLock(queueId);
     }
 
     await this.drainDeliveries();
@@ -716,25 +718,6 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       return hi;
     } catch {
       return null;
-    }
-  }
-
-  /** Best-effort Postgres advisory lock (namespace 4919, key=queueId). */
-  private async tryAdvisoryLock(queueId: number): Promise<boolean> {
-    try {
-      const rows = await this.prisma.$queryRaw<Array<{ locked: boolean }>>`
-        SELECT pg_try_advisory_lock(4919, ${queueId}) AS locked`;
-      return rows?.[0]?.locked ?? true;
-    } catch {
-      return true; // lock unavailable (e.g. non-PG in a unit test) — proceed; claim insert still guards
-    }
-  }
-
-  private async releaseAdvisoryLock(queueId: number): Promise<void> {
-    try {
-      await this.prisma.$queryRaw`SELECT pg_advisory_unlock(4919, ${queueId})`;
-    } catch {
-      /* ignore */
     }
   }
 
