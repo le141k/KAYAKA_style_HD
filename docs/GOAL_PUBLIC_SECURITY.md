@@ -24,10 +24,12 @@ remain behind the current CIDR/Tailscale restriction until the full Definition o
 >   one) + token delivered in a URL **fragment**; the reset page strips it with `replaceState` and
 >   sets `Referrer-Policy: no-referrer`.
 >
-> **Still open (need production access, approvals, new deps, or a breaking-contract change — not
-> done here):** S1-6/1-7/1-8 (cookie-only auth: remove JWT from login/refresh JSON, exact cookie
-> scoping, XSS-can't-read proof — breaks the current frontend token contract), S1-9 (secret
-> rotation / credential cutover), and all of S0, S2, S3, S4, S5, S6.
+> _(Historical snapshot from the S1 landing — see the status line at the top of this file for the
+> current picture.)_ **Since then:** S2 (verified client sessions, backend + frontend cutover), S3
+> (staff-session correctness, CSRF-origin, login throttle) and S5-7 (preflight/boot guards) have all
+> landed with tests. **Still open (need approvals, new deps, a breaking-contract change, or the live
+> VM):** S1-6/1-7/1-8 + S3-5-token/S3-6 (cookie-only auth — breaks the current frontend token
+> contract), S4 (new deps), and the S0 / S1-9 / S5-edge / S6-ops track (VM).
 
 ## Scope decision
 
