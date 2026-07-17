@@ -5,6 +5,12 @@
 Область: полностью переработанный входящий поток (IMAP + PIPE) поверх durable-леджера.
 Закрывает 7 блокеров из повторного ревью PR #6. PR #6 **не** тронут (без force-push, без merge).
 
+> **Раунд 2 (после 3-го ревью).** Дополнительно закрыты 10 пунктов + false-green тесты —
+> см. раздел **«12. Раунд 2»** в конце. Быстрая проверка: `cd apps/api && npm install &&
+npx prisma generate && npx vitest run src/modules/mail src/modules/tickets src/auth
+--reporter=dot` → **265 passed**, `npx tsc --noEmit` и `eslint` чисто. На чистом чекауте
+> сначала `npm install` в КОРНЕ монорепо (иначе eslint не поднимется).
+
 ## 1. Что сделано (по блокерам ревью)
 
 | Блокер                               | Было                                                                               | Стало                                                                                                                                                                                                                                                                                                      |
@@ -96,3 +102,44 @@ IMAP (GreenMail/Dovecot — **не** MailHog, у него нет IMAP EXPUNGE/UI
 
 SEC-01 (аутентификация клиентского портала — Internet-facing, приоритет) → ACL-01 (department
 scoping) → OUT-01 (durable outbox / честный статус доставки) → репетиция миграции Kayako и cutover.
+
+---
+
+## 12. Раунд 2 — что закрыто (10 пунктов + false-green)
+
+Коммиты `5fabf2d`..`a324c3d` (все на этой ветке, обычные коммиты, без force-push).
+
+| #           | Пункт                                 | Как проверить                                                                                                                                                                                                                                                  |
+| ----------- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| false-green | 3 теста не проверяли то, что заявляли | Мутации: снять 3-й `{uid:true}` у `fetch` / вызов bootstrap в `connectQueue` / запись `rawMime` — каждое роняет тест `inbound.service.spec.ts` (`passes { uid: true }…`, `P0-2: connectQueue captures the baseline…`, `accepts new UIDs…rawMime`).             |
+| #6          | небезопасный advisory-lock            | удалён; корректность на unique claim + CAS.                                                                                                                                                                                                                    |
+| #7 (flag)   | `TELECOM_HD_IMAP_ENABLED` не читался  | теперь гейтит поллер (`onModuleInit`).                                                                                                                                                                                                                         |
+| **#1**      | stale `PROCESSING` навсегда           | lease (`leaseOwner`/`leaseExpiresAt`): claim реклеймит протухший `PROCESSING`; settle lease-gated; startup-drain. Тесты `drain — retry/quarantine` + `reclaims a stale PROCESSING…`.                                                                           |
+| **#2**      | миграция теряла письма                | миграция ставит enabled IMAP-очереди в `NEEDS_RECONCILIATION` + копирует legacy Setting-курсор; `bootstrapQueue` не FROM_NOW-ит halted.                                                                                                                        |
+| **#4**      | check-then-act dedup                  | partial-unique index на непустой `InboundDelivery.messageId`; claim эффективного Message-ID (P2002→SKIPPED). Тесты `#4: stamps…`, `#4: concurrent duplicate loses…`.                                                                                           |
+| **#3**      | LIFE-03 частичная обработка           | `reply()`: пост+attachments+counters+audit в одной `$transaction`. Тест `LIFE-03: reply runs … in a single $transaction`.                                                                                                                                      |
+| **#5**      | cursor из старого UID-space           | `cursorGeneration` + CAS gated (generation/uidValidity/syncState/isEnabled); bootstrap CAS на `uidValidity IS NULL`.                                                                                                                                           |
+| **#7**      | нет reconnect/reconcile               | supervisor `reconcileConnections()` (connect/disconnect по enabled); API `POST /admin/email-queues/{id}/reconcile`, `GET …/inbound/quarantine`, `POST …/replay`; `syncState` в ответе очереди.                                                                 |
+| **#8**      | PIPE не byte-safe                     | `main.ts` свои body-parsers: raw `message/rfc822`/`octet-stream` как Buffer + лимит `TELECOM_HD_INBOUND_MAX_MB`; коллизия `x-inbound-delivery-id`↔contentHash → 409. Тесты в `inbound.controller.spec.ts` + `ingestRawMessage (PIPE) — delivery-id collision`. |
+| **#9**      | orphan-вложения / swallow             | attachments staged лениво (loop/skip/ignore не грузят файлы); DB-ошибка parser-rule → rethrow (RETRY).                                                                                                                                                         |
+| **#10**     | Int32 overflow UID + прочее           | `lastSeenUid`/`uid` → BigInt; dept-snapshot при acceptance; заполнение envelope/subject/messageId в леджере; self-loop с `Name <addr>`.                                                                                                                        |
+
+### Анти-false-green (мутации, которые ДОЛЖНЫ ронять тесты)
+
+1. Снять `inboundDelivery.update` (atomic claim) → `#4: concurrent duplicate…` зелёным НЕ останется.
+2. Вернуть `reply()` к не-транзакционному → `LIFE-03: reply runs … in a single $transaction` падает.
+3. Убрать generation/syncState-guard из cursor CAS → `accepts new UIDs … monotonic CAS` падает.
+4. Игнорировать Buffer body в контроллере → `#8: accepts a raw Buffer body` падает.
+
+### CI (осознанно НЕ добавлено)
+
+`CLAUDE.md` явно запрещает CI («No CI/CD… Do not add CI»). Поэтому GitHub Actions не добавлял;
+тесты гоняются локально (`npm test` / vitest). Это hard-constraint репозитория, не пропуск.
+
+### Обязательный live-gate (не в этом окружении — нет Docker/GreenMail/PG)
+
+Юнит-слой (265 тестов) моделирует IMAP через fake ImapFlow и Prisma-моки. Перед cutover прогнать
+на реальном IMAP (GreenMail/Dovecot) + реальном Postgres через `InboundMailService.pollNow()`:
+restart-recovery (lease), EXPUNGE, UIDVALIDITY halt+reconcile, DB-outage > 5 poll (cursor стоит),
+два поллера (unique claim / CAS), upgrade со старого Setting-курсора. Testcontainers-спек
+`inbound.int-spec.ts` (PIPE→ticket→dedup→threading) гоняется через `npm run test:integration`.
