@@ -745,60 +745,79 @@ export class TicketsService {
       authorEmail = ticket.requesterEmail ?? undefined;
     }
 
-    const post = await this.prisma.ticketPost.create({
-      data: {
-        ticketId,
-        authorType: isStaffReply ? 'STAFF' : 'USER',
-        staffId,
-        fullName: authorName,
-        email: authorEmail,
-        subject: ticket.subject,
-        contents: dto.contents,
-        isHtml: dto.isHtml,
-        isEmailed: dto.isEmailed,
-        isThirdParty: dto.isThirdParty,
-        creationMode: replyCreationMode,
-        ipAddress: replyIp,
-        // Inbound Message-ID written atomically with the post (not a follow-up UPDATE)
-        // so a drain retry is de-duplicated by the InboundDelivery pipeline.
-        ...(dto.messageId ? { messageId: dto.messageId } : {}),
-      },
+    // LIFE-03: post + attachment adoption + counters/reopen + audit are ONE transaction,
+    // so a mid-op failure can never leave a post created with wrong counters/missing
+    // attachments (which the inbound ledger would then treat as a completed duplicate).
+    const hasNewAttachments = !!dto.attachmentIds?.length;
+    // Resolve the reopen target status before the transaction (a read).
+    const reopenStatusId = !isStaffReply && ticket.isResolved ? await this.defaultStatusId() : null;
+
+    const post = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.ticketPost.create({
+        data: {
+          ticketId,
+          authorType: isStaffReply ? 'STAFF' : 'USER',
+          staffId,
+          fullName: authorName,
+          email: authorEmail,
+          subject: ticket.subject,
+          contents: dto.contents,
+          isHtml: dto.isHtml,
+          isEmailed: dto.isEmailed,
+          isThirdParty: dto.isThirdParty,
+          creationMode: replyCreationMode,
+          ipAddress: replyIp,
+          // Inbound Message-ID written atomically with the post (not a follow-up UPDATE)
+          // so a drain retry is de-duplicated by the InboundDelivery pipeline.
+          ...(dto.messageId ? { messageId: dto.messageId } : {}),
+        },
+      });
+
+      if (hasNewAttachments) {
+        // Adopt attachment orphans (same effect as AttachmentsService.linkToPost).
+        await tx.attachment.updateMany({
+          where: { id: { in: dto.attachmentIds! }, postId: null },
+          data: { postId: created.id, ticketId, claimToken: null },
+        });
+      }
+
+      const reopenData =
+        reopenStatusId != null
+          ? {
+              statusId: reopenStatusId,
+              isResolved: false,
+              resolvedAt: null,
+              reopenedAt: now,
+              wasReopened: true,
+            }
+          : {};
+
+      await tx.ticket.update({
+        where: { id: ticketId },
+        data: {
+          totalReplies: { increment: 1 },
+          lastReplyAt: now,
+          lastActivityAt: now,
+          ...(firstResponse && { firstResponseAt: now }),
+          ...(hasNewAttachments && { hasAttachments: true }),
+          ...reopenData,
+        },
+      });
+
+      await tx.ticketAuditLog.create({
+        data: {
+          ticketId,
+          staffId: staffId ?? null,
+          actorType: isStaffReply ? 'STAFF' : 'USER',
+          action: 'REPLY',
+          field: null,
+          oldValue: null,
+          newValue: null,
+        },
+      });
+
+      return created;
     });
-
-    // Link attachment orphans to the new post
-    const hasNewAttachments = !!(dto.attachmentIds?.length && this.attachmentsService);
-    if (hasNewAttachments && this.attachmentsService) {
-      await this.attachmentsService.linkToPost(dto.attachmentIds!, post.id, ticketId);
-    }
-
-    // Reopen the ticket when a USER (customer) replies to a resolved/closed
-    // ticket so it re-surfaces to staff. Staff replies must NOT reopen.
-    const reopenData =
-      !isStaffReply && ticket.isResolved
-        ? {
-            statusId: await this.defaultStatusId(),
-            isResolved: false,
-            resolvedAt: null,
-            reopenedAt: now,
-            wasReopened: true,
-          }
-        : {};
-
-    await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: {
-        totalReplies: { increment: 1 },
-        lastReplyAt: now,
-        lastActivityAt: now,
-        // Mark first staff response time if not yet set
-        ...(firstResponse && { firstResponseAt: now }),
-        // Set hasAttachments if new attachments were linked
-        ...(hasNewAttachments && { hasAttachments: true }),
-        ...reopenData,
-      },
-    });
-
-    await this.writeAudit(ticketId, 'REPLY', staffId ?? undefined, isStaffReply ? 'STAFF' : 'USER', {});
 
     // Send outbound email to requester when a staff member replies (non-blocking)
     if (isStaffReply && ticket.requesterEmail) {

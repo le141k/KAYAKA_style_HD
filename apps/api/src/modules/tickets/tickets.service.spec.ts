@@ -344,6 +344,29 @@ describe('TicketsService', () => {
       };
       expect(createArg.data.messageId).toBe('<mid-reply@x>');
     });
+
+    it('LIFE-03: reply runs post + counters + audit in a single $transaction', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeTicket({ id: 9, isResolved: false, firstResponseAt: null }),
+      );
+      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 100 });
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      await service.reply(9, {
+        contents: 'hi',
+        isHtml: false,
+        isNote: false,
+        isEmailed: true,
+        isThirdParty: false,
+        creationMode: 'EMAIL',
+        ipAddress: '0.0.0.0',
+      });
+
+      expect(prisma.$transaction).toHaveBeenCalled();
+      const txArg = (prisma.$transaction as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+      expect(typeof txArg).toBe('function');
+    });
   });
 
   // ─── recipient upsert (createTicket cc/bcc) ──────────────────────────────
