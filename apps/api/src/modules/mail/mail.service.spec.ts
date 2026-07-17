@@ -151,6 +151,24 @@ describe('MailService', () => {
       ).resolves.toBeUndefined();
     });
 
+    it('deliver(throwOnError=true) RETHROWS an SMTP failure so BullMQ retries (blocker #6)', async () => {
+      const sendMail = (service as unknown as { transporter: { sendMail: ReturnType<typeof vi.fn> } })
+        .transporter.sendMail;
+      sendMail.mockRejectedValueOnce(new Error('SMTP 421'));
+      await expect(service.deliver({ to: 'u@e.com', subject: 's', text: 'b' }, true)).rejects.toThrow(
+        'SMTP 421',
+      );
+    });
+
+    it('deliver(throwOnError=false) swallows an SMTP failure (inline fallback path)', async () => {
+      const sendMail = (service as unknown as { transporter: { sendMail: ReturnType<typeof vi.fn> } })
+        .transporter.sendMail;
+      sendMail.mockRejectedValueOnce(new Error('SMTP down'));
+      await expect(
+        service.deliver({ to: 'u@e.com', subject: 's', text: 'b' }, false),
+      ).resolves.toBeUndefined();
+    });
+
     it('handles array recipients by joining with comma', async () => {
       await expect(
         service.send({ to: ['a@example.com', 'b@example.com'], subject: 'Multi', text: 'body' }),

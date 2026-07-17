@@ -12,10 +12,14 @@ const CONFIG = {
 function makePrismaMock() {
   return {
     userEmail: { findMany: vi.fn() },
+    // Default: the resolved owner is enabled (blocker #5 isEnabled check).
+    user: { findUnique: vi.fn().mockResolvedValue({ isEnabled: true }) },
     ticket: { count: vi.fn() },
     clientLoginToken: {
       create: vi.fn(),
       findUnique: vi.fn(),
+      // Default: under the per-owner magic-link cap.
+      count: vi.fn().mockResolvedValue(0),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
       deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
@@ -99,6 +103,22 @@ describe('ClientAuthService', () => {
       expect(prisma.clientLoginToken.create).not.toHaveBeenCalled();
     });
 
+    it('is a silent no-op for a DISABLED user (blocker #5)', async () => {
+      (prisma.userEmail.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ userId: 5 }]);
+      (prisma.user.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ isEnabled: false });
+      (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(3);
+      await service.requestLink('user@example.com');
+      expect(prisma.clientLoginToken.create).not.toHaveBeenCalled();
+    });
+
+    it('stops issuing links once the per-owner mail-bomb cap is hit (blocker)', async () => {
+      (prisma.userEmail.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ userId: 5 }]);
+      (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(2);
+      (prisma.clientLoginToken.count as ReturnType<typeof vi.fn>).mockResolvedValue(3); // at cap
+      await service.requestLink('user@example.com');
+      expect(prisma.clientLoginToken.create).not.toHaveBeenCalled();
+    });
+
     it('invalidates the freshly-issued token when mail dispatch fails', async () => {
       mail.sendTemplateStrict.mockRejectedValue(new Error('smtp down'));
       (prisma.userEmail.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ userId: 5 }]);
@@ -146,9 +166,21 @@ describe('ClientAuthService', () => {
         userId: 5,
         revokedAt: null,
         expiresAt: new Date(Date.now() + 60_000),
+        user: { isEnabled: true },
       });
       const principal = await service.resolveSession('raw');
       expect(principal).toEqual({ userId: 5 });
+    });
+
+    it('returns null when the session user has since been DISABLED (blocker #5)', async () => {
+      (prisma.clientSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 's1',
+        userId: 5,
+        revokedAt: null,
+        expiresAt: new Date(Date.now() + 60_000),
+        user: { isEnabled: false },
+      });
+      expect(await service.resolveSession('raw')).toBeNull();
     });
 
     it('returns null for a revoked session', async () => {

@@ -215,10 +215,14 @@ function printReport(a: OwnershipAudit): void {
 // Run standalone.
 if (require.main === module) {
   auditUserEmailOwnership()
-    .then(printReport)
+    .then((audit) => {
+      printReport(audit);
+      // Exit non-zero when NOT CLEAN so CI / a go-live gate FAILS instead of silently
+      // passing while ambiguous/un-normalized ownership remains (blocker: audit exit code).
+      void prisma.$disconnect().finally(() => process.exit(audit.clean ? 0 : 1));
+    })
     .catch((err: unknown) => {
       console.error('Ownership audit error:', err);
-      process.exit(1);
-    })
-    .finally(() => void prisma.$disconnect());
+      void prisma.$disconnect().finally(() => process.exit(1));
+    });
 }

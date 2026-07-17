@@ -28,7 +28,10 @@ interface ApiStaffRef {
 }
 interface ApiAttachment {
   id: number;
-  filename: string;
+  // The API serializes the Prisma column as `fileName` (camelCase); older/other routes may
+  // use `filename`. Accept both so the client never shows an `undefined` attachment name.
+  fileName?: string;
+  filename?: string;
   size: number;
   storageKey?: string;
   mimeType?: string;
@@ -91,7 +94,7 @@ function mapApiAttachment(a: ApiAttachment): Attachment {
   const url = `${API_BASE}/attachments/client/${a.id}/download`;
   return {
     id: a.id,
-    filename: a.filename,
+    filename: a.fileName ?? a.filename ?? 'attachment',
     size: a.size,
     url,
     mime_type: a.mimeType ?? 'application/octet-stream',

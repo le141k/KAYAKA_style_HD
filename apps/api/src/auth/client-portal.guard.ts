@@ -2,13 +2,13 @@ import { CanActivate, ExecutionContext, Inject, Injectable, NotFoundException } 
 import { AppConfig, APP_CONFIG } from '../config/configuration';
 
 /**
- * Fail-closed gate for the legacy anonymous client portal (GOAL_PUBLIC_SECURITY S2-1).
+ * Fail-closed gate for the ENTIRE client portal surface (GOAL_PUBLIC_SECURITY S2-1).
  *
- * The public ticket routes authorize by "knowing an email" (`?email=` / requester
- * email) — an IDOR that lets anyone read, reply to, or enumerate any customer's
- * tickets. Public upload is likewise unguarded (S4). These MUST NOT be reachable in
- * production until the verified client-session flow (S2) and public-abuse controls
- * (S4) replace them.
+ * Applied (via `@ClientAuthenticated()` and the `ClientAuthController`) to every client
+ * route: magic-link `request-link`/`verify`, the client ticket list/detail/reply, and the
+ * owner-scoped attachment download — plus the still-unguarded public create/upload (S4).
+ * None of these may be reachable in production until the verified client-session flow (S2)
+ * and public-abuse controls (S4) are fully signed off for launch.
  *
  * In production the gate is CLOSED unless `TELECOM_HD_CLIENT_PORTAL_ENABLED` is set
  * (it stays off until S2/S4 land). Dev/test keep the routes so existing flows and

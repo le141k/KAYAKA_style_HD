@@ -432,6 +432,16 @@ export class AuthService {
       throw new BadRequestException('Invalid or expired reset token');
     }
 
+    // Blocker #7: never re-set the password of a DISABLED staff account via a stale link.
+    // (Disable also burns pending reset tokens via revokeAllForStaff; this is defense-in-depth.)
+    const target = await this.prisma.staff.findUnique({
+      where: { id: record.staffId },
+      select: { isEnabled: true },
+    });
+    if (!target || !target.isEnabled) {
+      throw new BadRequestException('Invalid or expired reset token');
+    }
+
     // Deliberate fail-safe: the token is already consumed above, OUTSIDE this transaction.
     // If the password write below fails (e.g. the staff row was deleted between issue and
     // reset), the token stays burned and the user must request a new link — we never change

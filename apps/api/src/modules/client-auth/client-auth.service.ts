@@ -22,6 +22,9 @@ export interface ClientPrincipal {
 
 /** Single-use login link TTL: 15 minutes. */
 const LOGIN_TOKEN_TTL_MS = 15 * 60 * 1000;
+/** Per-owner magic-link mail-bomb cap: at most N links issued per window. */
+const MAGIC_LINK_WINDOW_MS = 15 * 60 * 1000;
+const MAGIC_LINK_MAX_PER_WINDOW = 3;
 /** Client session TTL: 7 days. */
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -82,6 +85,12 @@ export class ClientAuthService implements OnModuleInit, OnModuleDestroy {
     const userIds = [...new Set(userEmails.map((u) => u.userId))];
     if (userIds.length !== 1) return null; // unknown or ambiguous → fail closed
     const userId = userIds[0]!;
+    // Blocker #5: never issue a login link for a disabled user.
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { isEnabled: true },
+    });
+    if (!user || !user.isEnabled) return null;
     const ticketCount = await this.prisma.ticket.count({ where: { userId } });
     return ticketCount > 0 ? userId : null;
   }
@@ -95,6 +104,14 @@ export class ClientAuthService implements OnModuleInit, OnModuleDestroy {
     const email = normalizeEmail(rawEmail);
     const userId = await this.resolveUnambiguousOwner(email);
     if (userId === null) return; // generic response, no email, no enumeration
+
+    // Mail-bomb protection (blocker): bound how many links a single owner is sent per window,
+    // on top of the per-IP @Throttle on the endpoint. Silently stop once the cap is hit —
+    // still a generic 202, so nothing about the account is disclosed.
+    const recentLinks = await this.prisma.clientLoginToken.count({
+      where: { userId, createdAt: { gt: new Date(Date.now() - MAGIC_LINK_WINDOW_MS) } },
+    });
+    if (recentLinks >= MAGIC_LINK_MAX_PER_WINDOW) return;
 
     await this.prisma.clientLoginToken.updateMany({
       where: { userId, usedAt: null },
@@ -172,8 +189,15 @@ export class ClientAuthService implements OnModuleInit, OnModuleDestroy {
   async resolveSession(rawSession: string): Promise<ClientPrincipal | null> {
     const session = await this.prisma.clientSession.findUnique({
       where: { tokenHash: sha256(rawSession) },
+      include: { user: { select: { isEnabled: true } } },
     });
     if (!session || session.revokedAt !== null || session.expiresAt < new Date()) {
+      return null;
+    }
+    // Blocker #5: a user disabled AFTER login loses access immediately, even though the
+    // 7-day session cookie hasn't expired. (Sessions are bound to a stable `userId`, so an
+    // email change does not transfer or invalidate them — the same person stays signed in.)
+    if (!session.user || !session.user.isEnabled) {
       return null;
     }
     // Best-effort last-seen bump (never blocks the request path).

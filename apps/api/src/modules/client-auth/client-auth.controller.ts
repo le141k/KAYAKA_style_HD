@@ -1,9 +1,10 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Post, Res } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Post, Res, UseGuards } from '@nestjs/common';
 import type { Response } from 'express';
 import { Throttle } from '@nestjs/throttler';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import { Public } from '../../auth/auth.decorators';
+import { ClientPortalGuard } from '../../auth/client-portal.guard';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
 import { ClientAuthService, type ClientPrincipal } from './client-auth.service';
 import { ClientAuthenticated, CurrentClient, CLIENT_SESSION_COOKIE } from './client-auth.decorators';
@@ -11,6 +12,9 @@ import { RequestLinkSchema, VerifyClientSchema, type RequestLinkDto, type Verify
 
 @ApiTags('client-auth')
 @Controller('client-auth')
+// S2-1: the ENTIRE client-auth surface (request-link/verify included) is fail-closed 404 in
+// production until TELECOM_HD_CLIENT_PORTAL_ENABLED is set — not just the ticket/upload routes.
+@UseGuards(ClientPortalGuard)
 export class ClientAuthController {
   constructor(
     private readonly clientAuth: ClientAuthService,

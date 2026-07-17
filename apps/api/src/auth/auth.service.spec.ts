@@ -385,6 +385,7 @@ describe('AuthService', () => {
       });
       (prisma.passwordReset.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
       (prisma.staff.update as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ isEnabled: true });
       (prisma.refreshToken.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 2 });
       vi.spyOn(passwordUtil, 'hashPassword').mockResolvedValue('new-password-hash');
 
@@ -515,6 +516,8 @@ describe('AuthService', () => {
         usedAt: new Date(),
         expiresAt: new Date(Date.now() + 1000),
       });
+      // Blocker #7: resetPassword now checks the target staff is enabled.
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ isEnabled: true });
 
       await service.resetPassword('raw-token', 'new-password-123');
 
@@ -528,6 +531,21 @@ describe('AuthService', () => {
         }),
       );
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a reset for a DISABLED staff account (blocker #7)', async () => {
+      vi.spyOn(passwordUtil, 'hashPassword').mockResolvedValue('new-hash');
+      (prisma.passwordReset.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.passwordReset.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 7,
+        staffId: 1,
+        usedAt: new Date(),
+        expiresAt: new Date(Date.now() + 1000),
+      });
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ isEnabled: false });
+
+      await expect(service.resetPassword('raw', 'new-password-123')).rejects.toThrow(BadRequestException);
+      expect(prisma.staff.update).not.toHaveBeenCalled();
     });
 
     it('rejects a replayed/used/expired token (zero rows consumed) without changing the password', async () => {
