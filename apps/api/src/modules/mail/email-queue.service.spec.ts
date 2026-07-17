@@ -46,6 +46,10 @@ function makePrismaMock() {
       update: vi.fn(),
       delete: vi.fn(),
     },
+    inboundDelivery: {
+      findMany: vi.fn().mockResolvedValue([]),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
   } as unknown as PrismaService;
 }
 
@@ -230,6 +234,50 @@ describe('EmailQueueService', () => {
 
       await expect(service.delete(404)).rejects.toBeInstanceOf(NotFoundException);
       expect(prisma.emailQueue.delete).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── #7 reconcile / quarantine ─────────────────────────────────────────────
+
+  describe('reconcile', () => {
+    it('clears sync state, resets the cursor and bumps cursorGeneration', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeSafeQueue());
+      (prisma.emailQueue.update as ReturnType<typeof vi.fn>).mockResolvedValue(makeSafeQueue());
+      await service.reconcile(1);
+      expect(prisma.emailQueue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 1 },
+          data: expect.objectContaining({
+            syncState: 'OK',
+            uidValidity: null,
+            lastSeenUid: 0,
+            cursorGeneration: { increment: 1 },
+          }),
+        }),
+      );
+    });
+
+    it('throws NotFoundException for an unknown queue', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(service.reconcile(404)).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
+  describe('replayQuarantined', () => {
+    it('resets a QUARANTINED delivery back to ACCEPTED', async () => {
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      await expect(service.replayQuarantined(9)).resolves.toEqual({ replayed: true });
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 9, state: 'QUARANTINED' },
+          data: expect.objectContaining({ state: 'ACCEPTED', attempts: 0 }),
+        }),
+      );
+    });
+
+    it('throws NotFoundException when the delivery is not quarantined', async () => {
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+      await expect(service.replayQuarantined(9)).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 });

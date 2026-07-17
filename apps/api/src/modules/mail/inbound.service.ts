@@ -258,14 +258,80 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async pollAll(): Promise<void> {
+    await this.reconcileConnections();
     for (const [queueId, client] of this.connections) {
       try {
         await this.pollQueue(queueId, client);
       } catch (err) {
         this.logger.error(`IMAP poll failed for queue ${queueId}: ${String(err)}`);
       }
+      // Drop an unusable (dropped) connection so reconcileConnections reconnects it.
+      if ((client as { usable?: boolean }).usable === false) {
+        this.connections.delete(queueId);
+        this.logger.warn(`IMAP queue ${queueId}: connection dropped — will reconnect next cycle`);
+      }
     }
     await this.drainDeliveries();
+  }
+
+  /**
+   * Supervisor: keep live connections in sync with the enabled IMAP queues without an
+   * API restart — connect any enabled queue that has no live connection (first run,
+   * reconnect after a drop, or a newly enabled/created queue), and log out + drop
+   * connections for queues that were disabled or deleted.
+   */
+  private async reconcileConnections(): Promise<void> {
+    if (!this.config.TELECOM_HD_IMAP_ENABLED) return;
+    let enabled: Array<{
+      id: number;
+      host: string;
+      port: number;
+      useTls: boolean;
+      username: string;
+      passwordEnc: string;
+    }>;
+    try {
+      enabled = await this.prisma.emailQueue.findMany({
+        where: { isEnabled: true, type: 'IMAP' },
+        select: { id: true, host: true, port: true, useTls: true, username: true, passwordEnc: true },
+      });
+    } catch (err) {
+      this.logger.error(`IMAP reconcile query failed: ${String(err)}`);
+      return;
+    }
+    const enabledIds = new Set(enabled.map((q) => q.id));
+
+    // Disconnect queues no longer enabled.
+    for (const [queueId, client] of this.connections) {
+      if (!enabledIds.has(queueId)) {
+        try {
+          await client.logout();
+        } catch {
+          /* ignore */
+        }
+        this.connections.delete(queueId);
+        this.logger.log(`IMAP queue ${queueId}: disabled/removed — disconnected`);
+      }
+    }
+
+    // Connect enabled queues that have no live connection.
+    const encKey = this.config.TELECOM_HD_FIELD_ENCRYPTION_KEY;
+    for (const q of enabled) {
+      if (this.connections.has(q.id)) continue;
+      let plainPassword: string;
+      try {
+        plainPassword = decryptField(q.passwordEnc, encKey);
+      } catch (err) {
+        this.logger.error(`Failed to decrypt IMAP password for queue ${q.id}: ${String(err)}`);
+        continue;
+      }
+      await this.connectQueue(q.id, {
+        host: q.host,
+        port: q.port,
+        secure: q.useTls,
+        auth: { user: q.username, pass: plainPassword },
+      });
+    }
   }
 
   private async pollQueue(queueId: number, client: ImapFlow): Promise<void> {

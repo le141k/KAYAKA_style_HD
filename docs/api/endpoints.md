@@ -319,3 +319,18 @@ SLA plans, schedules, holidays, and escalation rules. All routes require `admin.
 | POST   | /api/admin/email-templates      | 🔒 `admin.mail` | `{key, locale?, subject, htmlBody, textBody?}` | Created template                           |
 | PATCH  | /api/admin/email-templates/{id} | 🔒 `admin.mail` | Partial template fields (key/locale immutable) | Updated template                           |
 | DELETE | /api/admin/email-templates/{id} | 🔒 `admin.mail` | —                                              | 204 No Content                             |
+
+---
+
+## Admin / Email Queues + inbound ledger
+
+| Method | Path                                                           | Auth            | Body         | Returns                                                                                                        |
+| ------ | -------------------------------------------------------------- | --------------- | ------------ | -------------------------------------------------------------------------------------------------------------- |
+| GET    | /api/admin/email-queues                                        | 🔒 `admin.mail` | —            | `EmailQueue[]` (no password; incl. `syncState`, `lastError`, `lastSeenUid`, `uidValidity`, `cursorGeneration`) |
+| GET    | /api/admin/email-queues/{id}                                   | 🔒 `admin.mail` | —            | Queue (with sync health)                                                                                       |
+| POST   | /api/admin/email-queues                                        | 🔒 `admin.mail` | queue fields | Created queue                                                                                                  |
+| PUT    | /api/admin/email-queues/{id}                                   | 🔒 `admin.mail` | partial      | Updated queue                                                                                                  |
+| DELETE | /api/admin/email-queues/{id}                                   | 🔒 `admin.mail` | —            | 204 No Content                                                                                                 |
+| POST   | /api/admin/email-queues/{id}/reconcile                         | 🔒 `admin.mail` | —            | Clears `NEEDS_RECONCILIATION`, resets cursor, bumps `cursorGeneration` → re-bootstrap                          |
+| GET    | /api/admin/email-queues/inbound/quarantine                     | 🔒 `admin.mail` | —            | Quarantined `InboundDelivery[]` (metadata only)                                                                |
+| POST   | /api/admin/email-queues/inbound/quarantine/{deliveryId}/replay | 🔒 `admin.mail` | —            | `{ replayed: true }` — resets the delivery to ACCEPTED so the drain reprocesses it                             |
