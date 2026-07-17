@@ -35,6 +35,15 @@ const schema = z.object({
   TELECOM_HD_INBOUND_WEBHOOK_SECRET: z.string().min(32).default('inbound-dev-secret-change-me-0000'),
   TELECOM_HD_UPLOAD_DIR: z.string().default('/app/uploads'),
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: z.coerce.number().default(25),
+  // IMAP first-connect baseline policy. FROM_NOW (default) records the current
+  // high-water UID and imports nothing; BACKFILL additionally ingests up to
+  // TELECOM_HD_IMAP_BACKFILL_LIMIT most-recent existing messages. Chosen explicitly
+  // so a fresh connect can never silently import the whole historical mailbox.
+  TELECOM_HD_IMAP_BOOTSTRAP_POLICY: z.enum(['FROM_NOW', 'BACKFILL']).default('FROM_NOW'),
+  TELECOM_HD_IMAP_BACKFILL_LIMIT: z.coerce.number().int().nonnegative().default(0),
+  // Max processing attempts before an inbound delivery is QUARANTINED (raw MIME is
+  // always retained for replay — a quarantine never discards a message).
+  TELECOM_HD_INBOUND_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_FIELD_ENCRYPTION_KEY: z.string().optional(),

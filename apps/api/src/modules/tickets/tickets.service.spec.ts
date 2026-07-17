@@ -287,6 +287,65 @@ describe('TicketsService', () => {
     });
   });
 
+  // ─── atomic inbound Message-ID (written INSIDE the Prisma create) ─────────
+
+  describe('atomic inbound messageId', () => {
+    it('createTicket writes messageId onto the first post in the SAME Prisma create', async () => {
+      (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
+      (prisma.ticketPriority.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 2 });
+      (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue(makeTicket({ id: 7 }));
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeTicket({ id: 7, mask: 'TT-000007' }),
+      );
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      await service.createTicket({
+        subject: 's',
+        contents: 'b',
+        isHtml: false,
+        departmentId: 1,
+        requesterEmail: 'a@b.example',
+        requesterName: 'A',
+        creationMode: 'WEB',
+        ipAddress: '0.0.0.0',
+        tags: [],
+        customFields: {},
+        messageId: '<mid-create@x>',
+      });
+
+      // Assert the ACTUAL Prisma create — not just what the caller passed.
+      const createArg = (prisma.ticket.create as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        data: { posts: { create: { messageId?: string } } };
+      };
+      expect(createArg.data.posts.create.messageId).toBe('<mid-create@x>');
+    });
+
+    it('reply writes messageId onto the post in the SAME Prisma create', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeTicket({ id: 9, isResolved: false, firstResponseAt: null }),
+      );
+      (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 100 });
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      await service.reply(9, {
+        contents: 'hi',
+        isHtml: false,
+        isNote: false,
+        isEmailed: true,
+        isThirdParty: false,
+        creationMode: 'EMAIL',
+        ipAddress: '0.0.0.0',
+        messageId: '<mid-reply@x>',
+      });
+
+      const createArg = (prisma.ticketPost.create as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        data: { messageId?: string };
+      };
+      expect(createArg.data.messageId).toBe('<mid-reply@x>');
+    });
+  });
+
   // ─── recipient upsert (createTicket cc/bcc) ──────────────────────────────
 
   describe('createTicket with cc/bcc', () => {

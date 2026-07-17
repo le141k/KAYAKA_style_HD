@@ -126,6 +126,8 @@ export class TicketsService {
       attachmentClaimToken?: string;
       creationMode?: CreationMode;
       ipAddress?: string;
+      /** RFC Message-ID for inbound mail — written atomically onto the first post. */
+      messageId?: string;
     },
     creatorStaffId?: number,
   ): Promise<Ticket> {
@@ -210,6 +212,9 @@ export class TicketsService {
               isHtml: dto.isHtml,
               creationMode,
               ipAddress,
+              // Inbound Message-ID written in the SAME transaction as ticket+post so a
+              // drain retry is de-duplicated (never a second ticket) — see InboundDelivery.
+              ...(dto.messageId ? { messageId: dto.messageId } : {}),
             },
           },
           // Tags
@@ -709,7 +714,7 @@ export class TicketsService {
     ticketId: number,
     // creationMode/ipAddress are not on the public DTO (mass-assignment guard) — the
     // controller forces STAFF + real ip; inbound mail passes EMAIL explicitly.
-    dto: ReplyTicketDto & { creationMode?: CreationMode; ipAddress?: string },
+    dto: ReplyTicketDto & { creationMode?: CreationMode; ipAddress?: string; messageId?: string },
     staffId?: number,
   ): Promise<TicketPost | TicketNote> {
     const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
@@ -754,6 +759,9 @@ export class TicketsService {
         isThirdParty: dto.isThirdParty,
         creationMode: replyCreationMode,
         ipAddress: replyIp,
+        // Inbound Message-ID written atomically with the post (not a follow-up UPDATE)
+        // so a drain retry is de-duplicated by the InboundDelivery pipeline.
+        ...(dto.messageId ? { messageId: dto.messageId } : {}),
       },
     });
 
