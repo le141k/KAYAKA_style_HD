@@ -518,11 +518,11 @@ describe('InboundMailService — parser rule helpers', () => {
         expect.objectContaining({
           where: expect.objectContaining({
             id: 1,
-            lastSeenUid: { lt: 102 },
+            lastSeenUid: { lt: 102n },
             cursorGeneration: 0,
             syncState: 'OK',
           }),
-          data: { lastSeenUid: 102 },
+          data: { lastSeenUid: 102n },
         }),
       );
     });
@@ -542,7 +542,7 @@ describe('InboundMailService — parser rule helpers', () => {
       await poll(makeLedgerClient([103, 101], { uidValidity: 7n, uidNext: 104 }));
       expect(prisma.inboundDelivery.create).toHaveBeenCalledTimes(2);
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({ data: { lastSeenUid: 103 } }),
+        expect.objectContaining({ data: { lastSeenUid: 103n } }),
       );
     });
 
@@ -566,7 +566,7 @@ describe('InboundMailService — parser rule helpers', () => {
       (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
       await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({ data: { lastSeenUid: 101 } }),
+        expect.objectContaining({ data: { lastSeenUid: 101n } }),
       );
     });
 
@@ -576,7 +576,7 @@ describe('InboundMailService — parser rule helpers', () => {
       // 101 vanished (no create), 102 accepted; cursor reaches 102.
       expect(prisma.inboundDelivery.create).toHaveBeenCalledTimes(1);
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({ data: { lastSeenUid: 102 } }),
+        expect.objectContaining({ data: { lastSeenUid: 102n } }),
       );
     });
 
@@ -625,7 +625,7 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 1, uidValidity: null },
-          data: expect.objectContaining({ lastSeenUid: 500, uidValidity: 7n, syncState: 'OK' }),
+          data: expect.objectContaining({ lastSeenUid: 500n, uidValidity: 7n, syncState: 'OK' }),
         }),
       );
     });
@@ -656,7 +656,7 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 1, uidValidity: null },
-          data: expect.objectContaining({ lastSeenUid: 9, uidValidity: 7n, syncState: 'OK' }),
+          data: expect.objectContaining({ lastSeenUid: 9n, uidValidity: 7n, syncState: 'OK' }),
         }),
       );
     });

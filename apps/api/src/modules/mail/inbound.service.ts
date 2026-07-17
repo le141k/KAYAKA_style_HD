@@ -231,7 +231,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       // write different baselines — the first wins, the loser's updateMany matches 0 rows.
       const cas = await this.prisma.emailQueue.updateMany({
         where: { id: queueId, uidValidity: null },
-        data: { lastSeenUid: baseline, uidValidity, syncState: 'OK', lastError: null },
+        data: { lastSeenUid: BigInt(baseline), uidValidity, syncState: 'OK', lastError: null },
       });
       if (cas.count === 0) {
         this.logger.log(`IMAP queue ${queueId}: bootstrap already done by another worker`);
@@ -380,7 +380,9 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           return;
         }
 
-        const lastUid = queue.lastSeenUid;
+        // Cursor is a BigInt column (IMAP UIDs are unsigned 32-bit). UID values are well
+        // within 2^53, so we compute in Number and store back as BigInt.
+        const lastUid = Number(queue.lastSeenUid);
         // Discover new UIDs first (uid-only), then fetch+accept each in ascending order
         // so out-of-order server responses can't make the cursor leapfrog a gap.
         const uids: number[] = [];
@@ -415,13 +417,13 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           const cas = await this.prisma.emailQueue.updateMany({
             where: {
               id: queueId,
-              lastSeenUid: { lt: cursor },
+              lastSeenUid: { lt: BigInt(cursor) },
               cursorGeneration: queue.cursorGeneration,
               uidValidity: queue.uidValidity,
               syncState: 'OK',
               isEnabled: true,
             },
-            data: { lastSeenUid: cursor },
+            data: { lastSeenUid: BigInt(cursor) },
           });
           if (cas.count === 0) {
             this.logger.warn(`IMAP queue ${queueId}: cursor CAS skipped (queue reconciled mid-poll)`);
@@ -458,7 +460,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           departmentId, // snapshot at acceptance
           transportKey,
           uidValidity,
-          uid,
+          uid: BigInt(uid),
           contentHash,
           rawMime: new Uint8Array(source),
           sizeBytes: source.length,

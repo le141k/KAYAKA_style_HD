@@ -698,7 +698,7 @@ model EmailQueue {
   // `uidValidity` NULL means the queue has never been bootstrapped → the poller sets a
   // synchronous baseline before its first fetch (no historical import). A UIDVALIDITY
   // change flips `syncState` to NEEDS_RECONCILIATION and halts polling (fail-closed).
-  lastSeenUid    Int                 @default(0)
+  lastSeenUid    BigInt              @default(0)
   uidValidity    BigInt?
   syncState      EmailQueueSyncState @default(OK)
   lastError      String?
@@ -720,9 +720,10 @@ model InboundDelivery {
   //   PIPE: `pipe:<queueId|->:<externalId or sha256:hash>`
   transportKey  String           @unique
 
-  // IMAP transport identity (also stored structured for admin/observability)
+  // IMAP transport identity (also stored structured for admin/observability). IMAP UIDs
+  // are unsigned 32-bit, so BigInt (not signed 32-bit INTEGER) to avoid overflow.
   uidValidity   BigInt?
-  uid           Int?
+  uid           BigInt?
   // PIPE/MTA transport identity (webhook idempotency id / MTA delivery id)
   externalId    String?
 

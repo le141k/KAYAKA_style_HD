@@ -7,7 +7,7 @@ CREATE TYPE "InboundDeliveryState" AS ENUM ('ACCEPTED', 'PROCESSING', 'PROCESSED
 CREATE TYPE "EmailQueueSyncState" AS ENUM ('OK', 'NEEDS_RECONCILIATION');
 
 -- Per-queue durable IMAP cursor + sync health (replaces Setting `imap/lastSeenUid:<id>`).
-ALTER TABLE "EmailQueue" ADD COLUMN "lastSeenUid" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "EmailQueue" ADD COLUMN "lastSeenUid" BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE "EmailQueue" ADD COLUMN "uidValidity" BIGINT;
 ALTER TABLE "EmailQueue" ADD COLUMN "syncState" "EmailQueueSyncState" NOT NULL DEFAULT 'OK';
 ALTER TABLE "EmailQueue" ADD COLUMN "lastError" TEXT;
@@ -20,7 +20,7 @@ CREATE TABLE "InboundDelivery" (
     "queueId" INTEGER,
     "transportKey" TEXT NOT NULL,
     "uidValidity" BIGINT,
-    "uid" INTEGER,
+    "uid" BIGINT,
     "externalId" TEXT,
     "messageId" TEXT,
     "contentHash" TEXT NOT NULL,
