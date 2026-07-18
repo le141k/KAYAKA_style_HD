@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException } from '@nestjs/common';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { EmailQueueService } from './email-queue.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 
@@ -19,6 +19,13 @@ function makeSafeQueue(overrides: Partial<SafeQueue> = {}): SafeQueue {
     signature: '',
     isEnabled: false,
     createdAt: new Date('2024-01-01T00:00:00.000Z'),
+    syncState: 'OK',
+    lastError: null,
+    lastSeenUid: 0n,
+    uidValidity: null,
+    cursorGeneration: 0,
+    bootstrapPolicy: null,
+    bootstrapBackfillLimit: null,
     ...overrides,
   };
 }
@@ -35,6 +42,13 @@ type SafeQueue = {
   signature: string;
   isEnabled: boolean;
   createdAt: Date;
+  syncState: 'OK' | 'NEEDS_RECONCILIATION';
+  lastError: string | null;
+  lastSeenUid: bigint;
+  uidValidity: bigint | null;
+  cursorGeneration: number;
+  bootstrapPolicy: 'FROM_NOW' | 'BACKFILL' | null;
+  bootstrapBackfillLimit: number | null;
 };
 
 function makePrismaMock() {
@@ -50,7 +64,15 @@ function makePrismaMock() {
       findMany: vi.fn().mockResolvedValue([]),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
+    setting: {
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
   } as unknown as PrismaService;
+}
+
+/** The projection the reconcile `before` snapshot reads. */
+function makeCursorBefore(overrides: Record<string, unknown> = {}) {
+  return { uidValidity: null, lastSeenUid: 0n, syncState: 'OK', cursorGeneration: 0, ...overrides };
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
@@ -239,27 +261,100 @@ describe('EmailQueueService', () => {
 
   // ── #7 reconcile / quarantine ─────────────────────────────────────────────
 
-  describe('reconcile', () => {
-    it('clears sync state, resets the cursor and bumps cursorGeneration', async () => {
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeSafeQueue());
+  describe('reconcile (cutover)', () => {
+    it('FROM_NOW: discards the cursor, bumps generation, records a per-queue FROM_NOW intent', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCursorBefore());
       (prisma.emailQueue.update as ReturnType<typeof vi.fn>).mockResolvedValue(makeSafeQueue());
-      await service.reconcile(1);
+      await service.reconcile(1, { mode: 'FROM_NOW', confirm: true, reason: 'clean cutover' }, 42);
       expect(prisma.emailQueue.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 1 },
           data: expect.objectContaining({
             syncState: 'OK',
             uidValidity: null,
-            lastSeenUid: 0,
+            lastSeenUid: 0n,
+            cursorGeneration: { increment: 1 },
+            bootstrapPolicy: 'FROM_NOW',
+          }),
+        }),
+      );
+    });
+
+    it('BACKFILL: records a per-queue BACKFILL intent + limit for the next bootstrap', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCursorBefore());
+      (prisma.emailQueue.update as ReturnType<typeof vi.fn>).mockResolvedValue(makeSafeQueue());
+      await service.reconcile(1, { mode: 'BACKFILL', backfillLimit: 250 }, 42);
+      expect(prisma.emailQueue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ bootstrapPolicy: 'BACKFILL', bootstrapBackfillLimit: 250 }),
+        }),
+      );
+    });
+
+    it('RESUME_MIGRATED: carries state:<id> UIDVALIDITY + watermark forward onto the ledger cursor', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCursorBefore());
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        value: { uidValidity: '900', watermark: 512, failures: [] },
+      });
+      (prisma.emailQueue.update as ReturnType<typeof vi.fn>).mockResolvedValue(makeSafeQueue());
+      await service.reconcile(1, { mode: 'RESUME_MIGRATED' }, 42);
+      expect(prisma.emailQueue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            uidValidity: 900n,
+            lastSeenUid: 512n,
+            syncState: 'OK',
             cursorGeneration: { increment: 1 },
           }),
         }),
       );
     });
 
+    it('RESUME_MIGRATED: rewinds the cursor below the lowest still-pending UID', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCursorBefore());
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        value: {
+          uidValidity: '900',
+          watermark: 512,
+          failures: [
+            { uid: 500, status: 'pending', attempts: 1, lastFailedAt: 'x' },
+            { uid: 480, status: 'quarantined', attempts: 3, lastFailedAt: 'x' },
+          ],
+        },
+      });
+      (prisma.emailQueue.update as ReturnType<typeof vi.fn>).mockResolvedValue(makeSafeQueue());
+      await service.reconcile(1, { mode: 'RESUME_MIGRATED' }, 42);
+      // pending uid 500 → resume cursor rewound to 499 so it is re-fetched (idempotent).
+      expect(prisma.emailQueue.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: 499n }) }),
+      );
+    });
+
+    it('RESUME_MIGRATED: falls back to the bare lastSeenUid:<id> but REFUSES it (no UIDVALIDITY)', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCursorBefore());
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(null) // state:<id> absent
+        .mockResolvedValueOnce({ value: 400 }); // legacy bare watermark
+      await expect(service.reconcile(1, { mode: 'RESUME_MIGRATED' }, 42)).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(prisma.emailQueue.update).not.toHaveBeenCalled();
+    });
+
+    it('RESUME_MIGRATED: refuses when no legacy cursor exists at all', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCursorBefore());
+      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(service.reconcile(1, { mode: 'RESUME_MIGRATED' }, 42)).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(prisma.emailQueue.update).not.toHaveBeenCalled();
+    });
+
     it('throws NotFoundException for an unknown queue', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      await expect(service.reconcile(404)).rejects.toBeInstanceOf(NotFoundException);
+      await expect(
+        service.reconcile(404, { mode: 'FROM_NOW', confirm: true, reason: 'x' }),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 

@@ -768,8 +768,19 @@ model EmailQueue {
   // Bumped on every reconcile/rebootstrap. The cursor CAS is gated on this so a stale
   // poller (finishing after a reconcile) can't write a cursor from the old UID space.
   cursorGeneration Int               @default(0)
+  // Per-queue re-bootstrap intent set by an explicit operator reconcile (overrides the
+  // global TELECOM_HD_IMAP_BOOTSTRAP_POLICY for THIS queue's next bootstrap). NULL = use
+  // the global config. Only consulted while `uidValidity IS NULL` (never bootstrapped).
+  bootstrapPolicy       EmailQueueBootstrapPolicy?
+  bootstrapBackfillLimit Int?
 
   inboundDeliveries InboundDelivery[]
+}
+
+/** Per-queue bootstrap intent chosen by an operator reconcile (see EmailQueue). */
+enum EmailQueueBootstrapPolicy {
+  FROM_NOW
+  BACKFILL
 }
 
 model InboundDelivery {

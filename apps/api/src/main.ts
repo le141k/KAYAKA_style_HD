@@ -5,6 +5,7 @@ import helmet from 'helmet';
 import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import { loadConfig } from './config/configuration';
+import { BigIntSerializerInterceptor } from './common/bigint-serializer.interceptor';
 
 async function bootstrap(): Promise<void> {
   const config = loadConfig();
@@ -52,6 +53,10 @@ async function bootstrap(): Promise<void> {
       crossOriginEmbedderPolicy: false,
     }),
   );
+
+  // Serialize BigInt columns (IMAP UID cursors) as strings — JSON.stringify throws on
+  // BigInt, and the values can exceed Number.MAX_SAFE_INTEGER.
+  app.useGlobalInterceptors(new BigIntSerializerInterceptor());
 
   // Global API prefix (all routes become /api/*)
   app.setGlobalPrefix('api');

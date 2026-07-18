@@ -1,7 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { encryptField } from '../../common/field-encrypt.util';
-import type { CreateEmailQueueDto, UpdateEmailQueueDto } from './dto';
+import type { CreateEmailQueueDto, ReconcileEmailQueueDto, UpdateEmailQueueDto } from './dto';
 
 /** Fields that are always omitted from responses (stored password). */
 const SAFE_SELECT = {
@@ -22,10 +23,14 @@ const SAFE_SELECT = {
   lastSeenUid: true,
   uidValidity: true,
   cursorGeneration: true,
+  bootstrapPolicy: true,
+  bootstrapBackfillLimit: true,
 } as const;
 
 @Injectable()
 export class EmailQueueService {
+  private readonly logger = new Logger(EmailQueueService.name);
+
   constructor(private readonly prisma: PrismaService) {}
 
   /** List all email queues (passwordEnc excluded). */
@@ -82,24 +87,151 @@ export class EmailQueueService {
   }
 
   /**
-   * Reconcile a halted (NEEDS_RECONCILIATION) or paused IMAP queue: clears the sync
-   * state, bumps `cursorGeneration` (invalidating any in-flight stale poller's CAS) and
-   * resets `uidValidity` to NULL so the next poll re-bootstraps under the configured
-   * FROM_NOW / BACKFILL policy. The operator's explicit action to resume intake.
+   * Cutover / reconcile a halted (NEEDS_RECONCILIATION) or paused IMAP queue onto the
+   * ledger cursor. Every branch bumps `cursorGeneration` (invalidating any in-flight stale
+   * poller's CAS) and audits the before/after cursor + UIDVALIDITY + mode + actor.
+   *
+   *  - `RESUME_MIGRATED` carries the legacy Setting cursor forward: `imap/state:<id>`
+   *    (primary — UIDVALIDITY + watermark, rewound past still-pending UIDs) or the bare
+   *    `imap/lastSeenUid:<id>` (fallback — refused when it has no UIDVALIDITY).
+   *  - `FROM_NOW` DISCARDS the legacy cursor and re-bootstraps at the current high-water
+   *    UID (requires confirm + reason — it can skip mail that arrived unprocessed).
+   *  - `BACKFILL` re-bootstraps and additionally rewinds by `backfillLimit`.
    */
-  async reconcile(id: number) {
-    await this.get(id); // 404 when missing
-    return this.prisma.emailQueue.update({
+  async reconcile(id: number, dto: ReconcileEmailQueueDto, actorStaffId?: number) {
+    const before = await this.prisma.emailQueue.findUnique({
       where: { id },
-      data: {
+      select: { uidValidity: true, lastSeenUid: true, syncState: true, cursorGeneration: true },
+    });
+    if (!before) throw new NotFoundException(`EmailQueue #${id} not found`);
+
+    let data: Prisma.EmailQueueUpdateInput;
+    let detail: Record<string, unknown> = {};
+
+    if (dto.mode === 'RESUME_MIGRATED') {
+      const legacy = await this.readLegacyCursor(id);
+      if (!legacy) {
+        throw new BadRequestException(
+          `No legacy IMAP cursor found for queue #${id} (Setting imap/state:${id} or imap/lastSeenUid:${id}). ` +
+            `Use FROM_NOW or a bounded BACKFILL instead.`,
+        );
+      }
+      if (legacy.uidValidity === null) {
+        throw new BadRequestException(
+          `Legacy cursor for queue #${id} has no UIDVALIDITY (pre-upgrade watermark) and cannot be resumed ` +
+            `safely across UID-space generations. Verify the mailbox, then use FROM_NOW or a bounded BACKFILL.`,
+        );
+      }
+      // Rewind past still-pending UIDs so a message the legacy poller had not finished is
+      // re-fetched; the ledger's Message-ID idempotency makes any already-created ticket a
+      // no-op. Never rewind above the watermark, never below 0.
+      const resumeCursor =
+        legacy.pendingUids.length > 0
+          ? Math.max(Math.min(legacy.watermark, Math.min(...legacy.pendingUids) - 1), 0)
+          : legacy.watermark;
+      data = {
+        uidValidity: legacy.uidValidity,
+        lastSeenUid: BigInt(resumeCursor),
         syncState: 'OK',
         lastError: null,
-        uidValidity: null,
-        lastSeenUid: 0,
         cursorGeneration: { increment: 1 },
-      },
-      select: SAFE_SELECT,
+        bootstrapPolicy: null,
+        bootstrapBackfillLimit: null,
+      };
+      detail = {
+        uidValidity: legacy.uidValidity.toString(),
+        watermark: legacy.watermark,
+        resumeCursor,
+        pendingUids: legacy.pendingUids,
+      };
+    } else if (dto.mode === 'FROM_NOW') {
+      data = {
+        uidValidity: null,
+        lastSeenUid: BigInt(0),
+        syncState: 'OK',
+        lastError: null,
+        cursorGeneration: { increment: 1 },
+        bootstrapPolicy: 'FROM_NOW',
+        bootstrapBackfillLimit: null,
+      };
+    } else {
+      // BACKFILL
+      data = {
+        uidValidity: null,
+        lastSeenUid: BigInt(0),
+        syncState: 'OK',
+        lastError: null,
+        cursorGeneration: { increment: 1 },
+        bootstrapPolicy: 'BACKFILL',
+        bootstrapBackfillLimit: dto.backfillLimit ?? null,
+      };
+      detail = { backfillLimit: dto.backfillLimit ?? null };
+    }
+
+    const after = await this.prisma.emailQueue.update({ where: { id }, data, select: SAFE_SELECT });
+
+    // Audit: old/new cursor + UIDVALIDITY + mode + actor + reason (structured, log-aggregatable).
+    this.logger.warn(
+      `AUDIT email-queue reconcile queue=${id} mode=${dto.mode} ` +
+        `actorStaffId=${actorStaffId ?? 'system'} reason=${JSON.stringify(dto.reason ?? null)} ` +
+        `before={uidValidity:${before.uidValidity?.toString() ?? 'null'},lastSeenUid:${before.lastSeenUid.toString()},` +
+        `syncState:${before.syncState},gen:${before.cursorGeneration}} ` +
+        `after={uidValidity:${after.uidValidity?.toString() ?? 'null'},lastSeenUid:${after.lastSeenUid.toString()},` +
+        `syncState:${after.syncState},gen:${after.cursorGeneration}} detail=${JSON.stringify(detail)}`,
+    );
+
+    return { reconciled: true, mode: dto.mode, queue: after, detail };
+  }
+
+  /**
+   * Read the legacy Setting IMAP cursor for a queue: `imap/state:<id>` (primary — the
+   * hardened `{ uidValidity, watermark, failures }` shape) or the pre-upgrade bare numeric
+   * `imap/lastSeenUid:<id>` (fallback, no UIDVALIDITY). Returns null when neither exists.
+   */
+  private async readLegacyCursor(
+    queueId: number,
+  ): Promise<{ uidValidity: bigint | null; watermark: number; pendingUids: number[] } | null> {
+    const stateRow = await this.prisma.setting.findUnique({
+      where: { section_key: { section: 'imap', key: `state:${queueId}` } },
+      select: { value: true },
     });
+    const state = stateRow?.value as
+      | { uidValidity?: unknown; watermark?: unknown; failures?: unknown }
+      | null
+      | undefined;
+    if (
+      state &&
+      typeof state === 'object' &&
+      typeof state.watermark === 'number' &&
+      Number.isSafeInteger(state.watermark)
+    ) {
+      const uidValidity =
+        typeof state.uidValidity === 'string' && /^\d+$/.test(state.uidValidity)
+          ? BigInt(state.uidValidity)
+          : null;
+      const pendingUids = Array.isArray(state.failures)
+        ? state.failures
+            .filter(
+              (f): f is { uid: number; status: string } =>
+                !!f &&
+                typeof f === 'object' &&
+                (f as { status?: unknown }).status === 'pending' &&
+                typeof (f as { uid?: unknown }).uid === 'number',
+            )
+            .map((f) => f.uid)
+        : [];
+      return { uidValidity, watermark: state.watermark, pendingUids };
+    }
+
+    const legacyRow = await this.prisma.setting.findUnique({
+      where: { section_key: { section: 'imap', key: `lastSeenUid:${queueId}` } },
+      select: { value: true },
+    });
+    const legacyValue = legacyRow?.value;
+    if (typeof legacyValue === 'number' && Number.isSafeInteger(legacyValue) && legacyValue >= 0) {
+      return { uidValidity: null, watermark: legacyValue, pendingUids: [] };
+    }
+    return null;
   }
 
   /** List quarantined inbound deliveries (metadata only — never the raw MIME blob). */

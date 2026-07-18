@@ -273,23 +273,34 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`IMAP queue ${queueId}: cannot resolve high-water UID — bootstrap deferred`);
         return;
       }
+      // A per-queue reconcile intent (bootstrapPolicy) overrides the global policy for
+      // THIS bootstrap so the mode an operator chose at reconcile time is honoured.
+      const policy = queue.bootstrapPolicy ?? this.config.TELECOM_HD_IMAP_BOOTSTRAP_POLICY;
       const backfill =
-        this.config.TELECOM_HD_IMAP_BOOTSTRAP_POLICY === 'BACKFILL'
-          ? this.config.TELECOM_HD_IMAP_BACKFILL_LIMIT
+        policy === 'BACKFILL'
+          ? (queue.bootstrapBackfillLimit ?? this.config.TELECOM_HD_IMAP_BACKFILL_LIMIT)
           : 0;
       const baseline = Math.max(highWater - backfill, 0);
       // CAS on uidValidity IS NULL so two pods bootstrapping the same fresh queue can't
       // write different baselines — the first wins, the loser's updateMany matches 0 rows.
+      // The per-queue override is consumed here (cleared) so it never re-applies.
       const cas = await this.prisma.emailQueue.updateMany({
         where: { id: queueId, uidValidity: null },
-        data: { lastSeenUid: BigInt(baseline), uidValidity, syncState: 'OK', lastError: null },
+        data: {
+          lastSeenUid: BigInt(baseline),
+          uidValidity,
+          syncState: 'OK',
+          lastError: null,
+          bootstrapPolicy: null,
+          bootstrapBackfillLimit: null,
+        },
       });
       if (cas.count === 0) {
         this.logger.log(`IMAP queue ${queueId}: bootstrap already done by another worker`);
         return;
       }
       this.logger.log(
-        `IMAP queue ${queueId}: bootstrap ${this.config.TELECOM_HD_IMAP_BOOTSTRAP_POLICY} at uid=${baseline} ` +
+        `IMAP queue ${queueId}: bootstrap ${policy} at uid=${baseline} ` +
           `(highWater=${highWater}, uidValidity=${uidValidity})`,
       );
     } finally {

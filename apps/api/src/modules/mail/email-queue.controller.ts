@@ -11,13 +11,15 @@ import {
   Put,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { RequirePermissions } from '../../auth/auth.decorators';
+import { RequirePermissions, CurrentStaff, type AuthStaff } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
   CreateEmailQueueSchema,
+  ReconcileEmailQueueSchema,
   UpdateEmailQueueSchema,
   type CreateEmailQueueDto,
+  type ReconcileEmailQueueDto,
   type UpdateEmailQueueDto,
 } from './dto';
 import { EmailQueueService } from './email-queue.service';
@@ -68,9 +70,15 @@ export class EmailQueueController {
 
   @Post(':id/reconcile')
   @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
-  @ApiOperation({ summary: 'Reconcile a halted IMAP queue (clear NEEDS_RECONCILIATION, re-bootstrap)' })
-  reconcile(@Param('id', ParseIntPipe) id: number) {
-    return this.emailQueueService.reconcile(id);
+  @ApiOperation({
+    summary: 'Cutover / reconcile a halted IMAP queue (RESUME_MIGRATED / FROM_NOW / BACKFILL)',
+  })
+  reconcile(
+    @Param('id', ParseIntPipe) id: number,
+    @Body(new ZodValidationPipe(ReconcileEmailQueueSchema)) dto: ReconcileEmailQueueDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.emailQueueService.reconcile(id, dto, staff.staffId);
   }
 
   @Get('inbound/quarantine')
