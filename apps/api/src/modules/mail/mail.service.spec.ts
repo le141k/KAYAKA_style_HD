@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MailService } from './mail.service';
+import * as nodemailer from 'nodemailer';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { AppConfig } from '../../config/configuration';
 
@@ -42,6 +43,23 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_INBOUND_WEBHOOK_SECRET: 'test-inbound-secret',
   TELECOM_HD_UPLOAD_DIR: '/tmp/uploads',
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: 25,
+  TELECOM_HD_UPLOAD_TOTAL_MAX_SIZE_MB: 50,
+  TELECOM_HD_UPLOAD_REQUEST_MAX_SIZE_MB: 51,
+  TELECOM_HD_INBOUND_MAX_SIZE_MB: 35,
+  TELECOM_HD_ORPHAN_ATTACHMENT_TTL_HOURS: 24,
+  TELECOM_HD_ORPHAN_ATTACHMENT_MAX_COUNT: 2000,
+  TELECOM_HD_ORPHAN_ATTACHMENT_MAX_SIZE_MB: 2048,
+  TELECOM_HD_UPLOAD_MIN_FREE_DISK_MB: 5120,
+  TELECOM_HD_ATTACHMENT_CLEANUP_MAX_ITEMS: 1000,
+  TELECOM_HD_ATTACHMENT_CLEANUP_MAX_RUN_SECONDS: 120,
+  TELECOM_HD_PUBLIC_TICKET_CREATE_ENABLED: false,
+  TELECOM_HD_PUBLIC_UPLOAD_ENABLED: false,
+  TELECOM_HD_CLIENT_UPLOAD_ENABLED: false,
+  TELECOM_HD_CLAMAV_ENABLED: false,
+  TELECOM_HD_CLAMAV_HOST: 'clamav',
+  TELECOM_HD_CLAMAV_PORT: 3310,
+  TELECOM_HD_CLAMAV_TIMEOUT_MS: 15000,
+  TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
 };
 
 const MOCK_TEMPLATE = {
@@ -143,10 +161,49 @@ describe('MailService', () => {
   // ─── send ────────────────────────────────────────────────────────────────────
 
   describe('send', () => {
+    it('requires STARTTLS with TLS 1.2+ for a production submission port', () => {
+      new MailService(
+        {
+          ...TEST_CONFIG,
+          NODE_ENV: 'production',
+          TELECOM_HD_SMTP_HOST: 'smtp.acme.test',
+          TELECOM_HD_SMTP_PORT: 587,
+          TELECOM_HD_SMTP_SECURE: false,
+        },
+        prisma as unknown as PrismaService,
+      );
+
+      const createTransport = nodemailer.createTransport as unknown as ReturnType<typeof vi.fn>;
+      expect(createTransport).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          requireTLS: true,
+          tls: expect.objectContaining({ minVersion: 'TLSv1.2', servername: 'smtp.acme.test' }),
+        }),
+      );
+    });
+
     it('sends an email without throwing', async () => {
       // Should resolve without error (nodemailer is mocked)
       await expect(
         service.send({ to: 'user@example.com', subject: 'Test', html: '<p>Test</p>' }),
+      ).resolves.toBeUndefined();
+    });
+
+    it('deliver(throwOnError=true) RETHROWS an SMTP failure so BullMQ retries (blocker #6)', async () => {
+      const sendMail = (service as unknown as { transporter: { sendMail: ReturnType<typeof vi.fn> } })
+        .transporter.sendMail;
+      sendMail.mockRejectedValueOnce(new Error('SMTP 421'));
+      await expect(service.deliver({ to: 'u@e.com', subject: 's', text: 'b' }, true)).rejects.toThrow(
+        'SMTP 421',
+      );
+    });
+
+    it('deliver(throwOnError=false) swallows an SMTP failure (inline fallback path)', async () => {
+      const sendMail = (service as unknown as { transporter: { sendMail: ReturnType<typeof vi.fn> } })
+        .transporter.sendMail;
+      sendMail.mockRejectedValueOnce(new Error('SMTP down'));
+      await expect(
+        service.deliver({ to: 'u@e.com', subject: 's', text: 'b' }, false),
       ).resolves.toBeUndefined();
     });
 
@@ -284,6 +341,38 @@ describe('MailService', () => {
       const callArg = sendMailSpy.mock.calls[0]?.[0] as Record<string, unknown>;
       expect(callArg).not.toHaveProperty('cc');
       expect(callArg).not.toHaveProperty('bcc');
+    });
+  });
+
+  describe('security mail persistence', () => {
+    it('delivers strict reset/magic-link mail inline and never serializes it into BullMQ', async () => {
+      const queue = { add: vi.fn() };
+      const strictService = new MailService(TEST_CONFIG, prisma as unknown as PrismaService, queue as never);
+      (prisma.emailTemplate.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TEMPLATE);
+      const sendMail = vi.fn().mockResolvedValue({ messageId: 'id' });
+      (
+        strictService as unknown as { transporter: { sendMail: ReturnType<typeof vi.fn> } }
+      ).transporter.sendMail = sendMail;
+
+      await strictService.sendTemplateStrict('user@example.com', 'password_reset', 'en', {
+        resetUrl: 'https://help.example/reset-password#token=live-secret',
+      });
+
+      expect(sendMail).toHaveBeenCalledTimes(1);
+      expect(queue.add).not.toHaveBeenCalled();
+    });
+
+    it('age-bounds failed normal-mail jobs in Redis', async () => {
+      const queue = { add: vi.fn().mockResolvedValue(undefined) };
+      const queuedService = new MailService(TEST_CONFIG, prisma as unknown as PrismaService, queue as never);
+
+      await queuedService.send({ to: 'user@example.com', subject: 'Normal', text: 'body' });
+
+      expect(queue.add).toHaveBeenCalledWith(
+        'send',
+        expect.any(Object),
+        expect.objectContaining({ removeOnFail: { age: 86_400, count: 100 } }),
+      );
     });
   });
 });

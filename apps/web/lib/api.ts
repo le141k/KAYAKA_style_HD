@@ -7,20 +7,87 @@ const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').rep
 // cookie carries no token — it only lets JS (hasToken) and the Next.js middleware
 // distinguish "logged in" vs "anonymous" for coarse route guarding.
 const PRESENCE_COOKIE = 'th_authed';
+const CSRF_COOKIE_NAMES = ['__Host-th_csrf', 'th_csrf'] as const;
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+let csrfBootstrap: Promise<string> | null = null;
 
 /**
- * True when the user appears authenticated. The real credential is the HttpOnly
- * cookie (unreadable from JS), so we rely on the non-sensitive th_authed presence
- * marker set at login. No JWT is ever stored in JS-readable storage.
+ * Bootstrap the signed readable CSRF cookie once per page lifecycle.
+ *
+ * Do not trust a pre-existing cookie before this call: it may have been signed
+ * with the previous access secret after a normal production key rotation.  The
+ * server reuses a valid token and replaces an invalid one.
  */
-export function hasToken(): boolean {
-  if (typeof window === 'undefined') return false;
-  return document.cookie.split('; ').some((row) => row.startsWith(`${PRESENCE_COOKIE}=`));
+export async function getCsrfToken(): Promise<string> {
+  if (csrfBootstrap) return csrfBootstrap;
+  csrfBootstrap = fetch(`${API_URL}/auth/csrf`, { credentials: 'include', cache: 'no-store' })
+    .then(async (res) => {
+      if (!res.ok) throw new Error(`Unable to obtain CSRF token (${res.status})`);
+      const body = (await res.json()) as { csrfToken?: string };
+      if (!body.csrfToken) throw new Error('CSRF response did not contain a token');
+      return body.csrfToken;
+    })
+    .catch((error: unknown) => {
+      // A transient bootstrap failure must not poison the page forever.
+      csrfBootstrap = null;
+      throw error;
+    });
+  return csrfBootstrap;
+}
+
+function resetCsrfBootstrap(): void {
+  csrfBootstrap = null;
+}
+
+async function isInvalidCsrfResponse(res: Response): Promise<boolean> {
+  if (res.status !== 403) return false;
+  try {
+    const data = (await res.clone().json()) as { code?: unknown };
+    return data.code === 'CSRF_TOKEN_INVALID';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Browser fetch with signed-CSRF bootstrap and one guard-safe recovery retry.
+ * Callers keep control of response/error handling and request body encoding.
+ */
+export async function fetchWithCsrf(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  _csrfRetry = false,
+): Promise<Response> {
+  const method = (init.method ?? 'GET').toUpperCase();
+  const headers: Record<string, string> = {
+    ...(init.headers as Record<string, string>),
+  };
+  if (!SAFE_METHODS.has(method)) headers['X-CSRF-Token'] = await getCsrfToken();
+
+  const res = await fetch(input, {
+    ...init,
+    headers,
+    credentials: init.credentials ?? 'include',
+  });
+  if (!_csrfRetry && !SAFE_METHODS.has(method) && (await isInvalidCsrfResponse(res))) {
+    // CsrfGuard rejects before the controller runs, so replaying only this
+    // machine-readable failure cannot duplicate an already-applied mutation.
+    resetCsrfBootstrap();
+    await getCsrfToken();
+    return fetchWithCsrf(input, init, true);
+  }
+  return res;
 }
 
 function clearTokens(): void {
   if (typeof window === 'undefined') return;
+  resetCsrfBootstrap();
   document.cookie = `${PRESENCE_COOKIE}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+  for (const name of CSRF_COOKIE_NAMES) {
+    const hardenedAttributes = name.startsWith('__Host-') ? '; Secure; SameSite=Lax' : '';
+    document.cookie = `${name}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT${hardenedAttributes}`;
+  }
   // Clean up any tokens left in localStorage / non-HttpOnly cookie by older builds.
   localStorage.removeItem('auth_token');
   localStorage.removeItem('refresh_token');
@@ -41,8 +108,8 @@ function clearTokens(): void {
  * 401 can replay a stale refresh cookie and trigger server-side reuse detection.
  * `/auth/me` is the one protected auth endpoint that legitimately may refresh.
  */
-function canRefreshAfterUnauthorized(path: string): boolean {
-  return !path.startsWith('/auth/') || path === '/auth/me';
+export function canRefreshAfterUnauthorized(path: string): boolean {
+  return !path.startsWith('/auth/') || path === '/auth/me' || path === '/auth/logout';
 }
 
 /** Attempt a token refresh using the HttpOnly th_refresh cookie. */
@@ -54,11 +121,10 @@ async function tryRefresh(): Promise<boolean> {
     try {
       // The refresh token is the HttpOnly th_refresh cookie, sent automatically via
       // credentials:'include'. The server rotates the th_access cookie on success.
-      const res = await fetch(`${API_URL}/auth/refresh`, {
+      const res = await fetchWithCsrf(`${API_URL}/auth/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: '{}',
       });
       if (!res.ok) {
         clearTokens();
@@ -86,7 +152,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, options: RequestInit = {}, _retry = false): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}, _authRetry = false): Promise<T> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string>),
@@ -94,9 +160,13 @@ async function request<T>(path: string, options: RequestInit = {}, _retry = fals
 
   // Auth is the HttpOnly cookie, sent automatically by credentials:'include'.
   // No Authorization header — the JWT is never read into JS.
-  const res = await fetch(`${API_URL}${path}`, { ...options, headers, credentials: 'include' });
+  const res = await fetchWithCsrf(`${API_URL}${path}`, {
+    ...options,
+    headers,
+    credentials: 'include',
+  });
 
-  if (res.status === 401 && !_retry && canRefreshAfterUnauthorized(path)) {
+  if (res.status === 401 && !_authRetry && canRefreshAfterUnauthorized(path)) {
     const refreshed = await tryRefresh();
     if (refreshed) {
       // Retry the original request once with the new token
@@ -120,7 +190,8 @@ async function request<T>(path: string, options: RequestInit = {}, _retry = fals
 
 export const api = {
   get: <T>(path: string) => request<T>(path),
-  post: <T>(path: string, body: unknown) => request<T>(path, { method: 'POST', body: JSON.stringify(body) }),
+  post: <T>(path: string, body: unknown, options: RequestInit = {}) =>
+    request<T>(path, { ...options, method: 'POST', body: JSON.stringify(body) }),
   patch: <T>(path: string, body: unknown) =>
     request<T>(path, { method: 'PATCH', body: JSON.stringify(body) }),
   put: <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),

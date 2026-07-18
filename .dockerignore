@@ -10,6 +10,16 @@
 **/.env
 **/.env.*
 !**/.env.example
+secrets.md
+secrets*
+deploy.md
+backups
+**/backups
+uploads
+**/uploads
+*.dump
+*.dump.gz
+*.tar.gz
 docs
 kayako_src
 kayako_db

@@ -176,34 +176,32 @@ describe('TicketsService (extra coverage)', () => {
   // ─── listMyTickets ───────────────────────────────────────────────────────────
 
   describe('listMyTickets', () => {
-    it('returns tickets matching requesterEmail', async () => {
-      const ticket = makeTicket({ requesterEmail: 'jane@example.com' });
+    it('returns tickets owned by the verified client userId', async () => {
+      const ticket = makeTicket({ userId: 42 });
       (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([ticket]);
       (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
 
-      const result = await service.listMyTickets('jane@example.com');
+      const result = await service.listMyTickets(42);
       expect(result.data).toHaveLength(1);
       expect(result.total).toBe(1);
     });
 
-    it('passes OR clause covering requesterEmail and user.emails', async () => {
+    it('scopes the query strictly by userId (no email OR clause)', async () => {
       (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
 
-      await service.listMyTickets('test@example.com');
+      await service.listMyTickets(42);
 
       expect(prisma.ticket.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({ OR: expect.any(Array), mergedIntoId: null }),
-        }),
+        expect.objectContaining({ where: { mergedIntoId: null, userId: 42 } }),
       );
     });
 
-    it('returns empty list when no tickets match', async () => {
+    it('returns empty list when the client owns no tickets', async () => {
       (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
 
-      const result = await service.listMyTickets('nobody@example.com');
+      const result = await service.listMyTickets(7);
       expect(result.data).toHaveLength(0);
       expect(result.total).toBe(0);
     });

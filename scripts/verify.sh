@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Single verification GATE. "Done" is not a claim — it is `make verify` green.
 #
-# Runs the deterministic code gates (always) + a live smoke (if the stack is up).
+# Runs the deterministic code gates + a mandatory live developer-stack smoke.
 # Exits non-zero if ANYTHING fails, so it can gate a "done"/merge decision.
 #
 #   make verify                 # gate against the current working tree + running stack
@@ -29,18 +29,15 @@ run "api: typecheck"       npm run -s typecheck       --workspace=apps/api
 run "api: unit tests"      npm run -s test            --workspace=apps/api
 run "api: build"           npm run -s build           --workspace=apps/api
 run "api: lint"            npm run -s lint            --workspace=apps/api
+run "deps: production audit" npm audit --omit=dev --audit-level=high
 
 # ── Frontend gates ──
 run "web: typecheck"       npm run -s typecheck       --workspace=apps/web
 run "web: build"           npm run -s build           --workspace=apps/web
 run "web: lint"            npm run -s lint            --workspace=apps/web
 
-# ── Live smoke (only if the stack is up) ──
-if curl -fsS http://localhost:4000/api/docs-json >/dev/null 2>&1; then
-  run "smoke: live stack" bash scripts/smoke.sh
-else
-  printf '\n\033[33m⚠ stack not up on :4000 — skipping smoke. Run `make up` first for a full gate.\033[0m\n'
-fi
+# ── Live smoke is mandatory: an absent/unhealthy stack makes the gate red. ──
+run "smoke: live stack" bash scripts/smoke.sh
 
 # ── Summary ──
 printf '\n================ VERIFY SUMMARY ================\n'

@@ -67,7 +67,7 @@
 - Per-endpoint rate-limits (esp. `POST /tickets/public`), `GET /tickets/my` ownership/OTP.
 - Load test (k6 script exists in `infra/`), DB backups, monitoring/OTel (flag exists), JWT jti revocation blocklist.
 - Full RBAC review across all modules; multi-tenant data isolation review.
-- Token-in-JSON-body removal (retire legacy Bearer path → fully close SEC-2 residual).
+- Define and scope any future non-browser Bearer credential flow separately from cookie-only staff browser auth.
 
 # Phase 3 — Kayako parity v2.0 (migration target) — _months_
 

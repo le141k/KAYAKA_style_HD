@@ -1,9 +1,12 @@
 import { z } from 'zod';
+import { normalizeEmail } from '../../common/email.util';
+
+const NormalizedEmailSchema = z.string().transform(normalizeEmail).pipe(z.string().email());
 
 export const CreateUserSchema = z.object({
   fullName: z.string().min(1).max(200),
-  primaryEmail: z.string().email(),
-  additionalEmails: z.array(z.string().email()).default([]),
+  primaryEmail: NormalizedEmailSchema,
+  additionalEmails: z.array(NormalizedEmailSchema).default([]),
   phone: z.string().default(''),
   designation: z.string().default(''),
   organizationId: z.number().int().positive().optional(),
@@ -31,12 +34,12 @@ export const ListUsersQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(100).default(20),
   search: z.string().trim().max(200).optional(),
   organizationId: z.coerce.number().int().positive().optional(),
-  email: z.string().email().optional(),
+  email: NormalizedEmailSchema.optional(),
 });
 export type ListUsersQueryDto = z.infer<typeof ListUsersQuerySchema>;
 
 export const AddEmailSchema = z.object({
-  email: z.string().email(),
+  email: NormalizedEmailSchema,
   isPrimary: z.boolean().default(false),
 });
 export type AddEmailDto = z.infer<typeof AddEmailSchema>;

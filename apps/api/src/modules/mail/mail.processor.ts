@@ -19,7 +19,7 @@ export class MailProcessor extends WorkerHost {
   }
 
   async process(job: Job<SendMailJobData>): Promise<void> {
-    this.logger.debug(`Mail job ${job.id}: sending to ${String(job.data.to)}`);
+    this.logger.debug(`Mail job ${job.id}: delivery started`);
     // deliver() = actual SMTP. Must NOT call send() here (that would re-enqueue).
     // Pass throwOnError so a failed send rethrows → BullMQ retries (attempts:3).
     await this.mailService.deliver(job.data, true);

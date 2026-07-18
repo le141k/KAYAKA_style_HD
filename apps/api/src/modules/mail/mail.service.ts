@@ -55,6 +55,13 @@ export class MailService {
       host: config.TELECOM_HD_SMTP_HOST,
       port: config.TELECOM_HD_SMTP_PORT,
       secure: config.TELECOM_HD_SMTP_SECURE,
+      // Production port 587/25 must upgrade with STARTTLS; do not silently
+      // deliver credentials or reset links after a downgrade/strip attack.
+      requireTLS: config.NODE_ENV === 'production' && !config.TELECOM_HD_SMTP_SECURE,
+      tls: { minVersion: 'TLSv1.2', servername: config.TELECOM_HD_SMTP_HOST },
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 15_000,
       // Authenticated relay in prod; MailHog/dev needs none. Only set auth when
       // both credentials are provided (otherwise nodemailer would force AUTH).
       ...(config.TELECOM_HD_SMTP_USER && config.TELECOM_HD_SMTP_PASSWORD
@@ -78,11 +85,11 @@ export class MailService {
         attempts: 3,
         backoff: { type: 'exponential', delay: 2000 },
         removeOnComplete: true,
-        removeOnFail: 100,
+        removeOnFail: { age: 86_400, count: 100 },
       });
-    } catch (err) {
+    } catch {
       // If enqueue fails (Redis down), don't lose the mail — deliver inline.
-      this.logger.error(`Mail enqueue failed, delivering inline: ${String(err)}`);
+      this.logger.error('Mail enqueue failed; delivering inline');
       await this.deliver(opts);
     }
   }
@@ -94,29 +101,62 @@ export class MailService {
    */
   async deliver(opts: SendMailOptions, throwOnError = false): Promise<void> {
     try {
-      const toStr = Array.isArray(opts.to) ? opts.to.join(', ') : opts.to;
-      const ccStr = opts.cc ? (Array.isArray(opts.cc) ? opts.cc.join(', ') : opts.cc) : undefined;
-      const bccStr = opts.bcc ? (Array.isArray(opts.bcc) ? opts.bcc.join(', ') : opts.bcc) : undefined;
-      await this.transporter.sendMail({
-        from: opts.from ?? this.config.TELECOM_HD_MAIL_FROM,
-        to: toStr,
-        subject: opts.subject,
-        html: opts.html,
-        text: opts.text,
-        ...(ccStr ? { cc: ccStr } : {}),
-        ...(bccStr ? { bcc: bccStr } : {}),
-        ...(opts.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}),
-        ...(opts.references ? { references: opts.references } : {}),
-        ...(opts.autoSubmitted ? { headers: { 'Auto-Submitted': opts.autoSubmitted } } : {}),
-      });
-      this.logger.debug(`Mail sent to ${opts.to}: ${opts.subject}`);
+      await this.deliverOrThrow(opts);
+      this.logger.debug('Mail delivered');
     } catch (err) {
-      this.logger.error(`Failed to send mail to ${opts.to}: ${String(err)}`);
+      this.logger.error(`Mail delivery failed (${err instanceof Error ? err.name : 'UnknownError'})`);
       // When delivering from the BullMQ processor, rethrow so the job's retry/backoff
       // (attempts:3) actually fires. Inline fallback callers pass false so a send
       // failure never crashes the ticket flow.
       if (throwOnError) throw err instanceof Error ? err : new Error(String(err));
     }
+  }
+
+  /** SMTP delivery that PROPAGATES failures (used by the strict security path). */
+  private async deliverOrThrow(opts: SendMailOptions): Promise<void> {
+    const toStr = Array.isArray(opts.to) ? opts.to.join(', ') : opts.to;
+    const ccStr = opts.cc ? (Array.isArray(opts.cc) ? opts.cc.join(', ') : opts.cc) : undefined;
+    const bccStr = opts.bcc ? (Array.isArray(opts.bcc) ? opts.bcc.join(', ') : opts.bcc) : undefined;
+    await this.transporter.sendMail({
+      from: opts.from ?? this.config.TELECOM_HD_MAIL_FROM,
+      to: toStr,
+      subject: opts.subject,
+      html: opts.html,
+      text: opts.text,
+      ...(ccStr ? { cc: ccStr } : {}),
+      ...(bccStr ? { bcc: bccStr } : {}),
+      ...(opts.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}),
+      ...(opts.references ? { references: opts.references } : {}),
+      // A5 mail-loop/bounce protection (preserved from main): stamp Auto-Submitted so
+      // downstream mailers don't auto-reply to our own notifications.
+      ...(opts.autoSubmitted ? { headers: { 'Auto-Submitted': opts.autoSubmitted } } : {}),
+    });
+  }
+
+  /**
+   * Render and send a security-critical template (password reset, magic link),
+   * PROPAGATING any SMTP failure instead of swallowing it (GOAL_PUBLIC_SECURITY
+   * S1-4). The caller relies on this to fail closed — invalidating the issued token
+   * when the mail cannot be handed off — so a live token whose email silently
+   * vanished never dangles. Never logs the rendered body/subject (they carry the link).
+   */
+  async sendTemplateStrict(
+    to: string | string[],
+    templateKey: string,
+    locale: string,
+    vars: Record<string, string>,
+  ): Promise<void> {
+    const rendered = await this.renderTemplate(templateKey, locale, vars);
+    const opts: SendMailOptions = {
+      to,
+      subject: rendered.subject,
+      html: rendered.html,
+      text: rendered.text,
+    };
+    // Never serialize a live reset/magic-link URL into BullMQ/Redis. Security mail
+    // is delivered inline with bounded SMTP timeouts; callers invalidate the token
+    // and return the same generic response if delivery fails.
+    await this.deliverOrThrow(opts);
   }
 
   /**

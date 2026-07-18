@@ -1,18 +1,15 @@
-# Caddy reverse proxy + automatic TLS (Let's Encrypt) for the prod stack.
-#
-# Run it alongside the prod compose (same project → same default network, so
-# Caddy reaches `api:4000` and `web:3000` by service name):
-#
-#   docker compose -f docker-compose.prod.yml -f docker-compose.proxy.yml \
-#     --env-file .env.prod up -d --build
-#
-# Requires DOMAIN=<your-host> in .env.prod (no scheme), and host ports 80/443 free.
+# REFERENCE EDGE ONLY — this file publishes 80/443 and must never be included in
+# the base production deploy. Follow the separate HTTPS edge gate in
+# docs/DEPLOY.md after trusted proxy hops, firewall rollback and smoke are reviewed.
+# There is intentionally no generic `docker compose up` command here.
 
 services:
   caddy:
-    image: caddy:2.8-alpine
+    image: caddy:2.11.4-alpine
     restart: unless-stopped
-    env_file: .env.prod
+    # Caddy receives only the hostname it needs, never application/DB/mail secrets.
+    environment:
+      DOMAIN: ${DOMAIN:?set in .env.prod}
     ports:
       - "80:80"
       - "443:443"

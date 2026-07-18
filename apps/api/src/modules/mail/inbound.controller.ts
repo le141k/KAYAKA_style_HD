@@ -9,7 +9,9 @@ import {
   HttpStatus,
   Inject,
   Post,
+  Req,
 } from '@nestjs/common';
+import type { Request } from 'express';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { InboundMailService } from './inbound.service';
 import { Public } from '../../auth/auth.decorators';
@@ -35,20 +37,21 @@ export class InboundController {
    * Not JWT-protected; guarded by a shared-secret header compared in constant time.
    * Feeds the exact same parse→thread→ticket pipeline as the IMAP poller.
    *
-   * Example pipe script:
+   * Example pipe script (stdin is streamed; it is never expanded into argv/env):
    *   #!/bin/sh
-   *   RAW=$(cat); exec curl -fsS -X POST "$API/api/inbound/pipe" \
-   *     -H "x-inbound-secret: $SECRET" -H 'content-type: application/json' \
-   *     --data "$(jq -Rs '{raw: .}' <<EOF
-   *   $RAW
-   *   EOF
-   *   )"
+   *   exec curl -fsS -X POST "$API/api/inbound/pipe" \
+   *     -H "x-inbound-secret: $SECRET" -H 'content-type: message/rfc822' \
+   *     --data-binary @-
    */
   @Public()
   @Post('pipe')
   @HttpCode(HttpStatus.ACCEPTED)
   @ApiOperation({ summary: 'Ingest a raw RFC822 message (MTA/PIPE; shared-secret auth, not JWT)' })
-  async pipe(@Headers('x-inbound-secret') secret: string | undefined, @Body() body: InboundPipeBody) {
+  async pipe(
+    @Headers('x-inbound-secret') secret: string | undefined,
+    @Body() body: InboundPipeBody | undefined,
+    @Req() request: Request,
+  ) {
     const expected = this.config.TELECOM_HD_INBOUND_WEBHOOK_SECRET;
     let secretOk = false;
     if (secret) {
@@ -60,14 +63,17 @@ export class InboundController {
       throw new ForbiddenException('Invalid inbound webhook secret');
     }
 
-    const raw = typeof body?.raw === 'string' ? body.raw : undefined;
-    if (!raw || raw.trim().length === 0) {
-      throw new BadRequestException('Missing required field: raw (the RFC822 message)');
+    const legacyJson = typeof body?.raw === 'string' ? body.raw : undefined;
+    const isRawRfc822 = Boolean(request.is('message/rfc822') || request.is('application/octet-stream'));
+    if (!legacyJson && !isRawRfc822) {
+      throw new BadRequestException(
+        'Send the RFC822 message as message/rfc822 (legacy JSON raw is accepted only for small messages)',
+      );
     }
 
     // Department is resolved downstream (parser rules / default); the webhook is a
     // single ingress so it does not carry a per-queue department.
-    await this.inbound.ingestRawMessage(raw, undefined);
+    await this.inbound.ingestRawMessage(legacyJson ?? request, undefined);
     return { accepted: true };
   }
 }

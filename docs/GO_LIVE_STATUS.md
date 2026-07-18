@@ -1,60 +1,55 @@
 # GO-LIVE STATUS — 23 Telecom Help Desk
 
-_Last updated: 2026-05-25. Honest snapshot of what is **live-verified** vs what still
-needs **USER-supplied** real credentials / infrastructure before production._
+_Last updated: 2026-07-18. The release-candidate implementation is code-complete, but the public
+GO gate is **not** complete. Keep the application internal/allowlisted until the VM and edge
+evidence below is recorded. The authoritative checklist is `docs/GOAL_PUBLIC_SECURITY.md`._
 
-This complements `docs/GO_LIVE.md` (the checklist) and `docs/GOAL_AUDIT_FIX.md` (the audit
-fixes). It exists so nobody has to reverse-engineer "is it actually ready?" from commit logs.
+## Code-complete in the release candidate
 
-## ✅ Verified in this codebase (tests + live checks)
+| Area               | Implemented evidence                                                                                                                                                                                                                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Staff browser auth | Cookie-only login/refresh; production `__Host-th_access`, `__Host-th_refresh` and `__Host-th_csrf` cookies at `Path=/`; exact-origin plus signed double-submit CSRF; atomic refresh-family rotation and immediate `authVersion` invalidation. JWTs are not returned to browser code.              |
+| Password reset     | Generic responses, Redis abuse limits, strict mail delivery, fragment tokens, atomic single-use consume, enabled/version checks and session/reset revocation on security changes.                                                                                                                 |
+| Client portal      | Generic asynchronous magic-link request, single-use token, revocable `__Host-th_client` session, stable `User.id` ownership and identical 404 responses for wrong-owner/unmapped tickets and attachments. The production feature gate defaults closed.                                            |
+| Inbound mail       | IMAP and webhook share one bounded parser/threading path; UID state is durable; poison messages are retried then quarantined; RFC Message-ID has a database uniqueness invariant and concurrent duplicate inserts are handled idempotently.                                                       |
+| Upload safety      | Pre-Multer request limits, disk quarantine, MIME/signature/extension validation, fail-closed ClamAV, independent upload kill switches, bounded quotas/storage reserve and orphan cleanup/reconciliation audits.                                                                                   |
+| Database           | The complete 31-migration chain has applied from zero on disposable PostgreSQL 15, followed by seed and a clean ownership audit. Identity and Message-ID invariants fail closed on unsafe legacy data.                                                                                            |
+| Release operations | Exact fetched-`main` provenance, immutable API/web tags, a derived `NEXT_PUBLIC_*` web-build digest, one-shot first-admin prompt, paused/drained BullMQ cutover, matched DB/uploads backups with disposable restore proof, disposable Redis-clone validation and an owner-only recovery manifest. |
+| Local verification | Targeted security suites and API/web typecheck and lint have passed during implementation. Historical numeric test counts are intentionally omitted; the final full release gate must be rerun and attached to the release evidence.                                                              |
 
-| Area                          | Status               | Evidence                                                                                                                                                                              |
-| ----------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Inbound email pipeline**    | ✅ proven end-to-end | `inbound.int-spec.ts` (Testcontainers): real MIME → CLIENT ticket (EMAIL), dedup on re-delivery, In-Reply-To threading, spawn → linked SUPPLIER ticket pair. 12/12 integration green. |
-| Inbound transport — webhook   | ✅                   | `POST /api/inbound/pipe` (`x-inbound-secret`), shares `ingestRawMessage` with the IMAP poller.                                                                                        |
-| Inbound transport — IMAP poll | ✅ code + unit tests | UID watermark in `Setting`, survives restart; enabled non-IMAP queues are warned, not silently dropped.                                                                               |
-| Loop / bounce protection      | ✅                   | Outbound `Auto-Submitted`; inbound skips Auto-Submitted/Precedence/X-Loop/self-from; workflow re-entry depth guard.                                                                   |
-| Mass-assignment / RBAC guards | ✅                   | B1/B2/B3 — creationMode/ipAddress stripped, group-privilege + last-admin guards, tests.                                                                                               |
-| Scale (indexes, caches, N+1)  | ✅                   | C1–C5 — refresh-token caps + indexes, search guard, SLA batch-load, workflow cache, CustomField cache, GIN trgm indexes (EXPLAIN-confirmed).                                          |
-| Per-account login lockout     | ✅                   | D2 — `failedLoginAttempts`/`lockedUntil`, tests.                                                                                                                                      |
-| Attachment safety             | ✅ (AV deferred)     | D6 — extension denylist + magic-byte + MIME allowlist. ClamAV is a documented hook, not yet wired.                                                                                    |
-| Public-endpoint field leakage | ✅                   | D7/D9 — public projections + list customFields decryption.                                                                                                                            |
-| CSP on web                    | ✅                   | D1 — verified served on `next start`.                                                                                                                                                 |
-| DB backup → restore           | ✅ cycle proven      | `pg_dump -Fc                                                                                                                                                                          | gzip`→`pg_restore`into a scratch DB reproduced exact row counts (1366 tickets / 1407 users / 11 orgs). Scripts:`scripts/db-backup.sh`, `scripts/db-restore.sh`, runbook `docs/BACKUP.md`. |
-| Secret gate (prod)            | ✅                   | `assertProductionSecrets` rejects default/weak JWT + webhook secrets at boot.                                                                                                         |
-| Graceful shutdown             | ✅                   | D3 — `enableShutdownHooks()`.                                                                                                                                                         |
-| Self-gate                     | ✅                   | `tsc` + `eslint` clean; **610 unit tests** green; **12 integration tests** green.                                                                                                     |
+## Public GO blockers — live VM/edge evidence required
 
-## 🙋 USER-LATER — needs real values / infrastructure at go-live
+These are operational gates, not missing application features:
 
-These are **deliberately not** in the codebase (build + test was done on local containers /
-placeholders). Substitute real values and flip the switch:
+- deploy the exact clean `origin/main` commit internally and pass environment, live-data,
+  ownership, template, attachment-storage and scanner audits;
+- prove the production-shaped upgrade and matched DB/uploads restore rehearsal; preserve and verify
+  the matching Redis rollback volume as the third member of the recovery point;
+- confirm no enabled demo/default staff, perform the approved session/reset/webhook/JWT credential
+  cutover and prove old values fail without restoring old secrets;
+- prove ClamAV signature freshness, EICAR rejection, storage reconciliation, configured upload load,
+  disk/RSS thresholds and zero OOMKills on the production VM;
+- prove real SMTP plus the approved inbound mailbox/MTA path, forgot-password delivery and a complete
+  client magic-link round trip;
+- select and document one canonical HTTPS edge, trusted-proxy/client-IP chain and firewall policy;
+  prove there is no origin bypass or unexpected public listener with an external scan;
+- run the mandatory HTTPS cookie/CSRF/logout smoke, security repro matrix, dependency/image scan,
+  staged pilot and monitored soak before opening the edge to the world.
 
-| Item                    | What to provide                                                                       | Where                                                                     |
-| ----------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| Real `noc@` mailbox     | IMAP host/user/app-password **or** an MTA pipe that POSTs to `/api/inbound/pipe`      | `EmailQueue` row (`isEnabled=true`) / `TELECOM_HD_INBOUND_WEBHOOK_SECRET` |
-| A real IMAP server test | GreenMail/Dovecot container (optional — the webhook proves the same pipeline)         | n/a                                                                       |
-| MX / DNS                | Mail routing for the support domain                                                   | DNS                                                                       |
-| TLS certificate         | Real cert/domain for the reverse proxy                                                | `infra/caddy` or `infra/nginx`                                            |
-| Production secrets      | Strong `TELECOM_HD_JWT_*`, `*_WEBHOOK_SECRET`, `TELECOM_HD_FIELD_ENCRYPTION_KEY`      | `.env.prod` (gitignored)                                                  |
-| Bootstrap admin         | Strong `TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL/PASSWORD` (the seed refuses weak/`demo1234`) | `.env.prod`                                                               |
-| SMTP relay              | Authenticated outbound relay creds                                                    | `TELECOM_HD_SMTP_*`                                                       |
+## Operator-supplied production values
 
-## ⏭️ Knowingly deferred (tracked, not blocking the audit)
+Real domain/DNS/TLS topology, SMTP and IMAP/MTA credentials, Turnstile keys, and strong application,
+database, Redis, webhook and encryption secrets belong only in the approved VM secret store or
+owner-only `.env.prod` as documented in `docs/DEPLOY.md`.
 
-- **Alaris module** — 🙋 USER will rewrite it; left untouched (stub).
-- **SLA pause/resume** for on-hold tickets (needs a schema column + clock-subtraction).
-- **ClamAV** attachment scanning (hook documented in `attachments.service.ts`).
-- **Cookie-only auth** (stop returning the raw token in the login/refresh body) — coordinated
-  FE change; tokens are already also set as HttpOnly cookies.
-- **Nonce-based CSP** `script-src` tightening (Next App Router inline scripts).
-- **Inbound dedup atomicity** — dedup is a check-then-act on `Message-ID`; a rare
-  concurrent IMAP-poll + webhook re-delivery of the same message could still double-create.
-  Hardening = a partial-unique index on non-empty `messageId` + insert-catch.
-- **Workflow re-entrancy guard** conflates concurrency with recursion depth — 5+ genuinely
-  concurrent events on one hot ticket could hit the cap and skip a run. Needs a proper
-  re-entrancy token vs a shared counter.
-- **Merge** does not re-parent `TicketRecipient`/tags/`TicketLink`/time-entries onto the
-  surviving ticket (product decision — flag for spec confirmation).
-- **Workflow auto-assign** (`WorkflowExecutor`) doesn't skip a disabled assignee the way the
-  manual `assign` path does (low impact — mail still goes to the intended staff).
+Bootstrap credentials are the exception: they must **not** be stored in `.env.prod`. On a true first
+install, `scripts/deploy-prod.sh` invokes `scripts/bootstrap-admin.sh`; the operator enters the email
+and strong password interactively for a removed one-shot API container. Existing installations skip
+that prompt.
+
+## Unrelated product work
+
+The planned Alaris rewrite, SLA pause/resume semantics, a nonce-only Next.js CSP, workflow hot-ticket
+re-entrancy semantics and merge/auto-assign product decisions remain separate backlog items. They do
+not replace any public GO evidence above. Inbound Message-ID atomicity and production malware
+scanning are implemented; they are no longer deferred code items.

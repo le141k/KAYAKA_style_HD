@@ -31,6 +31,13 @@ export class SessionRevocationService {
       where: { staffId, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    // Blocker #7: a security change (admin password reset, disable, logout-all) must also
+    // burn any still-pending password-reset link, so a previously-issued link can't be used
+    // to re-set the password after the change.
+    await this.prisma.passwordReset.updateMany({
+      where: { staffId, usedAt: null },
+      data: { usedAt: new Date() },
+    });
     if (this.blocklist) {
       await this.blocklist.revokeStaffAccessBefore(staffId, this.config.TELECOM_HD_JWT_ACCESS_TTL);
     }

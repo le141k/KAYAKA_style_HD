@@ -1,490 +1,265 @@
-# Production Deployment Runbook — 23 Telecom Help Desk
+# Production deployment runbook — 23 Telecom Help Desk
 
-> Follow top-to-bottom on a fresh server. Every step is required; none are optional unless
-> explicitly marked. Commands are written for a Debian/Ubuntu host running as a non-root user
-> with `sudo` access.
+Production launch is deliberately split into two gates:
 
----
+1. `scripts/deploy-prod.sh` installs and verifies an **internal-only** release. It publishes no host
+   ports and starts no Caddy/proxy container.
+2. HTTPS edge enablement is a separate operator change after the internal audits, cookie smoke,
+   trusted-client-IP topology and external firewall checks are green.
 
-## 1. Prerequisites
+Never combine these gates during an incident or a first deployment.
 
-| Requirement           | Minimum                        | Notes                                               |
-| --------------------- | ------------------------------ | --------------------------------------------------- |
-| Docker Engine         | 26+                            | `docker --version`                                  |
-| Docker Compose plugin | v2.24+                         | `docker compose version` (no hyphen)                |
-| RAM                   | 2 GB                           | 512 MB reserved per container × 2 + OS overhead     |
-| Disk                  | 10 GB free                     | images + Postgres data + uploads volume + backups   |
-| Domain name           | A record pointing at server IP | e.g. `help.example.com`                             |
-| DNS A record          | Propagated before first run    | Caddy uses HTTP-01 ACME; port 80 must be reachable  |
-| Firewall ports        | 80, 443 open inbound           | Caddy handles both; nothing else needs to be public |
+## 1. Pinned stack and host requirements
 
-Postgres (5432) and Redis (6379) are **internal-only** in the prod compose — they are never published to the host.
+| Component | Pin |
+| --- | --- |
+| Node.js | `22.23.1-alpine3.23` |
+| Next.js | `15.5.20` |
+| NestJS | `11.1.28` |
+| PostgreSQL | `16.14-alpine3.23` |
+| Redis | `7.4.8-alpine` |
+| ClamAV | `1.5.3` |
+| Optional edge Caddy | `2.11.4-alpine` |
 
-Install Docker if needed:
+The production host must have:
 
-```bash
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER   # then log out and back in
-```
+- `x86_64`/`amd64` Linux, Docker Engine and the Docker Compose plugin;
+- `flock`, Git, at least 8 GiB RAM+swap, at least 4 GiB currently available RAM+swap, and at least
+  15 GiB free disk;
+- private management access that does not depend on the application edge;
+- a clean `main` checkout and an owner-only `.env.prod` file;
+- no unrelated containers or volumes inside the dedicated `telecom-hd-prod` Compose project.
 
----
+ClamAV is mandatory for production, including staff and inbound attachments. Port 3310, PostgreSQL
+5432, Redis 6379, API 4000 and web 3000 must never be published to the host.
 
-## 2. Clone and Checkout
+## 2. Prepare the immutable release
 
-```bash
-git clone <repo-url> telecom-hd
-cd telecom-hd
-git checkout main
-```
-
-Confirm you are on the right commit:
+Use Git on the VM; the deploy helper verifies the working tree and commit identity:
 
 ```bash
-git log --oneline -3
+cd /srv/telecom-hd
+git fetch origin main
+git switch main
+git pull --ff-only origin main
+git status --short
+git rev-parse HEAD
 ```
 
----
+Do not deploy an rsync copy without `.git`: release identity, clean-tree enforcement and rollback
+provenance depend on the repository metadata. Runtime state (`.env.prod`, backups and Docker
+volumes) is VM-owned and must never enter Git.
 
-## 3. Fill `.env.prod`
+## 3. Configure `.env.prod`
 
-### 3a. Copy the template
+For a new host:
 
 ```bash
 cp .env.prod.example .env.prod
-chmod 600 .env.prod    # restrict to owner only
-$EDITOR .env.prod
+chmod 600 .env.prod
 ```
 
-### 3b. Variable reference
+Edit the file only on the VM or through the approved secret-management path. Never print or paste
+it into CI, chat or tickets.
 
-Fill **every** variable. The API refuses to boot if any secret retains a placeholder value
-(see `apps/api/src/config/configuration.ts` — `assertProductionSecrets`). Patterns rejected:
-`change-me`, `dev-secret`, `placeholder`, `example`, `changeme`, four or more zeros.
+Required invariants:
 
-#### Generate strong secrets
+- `TELECOM_HD_RELEASE` identifies `git rev-parse HEAD` (normally its 12-character prefix).
+- `TELECOM_HD_PUBLIC_URL=https://real-host`, `DOMAIN` and
+  `TELECOM_HD_TURNSTILE_HOSTNAME` refer to the same production host.
+- `NEXT_PUBLIC_API_URL` is empty for the recommended same-origin `/api` path.
+- JWT secrets are strong and distinct; DB/Redis passwords are URL-safe; the field-encryption key is
+  64 hexadecimal characters.
+- SMTP uses a real authenticated relay. Port 587 uses mandatory STARTTLS
+  (`TELECOM_HD_SMTP_SECURE=false`); port 465 uses implicit TLS (`true`).
+- `TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL/PASSWORD` are absent from `.env.prod`; first-install creation is
+  a terminal prompt in a removed one-shot container.
+- `TELECOM_HD_CLAMAV_ENABLED=true`, host `clamav`, and `COMPOSE_PROFILES=scanner`.
 
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+Start every public surface closed:
+
+```dotenv
+TELECOM_HD_CLIENT_PORTAL_ENABLED=false
+TELECOM_HD_CLIENT_UPLOAD_ENABLED=false
+TELECOM_HD_PUBLIC_TICKET_CREATE_ENABLED=false
+TELECOM_HD_PUBLIC_UPLOAD_ENABLED=false
 ```
 
-Run this command once per secret below.
+The upload switches are independent emergency controls. Verified-client uploads additionally
+require the client portal. Anonymous uploads additionally require public ticket creation. Turnstile
+credentials and its build-time site key are required before any client/public challenge surface is
+enabled.
 
-| Variable                              | Type                      | Notes                                                                                                                                                                                             |
-| ------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV`                            | fixed                     | Set to `production` — do not change                                                                                                                                                               |
-| `TELECOM_HD_PUBLIC_URL`               | **operator-supplied**     | Full public URL, e.g. `https://help.example.com` — no trailing slash                                                                                                                              |
-| `NEXT_PUBLIC_API_URL`                 | **operator-supplied**     | Same value as `TELECOM_HD_PUBLIC_URL`; baked into the web image at build time — changing it later requires a rebuild                                                                              |
-| `TELECOM_HD_DB_USER`                  | operator-supplied         | Postgres username, e.g. `telecom_hd`                                                                                                                                                              |
-| `TELECOM_HD_DB_PASSWORD`              | **auto-generated secret** | Strong random string; stored in `pgdata` volume                                                                                                                                                   |
-| `TELECOM_HD_DB_NAME`                  | operator-supplied         | Postgres database name, e.g. `telecom_hd`                                                                                                                                                         |
-| `TELECOM_HD_REDIS_PASSWORD`           | **auto-generated secret** | Redis requires a password in prod; used in both the `redis` service and `REDIS_URL`                                                                                                               |
-| `TELECOM_HD_JWT_ACCESS_SECRET`        | **auto-generated secret** | Min 32 chars; must differ from the refresh secret                                                                                                                                                 |
-| `TELECOM_HD_JWT_REFRESH_SECRET`       | **auto-generated secret** | Min 32 chars; must differ from the access secret                                                                                                                                                  |
-| `TELECOM_HD_JWT_ACCESS_TTL`           | operator-supplied         | Access token TTL in seconds; default `900` (15 min)                                                                                                                                               |
-| `TELECOM_HD_JWT_REFRESH_TTL`          | operator-supplied         | Refresh token TTL in seconds; default `2592000` (30 days)                                                                                                                                         |
-| `TELECOM_HD_SMTP_HOST`                | **operator-supplied**     | Real SMTP relay hostname (e.g. `smtp.sendgrid.net`); NOT MailHog                                                                                                                                  |
-| `TELECOM_HD_SMTP_PORT`                | **operator-supplied**     | Typically `587` (STARTTLS) or `465` (TLS)                                                                                                                                                         |
-| `TELECOM_HD_SMTP_SECURE`              | **operator-supplied**     | `true` for STARTTLS/TLS; `false` only if the relay requires it                                                                                                                                    |
-| `TELECOM_HD_SMTP_USER`                | **operator-supplied**     | SMTP auth username (e.g. `apikey` for SendGrid)                                                                                                                                                   |
-| `TELECOM_HD_SMTP_PASSWORD`            | **operator-supplied**     | SMTP auth password / API key                                                                                                                                                                      |
-| `TELECOM_HD_MAIL_FROM`                | **operator-supplied**     | Sender display name + address; must pass SPF/DKIM on your domain                                                                                                                                  |
-| `TELECOM_HD_ALARIS_WEBHOOK_SECRET`    | **auto-generated secret** | Shared secret for `POST /api/alaris/webhook`; min 32 chars; the shipped default `alaris-dev-secret-change-me-0000` is explicitly rejected at boot                                                 |
-| `TELECOM_HD_INBOUND_WEBHOOK_SECRET`   | **auto-generated secret** | Shared secret for `POST /api/inbound/pipe` (MTA/PIPE mail ingress); min 32 chars; the shipped dev default is rejected at boot — **set it even if you only use IMAP**, or the API refuses to start |
-| `TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL`    | **operator-supplied**     | Email for the first admin account created on first boot                                                                                                                                           |
-| `TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD` | **operator-supplied**     | Strong password for the bootstrap admin; never use `demo1234`                                                                                                                                     |
-| `TELECOM_HD_FIELD_ENCRYPTION_KEY`     | optional                  | 64 hex chars (256-bit AES key) for IMAP password field encryption; omit if not using IMAP polling                                                                                                 |
-| `TELECOM_HD_LOG_LEVEL`                | operator-supplied         | `info` for production; `debug` only for troubleshooting                                                                                                                                           |
-| `TELECOM_HD_UPLOAD_DIR`               | fixed                     | `/app/uploads` — mapped to the `uploads` named volume; do not change                                                                                                                              |
-| `TELECOM_HD_UPLOAD_MAX_SIZE_MB`       | operator-supplied         | File upload cap; default `25`                                                                                                                                                                     |
-
-> `TELECOM_HD_SEED=1` is intentionally absent from `.env.prod.example`. Do not set it — it
-> creates the known-password demo admin (`admin@23telecom.example` / `demo1234`), which is a
-> security risk in production.
-
-### 3c. Validate with preflight
-
-Run the preflight validator — it checks for unfilled `<<<` placeholders, required keys,
-secret strength, `https://` URLs, the 64-hex field key, and a non-default admin password,
-mirroring the server-side `assertProductionSecrets()` guard. It prints only key names (never
-values) and exits non-zero on any failure:
+Validate without exposing values:
 
 ```bash
 bash scripts/preflight.sh .env.prod
-# All [✓] and exit 0 → ready. Any [✗] → fix before deploying.
+export TELECOM_HD_WEB_BUILD_ID="$(./scripts/web-build-id.sh .env.prod)"
+docker compose --profile scanner -f docker-compose.prod.yml \
+  --env-file .env.prod config --services
+docker compose --profile scanner -f docker-compose.prod.yml \
+  --env-file .env.prod config --images
 ```
 
----
+Do not print the full rendered Compose configuration; it expands application secrets.
 
-## 4. TLS / Reverse Proxy (Caddy)
-
-The prod compose does **not** handle TLS internally. Caddy terminates HTTPS and proxies to
-`api:4000` and `web:3000` over the internal Docker network.
-
-The Caddyfile is at `infra/caddy/Caddyfile`. It:
-
-- Routes `/api/*` to the API container on port 4000.
-- Routes everything else to the web container on port 3000.
-- Sets HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`.
-- Handles gzip/zstd encoding and enforces a 25 MB upload limit.
-- Obtains and renews Let's Encrypt certificates automatically via HTTP-01 (requires port 80 to
-  be publicly reachable before first start).
-
-### 4a. Create the Caddy override compose file
+## 4. Internal-only deployment
 
 ```bash
-cat > docker-compose.proxy.yml << 'EOF'
-services:
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    volumes:
-      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    networks:
-      - telecom-hd-prod_default
-
-volumes:
-  caddy_data:
-  caddy_config:
-EOF
+chmod +x scripts/preflight.sh scripts/deploy-prod.sh scripts/smoke-prod.sh \
+  scripts/bootstrap-admin.sh scripts/web-build-id.sh scripts/validate-uploads-archive.sh \
+  scripts/db-backup.sh scripts/db-verify-backup.sh scripts/db-restore.sh \
+  scripts/uploads-backup.sh scripts/uploads-verify-backup.sh scripts/uploads-restore.sh
+./scripts/deploy-prod.sh
 ```
 
-### 4b. Set the DOMAIN in `.env.prod`
+For an existing release the helper performs, in order:
 
-Add to `.env.prod`:
+1. configuration, resource, architecture, clean-tree and exact fetched-`origin/main` checks;
+2. exact inventory and health validation of the dedicated Compose project;
+3. pinned image pulls and immutable builds while the old release remains online; the web tag includes
+   the digest of its `NEXT_PUBLIC_*` build inputs;
+4. ingress closure, global BullMQ pause, a ten-minute maximum active-job drain, then API/web stop;
+5. schema-compatible template, ownership and worker-idle pre-migration audits;
+6. one exact, quiesced DB/uploads pair in a unique deployment directory plus real restores into
+   disposable targets and exact file-count/byte reconciliation;
+7. live Redis RDB→AOF conversion when needed, a preserved immutable rollback-volume copy, target
+   volume copy, then a read-only-source clone into a disposable Redis volume/container with strict
+   truncated-AOF rejection and an exact bounded BullMQ aggregate comparison before cutover;
+8. internal base Compose startup, Prisma migrations and API/web health waits; first install prompts
+   once for an administrator through `scripts/bootstrap-admin.sh`;
+9. strict ownership, production-readiness, attachment-storage and scanner audits, followed by queue
+   resume only after every gate is green.
 
+The Redis conversion follows the supported live-switch procedure; simply restarting an RDB-only
+instance with AOF enabled can lose data. See the
+[Redis persistence documentation](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
+
+Each Redis queue audit has its own 15-second operation timeout, so an unreachable Redis cannot turn
+the outer drain deadline into an unbounded wait. Before the migration boundary, a failure attempts
+to resume queues and restart the unchanged old internal release, but reports rollback success only
+after old API/web health and queue resume are both proven. Otherwise it stays fail-closed with
+ingress off. After the boundary, the trap stops the new API/web, leaves queues paused and edge traffic
+off, and points to an owner-only recovery manifest containing the exact DB/uploads/Redis triplet and
+old image IDs. The helper never mounts the rollback Redis volume into the disposable rehearsal,
+never force-removes unknown containers and never runs `docker compose down -v`.
+
+On first deployment there is no old data to back up. That is reported explicitly; any partial
+project state instead aborts for manual inspection. The interactive administrator password exists
+only in the one-shot process/container environment and is removed with that container.
+
+Successful output ends with:
+
+```text
+Internal release is healthy and audited. No host ports or public edge were started.
 ```
-DOMAIN=help.example.com
-```
 
-The Caddyfile reads `{$DOMAIN}` from the environment.
-
-> Cookie note: Caddy forwards `Set-Cookie` and `Cookie` headers untouched. The API sets
-> `HttpOnly + Secure` session cookies — do not add header transforms that strip them.
-
----
-
-## 5. Build and Launch
+Verify that statement:
 
 ```bash
-docker compose \
-  -f docker-compose.prod.yml \
-  -f docker-compose.proxy.yml \
-  --env-file .env.prod \
-  up -d --build
+export TELECOM_HD_WEB_BUILD_ID="$(./scripts/web-build-id.sh .env.prod)"
+docker compose --profile scanner -f docker-compose.prod.yml \
+  --env-file .env.prod ps
+docker compose --profile scanner -f docker-compose.prod.yml \
+  --env-file .env.prod logs --tail=150 api web postgres redis clamav
+ss -lntup
 ```
 
-### What happens on first boot
+## 5. HTTPS edge gate
 
-The `api` container runs three steps before starting NestJS:
+`docker-compose.proxy.yml`, the Caddy file and nftables examples are reference components; the
+internal deploy helper does **not** start them. Before any edge is enabled, document and verify:
 
-```
-npx prisma migrate deploy   # applies all pending migrations to Postgres
-node dist/seed/bootstrap-admin.js   # creates admin StaffGroup + staff account (idempotent)
-node dist/main.js           # starts the NestJS app on :4000
-```
+- whether traffic reaches the origin directly, through Cloudflare proxy, or through a private
+  tunnel;
+- the exact trusted proxy hop count/ranges used to derive `req.ip`; caller-supplied forwarding
+  headers must not be trusted from the open Internet;
+- TLS mode and origin authentication, DNS, certificate issuance and canonical redirects;
+- firewall allowlist: only the approved edge may reach origin ingress; management remains private;
+- request-body limits, WAF/rate-limit rules and log redaction;
+- a tested timed firewall rollback from a second management session;
+- external port scan proving data-plane ports remain closed.
 
-`bootstrap-admin.js` reads `TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL` and
-`TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD`. If either is unset it logs a warning and skips silently
-(does not crash). On subsequent boots it is a no-op — it never resets a password that was
-already set.
+Do not use a blanket `nft flush ruleset`. Snapshot the exact current rules, install only the reviewed
+delta with an automatic rollback, test the existing management session, then cancel the rollback.
 
-The `web` container waits for the `api` healthcheck to pass before starting.
+Only after this gate may an operator explicitly start the reviewed edge override. There is no
+generic command here because direct Caddy, Cloudflare and tunnel topologies require different
+trusted-IP and firewall rules.
 
-### Monitor startup
+## 6. Mandatory HTTPS smoke
+
+With edge access restricted to the release team, use a temporary real staff account:
 
 ```bash
-docker compose -f docker-compose.prod.yml logs -f --tail=50
+export SMOKE_BASE_URL='https://real-helpdesk-host'
+read -r -p 'Temporary smoke staff email: ' SMOKE_STAFF_EMAIL
+read -r -s -p 'Temporary smoke staff password: ' SMOKE_STAFF_PASSWORD; echo
+export SMOKE_STAFF_EMAIL SMOKE_STAFF_PASSWORD
+bash scripts/smoke-prod.sh
+unset SMOKE_STAFF_EMAIL SMOKE_STAFF_PASSWORD
 ```
 
-Expected final lines:
-
-```
-api  | [bootstrap-admin] StaffGroup "Administrator" already exists ...
-api  | [Nest] ... Application is running on: http://[::]:4000
-web  | ... ready started server on 0.0.0.0:3000
-```
-
-### Service memory limits
-
-| Service    | Reserved   | Limit      |
-| ---------- | ---------- | ---------- |
-| `api`      | 256 MB     | 512 MB     |
-| `web`      | 256 MB     | 512 MB     |
-| `postgres` | OS default | OS default |
-| `redis`    | OS default | OS default |
-
----
-
-## 6. First-Run Verification
-
-Run each check in order. All must pass before declaring the deployment live.
-
-### 6a. API health endpoint
-
-```bash
-curl -f https://help.example.com/api/health
-# Expected: {"status":"ok","db":"up","redis":"up"} with HTTP 200
-```
-
-### 6b. Log in as the bootstrap admin
-
-1. Open `https://help.example.com/staff` in a browser.
-2. Sign in with `TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL` / `TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD`.
-3. Confirm the staff dashboard loads.
-
-### 6c. Submit a public ticket
-
-```bash
-curl -fsS -X POST https://help.example.com/api/tickets/public \
-  -H 'Content-Type: application/json' \
-  -d '{"subject":"Deploy test","requesterEmail":"ops@example.com","requesterName":"Ops","contents":"First prod ticket"}'
-# Expected: JSON body with a "mask" field (ticket reference)
-```
-
-Confirm the ticket appears in the staff queue at `/staff/tickets`.
-
-### 6d. Confirm SMTP delivery
-
-1. In the staff UI, reply to the test ticket from step 6c.
-2. Check the inbox for `ops@example.com` (or your test address).
-3. If no email arrives within 2 minutes, check the API logs:
-
-```bash
-docker compose -f docker-compose.prod.yml logs api | grep -i smtp
-```
-
-### 6e. Run the smoke suite against prod (optional but recommended)
-
-```bash
-API_URL=https://help.example.com \
-TELECOM_HD_ALARIS_WEBHOOK_SECRET=<your-alaris-secret> \
-bash scripts/smoke.sh
-```
-
-The smoke script verifies: OpenAPI served, staff login, public ticket creation, Alaris webhook
-ticket creation. All four checks must print `✓`.
-
----
-
-## 7. Day-2 Operations
-
-### 7a. Database backups
-
-`scripts/db-backup.sh` runs `pg_dump` inside the running `postgres` container, pipes through
-`gzip`, and stores files under `./backups/`. It reads credentials from `.env.prod` automatically.
-
-```bash
-chmod +x scripts/db-backup.sh
-
-# Manual backup
-./scripts/db-backup.sh
-
-# With options
-./scripts/db-backup.sh --keep 30 --backups-dir /var/backups/telecom-hd
-```
-
-Files are named `telecom_hd_<timestamp>.dump.gz` in custom pg_dump format. Default retention is
-14 files.
-
-Schedule daily backups with cron:
-
-```bash
-crontab -e
-# Add:
-0 2 * * * cd /path/to/telecom-hd && ./scripts/db-backup.sh --keep 14 >> /var/log/telecom-hd-backup.log 2>&1
-```
-
-Restore from backup:
-
-```bash
-# Find the backup file
-ls backups/
-
-# Restore with the helper (WARNING: overwrites the current DB; prompts for YES).
-# It gunzips the .dump.gz and runs pg_restore in a single transaction — do NOT pipe
-# the .gz straight into pg_restore (it cannot read gzip).
-bash scripts/db-restore.sh backups/telecom_hd_<timestamp>.dump.gz
-```
-
-Copy backups off-server to object storage (S3, GCS, Backblaze) regularly.
-
-### 7b. Log rotation
-
-All containers use the `json-file` driver with `max-size: 10m` and `max-file: 5` (capped at
-50 MB per service). This is configured in `docker-compose.prod.yml` and requires no additional
-setup. To view logs:
-
-```bash
-docker compose -f docker-compose.prod.yml logs -f --tail=100 api
-docker compose -f docker-compose.prod.yml logs -f --tail=100 web
-```
-
-### 7c. Updating (pull + rebuild + migrate)
-
-```bash
-git pull origin main
-
-# Rebuild and restart (migrations run automatically at api boot)
-docker compose \
-  -f docker-compose.prod.yml \
-  -f docker-compose.proxy.yml \
-  --env-file .env.prod \
-  up -d --build
-```
-
-The `api` container runs `prisma migrate deploy` on every start — migrations are applied before
-the app accepts traffic. Downtime is typically 10–30 seconds while images rebuild and containers
-restart.
-
-### 7d. Rollback
-
-If a deployment introduces a regression:
-
-```bash
-# Find the previous commit
-git log --oneline -5
-
-# Check out the last known-good tag or commit
-git checkout <previous-commit>
-
-# Rebuild and restart
-docker compose \
-  -f docker-compose.prod.yml \
-  -f docker-compose.proxy.yml \
-  --env-file .env.prod \
-  up -d --build
-```
-
-If the new migration is destructive and needs reverting, restore from backup (section 7a) before
-rolling back the code. Prisma does not support automatic down-migrations.
-
----
-
-## 8. Troubleshooting
-
-### API refuses to start — insecure secrets
-
-**Symptom:** Container exits immediately; logs show:
-
-```
-Refusing to start in production with insecure secrets:
-  - TELECOM_HD_JWT_ACCESS_SECRET: must be a strong non-default value in production
-```
-
-**Fix:** `assertProductionSecrets` in `apps/api/src/config/configuration.ts` blocks boot when
-any secret matches the placeholder pattern (`change-me`, `dev-secret`, `example`, `0000`, etc.)
-or when the two JWT secrets are identical. Generate fresh values and update `.env.prod`.
-
-Rejected values include (but are not limited to): any string containing `change-me`,
-`dev-secret`, `placeholder`, `example`, `changeme`, or four or more consecutive zeros.
-
-### Redis authentication failure
-
-**Symptom:** API logs show `NOAUTH Authentication required` or BullMQ workers fail to connect.
-
-**Cause:** The Redis container requires a password set via `TELECOM_HD_REDIS_PASSWORD` in
-`.env.prod`. The `REDIS_URL` in the compose file is built as
-`redis://:${TELECOM_HD_REDIS_PASSWORD}@redis:6379`. If the variable is missing or mismatched,
-Redis rejects all connections.
-
-**Fix:** Ensure `TELECOM_HD_REDIS_PASSWORD` is set and identical in `.env.prod`. Restart both
-`redis` and `api` after any change:
-
-```bash
-docker compose -f docker-compose.prod.yml --env-file .env.prod restart redis api
-```
-
-### `NEXT_PUBLIC_API_URL` points to wrong host
-
-**Symptom:** Browser console shows API calls going to `localhost:4000` or a stale domain.
-
-**Cause:** `NEXT_PUBLIC_API_URL` is baked into the Next.js bundle at image build time. Setting it
-in runtime environment has no effect. This is a Next.js constraint documented in
-`apps/web/Dockerfile`.
-
-**Fix:** Update `NEXT_PUBLIC_API_URL` in `.env.prod` and rebuild the `web` image:
-
-```bash
-docker compose -f docker-compose.prod.yml -f docker-compose.proxy.yml \
-  --env-file .env.prod up -d --build web
-```
-
-### Migrations fail at boot
-
-**Symptom:** `api` container exits with `Error: P3009` or similar Prisma migration error.
-
-**Fix:**
-
-```bash
-# Check migration status inside the running postgres container
-docker compose -f docker-compose.prod.yml --env-file .env.prod \
-  exec postgres psql -U telecom_hd -d telecom_hd \
-  -c "SELECT migration_name, finished_at FROM _prisma_migrations ORDER BY started_at DESC LIMIT 10;"
-```
-
-If a migration is marked failed, resolve the underlying cause (usually a schema conflict from a
-manual DB change) before restarting.
-
-### Caddy cannot obtain TLS certificate
-
-**Symptom:** Caddy logs show `ACME challenge failed` or `no A/AAAA records found`.
-
-**Fix:**
-
-- Confirm the DNS A record for your domain resolves to the server's public IP:
-  `dig +short help.example.com`
-- Confirm ports 80 and 443 are open: `curl -v http://help.example.com`
-- On first run, Caddy needs a few seconds to issue the certificate. Check:
-  `docker compose -f docker-compose.proxy.yml logs caddy`
-
-### Bootstrap admin was not created
-
-**Symptom:** Cannot log in to `/staff` because no staff account exists.
-
-**Cause:** `TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL` or `TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD` was
-missing from `.env.prod` on first boot. The script logs a warning and exits 0 (does not fail
-the boot).
-
-**Fix:** Add both variables to `.env.prod` and restart the api container. The script is
-idempotent — it creates the account if the email is not already in the database, and skips
-silently if it is.
-
-```bash
-docker compose -f docker-compose.prod.yml --env-file .env.prod restart api
-docker compose -f docker-compose.prod.yml logs api | grep bootstrap
-```
-
-### Uploads volume not writable
-
-**Symptom:** File attachment uploads return 500 errors; API logs show `EACCES /app/uploads`.
-
-**Cause:** The `uploads` named volume may be owned by root if it was created before the `node`
-user chown in the Dockerfile.
-
-**Fix:**
-
-```bash
-docker compose -f docker-compose.prod.yml --env-file .env.prod \
-  exec -u root api chown -R node:node /app/uploads
-```
-
----
-
-## Known Caveats
-
-- **Alaris admin page is a stub.** The "Alaris Integration" tab in the admin UI shows a
-  "Coming soon" thresholds form that is non-functional (see `docs/adr/0005-alaris-stub.md`).
-  The webhook endpoint (`POST /api/alaris/webhook`) is fully functional for receiving events.
-- **SLA calculations are UTC-based.** There is no timezone-aware business-hours calendar.
-  SLA breach times are computed in UTC regardless of the operator's local timezone.
-- **No CI/CD pipeline.** There is no GitHub Actions workflow. All gates (`make verify`) run
-  locally only. Run `make verify` before every production update.
-- **Demo seed must not be enabled in production.** `TELECOM_HD_SEED=1` creates
-  `admin@23telecom.example` with the public password `demo1234`. Never set this variable in
-  `.env.prod`.
+The smoke verifies cookie-only login, signed CSRF, refresh rotation, `/auth/me`, logout and immediate
+revocation. It rejects JWTs in JSON and never prints credentials, cookies, tokens or response bodies.
+
+Also prove:
+
+- production cookies are host-only `__Host-*`, `Secure`, and session cookies are `HttpOnly`;
+- one controlled outbound mail passes SPF/DKIM/DMARC alignment;
+- a client magic-link round trip works with an approved mailbox before enabling the portal;
+- scanner signatures are fresh and a controlled EICAR upload is rejected before enabling uploads;
+- external firewall/WAF checks and public rate-limit buckets use the real client IP.
+
+## 7. Enable features in stages
+
+After every stage: update `.env.prod`, rebuild/redeploy (the Turnstile site key is build-time and
+therefore produces a new web build-digest tag), run preflight, repeat the relevant smoke, and keep
+edge access restricted until green.
+
+1. Staff-only; all four switches false.
+2. `TELECOM_HD_CLIENT_PORTAL_ENABLED=true`; verify request-link, verify, session expiry and logout.
+3. `TELECOM_HD_CLIENT_UPLOAD_ENABLED=true`; verify owner-bound claim/adoption and malware rejection.
+4. `TELECOM_HD_PUBLIC_TICKET_CREATE_ENABLED=true`; verify action-bound Turnstile and the public
+   department allowlist.
+5. `TELECOM_HD_PUBLIC_UPLOAD_ENABLED=true`; verify request/byte quotas, storage reserve and EICAR.
+6. Open the approved edge policy to the intended audience.
+
+Turn the corresponding write switch off immediately on 429/403 spikes, mail abuse, scanner failure,
+unexpected disk growth or unresolved storage reconciliation.
+
+## 8. Rollback and common failures
+
+This first security rollout is **forward-recovery or restore-triplet only** after the migration
+boundary. Do not check out the previous commit and call its deploy script: that commit may not contain
+the orchestrator and its Compose file may attach a different Redis volume.
+
+On a post-boundary failure:
+
+1. Keep ingress off and do not resume BullMQ. The failure trap stops API/web automatically.
+2. Preserve logs and open the printed
+   `backups/deploy-<timestamp>-<sha>/recovery-manifest.txt`; it contains no credentials but is mode
+   `0600` because it is recovery provenance.
+3. Prefer correcting the blocker and finishing forward with the current release.
+4. If forward recovery is impossible, use the **current checkout's** helpers and `docs/BACKUP.md` to
+   restore the exact database/uploads pair. The manifest's Redis rollback volume is the third member
+   of that recovery point; do not attach, copy, delete or prune it without an attended recovery plan.
+5. Recreate an older application only from the manifest's immutable old image IDs after the matching
+   database and Redis state are restored. There is intentionally no generic destructive command:
+   volume attachment and schema compatibility must be reviewed for that incident.
+
+Never invent a down-migration, never restore only two members of the triplet, and never run
+`docker compose down -v`. A normal previous-version application rollback may be automated only after
+this release itself is the established known-good orchestrator and its migrations are proven backward
+compatible.
+
+Common fail-closed results:
+
+- release mismatch or dirty checkout: deploy the exact clean commit;
+- unknown/partial Compose state: inventory it manually; do not delete volumes;
+- backup or restore rehearsal failure: repair backups before cutover;
+- Redis AOF rewrite/restore mismatch: keep writers/edge off and inspect the copied volume;
+- scanner timeout/stale signatures: keep every upload switch off;
+- ownership/template/storage audit failure: correct data explicitly; do not bypass the audit;
+- API/web health timeout after migrations: keep edge off and finish forward recovery;
+- SMTP/Turnstile failure: keep the affected login/public feature closed.

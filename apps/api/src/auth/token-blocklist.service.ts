@@ -41,8 +41,8 @@ export class TokenBlocklistService implements OnModuleDestroy {
     if (!jti || ttlSeconds <= 0) return;
     try {
       await this.redis.set(`${KEY_PREFIX}${jti}`, '1', 'EX', Math.ceil(ttlSeconds));
-    } catch (err) {
-      this.logger.warn(`Failed to blocklist jti ${jti}: ${String(err)}`);
+    } catch {
+      this.logger.warn('Failed to blocklist access-token identifier');
     }
   }
 

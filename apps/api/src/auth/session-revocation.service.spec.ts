@@ -7,6 +7,8 @@ import type { AppConfig } from '../config/configuration';
 function makePrismaMock() {
   return {
     refreshToken: { updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
+    // revokeAllForStaff also burns pending password-reset tokens (blocker #7).
+    passwordReset: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
     staff: { findMany: vi.fn().mockResolvedValue([]) },
   } as unknown as PrismaService;
 }
@@ -35,6 +37,14 @@ describe('SessionRevocationService', () => {
       data: { revokedAt: expect.any(Date) },
     });
     expect(blocklist.revokeStaffAccessBefore).toHaveBeenCalledWith(7, 900);
+  });
+
+  it('revokeAllForStaff also burns pending password-reset tokens (blocker #7)', async () => {
+    await svc.revokeAllForStaff(7);
+    expect(
+      (prisma as unknown as { passwordReset: { updateMany: ReturnType<typeof vi.fn> } }).passwordReset
+        .updateMany,
+    ).toHaveBeenCalledWith({ where: { staffId: 7, usedAt: null }, data: { usedAt: expect.any(Date) } });
   });
 
   it('revokeAllForGroup revokes for every member and sets a cutoff each', async () => {

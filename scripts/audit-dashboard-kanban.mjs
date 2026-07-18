@@ -2,42 +2,56 @@
  * RE-AUDIT: Staff Dashboard + Kanban — post-fix verification + bug sweep
  * Run: node scripts/audit-dashboard-kanban.mjs
  */
-import { chromium } from 'playwright';
+import { chromium, request as playwrightRequest } from 'playwright';
 import { setTimeout as sleep } from 'timers/promises';
 
 const BASE = 'http://localhost:3000';
-const API  = 'http://localhost:4000/api';
+const API = 'http://localhost:4000/api';
 const CREDS = { email: 'admin@23telecom.example', password: 'demo1234' };
 
-let token = null;
+let apiContext = null;
+let csrfToken = null;
 const results = { fixed: [], broken: [] };
-const ok  = (msg) => { console.log('  ✓ ' + msg); results.fixed.push(msg); };
-const bad = (p, msg, detail = '') => { console.warn(`  ✗ [${p}] ${msg}${detail ? ' — ' + detail : ''}`); results.broken.push({ p, msg, detail }); };
+const ok = (msg) => {
+  console.log('  ✓ ' + msg);
+  results.fixed.push(msg);
+};
+const bad = (p, msg, detail = '') => {
+  console.warn(`  ✗ [${p}] ${msg}${detail ? ' — ' + detail : ''}`);
+  results.broken.push({ p, msg, detail });
+};
 
 // ── API helpers ──────────────────────────────────────────────────────────────
 async function apiLogin() {
-  const r = await fetch(`${API}/auth/login`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(CREDS),
+  apiContext = await playwrightRequest.newContext({ baseURL: API });
+  const r = await apiContext.post(`${API}/auth/login`, {
+    headers: { Origin: BASE },
+    data: CREDS,
   });
-  if (!r.ok) throw new Error(`Login failed: ${r.status}`);
+  if (!r.ok()) throw new Error(`Login failed: ${r.status()}`);
   const j = await r.json();
-  token = j.accessToken;
-  return token;
+  if (!j.staff || j.accessToken || j.refreshToken) {
+    throw new Error('Login response does not match the cookie-only contract');
+  }
+  const state = await apiContext.storageState();
+  csrfToken = state.cookies.find(
+    (cookie) => cookie.name === 'th_csrf' || cookie.name === '__Host-th_csrf',
+  )?.value;
+  if (!csrfToken) throw new Error('Login did not issue a CSRF cookie');
 }
 
 async function apiGet(path) {
-  const r = await fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) throw new Error(`GET ${path} → ${r.status}`);
+  const r = await apiContext.get(`${API}${path}`);
+  if (!r.ok()) throw new Error(`GET ${path} → ${r.status()}`);
   return r.json();
 }
 
 async function apiPatch(path, body) {
-  const r = await fetch(`${API}${path}`, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify(body),
+  const r = await apiContext.patch(`${API}${path}`, {
+    headers: { Origin: BASE, 'X-CSRF-Token': csrfToken },
+    data: body,
   });
-  return { status: r.status, body: await r.json().catch(() => null) };
+  return { status: r.status(), body: await r.json().catch(() => null) };
 }
 
 // ── Browser helpers ──────────────────────────────────────────────────────────
@@ -65,7 +79,8 @@ async function main() {
     console.log('  API login OK');
   } catch (e) {
     bad('P0', 'API login failed', e.message);
-    console.error('Cannot continue — aborting'); process.exit(1);
+    console.error('Cannot continue — aborting');
+    process.exit(1);
   }
   await sleep(300);
 
@@ -74,10 +89,12 @@ async function main() {
     const dash = await apiGet('/reports/dashboard');
     console.log('  /reports/dashboard:', JSON.stringify(dash));
     const hasBreached = typeof dash.slaBreached === 'number';
-    const hasAvg      = typeof dash.avgFirstResponseMinutes === 'number';
+    const hasAvg = typeof dash.avgFirstResponseMinutes === 'number';
     const hasByStatus = Array.isArray(dash.byStatus) && dash.byStatus.length > 0;
     if (hasBreached && hasAvg && hasByStatus) {
-      ok(`/reports/dashboard returns slaBreached=${dash.slaBreached}, avgFirstResponseMinutes=${dash.avgFirstResponseMinutes}, byStatus[${dash.byStatus.length}]`);
+      ok(
+        `/reports/dashboard returns slaBreached=${dash.slaBreached}, avgFirstResponseMinutes=${dash.avgFirstResponseMinutes}, byStatus[${dash.byStatus.length}]`,
+      );
     } else {
       bad('P1', '/reports/dashboard missing fields', JSON.stringify(dash));
     }
@@ -97,8 +114,8 @@ async function main() {
   try {
     const statuses = await apiGet('/ticket-statuses');
     console.log('  ticket-statuses:', JSON.stringify(statuses));
-    for (const s of statuses) statusMap[s.id] = s.title?.toLowerCase().replace(/\s+/g,'_');
-    ok(`/ticket-statuses returns ${statuses.length} items: ${statuses.map(s=>s.title).join(', ')}`);
+    for (const s of statuses) statusMap[s.id] = s.title?.toLowerCase().replace(/\s+/g, '_');
+    ok(`/ticket-statuses returns ${statuses.length} items: ${statuses.map((s) => s.title).join(', ')}`);
   } catch (e) {
     bad('P1', '/ticket-statuses failed', e.message);
   }
@@ -126,7 +143,7 @@ async function main() {
   if (testTicketId) {
     // Find a different status to move to
     const statuses = Object.keys(statusMap).map(Number);
-    const targetStatusId = statuses.find(id => id !== originalStatusId) ?? statuses[0];
+    const targetStatusId = statuses.find((id) => id !== originalStatusId) ?? statuses[0];
     try {
       const patch = await apiPatch(`/tickets/${testTicketId}/status`, { statusId: targetStatusId });
       if (patch.status < 300) {
@@ -135,7 +152,11 @@ async function main() {
         await sleep(300);
         await apiPatch(`/tickets/${testTicketId}/status`, { statusId: originalStatusId });
       } else {
-        bad('P0', `PATCH /tickets/${testTicketId}/status returned ${patch.status}`, JSON.stringify(patch.body));
+        bad(
+          'P0',
+          `PATCH /tickets/${testTicketId}/status returned ${patch.status}`,
+          JSON.stringify(patch.body),
+        );
       }
     } catch (e) {
       bad('P0', 'Kanban PATCH /status failed', e.message);
@@ -149,9 +170,15 @@ async function main() {
     console.log('  /auth/me:', JSON.stringify(me));
     const hasMeName = me.firstName || me.lastName || me.fullName;
     if (hasMeName) {
-      ok(`/auth/me returns name fields: firstName="${me.firstName}" lastName="${me.lastName}" fullName="${me.fullName}"`);
+      ok(
+        `/auth/me returns name fields: firstName="${me.firstName}" lastName="${me.lastName}" fullName="${me.fullName}"`,
+      );
     } else {
-      bad('P1', '/auth/me has no firstName/lastName/fullName — user menu will show email only', JSON.stringify(me));
+      bad(
+        'P1',
+        '/auth/me has no firstName/lastName/fullName — user menu will show email only',
+        JSON.stringify(me),
+      );
     }
   } catch (e) {
     bad('P1', '/auth/me failed', e.message);
@@ -166,9 +193,13 @@ async function main() {
 
   // Capture console errors
   const consoleErrors = [];
-  page.on('console', msg => { if (msg.type() === 'error') consoleErrors.push(msg.text()); });
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') consoleErrors.push(msg.text());
+  });
   const networkErrors = [];
-  page.on('response', r => { if (r.status() >= 400) networkErrors.push(`${r.status()} ${r.url()}`); });
+  page.on('response', (r) => {
+    if (r.status() >= 400) networkErrors.push(`${r.status()} ${r.url()}`);
+  });
 
   try {
     await browserLogin(page);
@@ -204,9 +235,9 @@ async function main() {
     const statTexts = await page.locator('text=/^\\d+$/').allTextContents();
     console.log('  Stat numeric values found:', statTexts.slice(0, 10));
     // At least some non-zero numbers in stat area
-    const nonZero = statTexts.filter(t => parseInt(t) > 0);
+    const nonZero = statTexts.filter((t) => parseInt(t) > 0);
     if (nonZero.length > 0) {
-      ok(`Dashboard stats show non-zero values (sample: ${nonZero.slice(0,5).join(', ')})`);
+      ok(`Dashboard stats show non-zero values (sample: ${nonZero.slice(0, 5).join(', ')})`);
     } else {
       bad('P2', 'All visible numeric stat values are 0 — may indicate real data not flowing', '');
     }
@@ -216,11 +247,14 @@ async function main() {
     if (welcomeEl > 0) ok('Dashboard welcome subtitle present');
 
     // Check user display name (not email in top-bar)
-    const userMenuText = await page.locator('header').innerText().catch(() => '');
-    console.log('  Header text sample:', userMenuText.substring(0,100));
+    const userMenuText = await page
+      .locator('header')
+      .innerText()
+      .catch(() => '');
+    console.log('  Header text sample:', userMenuText.substring(0, 100));
     // Admin's name should show (e.g. "Admin" not just the email)
     if (userMenuText.includes('@') && !userMenuText.includes('Admin')) {
-      bad('P1', 'User menu may be showing email instead of display name', userMenuText.substring(0,80));
+      bad('P1', 'User menu may be showing email instead of display name', userMenuText.substring(0, 80));
     } else {
       ok('User display name in header appears correct');
     }
@@ -235,7 +269,9 @@ async function main() {
     }
 
     // New ticket button
-    const newTicketBtn = await page.locator('a[href*="create=1"], button:has-text("заявку"), a:has-text("заявку")').count();
+    const newTicketBtn = await page
+      .locator('a[href*="create=1"], button:has-text("заявку"), a:has-text("заявку")')
+      .count();
     if (newTicketBtn > 0) ok('New ticket button present on dashboard');
     else bad('P2', 'New ticket button not found on dashboard', '');
 
@@ -254,7 +290,7 @@ async function main() {
 
     // ── 2c. Notification bell ──────────────────────────────────────────
     const bellBtn = await page.locator('button[aria-label*="едомлени"]').first();
-    if (await bellBtn.count() > 0) {
+    if ((await bellBtn.count()) > 0) {
       await bellBtn.click();
       await sleep(500);
       const noNotifText = await page.locator('text=Нет уведомлений').count();
@@ -275,7 +311,7 @@ async function main() {
 
     // ── 2d. User menu Профиль/Настройки links ─────────────────────────
     const userMenuBtn = await page.locator('button[aria-label*="Меню профиля"]').first();
-    if (await userMenuBtn.count() > 0) {
+    if ((await userMenuBtn.count()) > 0) {
       await userMenuBtn.click();
       await sleep(400);
       const profileLink = await page.locator('a:has-text("Профиль")').first();
@@ -304,7 +340,9 @@ async function main() {
     // Open palette, check it renders; close it, confirm it's gone
     await page.keyboard.press('Meta+k');
     await sleep(600);
-    const paletteOpen = await page.locator('[role="dialog"][aria-label*="Командная строка"], [role="dialog"][aria-label*="командная"]').count();
+    const paletteOpen = await page
+      .locator('[role="dialog"][aria-label*="Командная строка"], [role="dialog"][aria-label*="командная"]')
+      .count();
     if (paletteOpen > 0) {
       ok('CommandPalette opens on Cmd+K');
       // Type a query
@@ -360,7 +398,11 @@ async function main() {
     if (cards >= 1) {
       // Find a card in the first non-empty column
       const firstCard = page.locator('[data-testid="kanban-card"]').first();
-      const cardText = await firstCard.locator('text=/[A-Z]+-\\d+/').first().textContent().catch(() => '');
+      const cardText = await firstCard
+        .locator('text=/[A-Z]+-\\d+/')
+        .first()
+        .textContent()
+        .catch(() => '');
       console.log(`  First card mask: "${cardText}"`);
 
       // Get the bounding boxes of card and a target column
@@ -385,7 +427,7 @@ async function main() {
 
           // Listen for PATCH request
           let patchFired = false;
-          page.on('request', req => {
+          page.on('request', (req) => {
             if (req.method() === 'PATCH' && req.url().includes('/status')) {
               patchFired = true;
               console.log(`  PATCH request: ${req.url()}`);
@@ -405,7 +447,11 @@ async function main() {
             ok('Kanban drag-drop fired PATCH /status (persists to backend)');
           } else {
             // More detailed check: the optimistic move may work but no PATCH if same column
-            bad('P1', 'Kanban drag-drop did NOT fire PATCH /status — persistence may be broken', 'Check if card was in same column or DnD events not wiring correctly');
+            bad(
+              'P1',
+              'Kanban drag-drop did NOT fire PATCH /status — persistence may be broken',
+              'Check if card was in same column or DnD events not wiring correctly',
+            );
           }
         }
       } else {
@@ -436,7 +482,7 @@ async function main() {
     await sleep(1500);
 
     const openLink = page.locator('a[href="/staff/tickets?status=open"]').first();
-    if (await openLink.count() > 0) {
+    if ((await openLink.count()) > 0) {
       await openLink.click();
       await sleep(800);
       const ticketsUrl = page.url();
@@ -454,8 +500,8 @@ async function main() {
     if (consoleErrors.length === 0) {
       ok('No browser console errors detected during audit');
     } else {
-      const significant = consoleErrors.filter(e =>
-        !e.includes('favicon') && !e.includes('HMR') && !e.includes('Warning:')
+      const significant = consoleErrors.filter(
+        (e) => !e.includes('favicon') && !e.includes('HMR') && !e.includes('Warning:'),
       );
       if (significant.length === 0) {
         ok('No significant browser console errors (only favicon/HMR noise)');
@@ -467,7 +513,7 @@ async function main() {
     }
 
     // ── 2k. 4xx/5xx network errors ─────────────────────────────────────
-    const apiErrors = networkErrors.filter(e => !e.includes('favicon') && !e.includes('hot-update'));
+    const apiErrors = networkErrors.filter((e) => !e.includes('favicon') && !e.includes('hot-update'));
     if (apiErrors.length === 0) {
       ok('No API 4xx/5xx errors during page loads');
     } else {
@@ -475,22 +521,25 @@ async function main() {
         bad('P1', 'Network error during page load', e);
       }
     }
-
   } finally {
     await browser.close();
+    await apiContext?.dispose();
   }
 
   // ── 3. Summary ──────────────────────────────────────────────────────────
   console.log('\n════════════════════════════════════════');
   console.log('FIXED ✓ items:');
-  results.fixed.forEach(f => console.log(`  [FIXED ✓] ${f}`));
+  results.fixed.forEach((f) => console.log(`  [FIXED ✓] ${f}`));
   console.log('\nBROKEN / NEW issues:');
   if (results.broken.length === 0) {
     console.log('  None found!');
   } else {
-    results.broken.forEach(b => console.log(`  [${b.p}] ${b.msg}${b.detail ? ' — ' + b.detail : ''}`));
+    results.broken.forEach((b) => console.log(`  [${b.p}] ${b.msg}${b.detail ? ' — ' + b.detail : ''}`));
   }
   console.log(`\nTotal: ${results.fixed.length} fixed, ${results.broken.length} broken/new`);
 }
 
-main().catch(e => { console.error('Fatal:', e); process.exit(1); });
+main().catch((e) => {
+  console.error('Fatal:', e);
+  process.exit(1);
+});

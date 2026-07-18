@@ -11,22 +11,52 @@ All routes are under the `/api` global prefix.
 
 - 🔓 public (no auth)
 - 🔑 shared-secret (`x-alaris-secret` header, not JWT)
-- 🔒 JWT Bearer + listed permission key
+- 🔒 staff session cookie (Bearer remains accepted for explicit external/test clients) + listed permission key
 
 ---
 
 ## Auth
 
-| Method | Path              | Auth                 | Body                | Returns                              |
-| ------ | ----------------- | -------------------- | ------------------- | ------------------------------------ |
-| POST   | /api/auth/login   | 🔓                   | `{email, password}` | `{accessToken, refreshToken, staff}` |
-| POST   | /api/auth/refresh | 🔓                   | `{refreshToken}`    | `{accessToken, refreshToken}`        |
-| POST   | /api/auth/logout  | 🔒 _(any valid JWT)_ | —                   | 204 No Content                       |
-| GET    | /api/auth/me      | 🔒 _(any valid JWT)_ | —                   | Current staff principal              |
+| Method | Path              | Auth                          | Body                | Returns                  |
+| ------ | ----------------- | ----------------------------- | ------------------- | ------------------------ |
+| GET    | /api/auth/csrf    | 🔓                            | —                   | `{csrfToken}` + cookie   |
+| POST   | /api/auth/login   | 🔓 exact-origin               | `{email, password}` | `{staff}` + auth cookies |
+| POST   | /api/auth/refresh | refresh cookie + CSRF         | —                   | `{ok: true}`             |
+| POST   | /api/auth/logout  | 🔒 _(any valid staff)_ + CSRF | —                   | 204 No Content           |
+| GET    | /api/auth/me      | 🔒 _(any valid staff)_        | —                   | Current staff principal  |
+
+> **Login throttle (S3-7).** `POST /api/auth/login` returns a generic **429** after 10 failed
+> attempts in a 15-min window per client IP + `HMAC(email)` (in addition to the per-IP
+> `@Throttle(5/60s)`). It never locks an account and discloses nothing about account/lock state;
+> fail-open on a Redis outage. Legacy DB `lockedUntil`/failure counters are ignored, so anonymous
+> failures cannot globally lock a known account. Browser JWTs are returned only as host-only,
+> HttpOnly cookies; unsafe cookie-authenticated requests require exact origin plus the signed
+> `X-CSRF-Token` double-submit value.
 
 ---
 
 ## Tickets
+
+> **Client access (GOAL_PUBLIC_SECURITY S2).** `GET /api/tickets/my`,
+> `GET /api/tickets/public/{id}` and `POST /api/tickets/public/{id}/reply` now require a
+> **verified client session** (`@ClientAuthenticated` → `th_client` cookie); they authorize
+> strictly by `Ticket.userId === session.userId` (no `?email=`), returning 401 without a
+> session and the same 404 for wrong-owner / unmapped / missing tickets. Obtain a session via
+> the `/api/client-auth/*` routes below.
+>
+> `POST /api/tickets/public` (create) and `POST /api/attachments/upload/public` remain gated by
+> `ClientPortalGuard` (fail-closed **404 in production** until S4 abuse controls land; override
+> with `TELECOM_HD_CLIENT_PORTAL_ENABLED=true`, not before S4). Dev/test are unaffected.
+
+## Client auth (verified customer sessions — S2)
+
+| Method | Path                                  | Auth              | Body                   | Returns                                                                                                                           |
+| ------ | ------------------------------------- | ----------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | /api/client-auth/request-link         | 🔓 (throttled)    | `{email}`              | Always 202 `{message}` — no account enumeration                                                                                   |
+| POST   | /api/client-auth/verify               | 🔓 (throttled)    | `{token}` (from #frag) | 200 `{ok, expiresAt}` + sets HttpOnly `th_client`                                                                                 |
+| POST   | /api/client-auth/logout               | 🔑 client session | —                      | 204; revokes the session + clears the cookie                                                                                      |
+| GET    | /api/client-auth/me                   | 🔑 client session | —                      | `{userId}`                                                                                                                        |
+| GET    | /api/attachments/client/{id}/download | 🔑 client session | —                      | File stream — owner-scoped (post attachment, non-third-party, `post.ticket.userId === session.userId`); same 404 otherwise (S2-8) |
 
 | Method | Path                                 | Auth               | Body                                                                                                                          | Returns                                                     |
 | ------ | ------------------------------------ | ------------------ | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
@@ -105,6 +135,10 @@ All routes are under the `/api` global prefix.
 | POST   | /api/users/{id}/emails                   | 🔒 `user.manage` | `{email: string}`                              | Created user email                |
 | DELETE | /api/users/{id}/emails/{emailId}         | 🔒 `user.manage` | —                                              | 204 No Content (non-primary only) |
 | PUT    | /api/users/{id}/emails/{emailId}/primary | 🔒 `user.manage` | —                                              | 204 No Content                    |
+
+Changing `isEnabled` or the user's email identity (add/remove/set-primary) atomically revokes all
+pending client magic links and active `th_client` sessions. Re-enabling a user does not revive
+pre-disable links or sessions; the customer must request a new link.
 
 ---
 
@@ -294,15 +328,15 @@ SLA plans, schedules, holidays, and escalation rules. All routes require `admin.
 
 ## Admin / Custom Fields
 
-| Method | Path | Auth | Body | Returns |
+| Method | Path                                            | Auth                    | Body                                                                          | Returns                                                         |
 | ------ | ----------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------- | ------- | ------------------------------- | ------------- |
-| GET | /api/admin/custom-field-groups | 🔒 `admin.customfields` | — | `CustomFieldGroup[]` (includes fields, ordered by displayOrder) |
-| POST | /api/admin/custom-field-groups | 🔒 `admin.customfields` | `{title, scope: 'TICKET'                                                      | 'USER'                                                          | 'STAFF' | 'ORGANIZATION', displayOrder?}` | Created group |
-| PATCH | /api/admin/custom-field-groups/{id} | 🔒 `admin.customfields` | Partial group fields | Updated group |
-| DELETE | /api/admin/custom-field-groups/{id} | 🔒 `admin.customfields` | — | 204 No Content |
-| POST | /api/admin/custom-field-groups/{groupId}/fields | 🔒 `admin.customfields` | `{fieldKey, title, type, isRequired?, isEncrypted?, options?, displayOrder?}` | Created field |
-| PATCH | /api/admin/custom-fields/{id} | 🔒 `admin.customfields` | Partial field fields (fieldKey immutable) | Updated field |
-| DELETE | /api/admin/custom-fields/{id} | 🔒 `admin.customfields` | — | 204 No Content |
+| GET    | /api/admin/custom-field-groups                  | 🔒 `admin.customfields` | —                                                                             | `CustomFieldGroup[]` (includes fields, ordered by displayOrder) |
+| POST   | /api/admin/custom-field-groups                  | 🔒 `admin.customfields` | `{title, scope: 'TICKET'                                                      | 'USER'                                                          | 'STAFF' | 'ORGANIZATION', displayOrder?}` | Created group |
+| PATCH  | /api/admin/custom-field-groups/{id}             | 🔒 `admin.customfields` | Partial group fields                                                          | Updated group                                                   |
+| DELETE | /api/admin/custom-field-groups/{id}             | 🔒 `admin.customfields` | —                                                                             | 204 No Content                                                  |
+| POST   | /api/admin/custom-field-groups/{groupId}/fields | 🔒 `admin.customfields` | `{fieldKey, title, type, isRequired?, isEncrypted?, options?, displayOrder?}` | Created field                                                   |
+| PATCH  | /api/admin/custom-fields/{id}                   | 🔒 `admin.customfields` | Partial field fields (fieldKey immutable)                                     | Updated field                                                   |
+| DELETE | /api/admin/custom-fields/{id}                   | 🔒 `admin.customfields` | —                                                                             | 204 No Content                                                  |
 
 > `type` enum: `TEXT | TEXTAREA | PASSWORD | CHECKBOX | RADIO | SELECT | MULTISELECT | DATE | FILE | CUSTOM`.
 

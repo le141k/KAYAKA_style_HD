@@ -1,0 +1,16 @@
+/**
+ * Canonical email normalization (GOAL_PUBLIC_SECURITY S2-2).
+ *
+ * One stable ownership identity depends on a single, shared normalization rule: an email
+ * has ASCII whitespace trimmed and is lower-cased before it is stored in `UserEmail` or
+ * used as a lookup key.
+ * This keeps `Foo@Bar.com` and `foo@bar.com` from resolving to different owners and makes
+ * the client-auth `resolveUnambiguousOwner` reliable. Address-parsing beyond case/whitespace
+ * (e.g. gmail dot/plus folding) is deliberately NOT done — it would merge distinct addresses.
+ */
+export function normalizeEmail(email: string): string {
+  // Keep this byte set in lock-step with SQL `btrim(email, E' \t\n\r\f\v')` in the
+  // ownership audit/migrations. `String.trim()` also strips Unicode whitespace, which
+  // PostgreSQL `btrim` does not and would let the application and DB disagree.
+  return email.replace(/^[\x20\t\n\r\f\v]+|[\x20\t\n\r\f\v]+$/g, '').toLowerCase();
+}

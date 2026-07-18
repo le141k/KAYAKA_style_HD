@@ -17,10 +17,14 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { z } from 'zod';
 import { TicketsService } from './tickets.service';
 import { RequirePermissions, CurrentStaff, Public } from '../../auth/auth.decorators';
+import { ClientAuthenticated, CurrentClient } from '../client-auth/client-auth.decorators';
+import type { ClientPrincipal } from '../client-auth/client-auth.service';
 import type { AuthStaff } from '../../auth/auth.decorators';
+import { AbuseQuotaService } from '../../security/abuse-quota.service';
+import { TurnstileService } from '../../security/turnstile.service';
+import { PublicWrite } from '../../security/public-write.guard';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
@@ -74,29 +78,47 @@ const PUBLIC_READ_LIMIT = Number(process.env['TELECOM_HD_PUBLIC_READ_LIMIT']) ||
 @ApiTags('tickets')
 @Controller('tickets')
 export class TicketsController {
-  constructor(private readonly ticketsService: TicketsService) {}
+  constructor(
+    private readonly ticketsService: TicketsService,
+    private readonly turnstile: TurnstileService,
+    private readonly abuseQuota: AbuseQuotaService,
+  ) {}
 
   // ─────────────────── Public submission (client portal) ───────────────────
 
   @Public()
+  @PublicWrite('ticket-create')
   @Post('public')
   // Per-endpoint throttle (tighter than the global 300/60s) to curb portal spam/DoS.
   @Throttle({ default: { limit: PUBLIC_SUBMIT_LIMIT, ttl: 60000 } })
   @UsePipes(new ZodValidationPipe(PublicCreateTicketSchema))
   @ApiOperation({ summary: 'Submit a ticket from the client portal (no auth required)' })
-  async publicCreate(@Body() dto: PublicCreateTicketDto) {
+  async publicCreate(@Body() dto: PublicCreateTicketDto, @Ip() ip: string) {
+    await this.turnstile.verify(dto.challengeToken, 'ticket-create', ip);
+    await this.abuseQuota.consume({
+      action: 'ticket-create',
+      ip,
+      identity: dto.requesterEmail,
+      windowSeconds: 3600,
+      globalLimit: 1000,
+      ipLimit: 20,
+      identityLimit: 5,
+    });
     // H8-3: a public adoption MUST carry the per-upload claimToken; without it
     // linkToPost would adopt any orphan by id (IDOR). Reject the unscoped case.
     if (dto.attachmentIds?.length && !dto.attachmentClaimToken) {
       throw new BadRequestException('attachmentClaimToken is required when attachmentIds are provided');
     }
+    const { challengeToken: _challengeToken, ...ticketDto } = dto;
+    void _challengeToken;
+    const departmentId = await this.ticketsService.resolvePublicDepartmentId(dto.departmentId);
     const ticket = await this.ticketsService.createTicket({
-      ...dto,
+      ...ticketDto,
       contents: dto.contents,
-      departmentId: dto.departmentId ?? 1,
+      departmentId,
       isHtml: false,
       creationMode: 'WEB',
-      ipAddress: '0.0.0.0',
+      ipAddress: ip,
       tags: [],
       customFields: dto.customFields,
     });
@@ -114,49 +136,40 @@ export class TicketsController {
 
   // ─────────────────── Client: my tickets ───────────────────
 
-  @Public()
+  @ClientAuthenticated()
   @Get('my')
   @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
-  @ApiOperation({ summary: "List the current requester's tickets by email (client portal)" })
-  listMy(@Query('email') email: string | undefined) {
-    return this.ticketsService.listMyTickets(this.requireEmailParam(email));
-  }
-
-  /** E1: validate the `email` query param as a real (bounded) email address. */
-  private requireEmailParam(email: string | undefined): string {
-    const parsed = z.string().trim().email().max(320).safeParse(email);
-    if (!parsed.success) {
-      throw new BadRequestException('Query parameter "email" must be a valid email address');
-    }
-    return parsed.data.toLowerCase();
+  @ApiOperation({ summary: "List the verified client's own tickets (session-authenticated)" })
+  listMy(@CurrentClient() client: ClientPrincipal) {
+    return this.ticketsService.listMyTickets(client.userId);
   }
 
   // ─────────────────── Client: public ticket detail ───────────────────
 
-  @Public()
+  @ClientAuthenticated()
   @Get('public/:id')
   @Throttle({ default: { limit: PUBLIC_READ_LIMIT, ttl: 60000 } })
   @ApiOperation({
-    summary:
-      'Get a single ticket (no auth) with public posts only — no internal notes. Requires ?email= matching the ticket requester.',
+    summary: "Get one of the verified client's own tickets (public posts only, no internal notes).",
   })
-  getPublic(@Param('id', ParseIntPipe) id: number, @Query('email') email: string | undefined) {
-    return this.ticketsService.getPublicTicket(id, this.requireEmailParam(email));
+  getPublic(@Param('id', ParseIntPipe) id: number, @CurrentClient() client: ClientPrincipal) {
+    return this.ticketsService.getPublicTicket(id, client.userId);
   }
 
   // ─────────────────── Client: public reply ───────────────────
 
-  @Public()
+  @ClientAuthenticated()
   @Post('public/:id/reply')
   @Throttle({ default: { limit: PUBLIC_REPLY_LIMIT, ttl: 60000 } })
-  @ApiOperation({ summary: 'Add a user reply to a ticket from the client portal (no auth required)' })
+  @ApiOperation({ summary: "Add a reply to the verified client's own ticket (session-authenticated)" })
   async publicReply(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(PublicReplySchema)) dto: PublicReplyDto,
+    @CurrentClient() client: ClientPrincipal,
   ) {
-    const post = await this.ticketsService.publicReply(id, dto);
-    // D7: the raw TicketPost carries ipAddress, creationMode, staffId and the
-    // author email — strip them. The portal only needs the created post's identity.
+    const post = await this.ticketsService.publicReply(id, dto, client.userId);
+    // D7 (preserved from main): the raw TicketPost carries ipAddress, creationMode, staffId
+    // and the author email — strip them; the portal only needs the created post's identity.
     return {
       id: post.id,
       ticketId: post.ticketId,

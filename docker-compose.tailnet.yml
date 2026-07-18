@@ -1,17 +1,18 @@
-# Tailnet overlay — publishes the portal on :1488 over plain HTTP (Tailscale-only).
-# Use INSTEAD of docker-compose.proxy.yml (which does public TLS on 80/443):
-#
-#   docker compose -f docker-compose.prod.yml -f docker-compose.tailnet.yml \
-#     --env-file .env.prod up -d --build
+# LEGACY DIAGNOSTIC overlay — publishes :1488 over plain HTTP (Tailscale-only).
+# Production browser authentication uses Secure cookies, so login cannot work over
+# this origin. Do not use it as the production/user-facing deployment path; use an
+# HTTPS origin via docker-compose.proxy.yml (or an approved HTTPS tunnel) instead.
+# This is a reference diagnostic override, not a deploy command. Use only after
+# the internal release from scripts/deploy-prod.sh is green and the exact :1488
+# firewall allowlist has been reviewed.
 #
 # api/web stay internal (expose-only); only this proxy binds a host port — and
 # nftables (infra/nftables/helpdesk.nft) restricts :1488 to the tailnet/LAN.
-# NOTE: set NEXT_PUBLIC_API_URL=http://10.0.0.20:1488 (the tailnet origin) in
-# .env.prod BEFORE building — it is baked into the browser bundle.
+# Keep NEXT_PUBLIC_API_URL empty; browser testing still requires HTTPS termination.
 
 services:
   proxy:
-    image: caddy:2.8-alpine
+    image: caddy:2.11.4-alpine
     restart: unless-stopped
     # Bind on the host so the tailnet/LAN can reach it; nftables gates the source.
     ports:

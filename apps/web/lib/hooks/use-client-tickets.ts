@@ -1,20 +1,16 @@
 'use client';
 
 /**
- * Client-portal ticket hooks.
+ * Client-portal ticket hooks (GOAL_PUBLIC_SECURITY S2).
  *
- * Uses the public /tickets/my?email=<requesterEmail> endpoint instead of the
- * permission-gated staff /tickets list, so unauthenticated / client users can
- * see their own tickets without having a staff session.
- *
- * The reply mutation first tries the authenticated route
- * POST /tickets/:id/reply, then falls back to the public
- * POST /tickets/public/:id/reply so the page still works while the
- * backend wires the public reply endpoint.
+ * All ownership is enforced server-side by the verified `th_client` session cookie
+ * (bound to a stable `userId`) — there is no caller-supplied `?email=` and no staff-route
+ * fallback. Requests go through `clientFetch` (raw fetch + credentials), keeping the client
+ * session cleanly separate from the staff JWT flow.
  */
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { api, ApiError } from '@/lib/api';
+import { clientFetch } from './use-client-auth';
 import type { Ticket, Reply, User, Department, PaginatedResponse, Attachment } from '@/lib/types';
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
@@ -32,7 +28,10 @@ interface ApiStaffRef {
 }
 interface ApiAttachment {
   id: number;
-  filename: string;
+  // The API serializes the Prisma column as `fileName` (camelCase); older/other routes may
+  // use `filename`. Accept both so the client never shows an `undefined` attachment name.
+  fileName?: string;
+  filename?: string;
   size: number;
   storageKey?: string;
   mimeType?: string;
@@ -90,11 +89,12 @@ function prioritySlug(title?: string): Ticket['priority'] {
 }
 
 function mapApiAttachment(a: ApiAttachment): Attachment {
-  // Backend serves file downloads at /api/attachments/:id/download
-  const url = `${API_BASE}/attachments/${a.id}/download`;
+  // S2-8: the client downloads via the owner-scoped, session-protected route
+  // (NOT the staff /attachments/:id/download route).
+  const url = `${API_BASE}/attachments/client/${a.id}/download`;
   return {
     id: a.id,
-    filename: a.filename,
+    filename: a.fileName ?? a.filename ?? 'attachment',
     size: a.size,
     url,
     mime_type: a.mimeType ?? 'application/octet-stream',
@@ -162,65 +162,48 @@ export function mapTicket(t: ApiTicket): Ticket {
 export const clientTicketKeys = {
   all: ['client-tickets'] as const,
   lists: () => [...clientTicketKeys.all, 'list'] as const,
-  list: (email: string) => [...clientTicketKeys.lists(), email] as const,
+  list: () => [...clientTicketKeys.lists()] as const,
   detail: (id: number) => [...clientTicketKeys.all, 'detail', id] as const,
 };
 
-/** Get the requester email stored after client login. */
-function getRequesterEmail(): string {
-  if (typeof window === 'undefined') return '';
-  // Stored during client login in localStorage as 'client_email'
-  return localStorage.getItem('client_email') ?? '';
-}
-
 /**
- * Fetches tickets for the currently logged-in client user via
- * GET /tickets/my?email=<requesterEmail>
+ * Fetches the signed-in client's own tickets via GET /tickets/my (S2-7). Ownership is the
+ * server-side `th_client` session bound to a stable `userId` — no caller-supplied email. Only
+ * call this when a session exists (the page gates on `useClientSession`); a 401 rejects so the
+ * page can send the user back to sign-in rather than showing a fake empty list.
  */
-export function useClientTickets() {
+export function useClientTickets(enabled = true) {
   return useQuery({
-    queryKey: clientTicketKeys.list(getRequesterEmail()),
+    queryKey: clientTicketKeys.list(),
     queryFn: async (): Promise<PaginatedResponse<Ticket>> => {
-      const email = getRequesterEmail();
-      if (!email) {
-        // Legit "no email yet" case — an empty list, not an error.
-        return { data: [], total: 0, page: 1, per_page: 25 };
-      }
-      // No catch: a real API failure must reject so the page shows an error
-      // (not a fake "you have no tickets" empty state).
-      const res = await api.get<{ data: ApiTicket[]; total: number }>(
-        `/tickets/my?email=${encodeURIComponent(email)}`,
-      );
+      const res = await clientFetch<{ data: ApiTicket[]; total: number }>('/tickets/my');
       return { data: res.data.map(mapTicket), total: res.total, page: 1, per_page: 25 };
     },
+    enabled,
     staleTime: 30_000,
+    retry: false,
   });
 }
 
 /**
- * Fetches a single ticket for the client.  Tries the staff detail route
- * first (works if the client has a staff session), then falls back to
- * the public route GET /tickets/public/:id.
+ * Fetches one of the client's own tickets via GET /tickets/public/:id (S2-7). The server
+ * authorizes by `Ticket.userId === session.userId` and returns the same 404 for a wrong owner,
+ * so there is no id-enumeration IDOR. No staff-route fallback, no email.
  */
 export function useClientTicket(id: number) {
   return useQuery({
     queryKey: clientTicketKeys.detail(id),
     queryFn: async (): Promise<Ticket | null> => {
       try {
-        return mapTicket(await api.get<ApiTicket>(`/tickets/${id}`));
-      } catch {
-        try {
-          // Public route now requires the requester email for ownership
-          // verification (prevents IDOR enumeration by integer id).
-          const email = getRequesterEmail();
-          const qs = email ? `?email=${encodeURIComponent(email)}` : '';
-          return mapTicket(await api.get<ApiTicket>(`/tickets/public/${id}${qs}`));
-        } catch {
-          return null;
-        }
+        return mapTicket(await clientFetch<ApiTicket>(`/tickets/public/${id}`));
+      } catch (e) {
+        // 404 (not owned / not found) → render "not found"; a real failure must surface.
+        if ((e as { status?: number }).status === 404) return null;
+        throw e;
       }
     },
     enabled: id > 0,
+    retry: false,
   });
 }
 
@@ -231,33 +214,21 @@ export interface ClientReplyInput {
 }
 
 /**
- * Posts a public reply.  Tries POST /tickets/:id/reply first (authenticated),
- * then falls back to POST /tickets/public/:id/reply.
+ * Posts a reply to the client's own ticket via POST /tickets/public/:id/reply (S2-7). The
+ * author is taken from the session on the server, never from a request field.
  */
 export function useClientReply(ticketId: number) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async (data: ClientReplyInput) => {
-      const payload = {
-        contents: data.contents,
-        ...(data.attachmentIds?.length ? { attachmentIds: data.attachmentIds } : {}),
-        ...(data.attachmentClaimToken ? { attachmentClaimToken: data.attachmentClaimToken } : {}),
-      };
-      try {
-        return await api.post(`/tickets/${ticketId}/reply`, payload);
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 401) {
-          // Fall back to the public reply endpoint, including the stored email so
-          // the post is attributed to the right requester.
-          const requesterEmail = getRequesterEmail() || undefined;
-          return api.post(`/tickets/public/${ticketId}/reply`, {
-            ...payload,
-            ...(requesterEmail ? { requesterEmail } : {}),
-          });
-        }
-        throw err;
-      }
-    },
+    mutationFn: (data: ClientReplyInput) =>
+      clientFetch(`/tickets/public/${ticketId}/reply`, {
+        method: 'POST',
+        body: JSON.stringify({
+          contents: data.contents,
+          ...(data.attachmentIds?.length ? { attachmentIds: data.attachmentIds } : {}),
+          ...(data.attachmentClaimToken ? { attachmentClaimToken: data.attachmentClaimToken } : {}),
+        }),
+      }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: clientTicketKeys.detail(ticketId) });
     },
