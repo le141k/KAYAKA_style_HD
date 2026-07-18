@@ -271,4 +271,102 @@ export class EmailQueueService {
     }
     return { replayed: true };
   }
+
+  /**
+   * Operator health snapshot: per-queue sync state + the inbound ledger backlog, staleness
+   * timestamps, and a computed `alerts` list (halted queue, quarantine, stalled lease,
+   * aged backlog). One call an admin dashboard / alerting probe can poll.
+   */
+  async health(now: Date = new Date()) {
+    const queues = await this.prisma.emailQueue.findMany({
+      where: { type: 'IMAP' },
+      orderBy: { id: 'asc' },
+      select: {
+        id: true,
+        emailAddress: true,
+        isEnabled: true,
+        syncState: true,
+        lastError: true,
+        lastSeenUid: true,
+        uidValidity: true,
+        cursorGeneration: true,
+        bootstrapPolicy: true,
+      },
+    });
+
+    const grouped = await this.prisma.inboundDelivery.groupBy({
+      by: ['state'],
+      _count: { _all: true },
+    });
+    const count = (state: string): number => grouped.find((g) => g.state === state)?._count._all ?? 0;
+    const byState = {
+      accepted: count('ACCEPTED'),
+      processing: count('PROCESSING'),
+      retry: count('RETRY'),
+      quarantined: count('QUARANTINED'),
+      processed: count('PROCESSED'),
+      skipped: count('SKIPPED'),
+    };
+
+    const [oldestPending, lastProcessed, stalledProcessing] = await Promise.all([
+      this.prisma.inboundDelivery.findFirst({
+        where: { state: { in: ['ACCEPTED', 'RETRY'] } },
+        orderBy: { createdAt: 'asc' },
+        select: { id: true, createdAt: true, nextAttemptAt: true, attempts: true },
+      }),
+      this.prisma.inboundDelivery.findFirst({
+        where: { state: 'PROCESSED' },
+        orderBy: { processedAt: 'desc' },
+        select: { processedAt: true },
+      }),
+      this.prisma.inboundDelivery.count({
+        where: { state: 'PROCESSING', leaseExpiresAt: { lt: now } },
+      }),
+    ]);
+
+    const halted = queues.filter((q) => q.syncState === 'NEEDS_RECONCILIATION').map((q) => q.id);
+    const alerts: Array<{ severity: 'warning' | 'critical'; kind: string; message: string }> = [];
+    if (halted.length) {
+      alerts.push({
+        severity: 'critical',
+        kind: 'queue_halted',
+        message: `Queue(s) ${halted.join(', ')} are NEEDS_RECONCILIATION — polling is halted until reconciled.`,
+      });
+    }
+    if (byState.quarantined > 0) {
+      alerts.push({
+        severity: 'warning',
+        kind: 'quarantine',
+        message: `${byState.quarantined} inbound delivery(ies) quarantined — review and replay.`,
+      });
+    }
+    if (stalledProcessing > 0) {
+      alerts.push({
+        severity: 'warning',
+        kind: 'stalled_processing',
+        message: `${stalledProcessing} delivery(ies) are PROCESSING past their lease — awaiting drain reclaim.`,
+      });
+    }
+    // Aged backlog: a still-pending delivery older than 15 min signals a stuck drain.
+    if (oldestPending && now.getTime() - oldestPending.createdAt.getTime() > 15 * 60_000) {
+      alerts.push({
+        severity: 'warning',
+        kind: 'aged_backlog',
+        message: `Oldest pending delivery #${oldestPending.id} has waited over 15 minutes.`,
+      });
+    }
+
+    return {
+      queues,
+      ledger: {
+        backlog: byState.accepted + byState.retry,
+        byState,
+        stalledProcessing,
+        oldestPendingAt: oldestPending?.createdAt ?? null,
+        lastProcessedAt: lastProcessed?.processedAt ?? null,
+      },
+      alerts,
+      checkedAt: now,
+    };
+  }
 }

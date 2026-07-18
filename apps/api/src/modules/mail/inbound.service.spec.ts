@@ -103,7 +103,7 @@ function makePrismaMock() {
   } as unknown as PrismaService;
 }
 
-function makeInboundService(prisma: PrismaService): InboundMailService {
+function makeInboundService(prisma: PrismaService, config: AppConfig = TEST_CONFIG): InboundMailService {
   const ticketsService = {
     reply: vi.fn().mockResolvedValue({ id: 1 }),
     getTicketByMask: vi.fn(),
@@ -115,7 +115,7 @@ function makeInboundService(prisma: PrismaService): InboundMailService {
   } as unknown as MailService;
 
   return new InboundMailService(
-    TEST_CONFIG,
+    config,
     prisma,
     ticketsService,
     mailService,
@@ -696,6 +696,53 @@ describe('InboundMailService — parser rule helpers', () => {
           data: expect.objectContaining({ lastSeenUid: 9n, uidValidity: 7n, syncState: 'OK' }),
         }),
       );
+    });
+  });
+
+  describe('supervisor — reconnect on config change / zero-queue fleet', () => {
+    const imapOn = { ...TEST_CONFIG, TELECOM_HD_IMAP_ENABLED: true };
+    const reconcile = (svc: InboundMailService) =>
+      (svc as unknown as { reconcileConnections: () => Promise<void> }).reconcileConnections();
+    const conns = (svc: InboundMailService) =>
+      (svc as unknown as { connections: Map<number, unknown> }).connections;
+    const row = (over: Record<string, unknown> = {}) => ({
+      id: 1,
+      host: 'imap.example',
+      port: 993,
+      useTls: true,
+      username: 'u',
+      passwordEnc: 'secret',
+      ...over,
+    });
+
+    it('keeps the SAME live connection when the queue config is unchanged', async () => {
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([row()]);
+      const svc = makeInboundService(prisma as unknown as PrismaService, imapOn);
+      await reconcile(svc);
+      const first = conns(svc).get(1);
+      expect(first).toBeDefined();
+      await reconcile(svc);
+      expect(conns(svc).get(1)).toBe(first); // no reconnect
+    });
+
+    it('reconnects (new connection) when host/credentials change', async () => {
+      const findMany = prisma.emailQueue.findMany as ReturnType<typeof vi.fn>;
+      findMany.mockResolvedValue([row()]);
+      const svc = makeInboundService(prisma as unknown as PrismaService, imapOn);
+      await reconcile(svc);
+      const first = conns(svc).get(1);
+      findMany.mockResolvedValue([row({ passwordEnc: 'ROTATED' })]); // credential rotation
+      await reconcile(svc);
+      const second = conns(svc).get(1);
+      expect(second).toBeDefined();
+      expect(second).not.toBe(first); // dropped + reconnected with new settings
+    });
+
+    it('no-ops with an empty fleet (supervisor tolerates zero queues)', async () => {
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const svc = makeInboundService(prisma as unknown as PrismaService, imapOn);
+      await expect(reconcile(svc)).resolves.toBeUndefined();
+      expect(conns(svc).size).toBe(0);
     });
   });
 

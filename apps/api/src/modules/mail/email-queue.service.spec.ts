@@ -63,6 +63,9 @@ function makePrismaMock() {
     inboundDelivery: {
       findMany: vi.fn().mockResolvedValue([]),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      groupBy: vi.fn().mockResolvedValue([]),
+      findFirst: vi.fn().mockResolvedValue(null),
+      count: vi.fn().mockResolvedValue(0),
     },
     setting: {
       findUnique: vi.fn().mockResolvedValue(null),
@@ -373,6 +376,63 @@ describe('EmailQueueService', () => {
     it('throws NotFoundException when the delivery is not quarantined', async () => {
       (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
       await expect(service.replayQuarantined(9)).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
+  describe('health', () => {
+    it('reports backlog + byState and raises halt / quarantine / stalled alerts', async () => {
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeSafeQueue({ id: 1, syncState: 'NEEDS_RECONCILIATION' }),
+        makeSafeQueue({ id: 2, syncState: 'OK' }),
+      ]);
+      (prisma.inboundDelivery.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { state: 'ACCEPTED', _count: { _all: 3 } },
+        { state: 'RETRY', _count: { _all: 2 } },
+        { state: 'QUARANTINED', _count: { _all: 1 } },
+        { state: 'PROCESSED', _count: { _all: 10 } },
+      ]);
+      (prisma.inboundDelivery.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>).mockResolvedValue(4); // stalled PROCESSING
+
+      const out = await service.health(new Date('2026-07-18T12:00:00.000Z'));
+
+      expect(out.ledger.backlog).toBe(5); // accepted 3 + retry 2
+      expect(out.ledger.byState).toMatchObject({ accepted: 3, retry: 2, quarantined: 1, processed: 10 });
+      expect(out.ledger.stalledProcessing).toBe(4);
+      const kinds = out.alerts.map((a) => a.kind);
+      expect(kinds).toContain('queue_halted');
+      expect(kinds).toContain('quarantine');
+      expect(kinds).toContain('stalled_processing');
+      expect(out.alerts.find((a) => a.kind === 'queue_halted')?.severity).toBe('critical');
+    });
+
+    it('raises an aged-backlog alert when the oldest pending delivery is over 15 min old', async () => {
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.inboundDelivery.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { state: 'ACCEPTED', _count: { _all: 1 } },
+      ]);
+      (prisma.inboundDelivery.findFirst as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ where }: { where: { state: unknown } }) =>
+          JSON.stringify(where.state).includes('ACCEPTED')
+            ? Promise.resolve({
+                id: 7,
+                createdAt: new Date('2026-07-18T11:40:00.000Z'),
+                nextAttemptAt: null,
+                attempts: 0,
+              })
+            : Promise.resolve(null),
+      );
+      (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+
+      const out = await service.health(new Date('2026-07-18T12:00:00.000Z')); // 20 min later
+      expect(out.alerts.map((a) => a.kind)).toContain('aged_backlog');
+    });
+
+    it('reports a clean bill of health (no alerts) when idle', async () => {
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeSafeQueue({ id: 1 })]);
+      const out = await service.health(new Date('2026-07-18T12:00:00.000Z'));
+      expect(out.alerts).toEqual([]);
+      expect(out.ledger.backlog).toBe(0);
     });
   });
 });

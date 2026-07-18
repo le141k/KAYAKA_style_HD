@@ -99,6 +99,9 @@ interface ThreadableTicket {
 export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(InboundMailService.name);
   private readonly connections: Map<number, ImapFlow> = new Map();
+  /** Fingerprint (host/port/tls/user/password) of each live connection so the supervisor
+   *  reconnects when a queue's credentials or host change, not only when it drops. */
+  private readonly connectionFingerprints = new Map<number, string>();
   private pollHandle: ReturnType<typeof setInterval> | null = null;
   private drainHandle: ReturnType<typeof setInterval> | null = null;
   /** Throttle repeated "queue halted" logs to once per interval per queue. */
@@ -193,6 +196,9 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         secure: queue.useTls,
         auth: { user: queue.username, pass: plainPassword },
       });
+      if (this.connections.has(queue.id)) {
+        this.connectionFingerprints.set(queue.id, this.connectionFingerprint(queue));
+      }
     }
 
     this.pollHandle = setInterval(() => {
@@ -372,14 +378,28 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           /* ignore */
         }
         this.connections.delete(queueId);
+        this.connectionFingerprints.delete(queueId);
         this.logger.log(`IMAP queue ${queueId}: disabled/removed — disconnected`);
       }
     }
 
-    // Connect enabled queues that have no live connection.
+    // Connect enabled queues with no live connection, and RECONNECT ones whose
+    // host/credentials changed (a stale connection would keep polling the old server).
     const encKey = this.config.TELECOM_HD_FIELD_ENCRYPTION_KEY;
     for (const q of enabled) {
-      if (this.connections.has(q.id)) continue;
+      const fingerprint = this.connectionFingerprint(q);
+      if (this.connections.has(q.id)) {
+        if (this.connectionFingerprints.get(q.id) === fingerprint) continue; // unchanged
+        const stale = this.connections.get(q.id);
+        try {
+          await stale?.logout();
+        } catch {
+          /* ignore */
+        }
+        this.connections.delete(q.id);
+        this.connectionFingerprints.delete(q.id);
+        this.logger.log(`IMAP queue ${q.id}: connection settings changed — reconnecting`);
+      }
       let plainPassword: string;
       try {
         plainPassword = decryptField(q.passwordEnc, encKey);
@@ -393,7 +413,23 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         secure: q.useTls,
         auth: { user: q.username, pass: plainPassword },
       });
+      // Only fingerprint a connection that actually established (connectQueue swallows
+      // connect errors) so a failed connect is retried next cycle.
+      if (this.connections.has(q.id)) this.connectionFingerprints.set(q.id, fingerprint);
     }
+  }
+
+  /** Stable fingerprint of a queue's connection settings (drives reconnect-on-change). */
+  private connectionFingerprint(q: {
+    host: string;
+    port: number;
+    useTls: boolean;
+    username: string;
+    passwordEnc: string;
+  }): string {
+    return createHash('sha256')
+      .update(`${q.host} ${q.port} ${q.useTls} ${q.username} ${q.passwordEnc}`)
+      .digest('hex');
   }
 
   private async pollQueue(queueId: number, client: ImapFlow): Promise<void> {

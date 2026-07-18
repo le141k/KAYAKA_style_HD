@@ -81,6 +81,13 @@ export class EmailQueueController {
     return this.emailQueueService.reconcile(id, dto, staff.staffId);
   }
 
+  @Get('inbound/health')
+  @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
+  @ApiOperation({ summary: 'Inbound health: per-queue sync state, ledger backlog + staleness, alerts' })
+  health() {
+    return this.emailQueueService.health();
+  }
+
   @Get('inbound/quarantine')
   @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
   @ApiOperation({ summary: 'List quarantined inbound deliveries (metadata only)' })
