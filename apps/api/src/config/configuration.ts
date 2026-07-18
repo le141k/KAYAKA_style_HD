@@ -39,6 +39,9 @@ const schema = z.object({
   // Multipart envelope included. Keep this slightly above the aggregate file-byte
   // limit and at/below the reverse-proxy request-body limit (55 MiB in production).
   TELECOM_HD_UPLOAD_REQUEST_MAX_SIZE_MB: z.coerce.number().int().min(1).max(55).default(51),
+  // Max accepted inbound message size (MB): the PIPE webhook body cap AND the IMAP
+  // fetch ceiling. Must be >= the largest real email+attachments; align with the
+  // reverse proxy / MTA limit. Reused by the ledger accept path (byte-safe PIPE).
   TELECOM_HD_INBOUND_MAX_SIZE_MB: z.coerce.number().int().min(1).max(35).default(35),
   TELECOM_HD_ORPHAN_ATTACHMENT_TTL_HOURS: z.coerce.number().int().min(1).max(168).default(24),
   // Absolute, cross-channel cap for unclaimed rows. Public/client/staff/inbound
@@ -83,6 +86,24 @@ const schema = z.object({
   TELECOM_HD_CLAMAV_HOST: z.string().default('clamav'),
   TELECOM_HD_CLAMAV_PORT: z.coerce.number().int().min(1).max(65535).default(3310),
   TELECOM_HD_CLAMAV_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(15000),
+  // Global IMAP poller switch. When false (default) the poller never connects; the
+  // inbound webhook (POST /api/inbound/pipe) and the ledger drain still run. Turn on
+  // ONLY once at least one IMAP EmailQueue is configured and reconciled.
+  TELECOM_HD_IMAP_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
+  // IMAP first-connect baseline policy. FROM_NOW (default) records the current
+  // high-water UID and imports nothing; BACKFILL additionally ingests up to
+  // TELECOM_HD_IMAP_BACKFILL_LIMIT most-recent existing messages. Chosen explicitly
+  // so a fresh connect can never silently import the whole historical mailbox.
+  TELECOM_HD_IMAP_BOOTSTRAP_POLICY: z.enum(['FROM_NOW', 'BACKFILL']).default('FROM_NOW'),
+  TELECOM_HD_IMAP_BACKFILL_LIMIT: z.coerce.number().int().nonnegative().default(0),
+  // Max processing attempts before an inbound delivery is QUARANTINED (raw MIME is
+  // always retained for replay — a quarantine never discards a message).
+  TELECOM_HD_INBOUND_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_FIELD_ENCRYPTION_KEY: z.string().optional(),

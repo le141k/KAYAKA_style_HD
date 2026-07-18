@@ -65,4 +65,25 @@ export class EmailQueueController {
   delete(@Param('id', ParseIntPipe) id: number) {
     return this.emailQueueService.delete(id);
   }
+
+  @Post(':id/reconcile')
+  @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
+  @ApiOperation({ summary: 'Reconcile a halted IMAP queue (clear NEEDS_RECONCILIATION, re-bootstrap)' })
+  reconcile(@Param('id', ParseIntPipe) id: number) {
+    return this.emailQueueService.reconcile(id);
+  }
+
+  @Get('inbound/quarantine')
+  @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
+  @ApiOperation({ summary: 'List quarantined inbound deliveries (metadata only)' })
+  listQuarantined() {
+    return this.emailQueueService.listQuarantined();
+  }
+
+  @Post('inbound/quarantine/:deliveryId/replay')
+  @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
+  @ApiOperation({ summary: 'Replay a quarantined inbound delivery (reset to ACCEPTED)' })
+  replayQuarantined(@Param('deliveryId', ParseIntPipe) deliveryId: number) {
+    return this.emailQueueService.replayQuarantined(deliveryId);
+  }
 }

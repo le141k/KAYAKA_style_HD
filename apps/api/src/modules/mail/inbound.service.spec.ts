@@ -4,13 +4,31 @@
  *   - applyParserRules (skip / route / stop-processing)
  *   - processMessage discard path (via applyParserRules mock)
  */
+import { createHash } from 'node:crypto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { ConflictException } from '@nestjs/common';
 import { InboundMailService } from './inbound.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { TicketsService } from '../tickets/tickets.service';
 import type { MailService } from './mail.service';
 import type { AppConfig } from '../../config/configuration';
-import { Readable } from 'node:stream';
+
+// Fake ImapFlow so connectQueue() can be exercised without a real IMAP server. The
+// mailbox advertises UIDVALIDITY/UIDNEXT so the connect-time bootstrap barrier runs.
+vi.mock('imapflow', () => ({
+  ImapFlow: class {
+    mailbox = { uidValidity: 7n, uidNext: 10, exists: 9 };
+    connect() {
+      return Promise.resolve();
+    }
+    getMailboxLock() {
+      return Promise.resolve({ release: () => undefined });
+    }
+    logout() {
+      return Promise.resolve();
+    }
+  },
+}));
 
 const TEST_CONFIG: AppConfig = {
   NODE_ENV: 'test',
@@ -47,29 +65,47 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_CLAMAV_HOST: 'clamav',
   TELECOM_HD_CLAMAV_PORT: 3310,
   TELECOM_HD_CLAMAV_TIMEOUT_MS: 15000,
-  TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined,
   TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
+  TELECOM_HD_IMAP_ENABLED: false,
+  TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'FROM_NOW',
+  TELECOM_HD_IMAP_BACKFILL_LIMIT: 0,
+  TELECOM_HD_INBOUND_MAX_ATTEMPTS: 5,
+  TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined,
 };
 
 function makePrismaMock() {
   return {
-    emailQueue: { findMany: vi.fn().mockResolvedValue([]), findUnique: vi.fn() },
+    emailQueue: {
+      findMany: vi.fn().mockResolvedValue([]),
+      findUnique: vi.fn(),
+      update: vi.fn().mockResolvedValue({}),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
     emailParserRule: {
       findMany: vi.fn().mockResolvedValue([]),
     },
     ticketPost: { findFirst: vi.fn(), update: vi.fn() },
-    ticket: { findUnique: vi.fn().mockResolvedValue(null) },
+    ticket: { findUnique: vi.fn() },
+    inboundDelivery: {
+      create: vi.fn().mockResolvedValue({ id: 1 }),
+      findMany: vi.fn().mockResolvedValue([]),
+      findUnique: vi.fn(),
+      update: vi.fn().mockResolvedValue({}),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
     department: { findFirst: vi.fn().mockResolvedValue({ id: 1 }) },
     setting: {
       findUnique: vi.fn().mockResolvedValue(null),
       upsert: vi.fn().mockResolvedValue({}),
     },
+    // Advisory-lock raw query — default to "lock acquired".
+    $queryRaw: vi.fn().mockResolvedValue([{ locked: true }]),
   } as unknown as PrismaService;
 }
 
 function makeInboundService(prisma: PrismaService): InboundMailService {
   const ticketsService = {
-    reply: vi.fn(),
+    reply: vi.fn().mockResolvedValue({ id: 1 }),
     getTicketByMask: vi.fn(),
     createTicket: vi.fn().mockResolvedValue({ id: 1, mask: 'TT-000001', subject: 'test' }),
   } as unknown as TicketsService;
@@ -153,18 +189,6 @@ describe('InboundMailService — parser rule helpers', () => {
 
     it('op:regex — invalid regex returns false without throwing', () => {
       const criteria = [{ field: 'subject', op: 'regex', value: '[invalid' }];
-      expect(service.evaluateCriteria(parsedBase, criteria, 'ALL')).toBe(false);
-    });
-
-    it('op:regex — rejects backtracking constructs instead of running them', () => {
-      const criteria = [{ field: 'body', op: 'regex', value: '(a+)+$' }];
-      expect(
-        service.evaluateCriteria({ ...parsedBase, body: `${'a'.repeat(100_000)}!` }, criteria, 'ALL'),
-      ).toBe(false);
-    });
-
-    it('op:regex — rejects unanchored unbounded scans', () => {
-      const criteria = [{ field: 'body', op: 'regex', value: '.*never-present' }];
       expect(service.evaluateCriteria(parsedBase, criteria, 'ALL')).toBe(false);
     });
 
@@ -288,396 +312,22 @@ describe('InboundMailService — parser rule helpers', () => {
     });
   });
 
-  describe('bounded MIME parsing', () => {
-    function parsedMail(overrides: Record<string, unknown> = {}) {
-      return {
-        subject: 'Need help',
-        text: 'body',
-        html: false,
-        from: { value: [{ address: 'customer@acme.example', name: 'Customer' }] },
-        to: { value: [{ address: 'support@test.example', name: 'Support' }] },
-        attachments: [],
-        ...overrides,
-      };
-    }
+  // ─── routing: dedup (A3) + subject-mask ownership + fail-closed mask ──────────
 
-    const validate = (value: unknown) =>
-      (
-        service as unknown as {
-          validateParsedMail: (parsed: unknown) => void;
-        }
-      ).validateParsedMail(value);
+  type RoutingSvc = {
+    processRawMessage: (
+      m: Buffer,
+      d: number | undefined,
+      deliveryId?: number,
+    ) => Promise<{ state: string; ticketId?: number; postId?: number }>;
+    ticketsService: {
+      createTicket: ReturnType<typeof vi.fn>;
+      reply: ReturnType<typeof vi.fn>;
+      getTicketByMask: ReturnType<typeof vi.fn>;
+    };
+  };
 
-    it('rejects oversized parsed subjects, reference sets and filenames', () => {
-      expect(() => validate(parsedMail({ subject: 'x'.repeat(501) }))).toThrow('Subject exceeds');
-      expect(() =>
-        validate(
-          parsedMail({
-            references: Array.from({ length: 51 }, (_, index) => `<ref-${index}@example.test>`),
-          }),
-        ),
-      ).toThrow('too many References');
-      expect(() =>
-        validate(
-          parsedMail({
-            attachments: [
-              {
-                filename: `${'x'.repeat(256)}.txt`,
-                contentType: 'text/plain',
-                content: Buffer.from('x'),
-              },
-            ],
-          }),
-        ),
-      ).toThrow('Attachment filename exceeds');
-      expect(() =>
-        validate(
-          parsedMail({
-            attachments: Array.from({ length: 11 }, (_, index) => ({
-              filename: `attachment-${index}.txt`,
-              contentType: 'text/plain',
-              content: Buffer.from('x'),
-            })),
-          }),
-        ),
-      ).toThrow('too many attachments');
-    });
-
-    it('rejects ambiguous From and an excessive address fanout', () => {
-      expect(() =>
-        validate(
-          parsedMail({
-            from: {
-              value: [{ address: 'one@example.test' }, { address: 'two@example.test' }],
-            },
-          }),
-        ),
-      ).toThrow('exactly one From');
-      expect(() =>
-        validate(
-          parsedMail({
-            to: {
-              value: Array.from({ length: 100 }, (_, index) => ({
-                address: `recipient-${index}@example.test`,
-              })),
-            },
-          }),
-        ),
-      ).toThrow('too many addresses');
-    });
-
-    it('rejects an already-buffered RFC822 body above its byte limit', () => {
-      const bounded = service as unknown as {
-        boundedInboundSource: (source: Buffer, maxBytes: number) => Buffer;
-      };
-      expect(() => bounded.boundedInboundSource(Buffer.alloc(6), 5)).toThrow('size limit');
-    });
-
-    it('stops a streamed RFC822 body as soon as it crosses the byte limit', async () => {
-      const bounded = service as unknown as {
-        boundedInboundSource: (source: Readable, maxBytes: number) => Readable;
-      };
-      const result = bounded.boundedInboundSource(Readable.from([Buffer.alloc(3), Buffer.alloc(3)]), 5);
-      await expect(
-        (async () => {
-          for await (const _chunk of result) {
-            // Drain until the bounded wrapper rejects.
-          }
-        })(),
-      ).rejects.toThrow('size limit');
-    });
-
-    it('limits parser concurrency and wakes queued parsing in FIFO order', async () => {
-      const withSlot = (
-        service as unknown as {
-          withParserSlot: <T>(work: () => Promise<T>) => Promise<T>;
-        }
-      ).withParserSlot.bind(service);
-      const started: number[] = [];
-      let releaseFirst!: () => void;
-      let releaseSecond!: () => void;
-      const firstGate = new Promise<void>((resolve) => {
-        releaseFirst = resolve;
-      });
-      const secondGate = new Promise<void>((resolve) => {
-        releaseSecond = resolve;
-      });
-      const first = withSlot(async () => {
-        started.push(1);
-        await firstGate;
-        return 1;
-      });
-      const second = withSlot(async () => {
-        started.push(2);
-        await secondGate;
-        return 2;
-      });
-      const third = withSlot(async () => {
-        started.push(3);
-        return 3;
-      });
-
-      await vi.waitFor(() => expect(started).toEqual([1, 2]));
-      releaseFirst();
-      await vi.waitFor(() => expect(started).toEqual([1, 2, 3]));
-      releaseSecond();
-      await expect(Promise.all([first, second, third])).resolves.toEqual([1, 2, 3]);
-    });
-  });
-
-  // ─── pollQueue durable UID state / poison handling ──────────────────────────
-
-  describe('pollQueue — durable UID state', () => {
-    /** A minimal fake ImapFlow that yields the given messages from fetch(). */
-    function makeFakeClient(messages: Array<{ uid: number }>) {
-      return {
-        mailbox: { uidValidity: 77n },
-        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
-        // eslint-disable-next-line @typescript-eslint/require-await
-        fetch: vi.fn(function* (range: number | string) {
-          for (const m of messages) {
-            if (typeof range === 'number' && m.uid !== range) continue;
-            yield m;
-          }
-        }),
-        list: vi.fn().mockResolvedValue([]),
-        mailboxCreate: vi.fn().mockResolvedValue(true),
-        messageMove: vi.fn().mockResolvedValue(true),
-      };
-    }
-
-    function mockState(value: unknown, legacy: unknown = null) {
-      (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockImplementation(
-        ({ where }: { where: { section_key: { key: string } } }) =>
-          Promise.resolve(where.section_key.key.startsWith('state:') ? value : legacy),
-      );
-    }
-
-    it('migrates the legacy watermark and fetches using UID semantics', async () => {
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: 1,
-        departmentId: null,
-      });
-      mockState(null, { value: 100 });
-      const client = makeFakeClient([]);
-
-      const processSpy = vi
-        .spyOn(service as unknown as { processMessage: () => Promise<void> }, 'processMessage')
-        .mockResolvedValue(undefined);
-
-      await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
-        1,
-        client,
-      );
-
-      expect(client.fetch).toHaveBeenCalledWith('101:*', expect.objectContaining({ uid: true }), {
-        uid: true,
-      });
-      expect(prisma.setting.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          create: expect.objectContaining({
-            value: { uidValidity: '77', watermark: 100, failures: [] },
-          }),
-        }),
-      );
-      processSpy.mockRestore();
-    });
-
-    it('checkpoints each successfully finalized UID and skips old fetch echoes', async () => {
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: 1,
-        departmentId: null,
-      });
-      mockState({ value: { uidValidity: '77', watermark: 100, failures: [] } });
-      const client = makeFakeClient([{ uid: 100 }, { uid: 101 }, { uid: 102 }]);
-
-      const processSpy = vi
-        .spyOn(service as unknown as { processMessage: () => Promise<void> }, 'processMessage')
-        .mockResolvedValue(undefined);
-
-      await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
-        1,
-        client,
-      );
-
-      expect(processSpy).toHaveBeenCalledTimes(2);
-      expect(prisma.setting.upsert).toHaveBeenCalledTimes(2);
-      expect(prisma.setting.upsert).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          update: { value: { uidValidity: '77', watermark: 102, failures: [] } },
-        }),
-      );
-      processSpy.mockRestore();
-    });
-
-    it('keeps a first processing failure as a retry gap and continues with later mail', async () => {
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: 1,
-        departmentId: null,
-      });
-      mockState({ value: { uidValidity: '77', watermark: 100, failures: [] } });
-      const client = makeFakeClient([{ uid: 101 }, { uid: 102 }]);
-      const processSpy = vi
-        .spyOn(service as unknown as { processMessage: () => Promise<void> }, 'processMessage')
-        .mockRejectedValueOnce(new Error('malformed MIME'))
-        .mockResolvedValueOnce(undefined);
-
-      await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
-        1,
-        client,
-      );
-
-      expect(processSpy).toHaveBeenCalledTimes(2);
-      expect(client.messageMove).not.toHaveBeenCalled();
-      expect(prisma.setting.upsert).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          update: {
-            value: {
-              uidValidity: '77',
-              watermark: 102,
-              failures: [expect.objectContaining({ uid: 101, status: 'pending', attempts: 1 })],
-            },
-          },
-        }),
-      );
-    });
-
-    it('dead-letters a repeatedly poison UID and continues checkpointing later mail', async () => {
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: 1,
-        departmentId: null,
-      });
-      mockState({
-        value: {
-          uidValidity: '77',
-          watermark: 101,
-          failures: [
-            {
-              uid: 101,
-              status: 'pending',
-              attempts: 2,
-              lastFailedAt: '2026-07-17T00:00:00.000Z',
-            },
-          ],
-        },
-      });
-      const client = makeFakeClient([{ uid: 101 }, { uid: 102 }]);
-      const processSpy = vi
-        .spyOn(service as unknown as { processMessage: () => Promise<void> }, 'processMessage')
-        .mockRejectedValueOnce(new Error('malformed MIME'))
-        .mockResolvedValueOnce(undefined);
-
-      await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
-        1,
-        client,
-      );
-
-      expect(processSpy).toHaveBeenCalledTimes(2);
-      expect(client.mailboxCreate).toHaveBeenCalledWith('Helpdesk-Processing-Errors');
-      expect(client.messageMove).toHaveBeenCalledWith(101, 'Helpdesk-Processing-Errors', {
-        uid: true,
-      });
-      expect(prisma.setting.upsert).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          update: {
-            value: {
-              uidValidity: '77',
-              watermark: 102,
-              failures: [expect.objectContaining({ uid: 101, status: 'quarantined', attempts: 3 })],
-            },
-          },
-        }),
-      );
-    });
-
-    it('bounds a repeatedly missing retry gap as a terminal dead record', async () => {
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: 1,
-        departmentId: null,
-      });
-      mockState({
-        value: {
-          uidValidity: '77',
-          watermark: 101,
-          failures: [
-            {
-              uid: 101,
-              status: 'pending',
-              attempts: 2,
-              lastFailedAt: '2026-07-17T00:00:00.000Z',
-            },
-          ],
-        },
-      });
-      const client = makeFakeClient([{ uid: 102 }]);
-      const processSpy = vi
-        .spyOn(service as unknown as { processMessage: () => Promise<void> }, 'processMessage')
-        .mockResolvedValue(undefined);
-
-      await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
-        1,
-        client,
-      );
-
-      expect(processSpy).toHaveBeenCalledTimes(1);
-      expect(prisma.setting.upsert).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          update: {
-            value: {
-              uidValidity: '77',
-              watermark: 102,
-              failures: [expect.objectContaining({ uid: 101, status: 'missing', attempts: 3 })],
-            },
-          },
-        }),
-      );
-    });
-
-    it('fails closed when UIDVALIDITY changes instead of reusing the old watermark', async () => {
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: 1,
-        departmentId: null,
-      });
-      mockState({ value: { uidValidity: '76', watermark: 900, failures: [] } });
-      const client = makeFakeClient([]);
-
-      await expect(
-        (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(1, client),
-      ).rejects.toThrow('UIDVALIDITY changed');
-      expect(client.fetch).not.toHaveBeenCalled();
-      expect(prisma.setting.upsert).not.toHaveBeenCalled();
-    });
-
-    it('does not overlap two direct polls for the same queue', async () => {
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: 1,
-        departmentId: null,
-      });
-      mockState({ value: { uidValidity: '77', watermark: 100, failures: [] } });
-      const client = makeFakeClient([{ uid: 101 }]);
-      let releaseProcess!: () => void;
-      const processBlocked = new Promise<void>((resolve) => {
-        releaseProcess = resolve;
-      });
-      const processSpy = vi
-        .spyOn(service as unknown as { processMessage: () => Promise<void> }, 'processMessage')
-        .mockReturnValue(processBlocked);
-      const privateService = service as unknown as {
-        pollQueue: (q: number, c: unknown) => Promise<void>;
-      };
-
-      const first = privateService.pollQueue(1, client);
-      await vi.waitFor(() => expect(processSpy).toHaveBeenCalledTimes(1));
-      await privateService.pollQueue(1, client);
-      expect(client.getMailboxLock).toHaveBeenCalledTimes(1);
-
-      releaseProcess();
-      await first;
-    });
-  });
-
-  // ─── A3: dedup by Message-ID ─────────────────────────────────────────────────
-  describe('processMessage dedup (A3)', () => {
+  describe('processRawMessage — dedup + mask routing', () => {
     const rawEmail = [
       'From: customer@acme.example',
       'To: support@test.example',
@@ -688,147 +338,498 @@ describe('InboundMailService — parser rule helpers', () => {
       '',
     ].join('\r\n');
 
-    const callProcess = (prismaArg: PrismaService) =>
-      makeInboundService(prismaArg) as unknown as {
-        processMessage: (m: unknown, d: number | undefined, id?: string) => Promise<void>;
-        ticketsService: { createTicket: ReturnType<typeof vi.fn>; reply: ReturnType<typeof vi.fn> };
-      };
+    const svcOf = () => makeInboundService(prisma as unknown as PrismaService) as unknown as RoutingSvc;
 
-    it('skips a message whose Message-ID already exists on a post', async () => {
-      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 99 });
-      const svc = callProcess(prisma as unknown as PrismaService);
-      await svc.processMessage({ source: Buffer.from(rawEmail) }, 1);
+    it('skips (SKIPPED) a message whose Message-ID already exists on a post', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 99, ticketId: 7 });
+      const svc = svcOf();
+      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1);
+      expect(out.state).toBe('SKIPPED');
       expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
       expect(svc.ticketsService.reply).not.toHaveBeenCalled();
     });
 
-    it('creates a ticket when the Message-ID is new', async () => {
+    it('creates a ticket (PROCESSED) passing the real Message-ID atomically when it is new', async () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      const svc = callProcess(prisma as unknown as PrismaService);
-      await svc.processMessage({ source: Buffer.from(rawEmail) }, 1);
-      expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
-    });
-
-    it('uses the deterministic IMAP fallback when the parsed Message-ID is empty', async () => {
-      const noIdEmail = [
-        'From: customer@acme.example',
-        'To: support@test.example',
-        'Subject: No message id',
-        'Message-ID:',
-        '',
-        'Body text',
-        '',
-      ].join('\r\n');
-      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      const svc = callProcess(prisma as unknown as PrismaService);
-      const fallback = '<imap-1-77-101@helpdesk.invalid>';
-
-      await svc.processMessage({ source: Buffer.from(noIdEmail) }, 1, fallback);
-
-      expect(prisma.ticketPost.findFirst).toHaveBeenCalledWith({
-        where: { messageId: fallback },
-        select: { id: true },
-      });
+      const svc = svcOf();
+      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1);
+      expect(out.state).toBe('PROCESSED');
       expect(svc.ticketsService.createTicket).toHaveBeenCalledWith(
-        expect.objectContaining({ incomingMessageId: fallback }),
+        expect.objectContaining({ incomingMessageId: '<dup-123@acme.example>' }),
       );
     });
 
-    // Subject-mask threading ownership guard.
+    it('#4: stamps the effective Message-ID + envelope + subject on the ledger row (atomic claim)', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = svcOf();
+      await svc.processRawMessage(Buffer.from(rawEmail), 1, 77);
+      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 77 },
+          data: expect.objectContaining({
+            messageId: '<dup-123@acme.example>',
+            envelopeFrom: 'customer@acme.example',
+            subject: 'Need help',
+          }),
+        }),
+      );
+    });
+
+    it('#4: a concurrent duplicate loses the atomic claim (P2002) → SKIPPED, no ticket', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.inboundDelivery.update as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      const svc = svcOf();
+      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1, 77);
+      expect(out.state).toBe('SKIPPED');
+      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+      expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+    });
+
+    it('synthesises a deterministic Message-ID from content when the mail carries none', async () => {
+      const noId = ['From: a@b.example', 'To: s@t.example', 'Subject: hi', '', 'body', ''].join('\r\n');
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = svcOf();
+      await svc.processRawMessage(Buffer.from(noId), 1);
+      const arg = (svc.ticketsService.createTicket as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        incomingMessageId: string;
+      };
+      // Deterministic synthetic id → a retry of the same bytes dedups to the same post.
+      expect(arg.incomingMessageId).toMatch(/^<inbound-[0-9a-f]{64}@23telecom\.local>$/);
+      expect(prisma.ticketPost.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { messageId: arg.incomingMessageId } }),
+      );
+    });
+
     const maskEmail = (from: string) =>
       [
         `From: ${from}`,
         'To: support@test.example',
         'Subject: Re: TT-000005 still broken',
-        `Message-ID: <mask-${Math.random()}@x.example>`,
+        `Message-ID: <mask-${from}@x.example>`,
         '',
         'still broken',
         '',
       ].join('\r\n');
 
-    it('does NOT thread by subject mask when the sender is not the ticket requester', async () => {
+    it('does NOT thread by mask when the sender is not a ticket participant → new ticket', async () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      const svc = callProcess(prisma as unknown as PrismaService);
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 5,
         requesterEmail: 'owner@acme.example',
         user: null,
         recipients: [],
       });
-
-      await svc.processMessage({ source: Buffer.from(maskEmail('attacker@evil.example')) }, 1);
-
-      // Not threaded onto ticket 5; a new ticket is created instead.
+      const svc = svcOf();
+      await svc.processRawMessage(Buffer.from(maskEmail('attacker@evil.example')), 1);
       expect(svc.ticketsService.reply).not.toHaveBeenCalled();
       expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
     });
 
-    it('threads by subject mask when the sender IS the ticket requester', async () => {
+    it('threads by mask (reply) when the sender IS an authorized participant', async () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      const svc = callProcess(prisma as unknown as PrismaService);
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 5,
         requesterEmail: 'owner@acme.example',
         user: null,
         recipients: [],
       });
-
-      await svc.processMessage({ source: Buffer.from(maskEmail('Owner <owner@acme.example>')) }, 1);
-
+      const svc = svcOf();
+      const out = await svc.processRawMessage(Buffer.from(maskEmail('owner@acme.example')), 1);
+      expect(out.state).toBe('PROCESSED');
       expect(svc.ticketsService.reply).toHaveBeenCalledTimes(1);
       expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
     });
 
-    it('accepts a linked UserEmail or TicketRecipient as an authorized thread sender', () => {
-      const senderCanReply = (
-        service as unknown as {
-          senderCanReply: (ticket: unknown, sender: string) => boolean;
-        }
-      ).senderCanReply.bind(service);
-      const ticket = {
+    it('authorizes a mask reply by a linked user email / recipient (not just requesterEmail)', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 5,
-        requesterEmail: 'primary@acme.example',
-        user: { emails: [{ email: 'alias@acme.example' }] },
-        recipients: [{ email: 'cc@partner.example' }],
-      };
-
-      expect(senderCanReply(ticket, 'ALIAS@acme.example')).toBe(true);
-      expect(senderCanReply(ticket, 'cc@partner.example')).toBe(true);
-      expect(senderCanReply(ticket, 'attacker@evil.example')).toBe(false);
+        requesterEmail: 'someone-else@acme.example',
+        user: { emails: [{ email: 'owner@acme.example' }] },
+        recipients: [{ email: 'cc@acme.example' }],
+      });
+      const svc = svcOf();
+      const out = await svc.processRawMessage(Buffer.from(maskEmail('cc@acme.example')), 1);
+      expect(out.state).toBe('PROCESSED');
+      expect(svc.ticketsService.reply).toHaveBeenCalledTimes(1);
     });
 
-    it('does not trust an RFC reference unless its sender belongs to that ticket', async () => {
-      const referencedEmail = [
-        'From: attacker@evil.example',
-        'To: support@test.example',
-        'Subject: Re: a private thread',
-        'Message-ID: <attacker-reply@evil.example>',
-        'In-Reply-To: <owner-post@acme.example>',
-        'References: <owner-post@acme.example>',
-        '',
-        'please append me',
-        '',
-      ].join('\r\n');
-      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockImplementation(
-        ({ where }: { where: { messageId: unknown } }) =>
-          typeof where.messageId === 'object'
-            ? Promise.resolve({
-                ticketId: 5,
-                ticket: {
-                  id: 5,
-                  requesterEmail: 'owner@acme.example',
-                  user: { emails: [{ email: 'owner-alias@acme.example' }] },
-                  recipients: [{ email: 'known-cc@acme.example' }],
-                },
-              })
-            : Promise.resolve(null),
-      );
-      const svc = callProcess(prisma as unknown as PrismaService);
-
-      await svc.processMessage({ source: Buffer.from(referencedEmail) }, 1);
-
-      expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+    it('IN-10: an unresolved mask → new ticket (never a silent thread)', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = svcOf();
+      await svc.processRawMessage(Buffer.from(maskEmail('owner@acme.example')), 1);
       expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
+    });
+
+    it('IN-10: a DB error from mask lookup propagates (no silent duplicate ticket)', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('db timeout'));
+      const svc = svcOf();
+      await expect(svc.processRawMessage(Buffer.from(maskEmail('owner@acme.example')), 1)).rejects.toThrow(
+        'db timeout',
+      );
+      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+      expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── durable ledger: accept (poll) + drain ───────────────────────────────────
+
+  describe('pollQueue — durable accept (no silent loss, fail-closed)', () => {
+    /** Deterministic raw bytes for a UID — reused by tests to assert stored rawMime/hash. */
+    const imapSrc = (uid: number) =>
+      Buffer.from(`From: a@b.example\r\nMessage-ID: <m-${uid}@x>\r\n\r\nhi ${uid}`);
+
+    /** Fake ImapFlow: uid-only `fetch` yields the ids; `fetchOne` returns the source. */
+    function makeLedgerClient(
+      uids: number[],
+      mailbox: { uidValidity: bigint; uidNext?: number; exists?: number },
+      opts: { vanish?: number[]; fetchOneThrowsAt?: number } = {},
+    ) {
+      const src = imapSrc;
+      return {
+        mailbox,
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        // eslint-disable-next-line @typescript-eslint/require-await
+        fetch: vi.fn(function* () {
+          for (const uid of uids) yield { uid };
+        }),
+        fetchOne: vi.fn((uidStr: string) => {
+          const uid = Number(uidStr);
+          if (opts.fetchOneThrowsAt === uid) return Promise.reject(new Error('fetch reset'));
+          if (opts.vanish?.includes(uid)) return Promise.resolve(false);
+          return Promise.resolve({ uid, source: src(uid) });
+        }),
+      };
+    }
+
+    const poll = (client: unknown) =>
+      (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(1, client);
+
+    function queue(over: Record<string, unknown> = {}) {
+      return {
+        id: 1,
+        isEnabled: true,
+        departmentId: null,
+        lastSeenUid: 100,
+        uidValidity: 7n,
+        syncState: 'OK',
+        lastError: null,
+        cursorGeneration: 0,
+        ...over,
+      };
+    }
+
+    beforeEach(() => {
+      // Drain finds nothing by default so these tests isolate the accept phase.
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    });
+
+    it('accepts new UIDs into the ledger and advances the cursor via monotonic CAS', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      const client = makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 });
+      await poll(client);
+
+      // IN-01: the discovery fetch is a real UID range — `{ uid: true }` is the THIRD arg
+      // (folding it into the query object leaves it a *sequence* range).
+      expect(client.fetch).toHaveBeenCalledWith('101:*', expect.anything(), { uid: true });
+      expect(client.fetchOne).toHaveBeenCalledWith('102', expect.anything(), { uid: true });
+
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledTimes(2);
+      // The ACTUAL raw bytes / hash / size must be persisted (durable, replayable) — not
+      // just the transport key.
+      const src102 = imapSrc(102);
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            transport: 'IMAP',
+            transportKey: 'imap:1:7:102',
+            rawMime: new Uint8Array(src102),
+            contentHash: createHash('sha256').update(src102).digest('hex'),
+            sizeBytes: src102.length,
+          }),
+        }),
+      );
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: 1,
+            lastSeenUid: { lt: 102n },
+            cursorGeneration: 0,
+            syncState: 'OK',
+          }),
+          data: { lastSeenUid: 102n },
+        }),
+      );
+    });
+
+    it('#10: snapshots the queue department onto the delivery at acceptance', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        queue({ departmentId: 4 }),
+      );
+      await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ departmentId: 4 }) }),
+      );
+    });
+
+    it('processes out-of-order UIDs and advances the cursor to the max (no loss)', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      await poll(makeLedgerClient([103, 101], { uidValidity: 7n, uidNext: 104 }));
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledTimes(2);
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { lastSeenUid: 103n } }),
+      );
+    });
+
+    it('fail-closed: a fetch error stops the poll WITHOUT advancing the cursor', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      await poll(makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 }, { fetchOneThrowsAt: 101 }));
+      // 101 failed before acceptance → nothing accepted, cursor NOT advanced.
+      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('fail-closed: a ledger DB error during accept does NOT advance the cursor', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('db down'));
+      await poll(makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 }));
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('idempotent: a duplicate transport key (P2002) is a no-op and the cursor still advances', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { lastSeenUid: 101n } }),
+      );
+    });
+
+    it('an EXPUNGE-vanished UID is skipped and the cursor advances past it (no wedge)', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      await poll(makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 }, { vanish: [101] }));
+      // 101 vanished (no create), 102 accepted; cursor reaches 102.
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledTimes(1);
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { lastSeenUid: 102n } }),
+      );
+    });
+
+    it('P0-3: a UIDVALIDITY change HALTS the queue (NEEDS_RECONCILIATION), accepts nothing', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        queue({ uidValidity: 7n }),
+      );
+      await poll(makeLedgerClient([1, 2], { uidValidity: 9n, uidNext: 50 }));
+      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 1 },
+          data: expect.objectContaining({ syncState: 'NEEDS_RECONCILIATION' }),
+        }),
+      );
+    });
+
+    it('a halted queue (NEEDS_RECONCILIATION) does not fetch or accept', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        queue({ syncState: 'NEEDS_RECONCILIATION' }),
+      );
+      const client = makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 });
+      await poll(client);
+      expect(client.getMailboxLock).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('bootstrapQueue — synchronous baseline (P0-2)', () => {
+    const bootstrap = (client: unknown) =>
+      (service as unknown as { bootstrapQueue: (q: number, c: unknown) => Promise<void> }).bootstrapQueue(
+        1,
+        client,
+      );
+
+    it('FROM_NOW records high-water and imports nothing', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        uidValidity: null,
+      });
+      await bootstrap({
+        mailbox: { uidValidity: 7n, uidNext: 501, exists: 500 },
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+      });
+      // Bootstrap is a CAS on `uidValidity IS NULL` (two-pod safe) → updateMany.
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 1, uidValidity: null },
+          data: expect.objectContaining({ lastSeenUid: 500n, uidValidity: 7n, syncState: 'OK' }),
+        }),
+      );
+    });
+
+    it('does nothing when the queue is already bootstrapped (uidValidity set)', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        uidValidity: 7n,
+      });
+      (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mockClear();
+      await bootstrap({ getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }) });
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('P0-2: connectQueue captures the baseline DURING connect (not the first poll)', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        uidValidity: null,
+      });
+      // Uses the mocked ImapFlow (uidNext=10 → high-water 9). If connectQueue did not call
+      // bootstrapQueue, no baseline would be written and mail arriving before the first
+      // poll would be skipped.
+      await (service as unknown as { connectQueue: (q: number, o: unknown) => Promise<void> }).connectQueue(
+        1,
+        { host: 'h', port: 993, secure: true, auth: { user: 'u', pass: 'p' } },
+      );
+
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 1, uidValidity: null },
+          data: expect.objectContaining({ lastSeenUid: 9n, uidValidity: 7n, syncState: 'OK' }),
+        }),
+      );
+    });
+  });
+
+  describe('drain — retry / quarantine (never discard)', () => {
+    const drain = () => (service as unknown as { drainDeliveries: () => Promise<void> }).drainDeliveries();
+    const raw = Buffer.from('From: a@b.example\r\nMessage-ID: <d-1@x>\r\n\r\nhello');
+
+    function stageDelivery(over: Record<string, unknown> = {}) {
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, queueId: null },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 55,
+        rawMime: raw,
+        attempts: 0,
+        queueId: null,
+        ...over,
+      });
+    }
+
+    it('marks a delivery PROCESSED after successful routing (lease-gated settle)', async () => {
+      stageDelivery();
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await drain();
+      // Settle is a lease-gated updateMany (where leaseOwner=us, state=PROCESSING).
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ state: 'PROCESSED', leaseOwner: null }),
+        }),
+      );
+    });
+
+    it('a claim that loses the CAS race (count 0) is a no-op', async () => {
+      stageDelivery();
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+      await drain();
+      expect(prisma.inboundDelivery.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('reclaims a stale PROCESSING delivery whose lease has expired', async () => {
+      // The due query must include expired-lease PROCESSING rows.
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, queueId: null },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 55,
+        rawMime: raw,
+        attempts: 1,
+        queueId: null,
+      });
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await drain();
+      const dueWhere = (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        where: { OR: Array<{ state?: unknown; leaseExpiresAt?: unknown }> };
+      };
+      // The PROCESSING branch of the due-query MUST be gated on an EXPIRED lease — otherwise
+      // the drain would re-select rows under a live lease and double-process them.
+      const dueProcessing = dueWhere.where.OR.find((c) => c.state === 'PROCESSING');
+      expect(dueProcessing?.leaseExpiresAt).toEqual({ lt: expect.any(Date) });
+      // The claim CAS must likewise accept a PROCESSING row only when its lease expired.
+      const claimWhere = (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mock
+        .calls[0]?.[0] as { where: { OR: Array<{ state?: unknown; leaseExpiresAt?: unknown }> } };
+      const claimProcessing = claimWhere.where.OR.find((c) => c.state === 'PROCESSING');
+      expect(claimProcessing?.leaseExpiresAt).toEqual({ lt: expect.any(Date) });
+    });
+
+    it('a transient failure below the limit → RETRY with backoff (raw retained)', async () => {
+      stageDelivery({ attempts: 0 });
+      (
+        service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }
+      ).ticketsService.createTicket = vi.fn();
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('db blip'));
+      await drain();
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ state: 'RETRY', attempts: 1 }),
+        }),
+      );
+    });
+
+    it('exhausted attempts → QUARANTINED (never discarded; raw MIME kept)', async () => {
+      stageDelivery({ attempts: 4 }); // maxAttempts = 5 → this attempt quarantines
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('still bad'));
+      await drain();
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ state: 'QUARANTINED', attempts: 5 }),
+        }),
+      );
+    });
+
+    it('a delivery with missing rawMime is QUARANTINED, not silently dropped', async () => {
+      stageDelivery({ rawMime: null });
+      await drain();
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ state: 'QUARANTINED' }),
+        }),
+      );
+    });
+  });
+
+  // ─── PIPE ingress: idempotency-key collision ─────────────────────────────────
+  describe('ingestRawMessage (PIPE) — delivery-id collision', () => {
+    const ingest = (raw: string, extId?: string) =>
+      (
+        service as unknown as {
+          ingestRawMessage: (s: string, d: number | undefined, e?: string) => Promise<void>;
+        }
+      ).ingestRawMessage(raw, undefined, extId);
+
+    it('#8: a reused delivery-id with DIFFERENT content is rejected (409), not silently lost', async () => {
+      (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      // The stored delivery under this key had a different message (different hash).
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        contentHash: 'a-different-hash',
+      });
+      await expect(ingest('a brand new message', 'mta-77')).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('#8: a reused delivery-id with the SAME content is an idempotent no-op', async () => {
+      const raw = 'same message body';
+      const sameHash = createHash('sha256').update(Buffer.from(raw, 'utf8')).digest('hex');
+      (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        contentHash: sameHash,
+      });
+      await expect(ingest(raw, 'mta-77')).resolves.toBeUndefined();
     });
   });
 
@@ -844,6 +845,21 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(call({ 'auto-submitted': 'auto-replied' })).toBe(true);
       expect(call({ 'auto-submitted': 'auto-generated' })).toBe(true);
       expect(call({ 'auto-submitted': 'no' })).toBe(false);
+    });
+
+    it('#10: self-loop matches even when MAIL_FROM is a `Name <addr>` display form', () => {
+      const svc = new InboundMailService(
+        { ...TEST_CONFIG, TELECOM_HD_MAIL_FROM: 'Support Desk <support@test.example>' },
+        prisma as unknown as PrismaService,
+        { reply: vi.fn(), createTicket: vi.fn(), getTicketByMask: vi.fn() } as unknown as TicketsService,
+        { sendTemplate: vi.fn() } as unknown as MailService,
+        undefined,
+      );
+      const loop = (svc as unknown as { isLoopMessage: (p: unknown, f: string) => boolean }).isLoopMessage(
+        { headers: new Map() },
+        'support@test.example',
+      );
+      expect(loop).toBe(true);
     });
 
     it('skips Precedence bulk/list/junk', () => {

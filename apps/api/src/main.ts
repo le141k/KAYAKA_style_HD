@@ -1,3 +1,4 @@
+import express from 'express';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
@@ -8,7 +9,21 @@ import { loadConfig } from './config/configuration';
 async function bootstrap(): Promise<void> {
   const config = loadConfig();
 
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  // Own the body parsers so the inbound webhook can accept a full raw RFC822 message
+  // (real mail + attachments) as bytes with an explicit large limit, without inflating
+  // the limit for every other JSON route.
+  const app = await NestFactory.create(AppModule, { bufferLogs: true, bodyParser: false });
+  const inboundLimit = `${config.TELECOM_HD_INBOUND_MAX_SIZE_MB}mb`;
+  // Route-specific parsers FIRST (registration order wins): raw bytes for an MTA that
+  // POSTs the message verbatim, or a large JSON `{ raw }` body.
+  app.use(
+    '/api/inbound/pipe',
+    express.raw({ type: ['message/rfc822', 'application/octet-stream'], limit: inboundLimit }),
+  );
+  app.use('/api/inbound/pipe', express.json({ limit: inboundLimit }));
+  // Global defaults for every other route (modest limit).
+  app.use(express.json({ limit: '1mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
   // Trust the first proxy hop (Caddy/nginx) so req.ip / X-Forwarded-* reflect the
   // real client — without this the per-IP rate limiter keys on the proxy's IP and

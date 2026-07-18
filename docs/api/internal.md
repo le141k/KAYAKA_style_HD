@@ -331,29 +331,56 @@ sendTemplateStrict(to: string | string[], templateKey: string, locale: string, v
 
 ## InboundMailService (`apps/api/src/modules/mail/inbound.service.ts`)
 
-Implements `OnModuleInit` / `OnModuleDestroy`; `ingestRawMessage` is also shared by the
-secret-authenticated MTA/PIPE controller.
+Durable, idempotent, fail-closed inbound pipeline backed by the **`InboundDelivery` ledger**.
+Both transports (IMAP poll, `POST /api/inbound/pipe`) record every message in the ledger under a
+UNIQUE `transportKey` before it is processed.
 
-- On init: queries `EmailQueue` for enabled IMAP queues, connects via `imapflow`, starts a
-  60-second `setInterval` poll.
-- A process-local poll lock prevents overlapping interval/direct polls. State is checkpointed
-  after every UID as `{uidValidity, watermark, failures}` in `Setting`. A failed message remains a
-  durable retry gap and is moved to `Helpdesk-Processing-Errors` after three failed processing
-  attempts; a failed move stays pending, while later UIDs continue. A UID that has disappeared
-  from INBOX is retained as a bounded terminal `missing` record after three lookup attempts.
-  A UIDVALIDITY change pauses that queue instead of reusing an unsafe watermark; operations must
-  inspect the mailbox and reset `imap/state:<queueId>` deliberately.
-- MIME source bytes, parsed subject/body/addresses/references/filenames and parser concurrency are
-  bounded. Database regex rules accept only a small non-backtracking subset; unsafe expressions
-  fail closed.
-- Per message: threads replies by RFC references first, then by an owned `TT-XXXXXX` subject
-  mask, and creates a new ticket otherwise. Threading requires normalized sender membership in
-  the ticket requester, linked `UserEmail`, or `TicketRecipient` set; possession of a Message-ID
-  or mask alone is never authorization. The receiving MTA must enforce its normal anti-spoofing
-  policy because the application sees the RFC `From` identity supplied by that trusted ingress.
-- The parsed/synthetic Message-ID is passed only through internal TicketsService inputs; a partial
-  unique DB index makes concurrent IMAP/webhook redelivery an idempotent no-op.
-- TODO: replace `setInterval` with IMAP IDLE push.
+- **Public:** `ingestRawMessage(source, departmentId, externalId?)` — PIPE ingress: records a
+  ledger delivery (idempotent by `externalId` or content hash) and processes it inline.
+  `pollNow()` — run one accept+drain cycle now (ops / live-IMAP verification).
+- **Accept phase (IMAP, per queue):** discovers new UIDs uid-only, then `fetchOne` each in
+  ascending order (source capped at `TELECOM_HD_INBOUND_MAX_SIZE_MB`) and `create`s an
+  `InboundDelivery` (state `ACCEPTED`, raw MIME stored) — `client.fetch(range, query, { uid: true })`
+  with `{ uid: true }` as the **third** arg (real UID range). The `EmailQueue.lastSeenUid` cursor
+  advances via a **monotonic CAS** (`updateMany where lastSeenUid < cursor`) ONLY after durable
+  acceptance; a fetch/DB error stops the poll without advancing (**fail-closed** — no silent loss).
+  A duplicate `transportKey` (`P2002`) is an idempotent no-op (multi-poller / re-poll safe; a
+  best-effort Postgres advisory lock avoids concurrent fetching but is not required for correctness).
+- **Bootstrap barrier:** the starting cursor is captured **synchronously at connect** (not the
+  first 60 s poll) via `TELECOM_HD_IMAP_BOOTSTRAP_POLICY` `FROM_NOW` (high-water, imports nothing)
+  or `BACKFILL` (rewinds by `TELECOM_HD_IMAP_BACKFILL_LIMIT`). Never fails open to `1:*`.
+- **UIDVALIDITY:** on a server UID-space reset the queue flips to
+  `EmailQueue.syncState = NEEDS_RECONCILIATION` and polling **halts** (fail-closed) until an
+  operator re-bootstraps (clear `uidValidity`).
+- **Drain phase:** processes `ACCEPTED`/`RETRY` deliveries in id order; claims each with a
+  **lease** (CAS: `ACCEPTED|RETRY`, or a `PROCESSING` whose `leaseExpiresAt` passed → `PROCESSING`
+  - `leaseOwner`/`leaseExpiresAt`). Every terminal/retry write is itself lease-gated
+    (`leaseOwner = us`), so a crashed worker's stalled write can't clobber the one that reclaimed it,
+    and a delivery is **never stranded in `PROCESSING`** (a stale lease is reclaimed on the next drain;
+    a startup drain kicks recovery immediately). Success → `PROCESSED` (+`ticketId`/`postId`);
+    transient error → `RETRY` (exponential backoff); a permanent input error (malformed / oversized
+    MIME) → `QUARANTINED` at once; attempts ≥ `TELECOM_HD_INBOUND_MAX_ATTEMPTS` (5) → `QUARANTINED`.
+    Raw MIME is **always retained** — a quarantine never discards a message.
+- **Security (preserved from the hardened baseline):** MIME source bytes, parsed
+  subject/body/addresses/references/filenames and parser concurrency are bounded; a threaded reply
+  (RFC `References` or `TT-XXXXXX` mask) requires the normalized sender to be a ticket participant
+  (requester, linked `UserEmail`, or `TicketRecipient`) — possessing a Message-ID or guessing a mask
+  is never authorization. Loop/bounce guard (A5) suppresses mail from our own configured mailboxes.
+- **Upgrade/cutover:** the ledger migration halts every already-enabled IMAP queue
+  (`syncState = NEEDS_RECONCILIATION`) so a deploy can't FROM_NOW-bootstrap over an in-flight legacy
+  cursor and skip mail. `bootstrapQueue` refuses to run on a halted queue — an operator reconciles
+  explicitly via `POST /api/admin/email-queues/:id/reconcile`, which reads the legacy `Setting`
+  state (`imap/state:<id>` primary, `imap/lastSeenUid:<id>` fallback) and carries UIDVALIDITY +
+  watermark forward before clearing the halt.
+- **Routing / idempotency:** de-dups by effective Message-ID — the RFC id, or a deterministic
+  `<inbound-<sha256>@23telecom.local>` synthesised from the content hash when absent — so a retry
+  or IMAP+PIPE double-delivery never double-posts even without a Message-ID. The Message-ID is
+  written **atomically** with the ticket/post create (`TicketsService.reply()` / `createTicket()`
+  accept an internal `incomingMessageId`); a unique `TicketPost.messageId` plus the ledger's unique
+  `messageId`/`transportKey` make redelivery an idempotent no-op. Subject-mask threading is
+  fail-closed: unresolved / unauthorized sender → new ticket; a DB error propagates (delivery
+  retried, never a silent duplicate ticket).
+- TODO: IMAP IDLE push; externalise raw MIME for very large messages; per-queue backfill policy.
 
 ---
 

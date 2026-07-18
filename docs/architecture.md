@@ -110,12 +110,12 @@ credential failure are generic, disclosing nothing about account existence or lo
 
 `BullModule.forRoot()` is registered in `AppModule` with Redis connection from `REDIS_URL`.
 
-| Component            | Mechanism                                            | What it does                                                                                                                                            |
-| -------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `InboundMailService` | `setInterval` (60 s), `OnModuleInit`                 | Non-overlapping IMAP polls with UIDVALIDITY-bound per-UID checkpoints and poison quarantine; sender-authorized RFC/mask threading; bounded MIME parsing |
-| `SlaProcessor`       | BullMQ queue `sla`, repeatable `scan` job (60 s)     | Calls `SlaService.runPeriodicCheck()` → breach detection → escalation action execution (notify, priority change, assign, add note)                      |
-| `AutoCloseProcessor` | BullMQ queue `workflow`, repeatable `auto-close` job | Closes pending tickets idle > `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); sends `autoresponder` mail template                                        |
-| `MailProcessor`      | BullMQ queue `mail`, per-job                         | Async outbound mail delivery via `MailService`/nodemailer                                                                                               |
+| Component            | Mechanism                                              | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| -------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `InboundMailService` | `setInterval` (60 s poll + 30 s drain), `OnModuleInit` | Durable, fail-closed inbound via the `InboundDelivery` ledger: accepts each IMAP/PIPE message (raw MIME) under a unique transport key, advances the `EmailQueue` UID cursor only on durable acceptance (monotonic CAS), then drains ACCEPTED/RETRY deliveries → thread/create ticket, with retry→quarantine (never discards). Sender-authorized RFC/mask threading, bounded MIME parsing, sync bootstrap barrier at connect, fail-closed UIDVALIDITY halt |
+| `SlaProcessor`       | BullMQ queue `sla`, repeatable `scan` job (60 s)       | Calls `SlaService.runPeriodicCheck()` → breach detection → escalation action execution (notify, priority change, assign, add note)                                                                                                                                                                                                                                                                                                                        |
+| `AutoCloseProcessor` | BullMQ queue `workflow`, repeatable `auto-close` job   | Closes pending tickets idle > `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); sends `autoresponder` mail template                                                                                                                                                                                                                                                                                                                                          |
+| `MailProcessor`      | BullMQ queue `mail`, per-job                           | Async outbound mail delivery via `MailService`/nodemailer                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ### Implemented — EventEmitter2
 
@@ -128,7 +128,10 @@ via `@OnEvent` decorators.
 - **SLA criteria engine**: plan selection beyond org-based lookup is TODO.
 - **Attachment upload**: `Attachment` model exists; no upload endpoint or storage adapter.
 - **IMAP IDLE**: replace polling with push-based IMAP IDLE.
-- **IMAP password decryption**: `EmailQueue.passwordEnc` stored but decryption not implemented.
+- **Inbound raw-MIME externalisation**: ledger stores raw MIME inline; externalise very large
+  messages to object storage (keep `rawStorageKey`).
+- **Inbound admin surface**: queue diagnostics (cursor, UIDVALIDITY, sync state) + ledger
+  quarantine list and replay endpoint.
 - **Public ticket rate-limiting**: `POST /tickets/public` — use `@nestjs/throttler`.
 - **Frontend staff auth**: JWT-only; no cookie session.
 
