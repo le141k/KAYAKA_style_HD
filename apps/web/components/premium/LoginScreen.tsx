@@ -12,6 +12,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useLogin } from '@/lib/hooks/use-auth';
 import { useI18n } from '@/lib/i18n';
+import { fetchWithCsrf } from '@/lib/api';
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
@@ -107,12 +108,13 @@ function ForgotPasswordPanel({ onBack }: { onBack: () => void }) {
   const onSubmit = async (data: ForgotForm) => {
     setIsSubmitting(true);
     try {
-      await fetch(`${API_URL}/auth/forgot-password`, {
+      const res = await fetchWithCsrf(`${API_URL}/auth/forgot-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify({ email: data.email }),
       });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       // Always show success to avoid email-enumeration attacks
       setSent(true);
     } catch {

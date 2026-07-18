@@ -123,8 +123,6 @@ export interface AuthStaffPrincipal {
 }
 
 export interface LoginResponse {
-  accessToken: string;
-  refreshToken: string;
   staff: AuthStaffPrincipal;
 }
 

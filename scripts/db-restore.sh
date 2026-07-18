@@ -14,11 +14,23 @@
 # Make executable: chmod +x scripts/db-restore.sh
 
 set -euo pipefail
+umask 077
+
+if [[ "${TELECOM_HD_OPS_LOCK_HELD:-0}" != 1 ]]; then
+  command -v flock >/dev/null 2>&1 || { echo 'ERROR: flock is required' >&2; exit 1; }
+  exec 9>"${TMPDIR:-/tmp}/telecom-hd-prod-ops.lock"
+  flock -n 9 || { echo 'ERROR: another deploy/backup/restore operation is running' >&2; exit 1; }
+fi
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ENV_FILE="${REPO_ROOT}/.env.prod"
+ENV_FILE="${ENV_FILE:-${REPO_ROOT}/.env.prod}"
+case "$ENV_FILE" in
+  /*) ;;
+  *) ENV_FILE="${REPO_ROOT}/${ENV_FILE}" ;;
+esac
+export TELECOM_HD_ENV_FILE="$ENV_FILE"
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.prod.yml"
 
 # ── Argument: dump file ───────────────────────────────────────────────────────
@@ -36,16 +48,17 @@ if [[ ! -f "${DUMP_FILE}" ]]; then
   echo "ERROR: dump file not found: ${DUMP_FILE}" >&2; exit 1
 fi
 
-# ── Load .env.prod if present (values already in env take precedence) ────────
-if [[ -f "${ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "${ENV_FILE}"
-  set +a
-fi
+env_value() {
+  local key="$1" line value
+  line="$(grep -E "^${key}[[:space:]]*=" "$ENV_FILE" 2>/dev/null | head -1 || true)"
+  value="${line#*=}"
+  printf '%s' "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^['"'"'"]//; s/['"'"'"]$//'
+}
 
-DB_NAME="${TELECOM_HD_DB_NAME:-telecom_hd}"
-DB_USER="${TELECOM_HD_DB_USER:-telecom_hd}"
+DB_NAME="${TELECOM_HD_DB_NAME:-$(env_value TELECOM_HD_DB_NAME)}"
+DB_USER="${TELECOM_HD_DB_USER:-$(env_value TELECOM_HD_DB_USER)}"
+DB_NAME="${DB_NAME:-telecom_hd}"
+DB_USER="${DB_USER:-telecom_hd}"
 
 # ── Sanity checks ────────────────────────────────────────────────────────────
 if ! command -v docker &>/dev/null; then
@@ -54,6 +67,19 @@ fi
 
 if [[ ! -f "${COMPOSE_FILE}" ]]; then
   echo "ERROR: ${COMPOSE_FILE} not found" >&2; exit 1
+fi
+
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "ERROR: ${ENV_FILE} not found" >&2; exit 1
+fi
+export TELECOM_HD_WEB_BUILD_ID="${TELECOM_HD_WEB_BUILD_ID:-$("${SCRIPT_DIR}/web-build-id.sh" "$ENV_FILE")}"
+
+if [[ ! "${DB_NAME}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; then
+  echo "ERROR: TELECOM_HD_DB_NAME contains unsupported characters" >&2; exit 1
+fi
+
+if [[ ! "${DB_USER}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; then
+  echo "ERROR: TELECOM_HD_DB_USER contains unsupported characters" >&2; exit 1
 fi
 
 # ── Confirmation prompt ───────────────────────────────────────────────────────
@@ -78,9 +104,19 @@ fi
 echo ""
 echo "[db-restore] Restoring '${DB_NAME}' from: ${DUMP_FILE}"
 
+# Keep the application quiesced for the entire destructive restore. Starting it
+# again is an explicit post-restore verification step below.
+echo "[db-restore] Stopping API writers..."
+docker compose \
+  --profile scanner \
+  -f "${COMPOSE_FILE}" \
+  --env-file "${ENV_FILE}" \
+  stop -t 30 api
+
 # ── Terminate active connections so pg_restore can drop/recreate objects ──────
 echo "[db-restore] Terminating existing connections to '${DB_NAME}'..."
 docker compose \
+  --profile scanner \
   -f "${COMPOSE_FILE}" \
   --env-file "${ENV_FILE}" \
   exec -T postgres \
@@ -101,6 +137,7 @@ docker compose \
 echo "[db-restore] Running pg_restore..."
 gunzip -c "${DUMP_FILE}" \
   | docker compose \
+      --profile scanner \
       -f "${COMPOSE_FILE}" \
       --env-file "${ENV_FILE}" \
       exec -T postgres \
@@ -119,4 +156,5 @@ echo ""
 echo "Next steps:"
 echo "  1. Verify the restore (row counts / migration version) — see docs/BACKUP.md"
 echo "  2. Restart API containers if needed:"
-echo "       docker compose -f docker-compose.prod.yml --env-file .env.prod restart api"
+echo "       export TELECOM_HD_WEB_BUILD_ID=\$(./scripts/web-build-id.sh .env.prod)"
+echo "       docker compose --profile scanner -f docker-compose.prod.yml --env-file .env.prod restart api"

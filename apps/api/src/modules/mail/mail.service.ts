@@ -55,6 +55,13 @@ export class MailService {
       host: config.TELECOM_HD_SMTP_HOST,
       port: config.TELECOM_HD_SMTP_PORT,
       secure: config.TELECOM_HD_SMTP_SECURE,
+      // Production port 587/25 must upgrade with STARTTLS; do not silently
+      // deliver credentials or reset links after a downgrade/strip attack.
+      requireTLS: config.NODE_ENV === 'production' && !config.TELECOM_HD_SMTP_SECURE,
+      tls: { minVersion: 'TLSv1.2', servername: config.TELECOM_HD_SMTP_HOST },
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 15_000,
       // Authenticated relay in prod; MailHog/dev needs none. Only set auth when
       // both credentials are provided (otherwise nodemailer would force AUTH).
       ...(config.TELECOM_HD_SMTP_USER && config.TELECOM_HD_SMTP_PASSWORD
@@ -78,11 +85,11 @@ export class MailService {
         attempts: 3,
         backoff: { type: 'exponential', delay: 2000 },
         removeOnComplete: true,
-        removeOnFail: 100,
+        removeOnFail: { age: 86_400, count: 100 },
       });
-    } catch (err) {
+    } catch {
       // If enqueue fails (Redis down), don't lose the mail — deliver inline.
-      this.logger.error(`Mail enqueue failed, delivering inline: ${String(err)}`);
+      this.logger.error('Mail enqueue failed; delivering inline');
       await this.deliver(opts);
     }
   }
@@ -95,9 +102,9 @@ export class MailService {
   async deliver(opts: SendMailOptions, throwOnError = false): Promise<void> {
     try {
       await this.deliverOrThrow(opts);
-      this.logger.debug(`Mail sent to ${opts.to}: ${opts.subject}`);
+      this.logger.debug('Mail delivered');
     } catch (err) {
-      this.logger.error(`Failed to send mail to ${opts.to}: ${String(err)}`);
+      this.logger.error(`Mail delivery failed (${err instanceof Error ? err.name : 'UnknownError'})`);
       // When delivering from the BullMQ processor, rethrow so the job's retry/backoff
       // (attempts:3) actually fires. Inline fallback callers pass false so a send
       // failure never crashes the ticket flow.
@@ -128,7 +135,7 @@ export class MailService {
 
   /**
    * Render and send a security-critical template (password reset, magic link),
-   * PROPAGATING any enqueue/SMTP failure instead of swallowing it (GOAL_PUBLIC_SECURITY
+   * PROPAGATING any SMTP failure instead of swallowing it (GOAL_PUBLIC_SECURITY
    * S1-4). The caller relies on this to fail closed — invalidating the issued token
    * when the mail cannot be handed off — so a live token whose email silently
    * vanished never dangles. Never logs the rendered body/subject (they carry the link).
@@ -146,19 +153,10 @@ export class MailService {
       html: rendered.html,
       text: rendered.text,
     };
-    if (!this.mailQueue) {
-      // No queue wired (dev/test) — deliver inline and let SMTP errors propagate.
-      await this.deliverOrThrow(opts);
-      return;
-    }
-    // Enqueue only. A failure here (e.g. Redis down) PROPAGATES — unlike send(),
-    // we do NOT fall back to swallowing inline delivery for security mail.
-    await this.mailQueue.add('send', opts, {
-      attempts: 3,
-      backoff: { type: 'exponential', delay: 2000 },
-      removeOnComplete: true,
-      removeOnFail: 100,
-    });
+    // Never serialize a live reset/magic-link URL into BullMQ/Redis. Security mail
+    // is delivered inline with bounded SMTP timeouts; callers invalidate the token
+    // and return the same generic response if delivery fails.
+    await this.deliverOrThrow(opts);
   }
 
   /**

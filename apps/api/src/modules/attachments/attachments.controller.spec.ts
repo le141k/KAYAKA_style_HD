@@ -5,6 +5,10 @@ import type { AttachmentsService } from './attachments.service';
 import type { StorageService } from './storage.service';
 import type { AppConfig } from '../../config/configuration';
 import type { Attachment } from '@prisma/client';
+import { GUARDS_METADATA } from '@nestjs/common/constants';
+import { ClientPortalGuard } from '../../auth/client-portal.guard';
+import { ClientAuthGuard } from '../client-auth/client-auth.guard';
+import { ClientUploadAdmissionGuard } from '../../security/client-upload-admission.guard';
 
 function makeFile(name = 'a.pdf'): Express.Multer.File {
   return {
@@ -12,6 +16,7 @@ function makeFile(name = 'a.pdf'): Express.Multer.File {
     mimetype: 'application/pdf',
     size: 10,
     buffer: Buffer.from('x'),
+    path: '/tmp/nonexistent-upload-test',
   } as unknown as Express.Multer.File;
 }
 
@@ -50,11 +55,30 @@ describe('AttachmentsController — public upload', () => {
     expect(keys.some((k) => String(k).startsWith('THROTTLER:LIMIT'))).toBe(true);
   });
 
+  it('runs verified-client auth and admission guards before the upload interceptor', () => {
+    const guards = Reflect.getMetadata(GUARDS_METADATA, controller.uploadClient) as unknown[];
+    expect(guards).toEqual([ClientPortalGuard, ClientAuthGuard, ClientUploadAdmissionGuard]);
+  });
+
+  it('marks verified-client uploads with the stricter five-file service policy', async () => {
+    const token = '11111111-2222-3333-4444-555555555555';
+
+    await controller.uploadClient([makeFile()], token);
+
+    expect(service.uploadFiles).toHaveBeenCalledWith(expect.any(Array), {
+      claimToken: token,
+      source: 'client',
+    });
+  });
+
   it('SEC-6: forwards a client-supplied UUID claimToken to uploadFiles and echoes it back', async () => {
     const token = '11111111-2222-3333-4444-555555555555';
     const res = await controller.uploadPublic([makeFile()], token);
 
-    expect(service.uploadFiles).toHaveBeenCalledWith(expect.any(Array), { claimToken: token });
+    expect(service.uploadFiles).toHaveBeenCalledWith(expect.any(Array), {
+      claimToken: token,
+      source: 'public',
+    });
     expect(res.claimToken).toBe(token);
     expect(res.attachmentIds).toEqual([1, 2]);
   });

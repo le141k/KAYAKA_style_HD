@@ -188,14 +188,20 @@ model RefreshToken {
 }
 
 model PasswordReset {
-  id        Int       @id @default(autoincrement())
-  staffId   Int
-  tokenHash String    @unique   // sha256 hex of the raw token
+  id          Int       @id @default(autoincrement())
+  staffId     Int
+  // Security-state stamp at issuance; reset requires an exact Staff.authVersion match.
+  authVersion Int       @default(-1)
+  tokenHash   String    @unique   // sha256 hex of the raw token
   expiresAt DateTime
   usedAt    DateTime?
   createdAt DateTime  @default(now())
 
   @@index([staffId])
+  @@index([expiresAt])
+  @@index([staffId, usedAt])
+  // A raw migration adds a partial UNIQUE(staffId) WHERE usedAt IS NULL;
+  // Prisma schema syntax cannot represent partial indexes.
 }
 
 // Append-only audit trail for RBAC / staff-account changes: who did what to which
@@ -223,29 +229,34 @@ model RbacAuditLog {
 // token is never persisted. `email` is an audit snapshot, NEVER the authorization key.
 
 model ClientLoginToken {
-  id        String    @id @default(uuid())
-  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId    Int
-  tokenHash String    @unique // sha256 hex of the single-use raw login token
-  email     String // normalized-email snapshot (audit only)
-  expiresAt DateTime
-  usedAt    DateTime?
-  createdAt DateTime  @default(now())
+  id                String    @id @default(uuid())
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId            Int
+  // Version of the client identity at issuance. Verification requires this to equal
+  // User.clientAuthVersion, so disable/re-enable and email changes burn old links.
+  clientAuthVersion Int       @default(-1)
+  tokenHash         String    @unique // sha256 hex of the single-use raw login token
+  email             String // normalized-email snapshot (audit only)
+  expiresAt         DateTime
+  usedAt            DateTime?
+  createdAt         DateTime  @default(now())
 
   @@index([userId])
   @@index([expiresAt])
 }
 
 model ClientSession {
-  id         String    @id @default(uuid())
-  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId     Int
-  tokenHash  String    @unique // sha256 hex of the raw session cookie value
-  email      String // normalized-email snapshot (audit only)
-  expiresAt  DateTime
-  revokedAt  DateTime?
-  createdAt  DateTime  @default(now())
-  lastSeenAt DateTime  @default(now())
+  id                String    @id @default(uuid())
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId            Int
+  // Must match User.clientAuthVersion on every resolution.
+  clientAuthVersion Int       @default(-1)
+  tokenHash         String    @unique // sha256 hex of the raw session cookie value
+  email             String // normalized-email snapshot (audit only)
+  expiresAt         DateTime
+  revokedAt         DateTime?
+  createdAt         DateTime  @default(now())
+  lastSeenAt        DateTime  @default(now())
 
   @@index([userId])
   @@index([expiresAt])
@@ -293,9 +304,12 @@ model User {
   phone          String        @default("")
   designation    String        @default("")
   // nullable: many customers are created from inbound email without a password
-  passwordHash   String?
-  isEnabled      Boolean       @default(true)
-  isValidated    Boolean       @default(false)
+  passwordHash      String?
+  isEnabled         Boolean       @default(true)
+  // Bumped whenever the verified client identity changes (enable state or email set).
+  // Login tokens and sessions are stamped with this value for durable revocation.
+  clientAuthVersion Int           @default(0)
+  isValidated       Boolean       @default(false)
   timezone       String        @default("UTC")
   userGroup      UserGroup?    @relation(fields: [userGroupId], references: [id])
   userGroupId    Int?
@@ -501,7 +515,7 @@ model TicketPost {
   isEmailed    Boolean    @default(false)
   isThirdParty Boolean    @default(false)
   creationMode CreationMode @default(WEB)
-  messageId    String?    @default("")    // RFC Message-ID for threading
+  messageId    String?    @unique // RFC Message-ID for threading/idempotency; absent = NULL
   ipAddress    String     @default("0.0.0.0")
   attachments  Attachment[]
   editedAt     DateTime?
@@ -509,7 +523,6 @@ model TicketPost {
   createdAt    DateTime   @default(now())
 
   @@index([ticketId])
-  @@index([messageId])
 }
 
 model TicketNote {

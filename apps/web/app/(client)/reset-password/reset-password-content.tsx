@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { useSearchParams, useRouter } from 'next/navigation';
+import { useRouter } from 'next/navigation';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { cn } from '@/lib/utils';
+import { fetchWithCsrf } from '@/lib/api';
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
@@ -27,27 +28,26 @@ const resetSchema = z
 type ResetForm = z.infer<typeof resetSchema>;
 
 export function ResetPasswordContent() {
-  const searchParams = useSearchParams();
   const router = useRouter();
 
   // The reset token arrives in the URL FRAGMENT (#token=…) so it never reaches the
   // server / proxy access logs. Read it once on mount, then immediately strip it from
   // the address bar with history.replaceState so it isn't left in the URL, browser
-  // history, or any later Referer. A legacy ?token= query is accepted as a fallback.
+  // history, or any later Referer. Query-string tokens are deliberately rejected.
   const [token, setToken] = useState('');
   const [tokenResolved, setTokenResolved] = useState(false);
 
   useEffect(() => {
     const hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '';
     const fromHash = new URLSearchParams(hash).get('token');
-    const resolved = fromHash ?? searchParams.get('token') ?? '';
+    const resolved = fromHash ?? '';
     setToken(resolved);
     setTokenResolved(true);
     if (resolved) {
-      // Drop both the fragment and any legacy query token from the visible URL.
+      // Drop the fragment from the visible URL.
       window.history.replaceState(null, '', window.location.pathname);
     }
-  }, [searchParams]);
+  }, []);
 
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
@@ -66,7 +66,7 @@ export function ResetPasswordContent() {
 
   const onSubmit = async (data: ResetForm) => {
     try {
-      const res = await fetch(`${API_URL}/auth/reset-password`, {
+      const res = await fetchWithCsrf(`${API_URL}/auth/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',

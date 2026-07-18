@@ -77,8 +77,9 @@ placeholders pass), the Alaris webhook secret has a **known default**, no TLS. N
       and is a no-op if the user exists.
 - 🙋 **USER** provides at go-live: domain, TLS cert (or Caddy auto-HTTPS email), real secret values,
   the bootstrap admin credentials. The bot builds + tests the **mechanism** with placeholders/self-signed.
-- **DoD:** `docker compose -f docker-compose.prod.yml up` boots with the prod env, runs **no demo seed**,
-  **refuses weak secrets**, serves over the proxy on https; smoke: bootstrap admin logs in (no `demo1234`).
+- **DoD:** `scripts/deploy-prod.sh` boots the internal prod profile with no demo seed and refuses weak
+  secrets; the separately approved HTTPS edge gate serves the proxy, and the smoke proves the bootstrap
+  admin can log in without `demo1234`.
 
 ## 🟡 Batch G3 — Operations: backups, monitoring, log hygiene
 

@@ -15,17 +15,18 @@ import { AppConfig, APP_CONFIG } from '../config/configuration';
 import { PrismaService } from '../prisma/prisma.service';
 import { TokenBlocklistService } from './token-blocklist.service';
 import type { Request } from 'express';
+import { authCookieNames, DEV_ACCESS_TOKEN_COOKIE } from './auth.cookies';
 
 /** Name of the HttpOnly access-token cookie set by AuthController on login/refresh. */
-export const ACCESS_TOKEN_COOKIE = 'th_access';
+export const ACCESS_TOKEN_COOKIE = DEV_ACCESS_TOKEN_COOKIE;
 
 /**
  * Global JWT guard.
  * - Routes decorated with @Public() bypass token validation entirely.
  * - All other routes require a valid access token, taken from EITHER the
- *   `Authorization: Bearer <token>` header OR the `th_access` HttpOnly cookie.
- *   The Bearer header takes precedence so legacy localStorage clients keep working
- *   during/after the cookie migration (dual-mode, fully backward compatible).
+ *   `Authorization: Bearer <token>` header OR the environment-selected HttpOnly
+ *   access cookie. Browser code uses only cookies; Bearer remains available for
+ *   explicit external integrations and test tooling.
  * - On success, sets req.user to an AuthStaff principal.
  */
 @Injectable()
@@ -137,14 +138,15 @@ export class JwtAuthGuard implements CanActivate {
   }
 
   /**
-   * Read the access token from the HttpOnly `th_access` cookie. Parses the raw
-   * Cookie header directly so this works even without cookie-parser middleware.
+   * Read the access token from the environment-selected HttpOnly cookie. Parses
+   * the raw Cookie header directly so this works without cookie-parser middleware.
    */
   private extractCookie(request: Request): string | undefined {
     // Prefer a pre-parsed cookies bag if some middleware populated it.
+    const cookieName = authCookieNames(this.config).access;
     const parsed = (request as Request & { cookies?: Record<string, string> }).cookies;
-    if (parsed && typeof parsed[ACCESS_TOKEN_COOKIE] === 'string') {
-      return parsed[ACCESS_TOKEN_COOKIE] || undefined;
+    if (parsed && typeof parsed[cookieName] === 'string') {
+      return parsed[cookieName] || undefined;
     }
     const header = request.headers['cookie'];
     if (!header) return undefined;
@@ -152,7 +154,7 @@ export class JwtAuthGuard implements CanActivate {
       const eq = part.indexOf('=');
       if (eq === -1) continue;
       const name = part.slice(0, eq).trim();
-      if (name === ACCESS_TOKEN_COOKIE) {
+      if (name === cookieName) {
         return decodeURIComponent(part.slice(eq + 1).trim()) || undefined;
       }
     }

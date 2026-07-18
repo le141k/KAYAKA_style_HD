@@ -1,5 +1,6 @@
 -- GOAL_PUBLIC_SECURITY S2-4/S2-5: provision the `client_login_link` email template in
--- every environment (the production seed does not run). Idempotent upsert.
+-- every environment (the production seed does not run). Provision only when absent;
+-- never overwrite an administrator-customized production template during deploy.
 INSERT INTO "EmailTemplate" ("key", "locale", "subject", "htmlBody", "textBody", "updatedAt")
 VALUES (
   'client_login_link',
@@ -17,8 +18,4 @@ VALUES (
     || E'If you did not request it, you can safely ignore this email.',
   now()
 )
-ON CONFLICT ("key", "locale") DO UPDATE
-  SET "subject"  = EXCLUDED."subject",
-      "htmlBody" = EXCLUDED."htmlBody",
-      "textBody" = EXCLUDED."textBody",
-      "updatedAt" = now();
+ON CONFLICT ("key", "locale") DO NOTHING;

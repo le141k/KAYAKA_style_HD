@@ -8,6 +8,14 @@ const MAX_BODY = 100_000;
 /** Cap on tag/recipient arrays to stop an unbounded payload. */
 const MAX_TAGS = 50;
 const MAX_RECIPIENTS = 100;
+const AttachmentIdsSchema = z
+  .array(z.number().int().positive())
+  .max(10)
+  .refine((ids) => new Set(ids).size === ids.length, 'Duplicate attachment IDs are not allowed');
+const PublicAttachmentIdsSchema = z
+  .array(z.number().int().positive())
+  .max(5)
+  .refine((ids) => new Set(ids).size === ids.length, 'Duplicate attachment IDs are not allowed');
 
 export const CreateTicketSchema = z.object({
   subject: z.string().min(1).max(500),
@@ -30,7 +38,7 @@ export const CreateTicketSchema = z.object({
   // NOTE: creationMode + ipAddress are deliberately NOT accepted from the request
   // body (mass-assignment guard) — the controller forces creationMode='STAFF' and
   // the real req.ip; internal callers (public/alaris/inbound) pass them explicitly.
-  attachmentIds: z.array(z.number().int().positive()).optional(),
+  attachmentIds: AttachmentIdsSchema.optional(),
   /** CC/BCC recipients stored in TicketRecipient */
   ccEmails: z.array(z.string().email()).max(MAX_RECIPIENTS).optional(),
   bccEmails: z.array(z.string().email()).max(MAX_RECIPIENTS).optional(),
@@ -46,7 +54,7 @@ export const ReplyTicketSchema = z.object({
   isNote: z.boolean().default(false),
   isEmailed: z.boolean().default(false),
   isThirdParty: z.boolean().default(false),
-  attachmentIds: z.array(z.number().int().positive()).optional(),
+  attachmentIds: AttachmentIdsSchema.optional(),
   /** CC/BCC recipients for outbound staff reply email */
   ccEmails: z.array(z.string().email()).max(MAX_RECIPIENTS).optional(),
   bccEmails: z.array(z.string().email()).max(MAX_RECIPIENTS).optional(),
@@ -59,7 +67,7 @@ export type ReplyTicketDto = z.infer<typeof ReplyTicketSchema>;
 export const AddNoteSchema = z.object({
   contents: z.string().min(1).max(MAX_BODY),
   /** Attachment IDs (pre-uploaded orphans) to link to this note (U1 data-loss fix). */
-  attachmentIds: z.array(z.number().int().positive()).optional(),
+  attachmentIds: AttachmentIdsSchema.optional(),
 });
 export type AddNoteDto = z.infer<typeof AddNoteSchema>;
 
@@ -185,6 +193,7 @@ export type SplitTicketDto = z.infer<typeof SplitTicketSchema>;
 // ─────────────────── public submission ───────────────────
 
 export const PublicCreateTicketSchema = z.object({
+  challengeToken: z.string().min(1).max(2048),
   subject: z.string().min(1).max(500),
   contents: z.string().min(1).max(MAX_BODY),
   requesterEmail: z.string().email(),
@@ -193,7 +202,7 @@ export const PublicCreateTicketSchema = z.object({
   priorityId: z.number().int().positive().optional(),
   typeId: z.number().int().positive().optional(),
   customFields: z.record(z.unknown()).default({}),
-  attachmentIds: z.array(z.number().int().positive()).optional(),
+  attachmentIds: PublicAttachmentIdsSchema.optional(),
   /** Per-upload secret from POST /attachments/upload/public — scopes orphan adoption. */
   attachmentClaimToken: z.string().uuid().optional(),
 });
@@ -205,7 +214,7 @@ export const PublicReplySchema = z.object({
   // Keep main's input cap (E1); identity is taken from the verified client session, NOT the
   // request body (S2-7) — there is intentionally no requesterEmail field here.
   contents: z.string().min(1).max(MAX_BODY),
-  attachmentIds: z.array(z.number().int().positive()).optional(),
+  attachmentIds: PublicAttachmentIdsSchema.optional(),
   /** Per-upload secret from POST /attachments/upload/public — scopes orphan adoption. */
   attachmentClaimToken: z.string().uuid().optional(),
 });

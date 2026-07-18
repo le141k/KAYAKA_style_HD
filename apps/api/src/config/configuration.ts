@@ -34,7 +34,55 @@ const schema = z.object({
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_INBOUND_WEBHOOK_SECRET: z.string().min(32).default('inbound-dev-secret-change-me-0000'),
   TELECOM_HD_UPLOAD_DIR: z.string().default('/app/uploads'),
-  TELECOM_HD_UPLOAD_MAX_SIZE_MB: z.coerce.number().default(25),
+  TELECOM_HD_UPLOAD_MAX_SIZE_MB: z.coerce.number().int().min(1).max(25).default(25),
+  TELECOM_HD_UPLOAD_TOTAL_MAX_SIZE_MB: z.coerce.number().int().min(1).max(50).default(50),
+  // Multipart envelope included. Keep this slightly above the aggregate file-byte
+  // limit and at/below the reverse-proxy request-body limit (55 MiB in production).
+  TELECOM_HD_UPLOAD_REQUEST_MAX_SIZE_MB: z.coerce.number().int().min(1).max(55).default(51),
+  TELECOM_HD_INBOUND_MAX_SIZE_MB: z.coerce.number().int().min(1).max(35).default(35),
+  TELECOM_HD_ORPHAN_ATTACHMENT_TTL_HOURS: z.coerce.number().int().min(1).max(168).default(24),
+  // Absolute, cross-channel cap for unclaimed rows. Public/client/staff/inbound
+  // orphan uploads share the same database-backed capacity boundary.
+  TELECOM_HD_ORPHAN_ATTACHMENT_MAX_COUNT: z.coerce.number().int().min(100).max(5000).default(2000),
+  TELECOM_HD_ORPHAN_ATTACHMENT_MAX_SIZE_MB: z.coerce.number().int().min(100).max(10240).default(2048),
+  // Refuse new writes when the upload filesystem would fall below this reserve.
+  // The 5 GiB default remains below the deployment host's 15 GiB launch gate.
+  TELECOM_HD_UPLOAD_MIN_FREE_DISK_MB: z.coerce.number().int().min(256).max(10240).default(5120),
+  // Bound each cleanup pass independently of the absolute outstanding-orphan cap.
+  // A short interval drains backlog without letting maintenance monopolize the API.
+  TELECOM_HD_ATTACHMENT_CLEANUP_MAX_ITEMS: z.coerce.number().int().min(1).max(5000).default(1000),
+  TELECOM_HD_ATTACHMENT_CLEANUP_MAX_RUN_SECONDS: z.coerce.number().int().min(10).max(300).default(120),
+  TELECOM_HD_PUBLIC_TICKET_CREATE_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
+  TELECOM_HD_PUBLIC_UPLOAD_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
+  // Separate from both the read-capable client portal and anonymous upload. This
+  // lets operations stop verified-client writes without taking ticket reads down.
+  TELECOM_HD_CLIENT_UPLOAD_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
+  TELECOM_HD_TURNSTILE_SECRET: z.string().optional(),
+  TELECOM_HD_TURNSTILE_HOSTNAME: z.string().optional(),
+  TELECOM_HD_CLAMAV_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
+  TELECOM_HD_CLAMAV_HOST: z.string().default('clamav'),
+  TELECOM_HD_CLAMAV_PORT: z.coerce.number().int().min(1).max(65535).default(3310),
+  TELECOM_HD_CLAMAV_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(15000),
   // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_FIELD_ENCRYPTION_KEY: z.string().optional(),
@@ -103,6 +151,55 @@ export function assertProductionSecrets(cfg: AppConfig): void {
   const smtpHost = (cfg.TELECOM_HD_SMTP_HOST ?? '').trim();
   if (smtpHost === '' || /^(localhost|127\.0\.0\.1|\[::1\]|mailhog)$/i.test(smtpHost)) {
     problems.push('  - TELECOM_HD_SMTP_HOST: must be a real mail host in production (not localhost/MailHog)');
+  }
+
+  const publicChallengeEnabled =
+    cfg.TELECOM_HD_CLIENT_PORTAL_ENABLED ||
+    cfg.TELECOM_HD_PUBLIC_TICKET_CREATE_ENABLED ||
+    cfg.TELECOM_HD_PUBLIC_UPLOAD_ENABLED ||
+    cfg.TELECOM_HD_CLIENT_UPLOAD_ENABLED;
+  if (publicChallengeEnabled) {
+    checkSecret('TELECOM_HD_TURNSTILE_SECRET', cfg.TELECOM_HD_TURNSTILE_SECRET);
+    const expectedHost = (cfg.TELECOM_HD_TURNSTILE_HOSTNAME ?? '').trim().toLowerCase();
+    let publicHost = '';
+    try {
+      publicHost = new URL(publicUrl).hostname.toLowerCase();
+    } catch {
+      // The URL validation above reports the canonical error.
+    }
+    if (!expectedHost || expectedHost !== publicHost) {
+      problems.push(
+        '  - TELECOM_HD_TURNSTILE_HOSTNAME: must exactly match TELECOM_HD_PUBLIC_URL hostname when public access is enabled',
+      );
+    }
+  }
+  if (!cfg.TELECOM_HD_CLAMAV_ENABLED) {
+    problems.push('  - TELECOM_HD_CLAMAV_ENABLED: must be true for production attachment safety');
+  }
+  if (cfg.TELECOM_HD_PUBLIC_UPLOAD_ENABLED && !cfg.TELECOM_HD_PUBLIC_TICKET_CREATE_ENABLED) {
+    problems.push(
+      '  - TELECOM_HD_PUBLIC_TICKET_CREATE_ENABLED: must be true when anonymous uploads are enabled',
+    );
+  }
+  if (cfg.TELECOM_HD_CLIENT_UPLOAD_ENABLED && !cfg.TELECOM_HD_CLIENT_PORTAL_ENABLED) {
+    problems.push(
+      '  - TELECOM_HD_CLIENT_PORTAL_ENABLED: must be true when verified-client uploads are enabled',
+    );
+  }
+  if (cfg.TELECOM_HD_UPLOAD_TOTAL_MAX_SIZE_MB < cfg.TELECOM_HD_UPLOAD_MAX_SIZE_MB) {
+    problems.push(
+      '  - TELECOM_HD_UPLOAD_TOTAL_MAX_SIZE_MB: must be greater than or equal to the per-file upload limit',
+    );
+  }
+  if (cfg.TELECOM_HD_UPLOAD_REQUEST_MAX_SIZE_MB < cfg.TELECOM_HD_UPLOAD_TOTAL_MAX_SIZE_MB) {
+    problems.push(
+      '  - TELECOM_HD_UPLOAD_REQUEST_MAX_SIZE_MB: must be greater than or equal to the aggregate file-byte limit',
+    );
+  }
+  if (cfg.TELECOM_HD_INBOUND_MAX_SIZE_MB < cfg.TELECOM_HD_UPLOAD_MAX_SIZE_MB) {
+    problems.push(
+      '  - TELECOM_HD_INBOUND_MAX_SIZE_MB: must be greater than or equal to the per-file upload limit',
+    );
   }
 
   if (problems.length) {

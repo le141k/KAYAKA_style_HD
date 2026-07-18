@@ -48,10 +48,11 @@ export function buildPinoHttpOptions(config: AppConfig): Params['pinoHttp'] {
       res(res: { statusCode?: number }) {
         return { statusCode: res.statusCode };
       },
-      err(err: Error & { type?: string }) {
+      err(err: Error & { type?: string; code?: string | number }) {
         // Keep only non-sensitive diagnostic fields; never spread arbitrary
         // properties a thrown value might carry (e.g. a request body).
-        return { type: err.type ?? err.name, message: err.message, stack: err.stack };
+        const safe = { type: err.type ?? err.name, code: err.code };
+        return config.NODE_ENV === 'production' ? safe : { ...safe, message: err.message, stack: err.stack };
       },
     },
 

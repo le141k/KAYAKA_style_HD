@@ -40,6 +40,7 @@ function makeGuard(opts: {
   staleSession?: boolean;
   staff?: unknown; // findUnique result; `undefined` key uses a default enabled staff
   prismaThrows?: boolean;
+  nodeEnv?: AppConfig['NODE_ENV'];
 }) {
   const reflector = {
     getAllAndOverride: vi.fn((key: string) => (key === IS_PUBLIC_KEY ? opts.isPublic : undefined)),
@@ -60,7 +61,13 @@ function makeGuard(opts: {
   });
   const prisma = { staff: { findUnique } } as unknown as PrismaService;
   return {
-    guard: new JwtAuthGuard(jwt, reflector, CONFIG, prisma, blocklist as never),
+    guard: new JwtAuthGuard(
+      jwt,
+      reflector,
+      { ...CONFIG, NODE_ENV: opts.nodeEnv ?? 'test' },
+      prisma,
+      blocklist as never,
+    ),
     jwt,
     blocklist,
     findUnique,
@@ -106,6 +113,20 @@ describe('JwtAuthGuard', () => {
     await expect(guard.canActivate(makeContext(req))).resolves.toBe(true);
     expect(jwt.verifyAsync).toHaveBeenCalledWith('cookie-token', expect.anything());
     expect((req as { user: { staffId: number } }).user.staffId).toBe(9);
+  });
+
+  it('reads only the hardened __Host access cookie in production', async () => {
+    const { guard, jwt } = makeGuard({
+      isPublic: false,
+      nodeEnv: 'production',
+      verifyResult: { sub: 9, av: 0, jti: 'j' },
+      staff: staffRow({ id: 9 }),
+    });
+    const req: Record<string, unknown> = {
+      headers: { cookie: '__Host-th_access=production-cookie; th_access=legacy-cookie' },
+    };
+    await expect(guard.canActivate(makeContext(req))).resolves.toBe(true);
+    expect(jwt.verifyAsync).toHaveBeenCalledWith('production-cookie', expect.anything());
   });
 
   it('rejects an invalid/expired token → 401 (no DB hit)', async () => {

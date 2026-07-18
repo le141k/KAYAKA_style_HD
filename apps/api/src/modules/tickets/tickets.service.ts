@@ -69,6 +69,25 @@ export const PUBLIC_TICKET_LIST_SELECT = {
 export type PublicTicketListItem = Prisma.TicketGetPayload<{ select: typeof PUBLIC_TICKET_LIST_SELECT }>;
 
 /**
+ * Trusted service-to-service create input. `incomingMessageId` is deliberately
+ * absent from CreateTicketSchema, so an HTTP caller cannot choose the RFC
+ * Message-ID used for inbound-mail idempotency.
+ */
+export type InternalCreateTicketInput = CreateTicketDto & {
+  attachmentClaimToken?: string;
+  creationMode?: CreationMode;
+  ipAddress?: string;
+  incomingMessageId?: string;
+};
+
+/** Trusted service-to-service reply input; not accepted by ReplyTicketSchema. */
+export type InternalReplyTicketInput = ReplyTicketDto & {
+  creationMode?: CreationMode;
+  ipAddress?: string;
+  incomingMessageId?: string;
+};
+
+/**
  * A client-safe post. Internal/PII fields (staff `email`, `ipAddress`, `staffId`,
  * `messageId`, edit audit) are NEVER projected onto the public ticket view.
  */
@@ -119,16 +138,44 @@ export class TicketsService {
 
   // ─────────────────────────── Create ───────────────────────────
 
+  /** Resolve only a PUBLIC department for anonymous ticket creation. */
+  async resolvePublicDepartmentId(requestedId?: number): Promise<number> {
+    const department = await this.prisma.department.findFirst({
+      where: {
+        type: 'PUBLIC',
+        ...(requestedId ? { id: requestedId } : {}),
+      },
+      ...(!requestedId
+        ? {
+            orderBy: [
+              { isDefault: 'desc' as const },
+              { displayOrder: 'asc' as const },
+              { id: 'asc' as const },
+            ],
+          }
+        : {}),
+      select: { id: true },
+    });
+    if (!department) {
+      // Identical response for a missing/private guessed id; never disclose the
+      // internal department inventory to an anonymous caller.
+      throw new BadRequestException('Public department is unavailable');
+    }
+    return department.id;
+  }
+
   async createTicket(
     // creationMode/ipAddress are not on the public DTO (mass-assignment guard) — only
     // trusted callers (controllers, alaris/inbound services) set them here.
-    dto: CreateTicketDto & {
-      attachmentClaimToken?: string;
-      creationMode?: CreationMode;
-      ipAddress?: string;
-    },
+    dto: InternalCreateTicketInput,
     creatorStaffId?: number,
   ): Promise<Ticket> {
+    const incomingMessageId = this.normalizeIncomingMessageId(dto.incomingMessageId);
+    if (incomingMessageId) {
+      const existing = await this.findTicketByInboundMessageId(incomingMessageId);
+      if (existing) return existing;
+    }
+
     const creationMode: CreationMode = dto.creationMode ?? 'STAFF';
     const ipAddress = dto.ipAddress ?? '0.0.0.0';
     // Validate custom fields against TICKET scope definitions, then encrypt any
@@ -165,6 +212,10 @@ export class TicketsService {
 
     const now = new Date();
 
+    if (dto.attachmentIds?.length && !this.attachmentsService) {
+      throw new BadRequestException('Attachment service is unavailable');
+    }
+
     // Compute SLA due dates if a plan was resolved
     let dueAt: Date | null = null;
     let resolutionDueAt: Date | null = null;
@@ -177,81 +228,94 @@ export class TicketsService {
     // Create ticket + assign its mask atomically. The mask is derived from the
     // auto-increment id, so we create first (temp mask) then update within a
     // single $transaction to avoid a window where a TT-PENDING mask is visible.
-    const [, updated] = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.ticket.create({
-        data: {
-          mask: 'TT-PENDING', // temporary; replaced within this same transaction
-          subject: dto.subject,
-          departmentId: dto.departmentId,
-          statusId,
-          priorityId,
-          typeId: dto.typeId,
-          userId,
-          requesterEmail: dto.requesterEmail,
-          requesterName: dto.requesterName,
-          ownerStaffId: dto.ownerStaffId,
-          slaPlanId,
-          dueAt,
-          resolutionDueAt,
-          creationMode,
-          creator: creatorActor,
-          ipAddress,
-          customFields: (customFields ?? {}) as object,
-          // First post
-          posts: {
-            create: {
-              authorType: creatorActor,
-              staffId: creatorStaffId,
-              userId,
-              fullName: dto.requesterName,
-              email: dto.requesterEmail,
-              subject: dto.subject,
-              contents: dto.contents,
-              isHtml: dto.isHtml,
-              creationMode,
-              ipAddress,
+    let updated: Ticket;
+    try {
+      const [, transactionTicket] = await this.prisma.$transaction(async (tx) => {
+        const created = await tx.ticket.create({
+          data: {
+            mask: 'TT-PENDING', // temporary; replaced within this same transaction
+            subject: dto.subject,
+            departmentId: dto.departmentId,
+            statusId,
+            priorityId,
+            typeId: dto.typeId,
+            userId,
+            requesterEmail: dto.requesterEmail,
+            requesterName: dto.requesterName,
+            ownerStaffId: dto.ownerStaffId,
+            slaPlanId,
+            dueAt,
+            resolutionDueAt,
+            creationMode,
+            creator: creatorActor,
+            ipAddress,
+            customFields: (customFields ?? {}) as object,
+            // First post
+            posts: {
+              create: {
+                authorType: creatorActor,
+                staffId: creatorStaffId,
+                userId,
+                fullName: dto.requesterName,
+                email: dto.requesterEmail,
+                subject: dto.subject,
+                contents: dto.contents,
+                isHtml: dto.isHtml,
+                creationMode,
+                messageId: incomingMessageId,
+                ipAddress,
+              },
             },
+            // Tags
+            tags: dto.tags.length
+              ? {
+                  connectOrCreate: dto.tags.map((name) => ({
+                    where: { name },
+                    create: { name },
+                  })),
+                }
+              : undefined,
+            totalReplies: 1,
           },
-          // Tags
-          tags: dto.tags.length
-            ? {
-                connectOrCreate: dto.tags.map((name) => ({
-                  where: { name },
-                  create: { name },
-                })),
-              }
-            : undefined,
-          totalReplies: 1,
-        },
-      });
+          include: { posts: { select: { id: true } } },
+        });
 
-      const updatedTicket = await tx.ticket.update({
-        where: { id: created.id },
-        data: { mask: formatTicketMask(created.id) },
-      });
+        if (dto.attachmentIds?.length && this.attachmentsService) {
+          const firstPost = created.posts[0];
+          if (!firstPost) throw new BadRequestException('Initial ticket post was not created');
+          await this.attachmentsService.linkToPost(
+            dto.attachmentIds,
+            firstPost.id,
+            created.id,
+            dto.attachmentClaimToken,
+            tx,
+          );
+        }
 
-      return [created, updatedTicket] as const;
-    });
+        const updatedTicket = await tx.ticket.update({
+          where: { id: created.id },
+          data: {
+            mask: formatTicketMask(created.id),
+            ...(dto.attachmentIds?.length ? { hasAttachments: true } : {}),
+          },
+        });
+
+        return [created, updatedTicket] as const;
+      });
+      updated = transactionTicket;
+    } catch (err) {
+      // Concurrent delivery: the partial unique index is the final arbiter. The
+      // losing transaction is fully rolled back; return the winning ticket and
+      // skip recipients, audit, events and autoresponder.
+      if (incomingMessageId && this.isUniqueConstraintViolation(err)) {
+        const existing = await this.findTicketByInboundMessageId(incomingMessageId);
+        if (existing) return existing;
+      }
+      throw err;
+    }
 
     const ticket = updated;
     const mask = updated.mask;
-
-    // Link attachment orphans to the first post (if any attachmentIds were supplied)
-    if (dto.attachmentIds?.length && this.attachmentsService) {
-      const firstPost = await this.prisma.ticketPost.findFirst({
-        where: { ticketId: ticket.id },
-        orderBy: { id: 'asc' },
-      });
-      if (firstPost) {
-        await this.attachmentsService.linkToPost(
-          dto.attachmentIds,
-          firstPost.id,
-          ticket.id,
-          dto.attachmentClaimToken,
-        );
-        await this.prisma.ticket.update({ where: { id: ticket.id }, data: { hasAttachments: true } });
-      }
-    }
 
     // Persist CC/BCC recipients
     const allRecipients = [
@@ -472,36 +536,12 @@ export class TicketsService {
     if (dto.attachmentIds?.length && !dto.attachmentClaimToken) {
       throw new BadRequestException('attachmentClaimToken is required when attachmentIds are provided');
     }
+    if (dto.attachmentIds?.length && !this.attachmentsService) {
+      throw new BadRequestException('Attachment service is unavailable');
+    }
 
     const now = new Date();
-
-    const post = await this.prisma.ticketPost.create({
-      data: {
-        ticketId,
-        authorType: 'USER',
-        staffId: null,
-        userId: ticket.userId,
-        fullName: ticket.requesterName ?? undefined,
-        // Identity is taken from the ticket/session, never from the request body.
-        email: ticket.requesterEmail ?? undefined,
-        subject: ticket.subject,
-        contents: dto.contents,
-        isHtml: false,
-        creationMode: 'WEB',
-        ipAddress: '0.0.0.0',
-      },
-    });
-
-    // Link attachment orphans to the new post
-    const hasPublicAttachments = !!(dto.attachmentIds?.length && this.attachmentsService);
-    if (hasPublicAttachments && this.attachmentsService) {
-      await this.attachmentsService.linkToPost(
-        dto.attachmentIds!,
-        post.id,
-        ticketId,
-        dto.attachmentClaimToken,
-      );
-    }
+    const hasPublicAttachments = Boolean(dto.attachmentIds?.length);
 
     // Reopen the ticket if it was resolved — a customer reply must re-surface it
     // to staff. Reset to the default status and clear resolved markers.
@@ -515,15 +555,43 @@ export class TicketsService {
         }
       : {};
 
-    await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: {
-        totalReplies: { increment: 1 },
-        lastReplyAt: now,
-        lastActivityAt: now,
-        ...(hasPublicAttachments && { hasAttachments: true }),
-        ...reopenData,
-      },
+    const post = await this.prisma.$transaction(async (tx) => {
+      const createdPost = await tx.ticketPost.create({
+        data: {
+          ticketId,
+          authorType: 'USER',
+          staffId: null,
+          userId: ticket.userId,
+          fullName: ticket.requesterName ?? undefined,
+          // Identity is taken from the ticket/session, never from the request body.
+          email: ticket.requesterEmail ?? undefined,
+          subject: ticket.subject,
+          contents: dto.contents,
+          isHtml: false,
+          creationMode: 'WEB',
+          ipAddress: '0.0.0.0',
+        },
+      });
+      if (hasPublicAttachments && this.attachmentsService) {
+        await this.attachmentsService.linkToPost(
+          dto.attachmentIds!,
+          createdPost.id,
+          ticketId,
+          dto.attachmentClaimToken,
+          tx,
+        );
+      }
+      await tx.ticket.update({
+        where: { id: ticketId },
+        data: {
+          totalReplies: { increment: 1 },
+          lastReplyAt: now,
+          lastActivityAt: now,
+          ...(hasPublicAttachments && { hasAttachments: true }),
+          ...reopenData,
+        },
+      });
+      return createdPost;
     });
 
     await this.writeAudit(ticketId, 'REPLY', undefined, 'USER', {});
@@ -681,14 +749,29 @@ export class TicketsService {
     ticketId: number,
     // creationMode/ipAddress are not on the public DTO (mass-assignment guard) — the
     // controller forces STAFF + real ip; inbound mail passes EMAIL explicitly.
-    dto: ReplyTicketDto & { creationMode?: CreationMode; ipAddress?: string },
+    dto: InternalReplyTicketInput,
     staffId?: number,
   ): Promise<TicketPost | TicketNote> {
+    const incomingMessageId = this.normalizeIncomingMessageId(dto.incomingMessageId);
+    if (dto.isNote) {
+      if (incomingMessageId) {
+        throw new BadRequestException('Inbound Message-ID cannot be assigned to an internal note');
+      }
+      return this.addNote(ticketId, dto.contents, staffId, dto.attachmentIds);
+    }
+
+    // Fast-path ordinary redelivery before doing any ticket/author work. The DB
+    // unique index remains the concurrency-safe arbiter below.
+    if (incomingMessageId) {
+      const existing = await this.findPostByInboundMessageId(incomingMessageId);
+      if (existing) return existing;
+    }
+
     const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
     if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
 
-    if (dto.isNote) {
-      return this.addNote(ticketId, dto.contents, staffId ?? undefined);
+    if (dto.attachmentIds?.length && !this.attachmentsService) {
+      throw new BadRequestException('Attachment service is unavailable');
     }
 
     const replyCreationMode: CreationMode = dto.creationMode ?? 'STAFF';
@@ -712,28 +795,7 @@ export class TicketsService {
       authorEmail = ticket.requesterEmail ?? undefined;
     }
 
-    const post = await this.prisma.ticketPost.create({
-      data: {
-        ticketId,
-        authorType: isStaffReply ? 'STAFF' : 'USER',
-        staffId,
-        fullName: authorName,
-        email: authorEmail,
-        subject: ticket.subject,
-        contents: dto.contents,
-        isHtml: dto.isHtml,
-        isEmailed: dto.isEmailed,
-        isThirdParty: dto.isThirdParty,
-        creationMode: replyCreationMode,
-        ipAddress: replyIp,
-      },
-    });
-
-    // Link attachment orphans to the new post
-    const hasNewAttachments = !!(dto.attachmentIds?.length && this.attachmentsService);
-    if (hasNewAttachments && this.attachmentsService) {
-      await this.attachmentsService.linkToPost(dto.attachmentIds!, post.id, ticketId);
-    }
+    const hasNewAttachments = Boolean(dto.attachmentIds?.length);
 
     // Reopen the ticket when a USER (customer) replies to a resolved/closed
     // ticket so it re-surfaces to staff. Staff replies must NOT reopen.
@@ -748,21 +810,61 @@ export class TicketsService {
           }
         : {};
 
-    await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: {
-        totalReplies: { increment: 1 },
-        lastReplyAt: now,
-        lastActivityAt: now,
-        // Mark first staff response time if not yet set
-        ...(firstResponse && { firstResponseAt: now }),
-        // Set hasAttachments if new attachments were linked
-        ...(hasNewAttachments && { hasAttachments: true }),
-        ...reopenData,
-      },
-    });
+    let post: TicketPost;
+    try {
+      post = await this.prisma.$transaction(async (tx) => {
+        const createdPost = await tx.ticketPost.create({
+          data: {
+            ticketId,
+            authorType: isStaffReply ? 'STAFF' : 'USER',
+            staffId,
+            fullName: authorName,
+            email: authorEmail,
+            subject: ticket.subject,
+            contents: dto.contents,
+            isHtml: dto.isHtml,
+            isEmailed: dto.isEmailed,
+            isThirdParty: dto.isThirdParty,
+            creationMode: replyCreationMode,
+            messageId: incomingMessageId,
+            ipAddress: replyIp,
+          },
+        });
 
-    await this.writeAudit(ticketId, 'REPLY', staffId ?? undefined, isStaffReply ? 'STAFF' : 'USER', {});
+        if (hasNewAttachments && this.attachmentsService) {
+          await this.attachmentsService.linkToPost(
+            dto.attachmentIds!,
+            createdPost.id,
+            ticketId,
+            undefined,
+            tx,
+          );
+        }
+
+        await tx.ticket.update({
+          where: { id: ticketId },
+          data: {
+            totalReplies: { increment: 1 },
+            lastReplyAt: now,
+            lastActivityAt: now,
+            // Mark first staff response time if not yet set
+            ...(firstResponse && { firstResponseAt: now }),
+            // Set hasAttachments if new attachments were linked
+            ...(hasNewAttachments && { hasAttachments: true }),
+            ...reopenData,
+          },
+        });
+
+        await this.writeAudit(ticketId, 'REPLY', staffId, isStaffReply ? 'STAFF' : 'USER', {}, tx);
+        return createdPost;
+      });
+    } catch (err) {
+      if (incomingMessageId && this.isUniqueConstraintViolation(err)) {
+        const existing = await this.findPostByInboundMessageId(incomingMessageId);
+        if (existing) return existing;
+      }
+      throw err;
+    }
 
     // Send outbound email to requester when a staff member replies (non-blocking)
     if (isStaffReply && ticket.requesterEmail) {
@@ -851,28 +953,34 @@ export class TicketsService {
     attachmentIds?: number[],
   ): Promise<TicketNote> {
     await this.findOrThrow(ticketId);
-    const note = await this.prisma.ticketNote.create({
-      data: { ticketId, staffId, contents },
-    });
-
-    // U1 fix: link any pre-uploaded attachment orphans to this note so they are
-    // not silently dropped (the original bug: addNote took no attachmentIds at all).
-    const hasNoteAttachments = !!(attachmentIds?.length && this.attachmentsService);
-    if (hasNoteAttachments && this.attachmentsService) {
-      await this.attachmentsService.linkToNote(attachmentIds!, note.id, ticketId);
+    if (attachmentIds?.length && !this.attachmentsService) {
+      throw new BadRequestException('Attachment service is unavailable');
     }
+    const hasNoteAttachments = Boolean(attachmentIds?.length);
 
-    await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: {
-        hasNotes: true,
-        lastActivityAt: new Date(),
-        ...(hasNoteAttachments && { hasAttachments: true }),
-      },
+    return this.prisma.$transaction(async (tx) => {
+      const note = await tx.ticketNote.create({
+        data: { ticketId, staffId, contents },
+      });
+
+      // Link the attachment rows in the same transaction as both the note and
+      // ticket metadata, so a failed adoption cannot leave a partial note.
+      if (hasNoteAttachments && this.attachmentsService) {
+        await this.attachmentsService.linkToNote(attachmentIds!, note.id, ticketId, tx);
+      }
+
+      await tx.ticket.update({
+        where: { id: ticketId },
+        data: {
+          hasNotes: true,
+          lastActivityAt: new Date(),
+          ...(hasNoteAttachments && { hasAttachments: true }),
+        },
+      });
+
+      await this.writeAudit(ticketId, 'NOTE', staffId, 'STAFF', {}, tx);
+      return note;
     });
-
-    await this.writeAudit(ticketId, 'NOTE', staffId, 'STAFF', {});
-    return note;
   }
 
   // ─────────────────────────── Assign ───────────────────────────
@@ -1663,6 +1771,52 @@ export class TicketsService {
       throw new BadRequestException(`Staff ${staffId} is disabled and cannot be assigned`);
   }
 
+  /** Normalize an untrusted RFC header before it reaches the idempotency index. */
+  private normalizeIncomingMessageId(messageId?: string): string | undefined {
+    const normalized = messageId?.trim();
+    if (!normalized) return undefined;
+    // RFC 5322 caps a physical line at 998 characters; reject pathological
+    // parser input instead of persisting an unbounded idempotency key.
+    const body = normalized.slice(1, -1);
+    const hasForbiddenCharacter = [...body].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return (
+        character === '<' ||
+        character === '>' ||
+        /\s/u.test(character) ||
+        codePoint <= 0x1f ||
+        codePoint === 0x7f
+      );
+    });
+    if (
+      normalized.length > 998 ||
+      !normalized.startsWith('<') ||
+      !normalized.endsWith('>') ||
+      body.length === 0 ||
+      hasForbiddenCharacter
+    ) {
+      throw new BadRequestException('Invalid inbound Message-ID');
+    }
+    return normalized;
+  }
+
+  private findPostByInboundMessageId(messageId: string): Promise<TicketPost | null> {
+    return this.prisma.ticketPost.findFirst({ where: { messageId } });
+  }
+
+  private async findTicketByInboundMessageId(messageId: string): Promise<Ticket | null> {
+    const post = await this.prisma.ticketPost.findFirst({
+      where: { messageId },
+      select: { ticketId: true },
+    });
+    if (!post) return null;
+    return this.prisma.ticket.findUnique({ where: { id: post.ticketId } });
+  }
+
+  private isUniqueConstraintViolation(err: unknown): boolean {
+    return (err as { code?: unknown } | null)?.code === 'P2002';
+  }
+
   private async defaultStatusId(): Promise<number> {
     const s = await this.prisma.ticketStatus.findFirst({ where: { isDefault: true } });
     if (!s) throw new BadRequestException('No default ticket status configured');
@@ -1682,8 +1836,10 @@ export class TicketsService {
     staffId: number | undefined,
     actorType: ActorType,
     opts: { field?: string; oldValue?: string | null; newValue?: string | null },
+    transaction?: Prisma.TransactionClient,
   ): Promise<void> {
-    await this.prisma.ticketAuditLog.create({
+    const client = transaction ?? this.prisma;
+    await client.ticketAuditLog.create({
       data: {
         ticketId,
         staffId: staffId ?? null,

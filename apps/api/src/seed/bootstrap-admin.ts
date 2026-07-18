@@ -72,10 +72,10 @@ export async function bootstrapAdmin(
   // bootstrap credentials are configured (or are intentionally removed later).
   const adminGroup = await ensureStandardGroups(db);
 
-  const email = env.TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL?.trim();
-  const password = env.TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD?.trim();
+  const rawEmail = env.TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL;
+  const password = env.TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD;
 
-  if (!email || !password) {
+  if (rawEmail === undefined && password === undefined) {
     console.log(
       '[bootstrap-admin] TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL or TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD ' +
         'not set — skipping bootstrap admin creation.',
@@ -83,29 +83,26 @@ export async function bootstrapAdmin(
     return;
   }
 
+  const email = rawEmail?.trim() ?? '';
+  if (!email || password === undefined || password.length === 0) {
+    throw new Error('[bootstrap-admin] Both bootstrap administrator credentials must be supplied');
+  }
+
   // Guard against an unfilled .env.prod placeholder or a non-email value — never
   // create a garbage-email admin (the email column is unique, which would then
   // block creating the real admin later).
   if (email.includes('<<<') || password.includes('<<<') || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-    console.warn(
-      `[bootstrap-admin] Skipping — TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL is not a valid email (got "${email}"). ` +
-        'Fill the .env.prod placeholder and redeploy.',
-    );
-    return;
+    throw new Error('[bootstrap-admin] Bootstrap administrator email is invalid');
   }
 
   // E4: refuse weak/demo bootstrap passwords — this account is a real production
   // administrator, never the seed demo credential.
   const WEAK = new Set(['demo1234', 'password', 'admin', 'changeme', 'change-me']);
-  if (password.length < 12 || WEAK.has(password.toLowerCase())) {
-    console.warn(
-      '[bootstrap-admin] Skipping — TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD is too weak ' +
-        '(min 12 chars, not a known default like demo1234). Set a strong password and redeploy.',
-    );
-    return;
+  if (password.length < 12 || password.trim().length < 12 || WEAK.has(password.toLowerCase())) {
+    throw new Error('[bootstrap-admin] Bootstrap administrator password is too weak');
   }
 
-  console.log(`[bootstrap-admin] Ensuring staff account for <${email}>…`);
+  console.log('[bootstrap-admin] Ensuring configured staff account…');
 
   // ── 2. Ensure the staff account exists ────────────────────────────────────
   //
@@ -116,7 +113,7 @@ export async function bootstrapAdmin(
   const existing = await db.staff.findUnique({ where: { email } });
 
   if (existing) {
-    console.log(`[bootstrap-admin] Staff <${email}> already exists (id=${existing.id}) — no changes made.`);
+    console.log(`[bootstrap-admin] Configured staff already exists (id=${existing.id}) — no changes made.`);
     return;
   }
 
@@ -145,10 +142,7 @@ export async function bootstrapAdmin(
     },
   });
 
-  console.log(
-    `[bootstrap-admin] Created staff account <${staff.email}> (id=${staff.id}, ` +
-      `username="${staff.username}") in StaffGroup id=${adminGroup.id}.`,
-  );
+  console.log(`[bootstrap-admin] Created staff id=${staff.id} in StaffGroup id=${adminGroup.id}.`);
 }
 
 async function main(): Promise<void> {

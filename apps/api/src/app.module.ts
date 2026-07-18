@@ -34,6 +34,7 @@ import { PrismaExceptionFilter } from './common/prisma-exception.filter';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { PermissionsGuard } from './auth/permissions.guard';
 import { CsrfGuard } from './auth/csrf.guard';
+import { PublicSecurityModule } from './security/public-security.module';
 
 const config = loadConfig();
 const redisUrl = new URL(config.REDIS_URL);
@@ -79,6 +80,7 @@ const redisUrl = new URL(config.REDIS_URL);
 
     // Feature modules
     AuthModule,
+    PublicSecurityModule,
     ClientAuthModule,
     StaffModule,
     UsersModule,

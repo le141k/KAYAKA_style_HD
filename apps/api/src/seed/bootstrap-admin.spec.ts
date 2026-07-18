@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { bootstrapAdmin, ensureStandardGroups } from './bootstrap-admin';
+import { hashPassword } from '../auth/password.util';
 
 vi.mock('../auth/password.util', () => ({
   hashPassword: vi.fn().mockResolvedValue('hashed-password'),
@@ -57,5 +58,48 @@ describe('bootstrapAdmin', () => {
     await ensureStandardGroups(db as never);
 
     expect(db.staffGroup.create).not.toHaveBeenCalled();
+  });
+
+  it('fails explicitly when supplied credentials are incomplete, invalid, or weak', async () => {
+    await expect(
+      bootstrapAdmin({ TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL: 'admin@example.com' }, makeDb() as never),
+    ).rejects.toThrow('Both bootstrap administrator credentials');
+    await expect(
+      bootstrapAdmin(
+        {
+          TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL: 'admin@',
+          TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD: 'a-strong-password',
+        },
+        makeDb() as never,
+      ),
+    ).rejects.toThrow('email is invalid');
+    await expect(
+      bootstrapAdmin(
+        {
+          TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL: 'admin@example.com',
+          TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD: '            ',
+        },
+        makeDb() as never,
+      ),
+    ).rejects.toThrow('password is too weak');
+  });
+
+  it('normalizes the email but preserves the exact password bytes', async () => {
+    const db = makeDb();
+    db.staff.findUnique.mockResolvedValue(null);
+    db.staff.create.mockResolvedValue({ id: 42 });
+    const hashPasswordMock = vi.mocked(hashPassword);
+    hashPasswordMock.mockClear();
+
+    await bootstrapAdmin(
+      {
+        TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL: '  Admin@Example.com  ',
+        TELECOM_HD_BOOTSTRAP_ADMIN_PASSWORD: '  strong-password-123  ',
+      },
+      db as never,
+    );
+
+    expect(hashPasswordMock).toHaveBeenCalledWith('  strong-password-123  ');
+    expect(db.staff.findUnique).toHaveBeenNthCalledWith(1, { where: { email: 'Admin@Example.com' } });
   });
 });

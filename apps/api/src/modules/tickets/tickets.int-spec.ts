@@ -27,10 +27,18 @@ let PostgreSqlContainerCtor: typeof PostgreSqlContainer;
 
 let container: StartedPostgreSqlContainer;
 let app: INestApplication;
-let request: ReturnType<typeof supertest>;
+let staffRequest: ReturnType<typeof supertest.agent>;
+let publicRequest: ReturnType<typeof supertest>;
+let csrfToken: string;
 
-/** JWT token for the admin staff (obtained via /auth/login after seeding). */
-let adminToken: string;
+function csrfCookieFrom(response: supertest.Response): string {
+  const raw = response.headers['set-cookie'];
+  const setCookies = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  const csrfCookie = setCookies.find((value) => /^(?:th_csrf|__Host-th_csrf)=/.test(value));
+  const value = csrfCookie?.split(';', 1)[0]?.split('=', 2)[1];
+  if (!value) throw new Error('Login did not issue a CSRF cookie');
+  return decodeURIComponent(value);
+}
 
 beforeAll(async () => {
   // ── 1. Start a Postgres container ──────────────────────────────────────────
@@ -72,16 +80,20 @@ beforeAll(async () => {
   app.setGlobalPrefix('api');
   await app.init();
 
-  request = supertest(app.getHttpServer());
+  staffRequest = supertest.agent(app.getHttpServer());
+  publicRequest = supertest(app.getHttpServer());
 
-  // ── 5. Log in as admin to get JWT ───────────────────────────────────────────
-  const loginRes = await request
+  // ── 5. Log in as admin with the browser cookie contract ─────────────────────
+  const loginRes = await staffRequest
     .post('/api/auth/login')
+    .set('Origin', 'http://localhost:3000')
     .send({ email: 'admin@23telecom.example', password: 'demo1234' })
     .expect(200);
 
-  adminToken = (loginRes.body as { accessToken: string }).accessToken;
-  expect(adminToken).toBeTruthy();
+  expect(loginRes.body).toHaveProperty('staff');
+  expect(loginRes.body).not.toHaveProperty('accessToken');
+  expect(loginRes.body).not.toHaveProperty('refreshToken');
+  csrfToken = csrfCookieFrom(loginRes);
 }, 120_000);
 
 afterAll(async () => {
@@ -102,10 +114,11 @@ describe('Tickets integration', () => {
    * create route. Returns 201 with the full ticket object including mask.
    */
   it('POST /api/tickets/public — creates a ticket (public portal)', async () => {
-    const res = await request
+    const res = await publicRequest
       .post('/api/tickets/public')
       .send({
         subject: 'Integration test ticket',
+        challengeToken: 'integration-test-bypass',
         contents: 'This is the initial post body.',
         requesterEmail: 'inttest@example.com',
         requesterName: 'Integration Tester',
@@ -122,10 +135,7 @@ describe('Tickets integration', () => {
   });
 
   it('GET /api/tickets/:id — retrieves the created ticket with posts', async () => {
-    const res = await request
-      .get(`/api/tickets/${ticketId}`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .expect(200);
+    const res = await staffRequest.get(`/api/tickets/${ticketId}`).expect(200);
 
     const body = res.body as {
       id: number;
@@ -140,9 +150,10 @@ describe('Tickets integration', () => {
   });
 
   it('POST /api/tickets/:id/reply — adds a staff reply', async () => {
-    await request
+    await staffRequest
       .post(`/api/tickets/${ticketId}/reply`)
-      .set('Authorization', `Bearer ${adminToken}`)
+      .set('Origin', 'http://localhost:3000')
+      .set('X-CSRF-Token', csrfToken)
       .send({
         contents: 'This is a staff reply.',
         isHtml: false,
@@ -154,10 +165,7 @@ describe('Tickets integration', () => {
   });
 
   it('GET /api/tickets/:id — now has 2 posts and totalReplies incremented after reply', async () => {
-    const res = await request
-      .get(`/api/tickets/${ticketId}`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .expect(200);
+    const res = await staffRequest.get(`/api/tickets/${ticketId}`).expect(200);
 
     const body = res.body as { posts: unknown[]; totalReplies: number };
     expect(body.posts).toHaveLength(2);
@@ -165,10 +173,7 @@ describe('Tickets integration', () => {
   });
 
   it('GET /api/tickets — lists tickets with pagination', async () => {
-    const res = await request
-      .get('/api/tickets?page=1&limit=10')
-      .set('Authorization', `Bearer ${adminToken}`)
-      .expect(200);
+    const res = await staffRequest.get('/api/tickets?page=1&limit=10').expect(200);
 
     const body = res.body as { data: unknown[]; total: number };
     expect(Array.isArray(body.data)).toBe(true);
@@ -176,9 +181,10 @@ describe('Tickets integration', () => {
   });
 
   it('PATCH /api/tickets/:id/status — changes status', async () => {
-    const res = await request
+    const res = await staffRequest
       .patch(`/api/tickets/${ticketId}/status`)
-      .set('Authorization', `Bearer ${adminToken}`)
+      .set('Origin', 'http://localhost:3000')
+      .set('X-CSRF-Token', csrfToken)
       .send({ statusId: 2 }) // Pending
       .expect(200);
 
@@ -187,9 +193,10 @@ describe('Tickets integration', () => {
   });
 
   it('POST /api/tickets/public — creates a second ticket without auth', async () => {
-    const res = await request
+    const res = await publicRequest
       .post('/api/tickets/public')
       .send({
+        challengeToken: 'integration-test-bypass',
         subject: 'Public portal ticket',
         contents: 'Submitted from the client portal.',
         requesterEmail: 'portal@external.example',

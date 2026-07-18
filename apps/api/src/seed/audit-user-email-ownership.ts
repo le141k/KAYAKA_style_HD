@@ -27,8 +27,8 @@ const prisma = new PrismaClient();
 const SAMPLE_LIMIT = 500;
 
 /**
- * ASCII whitespace set trimmed by `btrim()`, kept identical to JS `String.prototype.trim()`
- * (space, tab, LF, CR, FF, VT) so the DB and `normalizeEmail` agree on "normalized". Bound as a
+ * ASCII whitespace set trimmed by `btrim()`, kept identical to the explicit set in
+ * `normalizeEmail` (space, tab, LF, CR, FF, VT). Bound as a
  * query parameter so the exact byte set — not a shell/JS-escaping accident — reaches Postgres.
  */
 const WS = ' \t\n\r\f\v';
@@ -167,11 +167,11 @@ export async function auditUserEmailOwnership(client: PrismaClient = prisma): Pr
     totals,
     // "clean" ⇒ the DB-level case-insensitive UNIQUE(email) invariant can be enforced safely.
     // (linkable/orphan tickets do NOT block it — they are an ownership-completeness signal.)
-    clean: totals.ambiguousGroups === 0 && totals.unnormalizedRows === 0,
+    clean: totals.duplicateGroups === 0 && totals.unnormalizedRows === 0,
   };
 }
 
-function printReport(a: OwnershipAudit): void {
+function printReport(a: OwnershipAudit, includePii = false, showStrictVerdict = true): void {
   console.log('\n=== S2-2 UserEmail ownership audit ===');
   console.log(
     `duplicate email groups: ${a.totals.duplicateGroups} ` +
@@ -182,47 +182,70 @@ function printReport(a: OwnershipAudit): void {
   console.log(`unlinked tickets — linkable  (email → 1 user):    ${a.totals.linkableTickets}`);
   console.log(`unlinked tickets — orphan    (email → 0 users):   ${a.totals.unlinkedTickets}`);
 
-  if (a.duplicateEmailGroups.length) {
+  if (!includePii) {
+    console.log('PII samples omitted (use --include-pii only in a restricted operator session).');
+  }
+  if (includePii && a.duplicateEmailGroups.length) {
     console.log('\n-- duplicate email groups (resolve before enforcing UNIQUE) --');
     for (const g of a.duplicateEmailGroups) {
       const tag = g.userCount > 1 ? 'AMBIGUOUS' : 'variants';
       console.log(`  [${tag}] ${g.email} — rows=${g.rowCount} users=${g.userIds.join(',')}`);
     }
   }
-  if (a.ambiguousTickets.length) {
+  if (includePii && a.ambiguousTickets.length) {
     console.log('\n-- ambiguous tickets (email owned by multiple users) --');
     for (const t of a.ambiguousTickets) {
       console.log(`  ${t.mask} (#${t.ticketId}) — ${t.email} → ${t.userCount} users`);
     }
   }
-  if (a.linkableTickets.length) {
+  if (includePii && a.linkableTickets.length) {
     console.log('\n-- linkable tickets (email → 1 user; the migration backfills these) --');
     for (const t of a.linkableTickets) {
       console.log(`  ${t.mask} (#${t.ticketId}) — ${t.email}`);
     }
   }
-  if (a.unlinkedTickets.length) {
+  if (includePii && a.unlinkedTickets.length) {
     console.log('\n-- orphan tickets (email not registered to any user) --');
     for (const t of a.unlinkedTickets) {
       console.log(`  ${t.mask} (#${t.ticketId}) — ${t.email}`);
     }
   }
-  console.log(
-    `\n${a.clean ? 'CLEAN — the case-insensitive UNIQUE(email) invariant can be enforced.' : 'NOT CLEAN — resolve the duplicate/un-normalized rows above before enforcing UNIQUE(email).'}\n`,
-  );
+  if (showStrictVerdict) {
+    console.log(
+      `\n${a.clean ? 'CLEAN — the case-insensitive UNIQUE(email) invariant can be enforced.' : 'NOT CLEAN — resolve the duplicate/un-normalized rows above before enforcing UNIQUE(email).'}\n`,
+    );
+  }
+}
+
+/**
+ * Before the normalization migration, unique case/whitespace variants are safe:
+ * that migration normalizes them automatically. Any normalized duplicate group
+ * still blocks because two rows would collide under the final unique invariant.
+ */
+export function isPreMigrationOwnershipClean(audit: OwnershipAudit): boolean {
+  return audit.totals.duplicateGroups === 0;
 }
 
 // Run standalone.
 if (require.main === module) {
   auditUserEmailOwnership()
     .then((audit) => {
-      printReport(audit);
+      const preMigration = process.argv.includes('--pre-migration');
+      printReport(audit, process.argv.includes('--include-pii'), !preMigration);
+      const clean = preMigration ? isPreMigrationOwnershipClean(audit) : audit.clean;
+      if (preMigration) {
+        console.log(
+          clean
+            ? 'CLEAN — safe variants may be normalized by the pending migration.'
+            : 'NOT CLEAN — resolve every normalized duplicate group before migration.',
+        );
+      }
       // Exit non-zero when NOT CLEAN so CI / a go-live gate FAILS instead of silently
       // passing while ambiguous/un-normalized ownership remains (blocker: audit exit code).
-      void prisma.$disconnect().finally(() => process.exit(audit.clean ? 0 : 1));
+      void prisma.$disconnect().finally(() => process.exit(clean ? 0 : 1));
     })
-    .catch((err: unknown) => {
-      console.error('Ownership audit error:', err);
+    .catch(() => {
+      console.error('Ownership audit failed; no row data was printed.');
       void prisma.$disconnect().finally(() => process.exit(1));
     });
 }

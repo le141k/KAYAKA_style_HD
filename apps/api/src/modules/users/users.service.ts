@@ -2,13 +2,14 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 import { PrismaService } from '../../prisma/prisma.service';
 import { AdminService } from '../admin/admin.service';
 import { normalizeEmail } from '../../common/email.util';
+import { lockClientIdentity } from '../../common/client-auth-lock';
 import type { CreateUserDto, UpdateUserDto, ListUsersQueryDto, AddEmailDto } from './dto';
-import type { User, UserEmail } from '@prisma/client';
+import type { Prisma, User, UserEmail } from '@prisma/client';
 
 export type UserWithEmails = User & { emails: UserEmail[] };
 
 /** Safe user — strips passwordHash. */
-export type SafeUser = Omit<User, 'passwordHash'> & { emails: UserEmail[] };
+export type SafeUser = Omit<User, 'passwordHash' | 'clientAuthVersion'> & { emails: UserEmail[] };
 
 const SAFE_USER_SELECT = {
   id: true,
@@ -34,6 +35,26 @@ export class UsersService {
     private readonly prisma: PrismaService,
     private readonly adminService: AdminService,
   ) {}
+
+  /** Caller must hold the per-user client-auth advisory xact lock. */
+  private async bumpAndRevokeClientAuth(
+    tx: Prisma.TransactionClient,
+    userId: number,
+    now = new Date(),
+  ): Promise<void> {
+    await tx.user.update({
+      where: { id: userId },
+      data: { clientAuthVersion: { increment: 1 } },
+    });
+    await tx.clientLoginToken.updateMany({
+      where: { userId, usedAt: null },
+      data: { usedAt: now },
+    });
+    await tx.clientSession.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: now },
+    });
+  }
 
   async list(query: ListUsersQueryDto): Promise<{ data: SafeUser[]; total: number }> {
     const { page, limit, search, organizationId, email } = query;
@@ -160,7 +181,11 @@ export class UsersService {
   }
 
   async update(id: number, dto: UpdateUserDto): Promise<SafeUser> {
-    await this.get(id);
+    const existing = await this.prisma.user.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    if (!existing) throw new NotFoundException(`User ${id} not found`);
 
     // Validate + encrypt custom fields against USER scope definitions (if provided)
     let cf = dto.customFields as Record<string, unknown> | undefined;
@@ -169,54 +194,88 @@ export class UsersService {
       cf = await this.adminService.encryptCustomFields('USER', cf);
     }
 
-    return this.prisma.user.update({
-      where: { id },
-      data: {
-        ...dto,
-        ...(cf !== undefined ? { customFields: cf as object } : {}),
-      } as Parameters<typeof this.prisma.user.update>[0]['data'],
-      select: SAFE_USER_SELECT,
+    const data = {
+      ...dto,
+      ...(cf !== undefined ? { customFields: cf as object } : {}),
+    } as Parameters<typeof this.prisma.user.update>[0]['data'];
+
+    if (dto.isEnabled === undefined) {
+      return this.prisma.user.update({ where: { id }, data, select: SAFE_USER_SELECT });
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      await lockClientIdentity(tx, id);
+      const current = await tx.user.findUnique({ where: { id }, select: { isEnabled: true } });
+      if (!current) throw new NotFoundException(`User ${id} not found`);
+      const enabledChanged = current.isEnabled !== dto.isEnabled;
+      const updated = await tx.user.update({
+        where: { id },
+        data: {
+          ...data,
+          ...(enabledChanged && { clientAuthVersion: { increment: 1 } }),
+        },
+        select: SAFE_USER_SELECT,
+      });
+      if (enabledChanged) {
+        const now = new Date();
+        await tx.clientLoginToken.updateMany({
+          where: { userId: id, usedAt: null },
+          data: { usedAt: now },
+        });
+        await tx.clientSession.updateMany({
+          where: { userId: id, revokedAt: null },
+          data: { revokedAt: now },
+        });
+      }
+      return updated;
     });
   }
 
   async addEmail(userId: number, dto: AddEmailDto): Promise<UserEmail> {
     await this.get(userId);
     const email = normalizeEmail(dto.email); // S2-2: normalize before conflict check + insert
-    const conflict = await this.prisma.userEmail.findUnique({ where: { email } });
-    if (conflict) throw new ConflictException(`Email ${email} already in use`);
+    return this.prisma.$transaction(async (tx) => {
+      await lockClientIdentity(tx, userId);
+      const conflict = await tx.userEmail.findUnique({ where: { email } });
+      if (conflict) throw new ConflictException(`Email ${email} already in use`);
 
-    if (dto.isPrimary) {
-      // Demote existing primary
-      await this.prisma.userEmail.updateMany({
-        where: { userId, isPrimary: true },
-        data: { isPrimary: false },
-      });
-    }
-
-    return this.prisma.userEmail.create({ data: { userId, ...dto, email } });
+      if (dto.isPrimary) {
+        await tx.userEmail.updateMany({
+          where: { userId, isPrimary: true },
+          data: { isPrimary: false },
+        });
+      }
+      const created = await tx.userEmail.create({ data: { userId, ...dto, email } });
+      await this.bumpAndRevokeClientAuth(tx, userId);
+      return created;
+    });
   }
 
   async removeEmail(userId: number, emailId: number): Promise<void> {
-    const record = await this.prisma.userEmail.findFirst({
-      where: { id: emailId, userId },
+    await this.prisma.$transaction(async (tx) => {
+      await lockClientIdentity(tx, userId);
+      const record = await tx.userEmail.findFirst({ where: { id: emailId, userId } });
+      if (!record) throw new NotFoundException(`Email ${emailId} not found on user ${userId}`);
+      if (record.isPrimary) {
+        throw new ConflictException('Cannot remove primary email; set another email as primary first');
+      }
+      await tx.userEmail.delete({ where: { id: emailId } });
+      await this.bumpAndRevokeClientAuth(tx, userId);
     });
-    if (!record) throw new NotFoundException(`Email ${emailId} not found on user ${userId}`);
-    if (record.isPrimary) {
-      throw new ConflictException('Cannot remove primary email; set another email as primary first');
-    }
-    await this.prisma.userEmail.delete({ where: { id: emailId } });
   }
 
   async setPrimaryEmail(userId: number, emailId: number): Promise<void> {
-    const record = await this.prisma.userEmail.findFirst({ where: { id: emailId, userId } });
-    if (!record) throw new NotFoundException(`Email ${emailId} not found on user ${userId}`);
+    await this.prisma.$transaction(async (tx) => {
+      await lockClientIdentity(tx, userId);
+      const record = await tx.userEmail.findFirst({ where: { id: emailId, userId } });
+      if (!record) throw new NotFoundException(`Email ${emailId} not found on user ${userId}`);
 
-    await this.prisma.$transaction([
-      this.prisma.userEmail.updateMany({
+      await tx.userEmail.updateMany({
         where: { userId, isPrimary: true },
         data: { isPrimary: false },
-      }),
-      this.prisma.userEmail.update({ where: { id: emailId }, data: { isPrimary: true } }),
-    ]);
+      });
+      await tx.userEmail.update({ where: { id: emailId }, data: { isPrimary: true } });
+      await this.bumpAndRevokeClientAuth(tx, userId);
+    });
   }
 }

@@ -5,7 +5,6 @@ import { useRouter, usePathname } from 'next/navigation';
 import Link from 'next/link';
 import { Loader2 } from 'lucide-react';
 import { ThemeToggle } from '@/components/premium/ThemeToggle';
-import { hasToken } from '@/lib/api';
 import { useMe } from '@/lib/hooks/use-auth';
 import { ADMIN_TAB_PERMISSIONS, hasPermission, hasAnyPermission } from '@/lib/auth/permissions';
 
@@ -38,18 +37,15 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
       hasPermission(user, ADMIN_TAB_PERMISSIONS[tab.href]!),
   );
 
-  // `useMe` is disabled during SSR (hasToken() false) but enabled on the
-  // authenticated client, so SSR renders null while the first client paint
-  // renders the spinner → hydration mismatch (#418). Gate on `mounted`.
+  // Gate on `mounted` so SSR and the first client paint agree while `/auth/me`
+  // resolves the HttpOnly-cookie session.
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
   useEffect(() => {
     if (isLoading) return;
 
-    // hasToken() reads the non-sensitive th_authed presence marker (the JWT lives
-    // only in HttpOnly cookies, unreadable from JS).
-    if (!hasToken() || isError) {
+    if (isError) {
       router.replace('/login');
       return;
     }

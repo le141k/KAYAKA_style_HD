@@ -19,15 +19,9 @@ Two ready-to-use configs live in this directory:
 certificates via ACME HTTP-01 out of the box. No manual cert provisioning, no
 cron jobs.
 
-**How to run** — add a `caddy` service to a compose override file and join it
-to the prod network (full snippet is in the Caddyfile comments), then:
-
-```bash
-docker compose \
-  -f docker-compose.prod.yml \
-  -f docker-compose.proxy.yml \
-  --env-file .env.prod up -d
-```
+**How to run:** do not start this override ad hoc. First complete the internal-only release with
+`scripts/deploy-prod.sh`, document the approved edge topology/trusted proxy ranges, and enable the
+reviewed override only through the HTTPS edge gate in `docs/DEPLOY.md`.
 
 Set `DOMAIN=help.example.com` in `.env.prod`. The `{$DOMAIN}` placeholder is
 expanded by Caddy at startup.
@@ -65,7 +59,7 @@ break:
    does this automatically) so the API's CORS middleware sees the real domain.
 
 2. **HttpOnly session cookies** — Authentication relies on `Set-Cookie` headers
-   with `HttpOnly; Secure; SameSite=Strict`. Neither proxy strips `Set-Cookie`
+   with `HttpOnly; Secure; SameSite=Lax`. Neither proxy strips `Set-Cookie`
    or `Cookie` by default; do **not** add any header-hiding rules for those
    headers.
 

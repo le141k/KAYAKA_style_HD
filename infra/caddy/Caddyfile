@@ -1,37 +1,6 @@
-# 23 Telecom Help Desk — Caddy reverse proxy with automatic TLS (Let's Encrypt).
-#
-# HOW TO RUN (as an extra compose service):
-#
-#   Add the following to a docker-compose.override.yml (or a separate
-#   docker-compose.proxy.yml) in the repo root, then bring it up alongside
-#   the prod compose:
-#
-#     services:
-#       caddy:
-#         image: caddy:2-alpine
-#         restart: unless-stopped
-#         ports:
-#           - "80:80"
-#           - "443:443"
-#           - "443:443/udp"     # HTTP/3
-#         volumes:
-#           - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-#           - caddy_data:/data
-#           - caddy_config:/config
-#         networks:
-#           - telecom-hd-prod_default   # join the prod compose network
-#     volumes:
-#       caddy_data:
-#       caddy_config:
-#
-#   Then:
-#     docker compose \
-#       -f docker-compose.prod.yml \
-#       -f docker-compose.proxy.yml \
-#       --env-file .env.prod up -d
-#
-# DOMAIN: set DOMAIN in .env.prod (e.g. DOMAIN=help.example.com).
-# Caddy resolves it automatically; no separate cert management needed.
+# REFERENCE EDGE ONLY. It publishes the application and is not started by
+# scripts/deploy-prod.sh. Follow docs/DEPLOY.md's HTTPS edge gate; review the
+# exact proxy-hop/client-IP and firewall topology before enabling this file.
 #
 # COOKIES / AUTH: Caddy forwards Set-Cookie headers untouched by default.
 # The API sets HttpOnly + Secure session cookies — do not add header transforms
@@ -56,7 +25,8 @@
             # Caddy handles the Upgrade header automatically when the upstream
             # speaks WS; no extra config required.
 
-            # Do NOT strip: Cookie, Set-Cookie (HttpOnly auth session cookies).
+            # Do NOT strip: Cookie, Set-Cookie (HttpOnly auth session cookies),
+            # X-CSRF-Token, or X-Turnstile-Token. reverse_proxy forwards them.
         }
     }
 
@@ -100,9 +70,10 @@
     encode gzip zstd
 
     # ----------------------------------------------------------------
-    # Upload size limit — match the API's 25 MB multer limit.
+    # Whole-request cap: API accepts at most 50 MB of files; leave bounded room
+    # for multipart framing. Per-file/per-request/inbound limits remain in API.
     # ----------------------------------------------------------------
     request_body {
-        max_size 25MB
+        max_size 55MB
     }
 }

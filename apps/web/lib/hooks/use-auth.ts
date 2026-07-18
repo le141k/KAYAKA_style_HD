@@ -2,7 +2,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { usePathname } from 'next/navigation';
-import { api, hasToken } from '@/lib/api';
+import { api } from '@/lib/api';
 import type { User, LoginResponse } from '@/lib/types';
 import { deriveRole } from '@/lib/auth/permissions';
 
@@ -54,9 +54,10 @@ export function useMe() {
     },
     retry: false,
     staleTime: 5 * 60_000,
-    // Don't fire /auth/me when unauthenticated — avoids the noisy 401 on every
-    // public/unauthenticated page load. Layout guards check hasToken separately.
-    enabled: hasToken() && isStaffArea,
+    // Always resolve the server session inside protected areas. HttpOnly cookies
+    // are intentionally invisible to JS; `/auth/me` performs the single safe
+    // refresh retry when only the long-lived refresh cookie remains.
+    enabled: isStaffArea,
   });
 }
 
@@ -98,19 +99,22 @@ export function useLogin() {
 export function useLogout() {
   const qc = useQueryClient();
   return {
-    logout: () => {
-      // Tell the server to revoke refresh tokens and clear the HttpOnly cookies.
-      // Fire-and-forget: we redirect regardless of the result.
-      void api.post('/auth/logout', {}).catch(() => undefined);
-      if (typeof window !== 'undefined') {
-        localStorage.removeItem('auth_token');
-        localStorage.removeItem('refresh_token');
-        document.cookie = 'th_authed=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
-        // Clear the legacy non-HttpOnly token cookie too, in case it lingers.
-        document.cookie = 'auth_token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+    logout: async () => {
+      try {
+        // Await the server-side revoke/Set-Cookie response. keepalive prevents a
+        // navigation/unload from aborting the only operation that can clear HttpOnly cookies.
+        await api.post('/auth/logout', {}, { keepalive: true });
+      } finally {
+        if (typeof window !== 'undefined') {
+          localStorage.removeItem('auth_token');
+          localStorage.removeItem('refresh_token');
+          document.cookie = 'th_authed=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+          // Clear the legacy non-HttpOnly token cookie too, in case it lingers.
+          document.cookie = 'auth_token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+        }
+        qc.clear();
+        window.location.href = '/login';
       }
-      qc.clear();
-      window.location.href = '/login';
     },
   };
 }

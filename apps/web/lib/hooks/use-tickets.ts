@@ -364,6 +364,7 @@ export function useBulkTicketAction() {
 
 // Public (unauthenticated) submission from the client portal → POST /tickets/public.
 export interface PublicTicketInput {
+  challengeToken: string;
   subject: string;
   contents: string;
   requesterEmail: string;

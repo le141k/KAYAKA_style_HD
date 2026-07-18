@@ -19,12 +19,22 @@ import type { PostgreSqlContainer, StartedPostgreSqlContainer } from '@testconta
 let PostgreSqlContainerCtor: typeof PostgreSqlContainer;
 let container: StartedPostgreSqlContainer;
 let app: INestApplication;
-let request: ReturnType<typeof supertest>;
-let adminToken: string;
+let staffRequest: ReturnType<typeof supertest.agent>;
+let webhookRequest: ReturnType<typeof supertest>;
+let csrfToken: string;
 
 const INBOUND_SECRET = 'inbound-dev-secret-change-me-0000';
 const CLIENT_EMAIL = 'carrier-noc@acme-telecom.example';
 const FIRST_MESSAGE_ID = '<inbound-int-1@acme-telecom.example>';
+
+function csrfCookieFrom(response: supertest.Response): string {
+  const raw = response.headers['set-cookie'];
+  const setCookies = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  const csrfCookie = setCookies.find((value) => /^(?:th_csrf|__Host-th_csrf)=/.test(value));
+  const value = csrfCookie?.split(';', 1)[0]?.split('=', 2)[1];
+  if (!value) throw new Error('Login did not issue a CSRF cookie');
+  return decodeURIComponent(value);
+}
 
 /** A real multipart/alternative MIME message (text + html). */
 function buildMime(messageId: string, inReplyTo?: string): string {
@@ -53,10 +63,7 @@ function buildMime(messageId: string, inReplyTo?: string): string {
 }
 
 async function listTicketsByRequester(email: string): Promise<Array<{ id: number; requesterEmail: string }>> {
-  const res = await request
-    .get('/api/tickets?page=1&limit=100')
-    .set('Authorization', `Bearer ${adminToken}`)
-    .expect(200);
+  const res = await staffRequest.get('/api/tickets?page=1&limit=100').expect(200);
   const body = res.body as { data: Array<{ id: number; requesterEmail: string }> };
   return body.data.filter((t) => t.requesterEmail === email);
 }
@@ -92,13 +99,18 @@ beforeAll(async () => {
   app = moduleRef.createNestApplication();
   app.setGlobalPrefix('api');
   await app.init();
-  request = supertest(app.getHttpServer());
+  staffRequest = supertest.agent(app.getHttpServer());
+  webhookRequest = supertest(app.getHttpServer());
 
-  const loginRes = await request
+  const loginRes = await staffRequest
     .post('/api/auth/login')
+    .set('Origin', 'http://localhost:3000')
     .send({ email: 'admin@23telecom.example', password: 'demo1234' })
     .expect(200);
-  adminToken = (loginRes.body as { accessToken: string }).accessToken;
+  expect(loginRes.body).toHaveProperty('staff');
+  expect(loginRes.body).not.toHaveProperty('accessToken');
+  expect(loginRes.body).not.toHaveProperty('refreshToken');
+  csrfToken = csrfCookieFrom(loginRes);
 }, 120_000);
 
 afterAll(async () => {
@@ -110,27 +122,26 @@ describe('Inbound mail integration (A2 + A4)', () => {
   let clientTicketId: number;
 
   it('rejects the webhook without the shared secret', async () => {
-    await request
+    await webhookRequest
       .post('/api/inbound/pipe')
-      .send({ raw: buildMime(FIRST_MESSAGE_ID) })
+      .set('Content-Type', 'message/rfc822')
+      .send(buildMime(FIRST_MESSAGE_ID))
       .expect(403);
   });
 
   it('A2 — a delivered email creates a CLIENT ticket with the parsed body', async () => {
-    await request
+    await webhookRequest
       .post('/api/inbound/pipe')
       .set('x-inbound-secret', INBOUND_SECRET)
-      .send({ raw: buildMime(FIRST_MESSAGE_ID) })
+      .set('Content-Type', 'message/rfc822')
+      .send(buildMime(FIRST_MESSAGE_ID))
       .expect(202);
 
     const mine = await listTicketsByRequester(CLIENT_EMAIL);
     expect(mine).toHaveLength(1);
     clientTicketId = mine[0]!.id;
 
-    const detail = await request
-      .get(`/api/tickets/${clientTicketId}`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .expect(200);
+    const detail = await staffRequest.get(`/api/tickets/${clientTicketId}`).expect(200);
     const body = detail.body as {
       subject: string;
       creationMode: string;
@@ -142,37 +153,37 @@ describe('Inbound mail integration (A2 + A4)', () => {
   });
 
   it('A3 — re-delivering the same Message-ID creates no duplicate', async () => {
-    await request
+    await webhookRequest
       .post('/api/inbound/pipe')
       .set('x-inbound-secret', INBOUND_SECRET)
-      .send({ raw: buildMime(FIRST_MESSAGE_ID) })
+      .set('Content-Type', 'message/rfc822')
+      .send(buildMime(FIRST_MESSAGE_ID))
       .expect(202);
     const mine = await listTicketsByRequester(CLIENT_EMAIL);
     expect(mine).toHaveLength(1); // still one
   });
 
   it('A3 — a reply (In-Reply-To) threads onto the same ticket, no new ticket', async () => {
-    await request
+    await webhookRequest
       .post('/api/inbound/pipe')
       .set('x-inbound-secret', INBOUND_SECRET)
-      .send({ raw: buildMime('<inbound-int-2@acme-telecom.example>', FIRST_MESSAGE_ID) })
+      .set('Content-Type', 'message/rfc822')
+      .send(buildMime('<inbound-int-2@acme-telecom.example>', FIRST_MESSAGE_ID))
       .expect(202);
 
     const mine = await listTicketsByRequester(CLIENT_EMAIL);
     expect(mine).toHaveLength(1); // threaded, not a new ticket
 
-    const detail = await request
-      .get(`/api/tickets/${clientTicketId}`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .expect(200);
+    const detail = await staffRequest.get(`/api/tickets/${clientTicketId}`).expect(200);
     const body = detail.body as { posts: unknown[] };
     expect(body.posts.length).toBeGreaterThanOrEqual(2); // original + threaded reply
   });
 
   it('A4 — spawning a supplier creates a linked SUPPLIER ticket (two-way TicketLink)', async () => {
-    const spawn = await request
+    const spawn = await staffRequest
       .post(`/api/tickets/${clientTicketId}/spawn-supplier`)
-      .set('Authorization', `Bearer ${adminToken}`)
+      .set('Origin', 'http://localhost:3000')
+      .set('X-CSRF-Token', csrfToken)
       .send({
         supplierEmail: 'noc@sinch.example',
         supplierName: 'Sinch',
@@ -185,18 +196,12 @@ describe('Inbound mail integration (A2 + A4)', () => {
     expect(supplierTicketId).not.toBe(clientTicketId);
 
     // Client side shows a supplier link to the new ticket.
-    const clientLinks = await request
-      .get(`/api/tickets/${clientTicketId}/links`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .expect(200);
+    const clientLinks = await staffRequest.get(`/api/tickets/${clientTicketId}/links`).expect(200);
     const cl = clientLinks.body as Array<{ linkType: string; ticket: { id: number } }>;
     expect(cl.some((l) => l.ticket.id === supplierTicketId && l.linkType === 'supplier')).toBe(true);
 
     // Supplier ticket exists and is a distinct ticket from the client one.
-    const supplierDetail = await request
-      .get(`/api/tickets/${supplierTicketId}`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .expect(200);
+    const supplierDetail = await staffRequest.get(`/api/tickets/${supplierTicketId}`).expect(200);
     const sd = supplierDetail.body as { requesterEmail: string };
     expect(sd.requesterEmail).toBe('noc@sinch.example');
   });

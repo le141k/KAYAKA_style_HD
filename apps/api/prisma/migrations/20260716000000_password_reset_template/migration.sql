@@ -1,8 +1,8 @@
 -- GOAL_PUBLIC_SECURITY S1-4: provision the `password_reset` email template in every
 -- environment. The production seed does not run, so without this row the reset flow
 -- rendered the empty JSON fallback (and, combined with the mail-DI bug, logged the raw
--- reset URL instead of emailing it). Idempotent upsert — safe on already-seeded dev DBs
--- and safe to re-run.
+-- reset URL instead of emailing it). Provision only when absent: production templates
+-- are admin-editable and a schema deployment must never overwrite their content.
 INSERT INTO "EmailTemplate" ("key", "locale", "subject", "htmlBody", "textBody", "updatedAt")
 VALUES (
   'password_reset',
@@ -23,8 +23,4 @@ VALUES (
     || E'reset, you can safely ignore this email — your password will not change.',
   now()
 )
-ON CONFLICT ("key", "locale") DO UPDATE
-  SET "subject"  = EXCLUDED."subject",
-      "htmlBody" = EXCLUDED."htmlBody",
-      "textBody" = EXCLUDED."textBody",
-      "updatedAt" = now();
+ON CONFLICT ("key", "locale") DO NOTHING;

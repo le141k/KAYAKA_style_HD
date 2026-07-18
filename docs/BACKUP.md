@@ -1,227 +1,135 @@
-# Backup & Restore Runbook — 23 Telecom Help Desk
+# Backup and restore runbook — 23 Telecom Help Desk
 
-Covers: PostgreSQL database (`telecom_hd`) and the uploads file volume (`uploads`).
-
----
+PostgreSQL and the `uploads` volume form one application-data recovery pair. A deployment rollback
+also needs the matching Redis/BullMQ snapshot recorded by `scripts/deploy-prod.sh`; treat the three
+artifacts as one triplet because queued external side effects must not be separated from DB state.
 
 ## Prerequisites
 
-- Docker and Docker Compose installed on the prod host.
-- `.env.prod` present and populated (all `TELECOM_HD_DB_*` vars set).
-- Scripts are executable: `chmod +x scripts/db-backup.sh scripts/db-restore.sh`
-- The production stack is running: `docker compose -f docker-compose.prod.yml --env-file .env.prod ps`
-
----
-
-## 1. Taking a Database Backup
+- run from the clean production checkout with owner-only `.env.prod`;
+- Docker Engine, Docker Compose and `flock` installed;
+- the immutable API image named by `TELECOM_HD_RELEASE` already built;
+- backup destination mounted, encrypted and writable only by the production operator;
+- scripts executable:
 
 ```bash
-# One-shot backup (keeps last 14 dumps by default)
-./scripts/db-backup.sh
-
-# Keep last 30 dumps instead
-./scripts/db-backup.sh --keep 30
-
-# Write backups to a custom directory (e.g. a mounted NAS)
-./scripts/db-backup.sh --backups-dir /mnt/nas/telecom-hd-backups
+chmod +x scripts/web-build-id.sh scripts/validate-uploads-archive.sh \
+  scripts/db-backup.sh scripts/db-verify-backup.sh scripts/db-restore.sh \
+  scripts/uploads-backup.sh scripts/uploads-verify-backup.sh scripts/uploads-restore.sh
 ```
 
-What the script does:
+Every helper uses the same non-blocking host lock, `umask 077`, partial files and atomic rename.
+Never run two deploy/backup/restore operations concurrently.
 
-1. Sources `.env.prod` for `TELECOM_HD_DB_NAME` and `TELECOM_HD_DB_USER`.
-2. Runs `pg_dump -Fc` inside the `postgres` container via `docker compose exec -T`.
-3. Pipes output through `gzip` to `backups/<dbname>_<YYYYMMDDTHHMMSSz>.dump.gz`.
-4. Deletes the oldest `.dump.gz` files beyond the keep limit.
+## Take a consistent backup pair
 
-Backup files are in **custom format** (`-Fc`), which is compressed and supports parallel restore.
-
----
-
-## 2. Backing up the Uploads Volume
-
-The `uploads` Docker volume (`telecom-hd-prod_uploads`) stores user-attached files. Back it up separately:
+First close ingress and stop every application writer. The exact edge command depends on the
+approved topology; the base production Compose file intentionally has no public edge.
 
 ```bash
-# Create a timestamped tar archive of the uploads volume
-TIMESTAMP=$(date -u '+%Y%m%dT%H%M%SZ')
-mkdir -p backups
-
-docker run --rm \
-  -v telecom-hd-prod_uploads:/data:ro \
-  -v "$(pwd)/backups":/backup \
-  busybox \
-  tar czf "/backup/uploads_${TIMESTAMP}.tar.gz" -C /data .
-
-echo "Uploads backup: backups/uploads_${TIMESTAMP}.tar.gz"
+export TELECOM_HD_WEB_BUILD_ID="$(./scripts/web-build-id.sh .env.prod)"
+docker compose --profile scanner -f docker-compose.prod.yml --env-file .env.prod stop -t 30 api web
+./scripts/db-backup.sh --keep 30 --backups-dir /mnt/backup/telecom-hd
+./scripts/uploads-backup.sh --keep 30 --backups-dir /mnt/backup/telecom-hd
 ```
 
-Retention: prune old tarballs the same way as DB dumps:
+`db-backup.sh` runs `pg_dump -Fc` and writes
+`<dbname>_<UTC timestamp>.dump.gz`. `uploads-backup.sh` uses a one-off container from the immutable,
+unprivileged API image and writes `uploads_<UTC timestamp>.tar.gz`; it does not depend on the main
+API container being online.
+
+Record the two exact filenames as a pair. Copy both off-host before a migration or destructive
+operator action. A database dump and uploads archive taken while writes continue can each be valid
+but are not guaranteed to agree with each other.
+
+The internal deploy helper performs this quiescence, backup and restore proof automatically for an
+existing release.
+
+## Prove both backups are restorable
+
+Do not test a restore against production. The verification helpers create disposable targets and
+remove them on exit:
 
 ```bash
-# Keep last 14 uploads backups
-ls -1t backups/uploads_*.tar.gz | tail -n +15 | xargs -r rm -f
+POSTGRES_VERIFY_IMAGE=postgres:16.14-alpine3.23 \
+  ./scripts/db-verify-backup.sh /mnt/backup/telecom-hd/telecom_hd_<timestamp>.dump.gz
+
+UPLOADS_VERIFY_IMAGE='telecom-hd-api:REPLACE_WITH_TELECOM_HD_RELEASE' \
+  ./scripts/uploads-verify-backup.sh /mnt/backup/telecom-hd/uploads_<timestamp>.tar.gz
 ```
 
-> **Offsite storage**: copy both `*.dump.gz` and `uploads_*.tar.gz` to an offsite location
-> (S3, rclone, rsync to a remote host) after each backup run.
+The database proof performs a real single-transaction `pg_restore` and requires completed Prisma
+migration history. The uploads proof checks gzip/tar readability, extracts into a disposable Docker
+volume and inventories the restored regular files. `scripts/validate-uploads-archive.sh` rejects
+absolute/traversal paths, links and special files before any target volume is touched. A successful
+command is necessary but does not replace offsite-copy monitoring or periodic recovery drills.
 
----
+## Restore a matched pair or deployment triplet
 
-## 3. Scheduling Backups with Cron
+Restore is destructive and must be an attended maintenance operation. Keep management access that
+does not depend on the application edge. Close ingress first and keep all writers stopped.
 
-Add to the crontab of the prod-server user (run `crontab -e`):
+For a routine DB/uploads recovery, verify both artifacts with the commands above. For a failed
+deployment, first read the owner-only `recovery-manifest.txt` from its unique deployment backup
+directory and keep BullMQ paused. Do not restore only DB/uploads while allowing a post-cutover Redis
+queue to run; finish forward or plan restoration of the manifest's preserved Redis rollback volume
+and old image IDs as described in `docs/DEPLOY.md`.
+
+1. Verify both file artifacts with the commands above.
+2. Restore the database:
+
+   ```bash
+   ./scripts/db-restore.sh /mnt/backup/telecom-hd/telecom_hd_<timestamp>.dump.gz
+   ```
+
+3. Restore the uploads volume:
+
+   ```bash
+   ./scripts/uploads-restore.sh /mnt/backup/telecom-hd/uploads_<timestamp>.tar.gz
+   ```
+
+Both destructive helpers require typing `YES`. The uploads helper rejects traversal, links and
+special files, proves the archive in a disposable volume, stops known project writers/edges, takes
+one last safety archive, restores ownership, and deliberately leaves services stopped.
+
+After both restores, start only the internal stack and verify it before reopening any edge:
+
+```bash
+export TELECOM_HD_WEB_BUILD_ID="$(./scripts/web-build-id.sh .env.prod)"
+docker compose --profile scanner -f docker-compose.prod.yml --env-file .env.prod up -d --no-build
+docker compose --profile scanner -f docker-compose.prod.yml --env-file .env.prod exec -T api \
+  node dist/seed/audit-user-email-ownership.js
+docker compose --profile scanner -f docker-compose.prod.yml --env-file .env.prod exec -T api \
+  node dist/seed/audit-attachment-storage.js
+docker compose --profile scanner -f docker-compose.prod.yml --env-file .env.prod exec -T api \
+  node dist/seed/audit-production-readiness.js
+```
+
+Check API/web/database/scanner health and the expected migration version, user/ticket/post counts,
+attachment aggregate counts/bytes and a representative owner-scoped download. Reopening the edge is
+a separate decision.
+
+Deployment recovery is fail-closed. Before the migration boundary, `deploy-prod.sh` reopens the old
+internal release only after it proves old API/web health and BullMQ resume. After the boundary it
+stops the new writers, keeps queues paused and ingress closed, and requires forward recovery or the
+exact manifest-recorded DB/uploads/Redis triplet. Its Redis restore rehearsal copies the candidate
+volume into a disposable clone, starts a disposable Redis with strict truncated-AOF rejection and
+compares the bounded aggregate BullMQ snapshot; it never tests by mounting the rollback volume
+read-write.
+
+## Scheduled backups
+
+Use an absolute repository path and an off-host destination. Stagger the two jobs only if business
+accepts that they are not a transactionally consistent pair; the preferred scheduled job briefly
+quiesces writers and runs both helpers under the shared operations lock.
+
+Example for independent daily archives:
 
 ```cron
-# Daily DB backup at 02:00 UTC, keep last 30
-0 2 * * * /path/to/repo/scripts/db-backup.sh --keep 30 --backups-dir /mnt/nas/telecom-hd-backups >> /var/log/telecom-hd-backup.log 2>&1
-
-# Daily uploads volume backup at 02:30 UTC
-30 2 * * * TIMESTAMP=$(date -u '+\%Y\%m\%dT\%H\%M\%SZ') && \
-  docker run --rm \
-    -v telecom-hd-prod_uploads:/data:ro \
-    -v /mnt/nas/telecom-hd-backups:/backup \
-    busybox tar czf "/backup/uploads_${TIMESTAMP}.tar.gz" -C /data . \
-  >> /var/log/telecom-hd-backup.log 2>&1
+0 2 * * * /srv/telecom-hd/scripts/db-backup.sh --keep 30 --backups-dir /mnt/backup/telecom-hd >> /var/log/telecom-hd-backup.log 2>&1
+30 2 * * * /srv/telecom-hd/scripts/uploads-backup.sh --keep 30 --backups-dir /mnt/backup/telecom-hd >> /var/log/telecom-hd-backup.log 2>&1
 ```
 
-Adjust the path and `--backups-dir` to match the prod host layout.
-
-Verify cron is running and logs are appearing:
-
-```bash
-tail -f /var/log/telecom-hd-backup.log
-```
-
----
-
-## 4. Restoring the Database
-
-> **WARNING**: Restore OVERWRITES ALL DATA in the target database. Take a fresh backup first.
-
-```bash
-# List available backups
-ls -lht backups/*.dump.gz
-
-# Restore a specific dump
-./scripts/db-restore.sh backups/telecom_hd_20260524T020001Z.dump.gz
-```
-
-The script will:
-
-1. Print a clear warning and ask you to type `YES` to confirm.
-2. Terminate active connections to the database.
-3. Decompress the `.dump.gz` on the host and pipe it to `pg_restore --clean` inside the container.
-4. Restore runs in a single transaction (`-1`): if it fails, the database is rolled back.
-
-After restore, restart the API so Prisma reconnects cleanly:
-
-```bash
-docker compose -f docker-compose.prod.yml --env-file .env.prod restart api
-```
-
-### Restoring the Uploads Volume
-
-```bash
-# Stop the API first to avoid writes during restore
-docker compose -f docker-compose.prod.yml --env-file .env.prod stop api
-
-# Clear the volume and restore
-docker run --rm \
-  -v telecom-hd-prod_uploads:/data \
-  -v "$(pwd)/backups":/backup:ro \
-  busybox \
-  sh -c "rm -rf /data/* && tar xzf /backup/uploads_20260524T020031Z.tar.gz -C /data"
-
-# Restart the API
-docker compose -f docker-compose.prod.yml --env-file .env.prod start api
-```
-
----
-
-## 5. Testing a Restore (Staging / Dry-Run)
-
-Never test a restore against the live prod database. Use a separate container:
-
-```bash
-# 1. Start a throwaway Postgres container
-docker run -d --name pg-restore-test \
-  -e POSTGRES_USER=telecom_hd \
-  -e POSTGRES_PASSWORD=testpass \
-  -e POSTGRES_DB=telecom_hd \
-  postgres:16-alpine
-
-# 2. Wait for it to be ready
-docker exec pg-restore-test pg_isready -U telecom_hd
-
-# 3. Restore the dump
-gunzip -c backups/telecom_hd_20260524T020001Z.dump.gz \
-  | docker exec -i pg-restore-test \
-      pg_restore \
-        -U telecom_hd \
-        -d telecom_hd \
-        --clean --if-exists --no-owner --no-acl -1 -Fc
-
-# 4. Verify (see section 6)
-docker exec -it pg-restore-test psql -U telecom_hd -d telecom_hd
-
-# 5. Tear down
-docker rm -f pg-restore-test
-```
-
----
-
-## 6. Verifying Backup Integrity
-
-### Check the dump file is readable
-
-```bash
-# List table of contents without extracting (fast sanity check)
-gunzip -c backups/telecom_hd_20260524T020001Z.dump.gz \
-  | pg_restore --list -Fc | head -40
-```
-
-A healthy dump prints a table-of-contents with schema, table, and index entries. An empty or
-corrupt file will produce an error immediately.
-
-### Row-count spot-check after restore (inside the test container)
-
-```bash
-docker exec -it pg-restore-test psql -U telecom_hd -d telecom_hd -c "
-  SELECT
-    (SELECT count(*) FROM \"User\")      AS users,
-    (SELECT count(*) FROM \"Ticket\")    AS tickets,
-    (SELECT count(*) FROM \"Message\")   AS messages,
-    (SELECT count(*) FROM \"Attachment\") AS attachments;
-"
-```
-
-Compare these counts against known-good numbers from a recent prod query or the monitoring
-dashboard. A restore that produces all-zero counts despite a recent active database is a red flag.
-
-### Schema version check
-
-```bash
-docker exec -it pg-restore-test psql -U telecom_hd -d telecom_hd -c "
-  SELECT migration_name, finished_at
-  FROM \"_prisma_migrations\"
-  ORDER BY finished_at DESC
-  LIMIT 5;
-"
-```
-
-The latest migration in the dump should match the latest migration currently in `apps/api/prisma/migrations/`.
-
----
-
-## 7. Quick Reference
-
-| Task                    | Command                                             |
-| ----------------------- | --------------------------------------------------- |
-| Take a backup now       | `./scripts/db-backup.sh`                            |
-| Take a backup, keep 30  | `./scripts/db-backup.sh --keep 30`                  |
-| List backups            | `ls -lht backups/*.dump.gz`                         |
-| Restore a dump          | `./scripts/db-restore.sh backups/<file>.dump.gz`    |
-| Backup uploads volume   | See section 2                                       |
-| Restore uploads volume  | See section 4                                       |
-| Verify dump readable    | `gunzip -c <file> \| pg_restore --list -Fc \| head` |
-| Test restore (isolated) | See section 5                                       |
+Alert on a missing/zero-size artifact, helper failure, offsite-copy failure, retention failure and a
+restore rehearsal that has not succeeded within the agreed recovery-test interval. Never put
+database passwords or the rendered Compose configuration in backup logs.

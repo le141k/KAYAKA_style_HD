@@ -7,6 +7,7 @@ import type { UsersService } from '../users/users.service';
 import type { SlaService } from '../sla/sla.service';
 import type { MailService } from '../mail/mail.service';
 import type { AdminService } from '../admin/admin.service';
+import type { AttachmentsService } from '../attachments/attachments.service';
 import type { EventEmitter2 } from '@nestjs/event-emitter';
 import type { Ticket } from '@prisma/client';
 
@@ -141,6 +142,7 @@ describe('TicketsService', () => {
   let service: TicketsService;
   let prisma: ReturnType<typeof makePrismaMock>;
   let users: UsersService;
+  let attachments: { linkToPost: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
     prisma = makePrismaMock();
@@ -161,6 +163,7 @@ describe('TicketsService', () => {
         .fn()
         .mockImplementation((_s: unknown, rows: unknown) => Promise.resolve(rows)),
     } as unknown as AdminService;
+    attachments = { linkToPost: vi.fn().mockResolvedValue(undefined) };
     service = new TicketsService(
       prisma as unknown as PrismaService,
       users,
@@ -168,6 +171,7 @@ describe('TicketsService', () => {
       eventEmitterMock,
       mailMock,
       adminMock,
+      attachments as unknown as AttachmentsService,
     );
   });
 
@@ -237,6 +241,42 @@ describe('TicketsService', () => {
       expect(prisma.$transaction).toHaveBeenCalled();
       const txArg = (prisma.$transaction as ReturnType<typeof vi.fn>).mock.calls[0]![0];
       expect(typeof txArg).toBe('function');
+    });
+
+    it('claims attachments inside the ticket transaction and sets hasAttachments atomically', async () => {
+      const mockTicket = makeTicket({ id: 42, mask: 'TT-PENDING' });
+      (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
+      (prisma.ticketPriority.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 2 });
+      (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...mockTicket,
+        posts: [{ id: 77 }],
+      });
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...mockTicket,
+        mask: 'TT-000042',
+        hasAttachments: true,
+      });
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      await service.createTicket({
+        subject: 'Atomic claim',
+        contents: 'Body',
+        isHtml: false,
+        departmentId: 1,
+        requesterEmail: 'test@example.com',
+        requesterName: 'Test',
+        tags: [],
+        customFields: {},
+        attachmentIds: [9],
+        attachmentClaimToken: 'claim',
+      });
+
+      expect(attachments.linkToPost).toHaveBeenCalledWith([9], 77, 42, 'claim', prisma);
+      expect(prisma.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ mask: 'TT-000042', hasAttachments: true }),
+        }),
+      );
     });
 
     it('throws if no default status is configured', async () => {

@@ -51,3 +51,12 @@ secrets.md
 
 # Redis snapshot files (e.g. from a local redis-server used for testing)
 *.rdb
+
+# VM-owned runtime state and backup artifacts — never sync/commit with a release
+backups/
+**/backups/
+uploads/
+**/uploads/
+*.dump
+*.dump.gz
+*.tar.gz

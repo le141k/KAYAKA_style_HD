@@ -48,7 +48,7 @@ export class PrismaExceptionFilter implements ExceptionFilter {
         return;
       }
       default: {
-        this.logger.error(`Unhandled Prisma error ${exception.code}: ${exception.message}`);
+        this.logger.error(`Unhandled Prisma error ${exception.code}`);
         res.status(HttpStatus.INTERNAL_SERVER_ERROR).json({
           statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
           message: 'Internal server error',

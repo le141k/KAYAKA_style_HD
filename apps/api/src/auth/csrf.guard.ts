@@ -1,6 +1,20 @@
 import { CanActivate, ExecutionContext, ForbiddenException, Inject, Injectable } from '@nestjs/common';
 import type { Request } from 'express';
 import { AppConfig, APP_CONFIG } from '../config/configuration';
+import {
+  DEV_ACCESS_TOKEN_COOKIE,
+  DEV_REFRESH_TOKEN_COOKIE,
+  LEGACY_PROD_REFRESH_TOKEN_COOKIE,
+  PROD_ACCESS_TOKEN_COOKIE,
+  PROD_REFRESH_TOKEN_COOKIE,
+  readCookie,
+} from './auth.cookies';
+import { CsrfService } from './csrf.service';
+import {
+  DEV_CLIENT_SESSION_COOKIE,
+  LEGACY_PROD_CLIENT_SESSION_COOKIE,
+  PROD_CLIENT_SESSION_COOKIE,
+} from '../modules/client-auth/client-auth.cookies';
 
 /** Methods that cannot change state and never need CSRF protection. */
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
@@ -22,15 +36,18 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
  *  - Otherwise the request's `Origin` (or, if absent, `Referer`) must EXACTLY equal the
  *    configured app origin — strict allowlist, no wildcard subdomains. Mismatch → 403.
  *
- * This is the Origin-validation half of S3-5; the signed double-submit token layer and
- * `__Host-` cookie hardening (S3-6) land with the cookie-only/same-origin foundation
- * (S1-6/7). `SameSite=Lax` on the auth cookies remains an independent second barrier.
+ * Cookie-authenticated mutations additionally require a signed double-submit token in
+ * both the readable CSRF cookie and `X-CSRF-Token`. Login/refresh/client-verify require
+ * exact-origin validation even before a credential cookie exists, preventing login CSRF.
  */
 @Injectable()
 export class CsrfGuard implements CanActivate {
   private readonly allowedOrigin: string;
 
-  constructor(@Inject(APP_CONFIG) config: AppConfig) {
+  constructor(
+    @Inject(APP_CONFIG) config: AppConfig,
+    private readonly csrf: CsrfService,
+  ) {
     this.allowedOrigin = new URL(config.TELECOM_HD_PUBLIC_URL).origin;
   }
 
@@ -43,17 +60,70 @@ export class CsrfGuard implements CanActivate {
     const auth = req.headers['authorization'];
     if (typeof auth === 'string' && auth.startsWith('Bearer ')) return true;
 
-    // No ambient cookie credential ⇒ nothing for CSRF to abuse (covers webhooks too).
+    // No ambient cookie credential normally means nothing for CSRF to abuse (covers
+    // shared-secret webhooks). Cookie-establishing auth endpoints are the exception:
+    // they still require exact origin so an attacker cannot log a victim into the
+    // attacker's staff/client account with a cross-site form submission.
     const cookieHeader = req.headers['cookie'];
-    if (!cookieHeader || !/(?:^|;\s*)(?:th_access|th_client|th_refresh)=/.test(cookieHeader)) {
+    if (!this.hasAuthCookie(cookieHeader)) {
+      if (this.establishesBrowserSession(req)) {
+        if (this.requestOriginMatches(req)) return true;
+        throw new ForbiddenException('CSRF validation failed: cross-origin request rejected');
+      }
       return true;
     }
 
-    // Cookie-authenticated mutation: require an exact same-origin Origin/Referer.
-    if (this.originMatches(req.headers['origin']) || this.originMatches(req.headers['referer'])) {
-      return true;
+    // Cookie-authenticated mutation: require exact origin AND signed double-submit.
+    if (!this.requestOriginMatches(req)) {
+      throw new ForbiddenException('CSRF validation failed: cross-origin request rejected');
     }
-    throw new ForbiddenException('CSRF validation failed: cross-origin request rejected');
+    if (!this.csrf.isValid(this.csrf.cookieFromHeader(cookieHeader), req.headers['x-csrf-token'])) {
+      // Give the same-origin browser client a machine-readable reason so it can
+      // safely mint a fresh token and retry.  The guard rejects the request
+      // before the controller runs, so this specific retry cannot duplicate a
+      // completed mutation.
+      throw new ForbiddenException({
+        statusCode: 403,
+        error: 'Forbidden',
+        message: 'CSRF validation failed: token missing or invalid',
+        code: 'CSRF_TOKEN_INVALID',
+      });
+    }
+    return true;
+  }
+
+  private hasAuthCookie(header: string | undefined): boolean {
+    return [
+      DEV_ACCESS_TOKEN_COOKIE,
+      PROD_ACCESS_TOKEN_COOKIE,
+      DEV_REFRESH_TOKEN_COOKIE,
+      LEGACY_PROD_REFRESH_TOKEN_COOKIE,
+      PROD_REFRESH_TOKEN_COOKIE,
+      DEV_CLIENT_SESSION_COOKIE,
+      LEGACY_PROD_CLIENT_SESSION_COOKIE,
+      PROD_CLIENT_SESSION_COOKIE,
+    ].some((name) => readCookie(header, name) !== undefined);
+  }
+
+  private establishesBrowserSession(req: Request): boolean {
+    // Express routing is case-insensitive and non-strict by default, so the CSRF
+    // classification must normalize the same variants (`/LOGIN/` included).
+    const rawPath = (req.originalUrl || req.url || '').split('?')[0] ?? '';
+    const path = (rawPath.length > 1 ? rawPath.replace(/\/+$/, '') : rawPath).toLowerCase();
+    return [
+      '/api/auth/login',
+      '/auth/login',
+      '/api/auth/refresh',
+      '/auth/refresh',
+      '/api/client-auth/verify',
+      '/client-auth/verify',
+    ].includes(path);
+  }
+
+  private requestOriginMatches(req: Request): boolean {
+    // Prefer Origin when present; only fall back to Referer when Origin is absent.
+    const origin = req.headers['origin'];
+    return origin !== undefined ? this.originMatches(origin) : this.originMatches(req.headers['referer']);
   }
 
   private originMatches(header: string | string[] | undefined): boolean {

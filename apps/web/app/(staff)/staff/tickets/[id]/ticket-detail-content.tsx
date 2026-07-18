@@ -423,6 +423,9 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                     <FileUploadZone
                       uploadEndpoint="/attachments/upload"
                       onUploaded={(ids) => setReplyAttachmentIds((prev) => [...prev, ...ids])}
+                      onRemoved={(id) =>
+                        setReplyAttachmentIds((prev) => prev.filter((value) => value !== id))
+                      }
                       maxFiles={10}
                       className="text-sm"
                     />
@@ -473,6 +476,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                     <FileUploadZone
                       uploadEndpoint="/attachments/upload"
                       onUploaded={(ids) => setNoteAttachmentIds((prev) => [...prev, ...ids])}
+                      onRemoved={(id) => setNoteAttachmentIds((prev) => prev.filter((value) => value !== id))}
                       maxFiles={10}
                       className="text-sm"
                     />

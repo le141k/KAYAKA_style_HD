@@ -9,6 +9,8 @@ import { ClientPortalGuard } from './client-portal.guard';
 import { TokenBlocklistService } from './token-blocklist.service';
 import { SessionRevocationService } from './session-revocation.service';
 import { LoginThrottleService } from './login-throttle.service';
+import { CsrfService } from './csrf.service';
+import { PasswordResetThrottleService } from './password-reset-throttle.service';
 import { MailService } from '../modules/mail/mail.service';
 import { loadConfig, APP_CONFIG } from '../config/configuration';
 
@@ -46,6 +48,8 @@ const config = loadConfig();
     TokenBlocklistService,
     SessionRevocationService,
     LoginThrottleService,
+    PasswordResetThrottleService,
+    CsrfService,
   ],
   exports: [
     AuthService,
@@ -57,6 +61,7 @@ const config = loadConfig();
     JwtModule,
     APP_CONFIG,
     MAIL_SERVICE_TOKEN,
+    CsrfService,
   ],
 })
 export class AuthModule {}

@@ -186,9 +186,10 @@ export function ClientTicketDetail({ ticketId }: { ticketId: number }) {
               <Label className="text-xs text-muted-foreground">Вложения (необязательно)</Label>
               <FileUploadZone
                 ref={fileUploadRef}
-                uploadEndpoint="/attachments/upload/public"
+                uploadEndpoint="/attachments/upload/client"
                 claimToken={claimToken}
                 onUploaded={(ids) => setAttachmentIds((prev) => [...prev, ...ids])}
+                onRemoved={(id) => setAttachmentIds((prev) => prev.filter((value) => value !== id))}
                 accept="image/*,.pdf,.txt,.log,.pcap"
                 maxSizeMb={25}
                 maxFiles={5}

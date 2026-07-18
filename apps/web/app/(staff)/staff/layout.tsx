@@ -19,7 +19,6 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { getInitials } from '@/lib/utils';
-import { hasToken } from '@/lib/api';
 import { useLogout, useMe } from '@/lib/hooks/use-auth';
 import { useI18n } from '@/lib/i18n';
 import { ADMIN_AREA_PERMISSIONS, ROLE_LABEL, hasAnyPermission } from '@/lib/auth/permissions';
@@ -32,20 +31,15 @@ export default function StaffLayout({ children }: { children: React.ReactNode })
   const router = useRouter();
   const { data: user, isLoading, isError } = useMe();
 
-  // `useMe` is `enabled: hasToken()`, which is false during SSR (no
-  // localStorage) but true on the client once authenticated. That makes the
-  // server render `null` while the first client paint renders the spinner —
-  // a hydration mismatch (#418). Gate on `mounted` so both render the loader
-  // first, then resolve auth purely on the client.
+  // Gate on `mounted` so SSR and the first client paint both render the loader,
+  // then resolve the HttpOnly-cookie session through `/auth/me`.
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
-  // Auth guard: redirect to /login if not authenticated / API returns error.
-  // hasToken() reads the non-sensitive th_authed presence marker (the JWT lives
-  // only in HttpOnly cookies, unreadable from JS).
+  // Auth guard: the API is authoritative; JS-readable marker expiry is not.
   useEffect(() => {
     if (isLoading) return;
-    if (!hasToken() || isError) {
+    if (isError) {
       router.replace('/login');
     }
   }, [isLoading, isError, router]);

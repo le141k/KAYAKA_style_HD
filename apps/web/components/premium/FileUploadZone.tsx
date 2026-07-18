@@ -4,6 +4,7 @@ import { useState, useCallback, useRef, useImperativeHandle, forwardRef } from '
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, X, FileText, CheckCircle2, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { fetchWithCsrf } from '@/lib/api';
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
@@ -26,11 +27,16 @@ interface FileUploadZoneProps {
   uploadEndpoint?: string;
   /** Called when files are successfully uploaded; receives the DB attachment ids */
   onUploaded?: (ids: number[]) => void;
+  /** Called when a completed upload is removed from the form. */
+  onRemoved?: (id: number) => void;
   /**
    * Per-session orphan-claim secret sent with each public upload. Bind orphan
    * attachments to the submit that follows so they can't be adopted by others.
    */
   claimToken?: string;
+  /** One-time action-bound challenge required by the anonymous public upload endpoint. */
+  challengeToken?: string;
+  onChallengeConsumed?: () => void;
   accept?: string;
   maxSizeMb?: number;
   maxFiles?: number;
@@ -38,7 +44,19 @@ interface FileUploadZoneProps {
 }
 
 export const FileUploadZone = forwardRef<FileUploadZoneHandle, FileUploadZoneProps>(function FileUploadZone(
-  { onFiles, uploadEndpoint, onUploaded, claimToken, accept = '*', maxSizeMb = 25, maxFiles = 10, className },
+  {
+    onFiles,
+    uploadEndpoint,
+    onUploaded,
+    onRemoved,
+    claimToken,
+    challengeToken,
+    onChallengeConsumed,
+    accept = '*',
+    maxSizeMb = 25,
+    maxFiles = 10,
+    className,
+  },
   ref,
 ) {
   const [isDragging, setIsDragging] = useState(false);
@@ -80,9 +98,12 @@ export const FileUploadZone = forwardRef<FileUploadZoneHandle, FileUploadZonePro
       // let the browser set the multipart boundary.
 
       try {
-        const res = await fetch(`${API_URL}${uploadEndpoint}`, {
+        const res = await fetchWithCsrf(`${API_URL}${uploadEndpoint}`, {
           method: 'POST',
           credentials: 'include',
+          headers: {
+            ...(challengeToken ? { 'x-turnstile-token': challengeToken } : {}),
+          },
           body: formData,
         });
 
@@ -110,9 +131,65 @@ export const FileUploadZone = forwardRef<FileUploadZoneHandle, FileUploadZonePro
         setUploads((prev) =>
           prev.map((u) => (u.id === upload.id ? { ...u, progress: 0, status: 'error' } : u)),
         );
+      } finally {
+        if (uploadEndpoint.endsWith('/public')) onChallengeConsumed?.();
       }
     },
-    [uploadEndpoint, onUploaded, claimToken],
+    [uploadEndpoint, onUploaded, claimToken, challengeToken, onChallengeConsumed],
+  );
+
+  const uploadBatch = useCallback(
+    async (batch: UploadedFile[]): Promise<void> => {
+      if (!uploadEndpoint) {
+        await Promise.all(batch.map(uploadFile));
+        return;
+      }
+      if (uploadEndpoint.endsWith('/public') && !challengeToken) {
+        setUploads((prev) =>
+          prev.map((item) =>
+            batch.some((candidate) => candidate.id === item.id)
+              ? { ...item, progress: 0, status: 'error' }
+              : item,
+          ),
+        );
+        return;
+      }
+
+      const formData = new FormData();
+      for (const item of batch) formData.append('files', item.file);
+      if (claimToken) formData.append('claimToken', claimToken);
+      try {
+        const res = await fetchWithCsrf(`${API_URL}${uploadEndpoint}`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            ...(challengeToken ? { 'x-turnstile-token': challengeToken } : {}),
+          },
+          body: formData,
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as { attachments: { id: number }[] } | { attachmentIds: number[] };
+        const ids = 'attachments' in data ? data.attachments.map((a) => a.id) : data.attachmentIds;
+        setUploads((prev) =>
+          prev.map((item) => {
+            const index = batch.findIndex((candidate) => candidate.id === item.id);
+            return index === -1 ? item : { ...item, progress: 100, status: 'done', attachmentId: ids[index] };
+          }),
+        );
+        onUploaded?.(ids);
+      } catch {
+        setUploads((prev) =>
+          prev.map((item) =>
+            batch.some((candidate) => candidate.id === item.id)
+              ? { ...item, progress: 0, status: 'error' }
+              : item,
+          ),
+        );
+      } finally {
+        if (uploadEndpoint.endsWith('/public')) onChallengeConsumed?.();
+      }
+    },
+    [challengeToken, claimToken, onChallengeConsumed, onUploaded, uploadEndpoint, uploadFile],
   );
 
   const processFiles = useCallback(
@@ -125,7 +202,7 @@ export const FileUploadZone = forwardRef<FileUploadZoneHandle, FileUploadZonePro
       if (validFiles.length === 0) return;
 
       const newUploads: UploadedFile[] = validFiles.map((file) => ({
-        id: `${Date.now()}-${file.name}`,
+        id: crypto.randomUUID(),
         file,
         progress: 0,
         status: 'uploading',
@@ -134,12 +211,11 @@ export const FileUploadZone = forwardRef<FileUploadZoneHandle, FileUploadZonePro
       setUploads((prev) => [...prev, ...newUploads]);
       onFiles?.(validFiles);
 
-      // Upload each file
-      newUploads.forEach((upload) => {
-        void uploadFile(upload);
-      });
+      // Public challenges are single-use, so anonymous files are sent in one bounded request.
+      if (uploadEndpoint?.endsWith('/public')) void uploadBatch(newUploads);
+      else newUploads.forEach((upload) => void uploadFile(upload));
     },
-    [maxFiles, maxSizeMb, onFiles, uploads.length, uploadFile],
+    [maxFiles, maxSizeMb, onFiles, uploads.length, uploadBatch, uploadEndpoint, uploadFile],
   );
 
   const onDrop = useCallback(
@@ -151,9 +227,14 @@ export const FileUploadZone = forwardRef<FileUploadZoneHandle, FileUploadZonePro
     [processFiles],
   );
 
-  const removeFile = useCallback((id: string) => {
-    setUploads((prev) => prev.filter((u) => u.id !== id));
-  }, []);
+  const removeFile = useCallback(
+    (id: string) => {
+      const removed = uploads.find((upload) => upload.id === id);
+      if (removed?.attachmentId !== undefined) onRemoved?.(removed.attachmentId);
+      setUploads((prev) => prev.filter((upload) => upload.id !== id));
+    },
+    [onRemoved, uploads],
+  );
 
   return (
     <div className={cn('space-y-3', className)}>
@@ -265,7 +346,8 @@ export const FileUploadZone = forwardRef<FileUploadZoneHandle, FileUploadZonePro
               <button
                 type="button"
                 onClick={() => removeFile(upload.id)}
-                className="flex-shrink-0 text-muted-foreground hover:text-foreground"
+                disabled={upload.status === 'uploading'}
+                className="flex-shrink-0 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                 aria-label={`Удалить ${upload.file.name}`}
               >
                 <X className="h-4 w-4" />

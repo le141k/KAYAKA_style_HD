@@ -6,9 +6,13 @@
 # (:1488) and SSH (:22) are reachable only over those.
 #
 # ⚠️ APPLY CAREFULLY — this sets input policy to DROP and CAN LOCK YOU OUT of SSH.
-#   Always apply behind a rollback timer, e.g.:
-#     sudo sh -c 'nft -f /path/helpdesk.nft && sleep 120 && nft flush ruleset' &
-#   then, in ANOTHER session, confirm SSH still works and KILL the rollback timer.
+#   Snapshot the exact current rules and schedule an exact restore (NEVER flush):
+#     sudo sh -c 'umask 077; nft list ruleset > /root/nft.before-helpdesk'
+#     sudo systemd-run --unit=helpdesk-firewall-rollback --on-active=120s \
+#       /bin/sh -c 'nft -f /root/nft.before-helpdesk'
+#     sudo nft -f /path/helpdesk.nft
+#   In ANOTHER session confirm SSH, then cancel the timer:
+#     sudo systemctl stop helpdesk-firewall-rollback.timer
 #   Persist only after confirming: sudo cp helpdesk.nft /etc/nftables.conf && systemctl enable --now nftables
 #
 # ⚠️ DOCKER CAVEAT — Docker publishes container ports via DNAT into the FORWARD

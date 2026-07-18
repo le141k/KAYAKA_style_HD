@@ -3,9 +3,10 @@ import { NotFoundException, ConflictException, BadRequestException } from '@nest
 import { UsersService } from './users.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { AdminService } from '../admin/admin.service';
+import { AddEmailSchema, CreateUserSchema, ListUsersQuerySchema } from './dto';
 
 function makePrismaMock() {
-  return {
+  const prisma = {
     user: {
       findMany: vi.fn(),
       findUnique: vi.fn(),
@@ -23,8 +24,19 @@ function makePrismaMock() {
       updateMany: vi.fn(),
       delete: vi.fn(),
     },
+    clientLoginToken: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
+    clientSession: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    $executeRaw: vi.fn().mockResolvedValue(0),
     $transaction: vi.fn(),
-  } as unknown as PrismaService;
+  };
+  prisma.$transaction.mockImplementation((arg: unknown) => {
+    if (typeof arg === 'function') {
+      return (arg as (tx: typeof prisma) => Promise<unknown>)(prisma);
+    }
+    return Promise.all(arg as Promise<unknown>[]);
+  });
+  return prisma as unknown as PrismaService;
 }
 
 const SAFE_USER = {
@@ -276,6 +288,54 @@ describe('UsersService', () => {
 
       await expect(service.update(1, { customFields: {} } as any)).rejects.toThrow(BadRequestException);
     });
+
+    it('atomically bumps client auth and revokes links/sessions on disable and re-enable', async () => {
+      (prisma.user.findUnique as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ id: 1 })
+        .mockResolvedValueOnce({ isEnabled: true });
+      (prisma.user.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_USER,
+        isEnabled: false,
+      });
+
+      await service.update(1, { isEnabled: false });
+
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            isEnabled: false,
+            clientAuthVersion: { increment: 1 },
+          }),
+        }),
+      );
+      expect(prisma.clientLoginToken.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userId: 1, usedAt: null } }),
+      );
+      expect(prisma.clientSession.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userId: 1, revokedAt: null } }),
+      );
+
+      vi.clearAllMocks();
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.$executeRaw as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((arg: unknown) =>
+        (arg as (tx: typeof prisma) => Promise<unknown>)(prisma),
+      );
+      (prisma.user.findUnique as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ id: 1 })
+        .mockResolvedValueOnce({ isEnabled: false });
+      (prisma.user.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_USER,
+        isEnabled: true,
+      });
+
+      await service.update(1, { isEnabled: true });
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ clientAuthVersion: { increment: 1 } }),
+        }),
+      );
+    });
   });
 
   // ─── addEmail ────────────────────────────────────────────────────────────────
@@ -289,6 +349,10 @@ describe('UsersService', () => {
       const result = await service.addEmail(1, { email: 'jane2@example.com', isPrimary: false });
       expect(result.id).toBe(2);
       expect(prisma.userEmail.updateMany).not.toHaveBeenCalled();
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { clientAuthVersion: { increment: 1 } } }),
+      );
+      expect(prisma.clientSession.updateMany).toHaveBeenCalled();
     });
 
     it('demotes existing primary when adding a new primary email', async () => {
@@ -315,6 +379,41 @@ describe('UsersService', () => {
       await expect(service.addEmail(999, { email: 'x@example.com', isPrimary: false })).rejects.toThrow(
         NotFoundException,
       );
+    });
+  });
+
+  // ─── removeEmail / durable revocation ───────────────────────────────────────
+
+  describe('removeEmail', () => {
+    it('deletes a non-primary email and revokes client auth in the same transaction', async () => {
+      (prisma.userEmail.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 2,
+        userId: 1,
+        email: 'old@example.com',
+        isPrimary: false,
+      });
+      (prisma.userEmail.delete as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 2 });
+      (prisma.user.update as ReturnType<typeof vi.fn>).mockResolvedValue(SAFE_USER);
+
+      await service.removeEmail(1, 2);
+
+      expect(prisma.userEmail.delete).toHaveBeenCalledWith({ where: { id: 2 } });
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { clientAuthVersion: { increment: 1 } } }),
+      );
+      expect(prisma.clientLoginToken.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userId: 1, usedAt: null } }),
+      );
+      expect(prisma.clientSession.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userId: 1, revokedAt: null } }),
+      );
+    });
+
+    it('does not mutate identity when the email belongs to another user', async () => {
+      (prisma.userEmail.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(service.removeEmail(1, 99)).rejects.toThrow(NotFoundException);
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(prisma.clientSession.updateMany).not.toHaveBeenCalled();
     });
   });
 
@@ -393,5 +492,19 @@ describe('UsersService', () => {
       (prisma.userEmail.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await expect(service.setPrimaryEmail(1, 99)).rejects.toThrow(NotFoundException);
     });
+  });
+});
+
+describe('user email DTO normalization', () => {
+  it('normalizes every UserEmail boundary before service/database use', () => {
+    const created = CreateUserSchema.parse({
+      fullName: 'Jane',
+      primaryEmail: ' Jane@Example.COM ',
+      additionalEmails: ['\tSECOND@Example.COM\r'],
+    });
+    expect(created.primaryEmail).toBe('jane@example.com');
+    expect(created.additionalEmails).toEqual(['second@example.com']);
+    expect(AddEmailSchema.parse({ email: ' EXTRA@Example.COM ' }).email).toBe('extra@example.com');
+    expect(ListUsersQuerySchema.parse({ email: ' FIND@Example.COM ' }).email).toBe('find@example.com');
   });
 });

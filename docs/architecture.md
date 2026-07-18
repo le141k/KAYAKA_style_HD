@@ -55,8 +55,9 @@ All 16 modules above are registered in `AppModule` and serve live routes (verifi
 ```
 HTTP Request
   → NestJS Router (global prefix: /api)
-  → CsrfGuard  (rejects cookie-authenticated `th_access`/`th_client`/`th_refresh` unsafe methods whose
-     Origin/Referer ≠ the configured app origin; Bearer-auth + cookieless requests pass — S3-5)
+  → CsrfGuard  (cookie-authenticated unsafe methods require exact Origin/Referer plus a matching,
+     HMAC-signed double-submit cookie / `X-CSRF-Token`; login/refresh/client-verify require exact
+     origin even before a cookie exists; explicit Bearer and shared-secret webhooks bypass — S3-5)
   → JwtAuthGuard  (checks @Public(); else verifies Bearer/cookie JWT, then loads the CURRENT
      Staff+group from DB and checks isEnabled + authVersion (`av` claim) — so disable/password/
      group changes and logout-all revoke access immediately; fails closed 503 if DB is down.
@@ -75,6 +76,14 @@ Public routes (bypass JWT): `POST /auth/login`, `POST /auth/refresh`,
 `POST /tickets/public`, `POST /alaris/webhook` (but checks shared-secret header),
 `GET /news`, `GET /kb/articles`, `GET /kb/articles/slug/:slug`, `GET /kb/categories`,
 `POST /client-auth/request-link`, `POST /client-auth/verify`.
+
+**Staff browser auth is cookie-only.** Login returns `{staff}` and refresh returns `{ok:true}`;
+raw JWTs never enter browser JSON. Production uses host-only `__Host-th_access` (`Path=/`) and
+`__Host-th_refresh` (`Path=/`), both Secure/HttpOnly/SameSite=Lax. The root path is required by the
+`__Host-` cookie contract and lets a refresh-only hard navigation recover through `/auth/me`.
+Logout and every invalid refresh clear current and legacy names/paths, including the former
+`__Secure-th_refresh` narrow-path cookie. Bearer validation remains only for explicit external/test
+clients; the application does not issue browser tokens in JSON.
 
 **Client (customer) auth mode (S2).** Distinct from staff JWT: a magic-link
 (`request-link` → single-use hashed token → `verify`) opens a hashed `ClientSession`
@@ -101,12 +110,12 @@ credential failure are generic, disclosing nothing about account existence or lo
 
 `BullModule.forRoot()` is registered in `AppModule` with Redis connection from `REDIS_URL`.
 
-| Component            | Mechanism                                            | What it does                                                                                                                       |
-| -------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `InboundMailService` | `setInterval` (60 s), `OnModuleInit`                 | Polls enabled IMAP queues; threads replies by `TT-XXXXXX` mask in subject; creates new tickets from unthreaded messages            |
-| `SlaProcessor`       | BullMQ queue `sla`, repeatable `scan` job (60 s)     | Calls `SlaService.runPeriodicCheck()` → breach detection → escalation action execution (notify, priority change, assign, add note) |
-| `AutoCloseProcessor` | BullMQ queue `workflow`, repeatable `auto-close` job | Closes pending tickets idle > `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); sends `autoresponder` mail template                   |
-| `MailProcessor`      | BullMQ queue `mail`, per-job                         | Async outbound mail delivery via `MailService`/nodemailer                                                                          |
+| Component            | Mechanism                                            | What it does                                                                                                                                            |
+| -------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `InboundMailService` | `setInterval` (60 s), `OnModuleInit`                 | Non-overlapping IMAP polls with UIDVALIDITY-bound per-UID checkpoints and poison quarantine; sender-authorized RFC/mask threading; bounded MIME parsing |
+| `SlaProcessor`       | BullMQ queue `sla`, repeatable `scan` job (60 s)     | Calls `SlaService.runPeriodicCheck()` → breach detection → escalation action execution (notify, priority change, assign, add note)                      |
+| `AutoCloseProcessor` | BullMQ queue `workflow`, repeatable `auto-close` job | Closes pending tickets idle > `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); sends `autoresponder` mail template                                        |
+| `MailProcessor`      | BullMQ queue `mail`, per-job                         | Async outbound mail delivery via `MailService`/nodemailer                                                                                               |
 
 ### Implemented — EventEmitter2
 

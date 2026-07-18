@@ -2,9 +2,7 @@
 const nextConfig = {
   output: "standalone",
   reactStrictMode: true,
-  experimental: {
-    typedRoutes: false,
-  },
+  typedRoutes: false,
   images: {
     remotePatterns: [
       { protocol: "https", hostname: "*.gravatar.com" },
@@ -32,11 +30,12 @@ const nextConfig = {
     // A nonce-based tightening of script-src is tracked as a future hardening step.
     const csp = [
       "default-src 'self'",
-      `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""}`,
+      `script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com${isDev ? " 'unsafe-eval'" : ""}`,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: https:",
       "font-src 'self' data:",
-      `connect-src 'self' ${apiOrigin}${isDev ? " ws: http://localhost:*" : ""}`,
+      `connect-src 'self' ${apiOrigin} https://challenges.cloudflare.com${isDev ? " ws: http://localhost:*" : ""}`,
+      "frame-src https://challenges.cloudflare.com",
       "frame-ancestors 'none'",
       "object-src 'none'",
       "base-uri 'self'",

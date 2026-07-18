@@ -12,6 +12,7 @@ import type { UsersService } from '../users/users.service';
 import type { SlaService } from '../sla/sla.service';
 import type { MailService } from '../mail/mail.service';
 import type { AdminService } from '../admin/admin.service';
+import type { AttachmentsService } from '../attachments/attachments.service';
 import type { EventEmitter2 } from '@nestjs/event-emitter';
 import type { Ticket, TicketPost } from '@prisma/client';
 
@@ -131,6 +132,7 @@ function makePrismaMock() {
 describe('TicketsService — client-session endpoints', () => {
   let service: TicketsService;
   let prisma: ReturnType<typeof makePrismaMock>;
+  let attachments: { linkToPost: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
     prisma = makePrismaMock();
@@ -149,8 +151,17 @@ describe('TicketsService — client-session endpoints', () => {
         .fn()
         .mockImplementation((_s: unknown, rows: unknown) => Promise.resolve(rows)),
     } as unknown as AdminService;
+    attachments = { linkToPost: vi.fn().mockResolvedValue(undefined) };
 
-    service = new TicketsService(prisma as unknown as PrismaService, users, sla, eventEmitter, mail, admin);
+    service = new TicketsService(
+      prisma as unknown as PrismaService,
+      users,
+      sla,
+      eventEmitter,
+      mail,
+      admin,
+      attachments as unknown as AttachmentsService,
+    );
   });
 
   // ─── getPublicTicket (owner-scoped) ───────────────────────────────────────
@@ -284,6 +295,33 @@ describe('TicketsService — client-session endpoints', () => {
       expect(prisma.ticket.update).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ totalReplies: { increment: 1 } }) }),
       );
+    });
+
+    it('claims client attachments in the same transaction as the reply post', async () => {
+      armReplyMocks(makeTicket());
+
+      await service.publicReply(
+        1,
+        { contents: 'Reply with file', attachmentIds: [10], attachmentClaimToken: 'claim' },
+        OWNER,
+      );
+
+      expect(attachments.linkToPost).toHaveBeenCalledWith([10], 10, 1, 'claim', prisma);
+      expect(prisma.$transaction).toHaveBeenCalled();
+    });
+
+    it('does not write audit/event state when an attachment claim rejects', async () => {
+      armReplyMocks(makeTicket());
+      attachments.linkToPost.mockRejectedValueOnce(new BadRequestException('claim failed'));
+
+      await expect(
+        service.publicReply(
+          1,
+          { contents: 'Reply with file', attachmentIds: [10], attachmentClaimToken: 'claim' },
+          OWNER,
+        ),
+      ).rejects.toThrow(/claim failed/);
+      expect(prisma.ticketAuditLog.create).not.toHaveBeenCalled();
     });
 
     it('throws NotFoundException when the ticket does not exist', async () => {

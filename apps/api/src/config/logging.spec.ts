@@ -37,6 +37,22 @@ function makeCapturingLogger(): { logger: pino.Logger; read: () => string } {
 const S = 'S3NT1NEL';
 
 describe('buildPinoHttpOptions (log secrecy)', () => {
+  it('drops request-controlled error messages and stacks in production', () => {
+    const options = buildPinoHttpOptions({
+      ...CONFIG,
+      NODE_ENV: 'production',
+    } as AppConfig) as unknown as pino.LoggerOptions;
+    const serialized = options.serializers?.['err']?.(
+      Object.assign(new Error(`${S}-customer@example.com`), {
+        stack: `${S}-stack-token`,
+        code: 'P2002',
+      }),
+    ) as Record<string, unknown>;
+
+    expect(JSON.stringify(serialized)).not.toContain(S);
+    expect(serialized).toEqual({ type: 'Error', code: 'P2002' });
+  });
+
   it('drops every header, cookie, body and URL secret, keeping only the allowlist', () => {
     const { logger, read } = makeCapturingLogger();
 

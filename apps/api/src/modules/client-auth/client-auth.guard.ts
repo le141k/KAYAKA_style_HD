@@ -4,10 +4,12 @@ import {
   Injectable,
   ServiceUnavailableException,
   UnauthorizedException,
+  Inject,
 } from '@nestjs/common';
 import type { Request } from 'express';
 import { ClientAuthService, type ClientPrincipal } from './client-auth.service';
-import { CLIENT_SESSION_COOKIE } from './client-auth.decorators';
+import { clientSessionCookieName } from './client-auth.cookies';
+import { APP_CONFIG, type AppConfig } from '../../config/configuration';
 
 /**
  * Enforces a verified client session (GOAL_PUBLIC_SECURITY S2-6). Reads the HttpOnly
@@ -17,11 +19,14 @@ import { CLIENT_SESSION_COOKIE } from './client-auth.decorators';
  */
 @Injectable()
 export class ClientAuthGuard implements CanActivate {
-  constructor(private readonly clientAuth: ClientAuthService) {}
+  constructor(
+    private readonly clientAuth: ClientAuthService,
+    @Inject(APP_CONFIG) private readonly config: AppConfig,
+  ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<Request & { client?: ClientPrincipal }>();
-    const raw = this.readCookie(request.headers['cookie'], CLIENT_SESSION_COOKIE);
+    const raw = this.readCookie(request.headers['cookie'], clientSessionCookieName(this.config));
     if (!raw) {
       throw new UnauthorizedException('Client session required');
     }

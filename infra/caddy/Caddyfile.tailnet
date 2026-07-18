@@ -3,8 +3,8 @@
 # Routes /api/* → api:4000 (NestJS keeps its global /api prefix — do NOT strip it),
 # everything else → web:3000.
 #
-# Used by docker-compose.tailnet.yml. Reachable as http://<tailnet-ip>:1488 and
-# http://10.0.0.20:1488 once nftables allows the port from the tailnet/LAN only.
+# Reference diagnostic listener only. It is not started by deploy-prod.sh and
+# must remain behind the reviewed tailnet/LAN firewall allowlist.
 
 {
 	# No automatic HTTPS — this listener is plain HTTP on a private tailnet.
@@ -15,9 +15,10 @@
 :1488 {
 	encode gzip
 
-	# Cap request bodies to the app's upload limit.
+	# Match the public edge: 50 MiB aggregate files plus bounded multipart framing.
+	# The API still enforces per-file, aggregate and pre-Multer byte quotas.
 	request_body {
-		max_size 25MB
+		max_size 55MB
 	}
 
 	# API — preserve the /api prefix (handle, not handle_path).

@@ -22,6 +22,7 @@ import {
 import { generateTicketMask } from '@/lib/utils';
 import { toast } from '@/components/ui/use-toast';
 import { api } from '@/lib/api';
+import { TurnstileWidget, type TurnstileWidgetHandle } from '@/components/security/TurnstileWidget';
 
 interface Department {
   id: number;
@@ -72,6 +73,10 @@ export function SubmitTicketForm() {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [attachmentIds, setAttachmentIds] = useState<number[]>([]);
   const fileUploadRef = useRef<FileUploadZoneHandle>(null);
+  const ticketChallengeRef = useRef<TurnstileWidgetHandle>(null);
+  const uploadChallengeRef = useRef<TurnstileWidgetHandle>(null);
+  const [ticketChallenge, setTicketChallenge] = useState<string>();
+  const [uploadChallenge, setUploadChallenge] = useState<string>();
   // One orphan-claim secret per form session: the server scopes orphan adoption to
   // it so uploaded files can only be attached to THIS submit (not stolen by others).
   const [claimToken] = useState(genClaimToken);
@@ -116,6 +121,7 @@ export function SubmitTicketForm() {
     }
     setCfErrors({});
     try {
+      if (!ticketChallenge) throw new Error('Пройдите проверку безопасности.');
       // CL-6: map priority slug → numeric priorityId dynamically (no seed-order assumptions).
       const priorityId = await resolvePriorityId(data.priority);
       const ticket = await createTicket.mutateAsync({
@@ -123,6 +129,7 @@ export function SubmitTicketForm() {
         contents: data.body,
         requesterName: data.name,
         requesterEmail: data.email,
+        challengeToken: ticketChallenge,
         departmentId: data.department_id ? parseInt(data.department_id) : undefined,
         // cast needed because PublicTicketInput does not declare priorityId; the
         // value is still forwarded to the API at runtime.
@@ -142,6 +149,8 @@ export function SubmitTicketForm() {
       const message =
         err instanceof Error ? err.message : 'Не удалось отправить обращение. Попробуйте ещё раз.';
       toast({ title: 'Ошибка отправки', description: message, variant: 'destructive' });
+    } finally {
+      ticketChallengeRef.current?.reset();
     }
   };
 
@@ -266,21 +275,27 @@ export function SubmitTicketForm() {
 
       <div className="space-y-1.5">
         <Label>Вложения (необязательно)</Label>
+        <TurnstileWidget ref={uploadChallengeRef} action="public-upload" onToken={setUploadChallenge} />
         <FileUploadZone
           ref={fileUploadRef}
           uploadEndpoint="/attachments/upload/public"
           claimToken={claimToken}
+          challengeToken={uploadChallenge}
+          onChallengeConsumed={() => uploadChallengeRef.current?.reset()}
           onUploaded={(ids) => setAttachmentIds((prev) => [...prev, ...ids])}
+          onRemoved={(id) => setAttachmentIds((prev) => prev.filter((value) => value !== id))}
           accept="image/*,.pdf,.txt,.log,.pcap"
           maxSizeMb={25}
           maxFiles={5}
         />
       </div>
 
+      <TurnstileWidget ref={ticketChallengeRef} action="ticket-create" onToken={setTicketChallenge} />
+
       <Button
         type="submit"
         className="w-full"
-        disabled={createTicket.isPending}
+        disabled={createTicket.isPending || !ticketChallenge}
         data-testid="submit-ticket-btn"
       >
         {createTicket.isPending ? (

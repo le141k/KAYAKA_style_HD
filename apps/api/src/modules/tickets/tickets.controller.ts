@@ -13,17 +13,18 @@ import {
   Patch,
   Post,
   Query,
-  UseGuards,
   UsePipes,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { TicketsService } from './tickets.service';
 import { RequirePermissions, CurrentStaff, Public } from '../../auth/auth.decorators';
-import { ClientPortalGuard } from '../../auth/client-portal.guard';
 import { ClientAuthenticated, CurrentClient } from '../client-auth/client-auth.decorators';
 import type { ClientPrincipal } from '../client-auth/client-auth.service';
 import type { AuthStaff } from '../../auth/auth.decorators';
+import { AbuseQuotaService } from '../../security/abuse-quota.service';
+import { TurnstileService } from '../../security/turnstile.service';
+import { PublicWrite } from '../../security/public-write.guard';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
@@ -77,30 +78,47 @@ const PUBLIC_READ_LIMIT = Number(process.env['TELECOM_HD_PUBLIC_READ_LIMIT']) ||
 @ApiTags('tickets')
 @Controller('tickets')
 export class TicketsController {
-  constructor(private readonly ticketsService: TicketsService) {}
+  constructor(
+    private readonly ticketsService: TicketsService,
+    private readonly turnstile: TurnstileService,
+    private readonly abuseQuota: AbuseQuotaService,
+  ) {}
 
   // ─────────────────── Public submission (client portal) ───────────────────
 
   @Public()
-  @UseGuards(ClientPortalGuard)
+  @PublicWrite('ticket-create')
   @Post('public')
   // Per-endpoint throttle (tighter than the global 300/60s) to curb portal spam/DoS.
   @Throttle({ default: { limit: PUBLIC_SUBMIT_LIMIT, ttl: 60000 } })
   @UsePipes(new ZodValidationPipe(PublicCreateTicketSchema))
   @ApiOperation({ summary: 'Submit a ticket from the client portal (no auth required)' })
-  async publicCreate(@Body() dto: PublicCreateTicketDto) {
+  async publicCreate(@Body() dto: PublicCreateTicketDto, @Ip() ip: string) {
+    await this.turnstile.verify(dto.challengeToken, 'ticket-create', ip);
+    await this.abuseQuota.consume({
+      action: 'ticket-create',
+      ip,
+      identity: dto.requesterEmail,
+      windowSeconds: 3600,
+      globalLimit: 1000,
+      ipLimit: 20,
+      identityLimit: 5,
+    });
     // H8-3: a public adoption MUST carry the per-upload claimToken; without it
     // linkToPost would adopt any orphan by id (IDOR). Reject the unscoped case.
     if (dto.attachmentIds?.length && !dto.attachmentClaimToken) {
       throw new BadRequestException('attachmentClaimToken is required when attachmentIds are provided');
     }
+    const { challengeToken: _challengeToken, ...ticketDto } = dto;
+    void _challengeToken;
+    const departmentId = await this.ticketsService.resolvePublicDepartmentId(dto.departmentId);
     const ticket = await this.ticketsService.createTicket({
-      ...dto,
+      ...ticketDto,
       contents: dto.contents,
-      departmentId: dto.departmentId ?? 1,
+      departmentId,
       isHtml: false,
       creationMode: 'WEB',
-      ipAddress: '0.0.0.0',
+      ipAddress: ip,
       tags: [],
       customFields: dto.customFields,
     });

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useQueryClient } from '@tanstack/react-query';
 import { Mail, Loader2, CheckCircle2, LogOut } from 'lucide-react';
@@ -16,6 +16,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { QueryError } from '@/components/QueryError';
+import { TurnstileWidget, type TurnstileWidgetHandle } from '@/components/security/TurnstileWidget';
 
 /**
  * Client "Мои заявки" list (GOAL_PUBLIC_SECURITY S2-9).
@@ -37,13 +38,20 @@ export function ClientTicketsContent() {
 /** Request-a-link sign-in panel. Always shows the same confirmation — no email enumeration. */
 function SignInPanel() {
   const [email, setEmail] = useState('');
+  const [challengeToken, setChallengeToken] = useState<string>();
+  const challengeRef = useRef<TurnstileWidgetHandle>(null);
   const requestLink = useRequestClientLink();
   const sent = requestLink.isSuccess;
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = email.trim();
-    if (trimmed) requestLink.mutate(trimmed);
+    if (trimmed && challengeToken) {
+      requestLink.mutate(
+        { email: trimmed, challengeToken },
+        { onSettled: () => challengeRef.current?.reset() },
+      );
+    }
   };
 
   if (sent) {
@@ -66,18 +74,21 @@ function SignInPanel() {
       <p className="mx-auto mt-1 max-w-sm text-xs text-muted-foreground">
         Введите email, указанный в ваших обращениях — мы пришлём ссылку для входа.
       </p>
-      <form onSubmit={onSubmit} className="mx-auto mt-4 flex max-w-sm gap-2">
-        <Input
-          type="email"
-          placeholder="ivan@example.com"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          required
-          disabled={requestLink.isPending}
-        />
-        <Button type="submit" disabled={requestLink.isPending}>
-          {requestLink.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Получить ссылку'}
-        </Button>
+      <form onSubmit={onSubmit} className="mx-auto mt-4 max-w-sm space-y-3">
+        <div className="flex gap-2">
+          <Input
+            type="email"
+            placeholder="ivan@example.com"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+            disabled={requestLink.isPending}
+          />
+          <Button type="submit" disabled={requestLink.isPending || !challengeToken}>
+            {requestLink.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Получить ссылку'}
+          </Button>
+        </div>
+        <TurnstileWidget ref={challengeRef} action="request-link" onToken={setChallengeToken} />
       </form>
       {requestLink.isError && (
         <p className="mt-2 text-xs text-destructive">Не удалось отправить ссылку. Попробуйте ещё раз.</p>

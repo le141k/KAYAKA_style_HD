@@ -1,7 +1,6 @@
 import { ConflictException, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { TicketsService } from '../tickets/tickets.service';
-import type { AlarisEvent, Ticket } from '@prisma/client';
 
 export interface AlarisWebhookPayload {
   externalId: string;
@@ -11,8 +10,9 @@ export interface AlarisWebhookPayload {
 }
 
 export interface AlarisIngestResult {
-  event: AlarisEvent;
-  ticket: Ticket;
+  accepted: true;
+  eventId: number;
+  ticketId: number;
   deduplicated: boolean;
 }
 
@@ -37,11 +37,16 @@ export class AlarisService {
     });
 
     if (existing) {
-      this.logger.warn(`Alaris event ${payload.externalId} already processed — deduped`);
+      this.logger.warn('Alaris event already processed — deduplicated');
       if (!existing.ticket) {
-        throw new ConflictException(`Alaris event ${payload.externalId} exists but has no ticket`);
+        throw new ConflictException('Alaris event exists but has no ticket');
       }
-      return { event: existing, ticket: existing.ticket, deduplicated: true };
+      return {
+        accepted: true,
+        eventId: existing.id,
+        ticketId: existing.ticket.id,
+        deduplicated: true,
+      };
     }
 
     // Resolve default department + status + priority for ALARIS tickets
@@ -82,10 +87,8 @@ export class AlarisService {
       },
     });
 
-    this.logger.log(
-      `Alaris event ${payload.externalId} → ticket ${ticket.mask} (severity=${payload.severity})`,
-    );
+    this.logger.log(`Alaris event accepted as ticketId ${ticket.id}`);
 
-    return { event, ticket, deduplicated: false };
+    return { accepted: true, eventId: event.id, ticketId: ticket.id, deduplicated: false };
   }
 }

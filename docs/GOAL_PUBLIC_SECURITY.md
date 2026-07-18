@@ -1,29 +1,33 @@
 # GOAL — Security fixes before public access
 
-_Created: 2026-07-16. Status: **IN PROGRESS — PUBLIC GO-LIVE BLOCKED**. All code-doable, non-breaking application-security work is landed + tested: S1 secret-leakage core, S2 verified client sessions (backend + frontend cutover; DB-UNIQUE + e2e deferred), S3 staff-session correctness/CSRF-origin/login-throttle, and S5-7 preflight/boot guards. **Remaining is gated, not code-doable here:** S4 (needs new deps — Turnstile/ClamAV/scanner), S1-6/7/8 + S3-5-token/S3-6 (the breaking cookie-only auth change), and the S0/S1-9/S5-edge/S6-ops track (needs the live production VM: containment, secret rotation, Cloudflare/firewall edge, backups, prod smoke). The portal stays behind the CIDR/Tailscale allowlist until the full Definition of Done is green._
+_Created: 2026-07-16. Status updated 2026-07-17: **CODE COMPLETE; PUBLIC GO-LIVE STILL
+BLOCKED ON VM/EDGE EVIDENCE**. Cookie-only staff/client auth, signed CSRF, abuse quotas, Turnstile,
+disk-backed quarantine, fail-closed ClamAV, bounded cleanup, identity/message-id migrations and the
+internal-only deploy/backup/Redis recovery orchestration are implemented and locally gated. The
+remaining work is operational: credential cutover, live data audits, restore/Redis rehearsal,
+scanner/EICAR/load proof, real proxy-IP/firewall checks, HTTPS smoke and staged soak. Keep the portal
+private until the Definition of Done is green._
 
 Run later as an implementation goal: `/goal docs/GOAL_PUBLIC_SECURITY.md`.
 
-> **Integration (branch `claude/helpdesk-security-integration`).** The security work was merged
-> onto the current `origin/main` (RBAC/Manager, session revocation, last-admin guard, inbound
-> webhook, D2 login lockout, mail retry) — 14 conflicts resolved preserving BOTH sides; migrations
-> apply from zero AND as an upgrade of a main-shaped DB (28 migrations, no drift). A review pass
+> **Historical integration baseline (`claude/helpdesk-security-integration`).** The security work was merged
+> onto the then-current `origin/main` (RBAC/Manager, session revocation, last-admin guard, inbound
+> webhook, D2 login lockout, mail retry). A review pass
 > then closed these gaps: **#3** `ClientPortalGuard` now fail-closes the ENTIRE client surface in
 > prod (request-link/verify/list/detail/reply/download → 404 unless enabled; verified live 404↔202);
 > **#5** `User.isEnabled` enforced at link issuance + session resolution; **#6** SMTP-retry
 > (`throwOnError`) preserved with a regression test; **#7** a staff security change (admin reset /
 > disable / logout-all) now burns pending password-reset links, and reset rejects a disabled staff;
 > plus a per-owner magic-link mail-bomb cap, `audit:ownership` non-zero exit on NOT-CLEAN, and the
-> web `fileName` fix. Gate: **API 756 unit tests green, API+web typecheck + lint clean, boot smoke
-> OK.** Still NOT done (unchanged): the browser magic-link/logout e2e (needs mail interception —
-> S6), and the gated S4 / cookie-only / VM tracks.
+> web `fileName` fix. The current release candidate adds the later S4/auth/deploy closure; historical
+> numeric test counts are deliberately omitted because the final release gate must be attached to
+> the exact commit being deployed.
 
 This plan closes the security bugs found during the 2026-07-16 read-only review. The portal must
 remain behind the current CIDR/Tailscale restriction until the full Definition of Done is green.
 
-> **Progress (2026-07-16 — commit on `claude/helpdesk-security-workflow-rycs0y`).** Landed the
-> local, non-breaking S1 secret-leakage core with tests (573 API unit tests green, api + web
-> typecheck/lint clean):
+> **Historical S1 progress (2026-07-16 — `claude/helpdesk-security-workflow-rycs0y`).** Landed the
+> local, non-breaking S1 secret-leakage core with tests:
 >
 > - **S1-1/S1-2** strict-allowlist HTTP logging (`apps/api/src/config/logging.ts`) + a
 >   log-secrecy regression test (`logging.spec.ts`).
@@ -41,9 +45,9 @@ remain behind the current CIDR/Tailscale restriction until the full Definition o
 > _(Historical snapshot from the S1 landing — see the status line at the top of this file for the
 > current picture.)_ **Since then:** S2 (verified client sessions, backend + frontend cutover), S3
 > (staff-session correctness, CSRF-origin, login throttle) and S5-7 (preflight/boot guards) have all
-> landed with tests. **Still open (need approvals, new deps, a breaking-contract change, or the live
-> VM):** S1-6/1-7/1-8 + S3-5-token/S3-6 (cookie-only auth — breaks the current frontend token
-> contract), S4 (new deps), and the S0 / S1-9 / S5-edge / S6-ops track (VM).
+> landed with tests. **Since this historical snapshot:** S1-6/1-7 and the S3-5 token layer are
+> implemented; S1-8 has browser coverage awaiting live execution. S4 and client-cookie code are now
+> implemented; S0 / S1-9 / S5-edge / S6 live proof remains VM-owned.
 
 ## Scope decision
 
@@ -84,8 +88,9 @@ and inventory are completed before any production mutation or migration.
       `trycloudflare.com` URL no longer serves the application.
 - [ ] **H1 Stop secret leakage:** complete S1 logging, reset-mail, reset-race and cookie-only fixes;
       deploy redaction and verify it before rotating any affected secret.
-      _(Partially done: logging redaction, reset-mail DI, reset-race and reset-mail fail-safe landed
-      in code + tests. Cookie-only (S1-6/7/8) and the secret rotation (S1-9) remain.)_
+      _(Code done: logging redaction, reset-mail DI/fail-safe, authVersion-stamped reset transaction,
+      cookie-only login/refresh and exact cookie clearing. Runtime browser proof and S1-9 secret
+      rotation remain.)_
 - [ ] **H2 Close the client IDOR:** API fail-closes list/detail/reply and client attachment access;
       temporarily hide/disable those UI actions until the verified client-session flow is complete.
       Untrusted public attachment upload stays disabled until S4 is green.
@@ -97,10 +102,9 @@ and inventory are completed before any production mutation or migration.
 - [ ] **H3 Close staff-auth gaps:** use DB-backed `authVersion`, logout-all revocation, atomic refresh
       rotation and origin + CSRF checks for every cookie-authenticated mutation.
       _(Done: DB-backed `authVersion` + logout-all revocation (S3-1/2/4), atomic refresh rotation by
-      jti/familyId (S3-3), cookie-auth Origin-CSRF via `CsrfGuard` (S3-5 origin half), and the
+      jti/familyId (S3-3), exact-origin + signed double-submit CSRF via `CsrfGuard` (S3-5), and the
       login-abuse throttle (S3-7 — per-IP + HMAC(email) Redis throttle, generic 429, fail-open, no
-      account lock). Still open: the signed double-submit token + `__Host-` cookie hardening
-      (S3-5 token / S3-6, tied to cookie-only S1-6/7).)_
+      account lock). Staff and client production cookies use `__Host-` names at `Path=/`.)_
 - [ ] **H4 Remove known access paths:** soft-disable demo staff, revoke their sessions, then rotate JWT
       and webhook secrets in the order defined by S1. Never delete staff rows as containment.
 - [ ] **H5 Deploy privately and smoke:** use immutable images/config, run the mandatory production
@@ -203,20 +207,29 @@ This batch must deploy before creating any new magic-link/session secret.
       the password. Add concurrent replay coverage. Deliver the reset token in a URL fragment; the UI
       removes it immediately with `history.replaceState`, POSTs it in the body and uses
       `Referrer-Policy: no-referrer`.
-      _(Done: conditional `updateMany` consume + unit coverage; fragment delivery + `replaceState` +
-      `referrer: no-referrer` in the reset page. A true multi-process concurrency test belongs in the
-      Testcontainers integration suite and is still to be added.)_
-- [ ] **S1-6 Make browser auth cookie-only.** `POST /api/auth/login` returns only the safe staff
+      _(Done: PasswordReset is stamped with issue-time `authVersion`; one transaction consumes the
+      live token and conditionally updates only an enabled, version-matched Staff row before revoking
+      sibling reset/refresh tokens. Admin disable/password/logout races therefore fail closed.
+      Fragment delivery + `replaceState` + `referrer: no-referrer` remain in the reset page.)_
+- [x] **S1-6 Make browser auth cookie-only.** `POST /api/auth/login` returns only the safe staff
       principal; refresh returns a non-secret success shape. Remove refresh-token body DTO fallback
       after inventorying real non-browser consumers. Update web types/hooks, API tests, diagnostics,
       e2e, `scripts/smoke.sh`, docs and any screenshots/audit scripts that parse token JSON. If machine
       tokens are required, design a separate scoped flow.
-- [ ] **S1-7 Define and clear cookies exactly.** Use host-only secure cookies with no `Domain`; scope
-      the refresh cookie to `/api/auth/refresh` where compatible and keep the access cookie available
-      to `/api`. Use the exact same name/path/security attributes when clearing, clear legacy names and
-      paths during cutover, and clear both cookies on every invalid refresh response.
-- [ ] **S1-8 Prove XSS cannot read a refreshed token.** From browser-context integration/e2e tests,
-      call refresh and assert the response body contains no access/refresh token while cookies rotate.
+      _(Done: login returns `{staff}`, refresh is cookie-only and returns `{ok:true}`; the body-token
+      DTO fallback and frontend token types are removed. Bearer validation remains only for explicit
+      external/test compatibility; browser code never receives a JWT.)_
+- [x] **S1-7 Define and clear cookies exactly.** Use host-only secure cookies with no `Domain`.
+      Production access and refresh cookies use the `__Host-` prefix and therefore `Path=/`; keep
+      session cookies `HttpOnly` and clear every current and legacy name/path during cutover.
+      _(Done: production uses Secure/HttpOnly host-only `__Host-th_access` and
+      `__Host-th_refresh`, both at `/`. Refresh-only hard navigations can recover through `/auth/me`.
+      Logout and every handler-level refresh failure clear current and legacy names/paths, including
+      the former `__Secure-th_refresh` at `/api/auth/refresh`.)_
+- [~] **S1-8 Prove XSS cannot read a refreshed token.** From browser-context integration/e2e tests,
+  call refresh and assert the response body contains no access/refresh token while cookies rotate.
+  _(Browser-context assertions were added to `e2e/auth.setup.ts` for login/refresh JSON and
+  HttpOnly cookies; execution against the live stack remains part of the S6 gate.)_
 - [ ] **S1-9 Perform the credential cutover in safe order.** First deploy redaction and prove it at
       runtime. Then, with approval and sender coordination, revoke refresh/reset tokens and rotate both
       JWT secrets plus inbound and Alaris webhook secrets. Verify old values fail. Rollback may restore
@@ -237,49 +250,41 @@ This batch must deploy before creating any new magic-link/session secret.
 
 Current public list/detail/reply routes must not be exposed until this batch is complete.
 
-> **Progress.** The client-session backend core is **done and verified end-to-end on live
-> Postgres + a full built-app boot smoke**: **S2-1** (fail-closed gate), **S2-3** (`ClientLoginToken`
->
-> - `ClientSession` models/migration, hashed tokens bound to `User.id`), **S2-4** (request-link:
->   unambiguous-owner-only, always-202, no enumeration), **S2-5** (verify: atomic single-use consume,
->   `#token=` fragment, HttpOnly `th_client` cookie), **S2-6** (`@ClientAuthenticated` decorator +
->   `ClientAuthGuard`, fail-closed 503, logout/revocation), **S2-7** (ownership strictly by
->   `Ticket.userId === session.userId`; `?email=`/`requesterEmail` removed), **S2-11** (idempotent
->   scheduled cleanup). Verified: 607 unit tests; live e2e proved cross-client isolation, single-use
->   replay rejection, logout revocation; built app boots and `tickets/my` → 401 without a session.
->   plus **S2-8** (owner-scoped client attachment download `GET /api/attachments/client/:id/download`,
->   live-verified). **Still open:** S2-2 (UserEmail normalization + `Ticket.userId` backfill —
->   currently null-userId tickets simply fail closed), S2-9 (client UI), S2-10 (full
->   replay/enumeration e2e matrix).
+> **Progress.** The client-session implementation is code-complete: normalized unique ownership,
+> hashed magic-link/session persistence, generic asynchronous request-link responses, atomic
+> single-use verification, revocation/versioning, stable `User.id` authorization, owner-scoped
+> ticket/reply/download routes, the client UI cutover and expiry cleanup. Production cookies use
+> `__Host-th_client` at `Path=/`. The remaining S2 evidence is the full browser/mail round trip and
+> cross-client HTTP matrix on the deployed allowlisted stack; the production gate remains closed
+> until that evidence is green.
 
 - [x] **S2-1 Add a fail-closed interim gate.** While S2 is incomplete, production must return 404/503
       for `GET /api/tickets/my`, `GET /api/tickets/public/:id`, client attachment download and
       `POST /api/tickets/public/:id/reply`. Remove/hide matching reply, upload and download UI actions.
       Keep public ticket creation only after S4. The API gate defaults closed in production and does
       not depend on frontend behavior.
-      _(Done: `ClientPortalGuard` returns 404 in production for `POST /tickets/public`, `GET
-/tickets/my`, `GET /tickets/public/:id`, `POST /tickets/public/:id/reply` and
-      `POST /attachments/upload/public` unless `TELECOM_HD_CLIENT_PORTAL_ENABLED` is set. There is no
-      separate public client attachment download route yet — S2-8 adds one. Frontend hide of the
-      matching actions is still to be done as part of S2-9.)_
-- [~] **S2-2 Establish one stable ownership identity before migrating.** Audit and normalize
-  `UserEmail`, reject/fix case-insensitive duplicates, and enforce a DB-level normalized-email
-  uniqueness invariant. Backfill `Ticket.userId` only when one normalized email maps to exactly one
-  user; ambiguous or unlinked tickets remain inaccessible and enter a manual-resolution report.
-  _(Done: `normalizeEmail` (trim+lowercase) is canonical in `common/email.util.ts`; every
-  `UserEmail` read/write in `UsersService` (`findByEmail`/`findOrCreate`/`create`/`addEmail`) — and
-  thus ticket-create + inbound-mail, which route through `findOrCreate` — now normalizes, so new
-  data stays clean. Migration `20260716180000_normalize_user_email_ownership` normalizes existing
-  non-colliding rows and backfills `Ticket.userId` **only** where a normalized email maps to exactly
-  one user; ambiguous/unlinked tickets are left untouched. The **manual-resolution report** is
-  `npm run audit:ownership -w apps/api` (READ-ONLY): it lists case-insensitive duplicate groups
-  (flagging ambiguous >1-user ones), still-un-normalized rows, and ambiguous/orphan unlinked
-  tickets, with a `clean` gate. Verified live against Postgres (rolled back): non-colliding
-  normalized, ambiguous ci-dup left as-is, unambiguous ticket backfilled, ambiguous+orphan tickets
-  not backfilled, audit classifies all correctly. **Deferred (needs your call + prod data):** the
-  **DB-level case-insensitive `UNIQUE(email)` invariant** — it asserts an email is never shared
-  across users; enforce it only after `audit:ownership` reports `clean` on production (any real
-  duplicate groups must be merged/split first). Doing so on the VM also needs the rule-8 backup.)_
+      _(Done: `ClientPortalGuard` returns 404 in production across request-link/verify/session,
+      ticket list/detail/reply/download and client/public upload surfaces unless the corresponding
+      feature gates are enabled. The frontend uses only the verified-session routes.)_
+- [x] **S2-2 Establish one stable ownership identity before migrating.** Audit and normalize
+      `UserEmail`, reject/fix case-insensitive duplicates, and enforce a DB-level normalized-email
+      uniqueness invariant. Backfill `Ticket.userId` only when one normalized email maps to exactly one
+      user; ambiguous or unlinked tickets remain inaccessible and enter a manual-resolution report.
+      _(Done: `normalizeEmail` (trim+lowercase) is canonical in `common/email.util.ts`; every
+      `UserEmail` read/write in `UsersService` (`findByEmail`/`findOrCreate`/`create`/`addEmail`) — and
+      thus ticket-create + inbound-mail, which route through `findOrCreate` — now normalizes, so new
+      data stays clean. Migration `20260716180000_normalize_user_email_ownership` normalizes existing
+      non-colliding rows and backfills `Ticket.userId` **only** where a normalized email maps to exactly
+      one user; ambiguous/unlinked tickets are left untouched. The **manual-resolution report** is
+      `npm run audit:ownership -w apps/api` (READ-ONLY): it lists case-insensitive duplicate groups
+      (flagging ambiguous >1-user ones), still-un-normalized rows, and ambiguous/orphan unlinked
+      tickets, with a `clean` gate. Verified live against Postgres (rolled back): non-colliding
+      normalized, ambiguous ci-dup left as-is, unambiguous ticket backfilled, ambiguous+orphan tickets
+      not backfilled, audit classifies all correctly. Migration
+      `20260717000000_client_identity_invariant` now fails before mutation unless that audit is clean,
+      re-runs the unambiguous ticket backfill, adds the normalized-email check and unique expression
+      index, and invalidates pre-version client auth material. The live production audit/remediation
+      remains a VM gate, not deferred code.)_
 - [x] **S2-3 Add client-auth persistence.** Add Prisma models/migration for a single-use hashed login
       token and a hashed client session. Both require a non-null stable `userId`; normalized email is an
       audit snapshot, never the authorization key. Include expiry, `usedAt`/`revokedAt`, created and
@@ -307,8 +312,9 @@ Current public list/detail/reply routes must not be exposed until this batch is 
       _(Done: the emailed link is `…/verify#token=<raw>` (fragment, so the token never reaches
       proxy/access logs); `POST /api/client-auth/verify` reads the token from the request BODY,
       atomically single-use-consumes it (conditional `updateMany` on `usedAt IS NULL AND not expired` →
-      exactly one winner) and sets an `HttpOnly` + `Secure` (prod) + host-only (`path=/api`, no
-      `Domain`) `th_client` cookie. The `/verify` page (S2-9) reads the `#token=` fragment, strips it
+      exactly one winner) and sets an `HttpOnly`, `Secure`, host-only production
+      `__Host-th_client` cookie at `Path=/` (development uses `th_client`). The `/verify` page reads
+      the `#token=` fragment, strips it
       with `history.replaceState`, and is rendered with `referrer: no-referrer`. Path corrected
       `/client/verify` → `/verify` to match the `(client)` route group.)_
 - [x] **S2-6 Add an explicit client auth mode.** Implement `@ClientAuthenticated()` metadata/decorator
@@ -329,7 +335,7 @@ ClientAuthGuard))`; `ClientAuthGuard` resolves the `th_client` cookie to `{ user
       (`Ticket.userId === clientUserId` else 404); the reply's author is taken from the ticket, not
       the request body; no `?email=`/`requesterEmail` inputs remain. Wrong-owner, unmapped (`userId
 null`) and missing tickets all return the identical 404. Unit-tested incl. the cross-client
-      IDOR guard. Frontend enablement is the deferred S2-9.)_
+      IDOR guard. The frontend now uses these session-bound routes.)_
 - [x] **S2-8 Add an owner-scoped client attachment download.** The current client UI links to the
       staff-only `/api/attachments/:id/download` route. Add a separate client-session-protected
       route requiring `attachment.postId != null`, `post.ticket.userId === client.userId`,
@@ -339,27 +345,25 @@ null`) and missing tickets all return the identical 404. Unit-tested incl. the c
       `AttachmentsService.getClientDownloadableOrThrow` enforces post-attachment + non-third-party +
       not-a-note + `post.ticket.userId === client.userId`, same 404 on any failure. Staff route
       unchanged. Verified live (owner OK, other client 404, third-party 404) + boot smoke (401 without
-      session). Pointing the client UI mapper at it is part of the deferred frontend S2-9.)_
-- [~] **S2-9 Update the client UI.** Replace the free-form “enter any email to see tickets” flow with
-  request-link, check-email, verify, session-expired and logout states. Never persist the verified
-  email/session token in `localStorage`.
-  _(Done in code: the old "enter any email" lookup and the `client_email` localStorage write
-  (`submit-form`, `client-tickets-content`) are removed. New `use-client-auth.ts` hook
-  (`useClientSession`/`useRequestClientLink`/`useVerifyClientToken`/`useClientLogout`) talks to
-  `/client-auth/*` via a raw-fetch `clientFetch` (credentials-included, deliberately separate from
-  the staff `api` client so a client 401 never triggers a staff refresh). `client-tickets-content`
-  is now session-aware: signed out → a request-link form that always shows the same "check your
-  email" confirmation (no enumeration); signed in → the user's own tickets + a sign-out button. New
-  `/verify` page reads the `#token=` fragment, strips it with `history.replaceState`, POSTs it to
-  `/client-auth/verify`, and shows verifying/success/invalid-or-expired states; the page sets
-  `referrer: no-referrer` (matching `/reset-password`). `use-client-tickets` drops all `?email=`
-  params + the staff-route fallback and points attachments at the owner-scoped
-  `/attachments/client/:id/download` (S2-8). Backend link path fixed `/client/verify` → `/verify`
-  to match the `(client)` route group. Verified: web `tsc --noEmit` + `next lint` clean, API
-  client-auth spec green. **Still open:** browser **e2e** of the full magic-link round-trip (needs
-  the running web+API stack and mail interception to read the emitted token) — lands with the
-  S2-10/S6 e2e layer; it is safe to defer because S2-1 keeps the portal fail-closed (404) in
-  production until then.)_
+      session); the client UI mapper points at this owner-scoped route.)_
+- [x] **S2-9 Update the client UI.** Replace the free-form “enter any email to see tickets” flow with
+      request-link, check-email, verify, session-expired and logout states. Never persist the verified
+      email/session token in `localStorage`.
+      _(Done in code: the old "enter any email" lookup and the `client_email` localStorage write
+      (`submit-form`, `client-tickets-content`) are removed. New `use-client-auth.ts` hook
+      (`useClientSession`/`useRequestClientLink`/`useVerifyClientToken`/`useClientLogout`) talks to
+      `/client-auth/*` via a raw-fetch `clientFetch` (credentials-included, deliberately separate from
+      the staff `api` client so a client 401 never triggers a staff refresh). `client-tickets-content`
+      is now session-aware: signed out → a request-link form that always shows the same "check your
+      email" confirmation (no enumeration); signed in → the user's own tickets + a sign-out button. New
+      `/verify` page reads the `#token=` fragment, strips it with `history.replaceState`, POSTs it to
+      `/client-auth/verify`, and shows verifying/success/invalid-or-expired states; the page sets
+      `referrer: no-referrer` (matching `/reset-password`). `use-client-tickets` drops all `?email=`
+      params + the staff-route fallback and points attachments at the owner-scoped
+      `/attachments/client/:id/download` (S2-8). Backend link path fixed `/client/verify` → `/verify`
+      to match the `(client)` route group. The code-level web/API gates are green. **VM evidence
+      pending:** browser **e2e** of the full magic-link round-trip through the real mail path. S2-1
+      keeps the portal fail-closed until that production gate passes.)_
 - [~] **S2-10 Add ownership and replay tests.** Cover: unknown email response parity; expired token;
   consumed-token replay; concurrent double-consume (exactly one success); Client A cannot list,
   read, reply to or download attachments from Client B; aliases in `UserEmail`; session
@@ -370,9 +374,8 @@ null`) and missing tickets all return the identical 404. Unit-tested incl. the c
   winner); Client A → Client B list/detail/reply all 404 (IDOR guard) and owner-scoped attachment
   download 404; ambiguous `UserEmail` and unmapped `userId null` fail closed; session
   expiry/revocation → 401; internal notes and third-party posts/attachments hidden from the client
-  view. **Still open:** a real-DB **integration/e2e** layer proving concurrent double-consume under
-  true parallelism and the full HTTP path — needs Testcontainers/Postgres, which is blocked in this
-  sandbox (image pulls 403); it lands with the S6 gate + frontend S2-9.)_
+  view. **Deployment evidence pending:** the full HTTP/browser matrix and a real-mail magic-link
+  round trip on the allowlisted stack; production remains closed until S6 records it.)_
 - [x] **S2-11 Clean expired auth material.** Add an idempotent scheduled cleanup/TTL for used or expired
       login tokens and expired/revoked client sessions, with aggregate metrics and no secret output.
       _(Done, commit `ecbec7b`: `ClientAuthService.cleanupExpired()` idempotently `deleteMany`s
@@ -430,32 +433,33 @@ null`) and missing tickets all return the identical 404. Unit-tested incl. the c
       access-token `sid`/session-family design, not mixed revocation mechanisms.
       _(Done: `logout` now delegates to `revokeStaffSessions` (authVersion bump + revoke-all in one tx);
       the jti blocklist is kept only as best-effort defense-in-depth.)_
-- [~] **S3-5 Add real CSRF protection.** For cookie-authenticated unsafe methods, require both exact
-  `Origin`/target-origin validation (strict allowlist, no wildcard subdomains) and a session-bound
-  signed double-submit/synchronizer token in `X-CSRF-Token`.
-  Exempt only explicitly enumerated non-browser webhooks, which retain their own authentication.
-  Apply the custom header to JSON and multipart frontend calls.
-  _(Done: global `CsrfGuard` (app.module) rejects cookie-authenticated (`th_access`/`th_client`/
-  `th_refresh`) unsafe methods whose `Origin`/`Referer` isn't the exact configured app origin —
-  strict, no wildcard subdomains. Bearer-auth and cookieless requests (incl. the shared-secret
-  webhooks) pass. `th_refresh` is in the detected set (self-review) so cookie-only `POST /auth/refresh`
-  after `th_access` expiry is still origin-checked, not just `SameSite=Lax`-protected.
-  Verified live: cross-origin cookie POST → 403, same-origin → passes. **Still open:** the
-  session-bound signed double-submit `X-CSRF-Token` layer + applying the header on the frontend —
-  these land with the same-origin/cookie-only foundation (S1-6/7). `SameSite=Lax` is an
-  independent second barrier meanwhile.)_
-- [ ] **S3-6 Harden cookies.** Use production `__Host-`/`__Secure-` names compatible with the paths
+- [x] **S3-5 Add real CSRF protection.** For cookie-authenticated unsafe methods, require both exact
+      `Origin`/target-origin validation (strict allowlist, no wildcard subdomains) and a session-bound
+      signed double-submit/synchronizer token in `X-CSRF-Token`.
+      Exempt only explicitly enumerated non-browser webhooks, which retain their own authentication.
+      Apply the custom header to JSON and multipart frontend calls.
+      _(Done in code: global `CsrfGuard` requires both exact configured Origin/Referer and a matching
+      HKDF/HMAC-signed readable cookie + `X-CSRF-Token` on cookie-authenticated unsafe requests.
+      Login/refresh/client-verify require exact origin even before a credential cookie exists (login-CSRF
+      protection); explicit Bearer clients and cookieless shared-secret webhooks remain exempt. Staff,
+      client JSON and multipart frontend calls acquire/send the token. Unit matrix covers wrong origin,
+      missing/mismatched/unsigned token, refresh-only cookie, subdomain rejection and webhook/Bearer paths.)_
+- [x] **S3-6 Harden cookies.** Use production `__Host-`/`__Secure-` names compatible with the paths
       defined in S1, always `Secure`, `HttpOnly` for session cookies, no `Domain`, and identical
       attributes when clearing. Keep a separate readable CSRF cookie only if the signed pattern needs
       it. Same-origin `/api` is a prerequisite.
+      _(Done: production staff access/refresh, client session and readable CSRF cookies use host-only
+      `__Host-` names at `/`; session cookies are `Secure`/`HttpOnly`; current and legacy names/paths are
+      cleared exactly. Refresh-only hard navigations recover through `/auth/me` without relying on a
+      short-lived JS marker.)_
 - [x] **S3-7 Remove externally-triggered hard account DoS.** Replace the distinguishable hard lock
       response with a generic login failure. Do not let anonymous failures permanently lock a known
       account: use progressive Redis-backed delay/throttles keyed by trusted IP + HMAC(email) and
       security alerts. S4 may add a challenge after the threshold. Preserve credential-stuffing
       protection without enumeration.
-      _(Done: there was no hard account-lock to remove — the codebase never had lock columns or a
-      distinguishable lock response, so login already returns one generic `Invalid credentials`
-      regardless of account/lock state. Added `LoginThrottleService` (`auth/login-throttle.service.ts`):
+      _(Done: stale mainline `failedLoginAttempts`/`lockedUntil` columns remain for migration
+      compatibility but are no longer read or written by authentication; the distinguishable hard
+      lock response and global account DoS are removed. `LoginThrottleService` (`auth/login-throttle.service.ts`):
       a Redis counter keyed `th:login:<HMAC-SHA256(email)>:<ip>` that returns a generic **429** after
       10 failures in a 15-min sliding window and clears on success. Because the key is scoped to a
       single IP the counter can NEVER lock a known account out from its own IPs, and the raw email is
@@ -468,8 +472,8 @@ null`) and missing tickets all return the identical 404. Unit-tested incl. the c
       count=10/ttl=900s); the HMAC key is HKDF-derived from the JWT secret (purpose-bound subkey, not
       the raw signing key); and `validateStaff` now runs a decoy argon2 verify on the missing/disabled
       branch so login timing no longer leaks account existence (the enumeration oracle that would have
-      undermined "discloses nothing about account/lock state"). The optional post-threshold challenge
-      is S4 (Turnstile, deferred, needs approval).)_
+      undermined "discloses nothing about account/lock state"). Action-bound Turnstile validation is
+      implemented in S4; its production hostname/edge proof remains part of S6.)_
 - [~] **S3-8 Test the state transitions.** Prove old access/refresh tokens fail immediately after
   password change, disable and permission/group change; CSRF requests from missing/wrong origins
   fail; valid same-origin JSON and multipart requests work; two parallel refreshes produce one
@@ -484,10 +488,9 @@ null`) and missing tickets all return the identical 404. Unit-tested incl. the c
   JSON+multipart); two parallel refreshes → one winner without revoking ("concurrent loser … fails
   WITHOUT revoking the family"); genuine replay revokes the family ("revoked long ago … revokes the
   whole family"); logout-all revokes every refresh (`auth.service.spec` "logout"); DB/auth outage →
-  **503** (`jwt-auth.guard.spec` "fails CLOSED with 503", tagged S3-8). **Still open:** the
-  full-HTTP end-to-end layer (real multipart request, a live logout→old-access-token round-trip)
-  needs Testcontainers/e2e, which is blocked in this sandbox (image pulls 403) — it lands with the
-  S6 gate.)_
+  **503** (`jwt-auth.guard.spec` "fails CLOSED with 503", tagged S3-8). **Deployment evidence
+  pending:** the full-HTTP multipart and live logout→old-access-token round trips are mandatory in
+  the S6 allowlisted smoke.)_
 
 **S3 acceptance**
 
@@ -500,44 +503,44 @@ null`) and missing tickets all return the identical 404. Unit-tested incl. the c
 
 ## 🔴 S4 — Public abuse, upload safety and storage lifecycle
 
-External service/container/config additions in this batch require approval before implementation.
+Implementation is complete; production scanner/load/storage evidence remains in S4-6/8/9 and S6.
 
-- [ ] **S4-1 Add a central challenge validator.** Integrate Turnstile (or an approved equivalent) via
+- [x] **S4-1 Add a central challenge validator.** Integrate Turnstile (or an approved equivalent) via
       a server-side service with strict hostname, expected action, single-use and short-timeout checks,
       plus fail-closed production behavior. Ticket creation, request-link and upload each require their
       own action-bound challenge; one solved token cannot authorize two actions or requests.
       Client-authenticated replies use session/rate limits, not an identity CAPTCHA.
-- [ ] **S4-2 Add layered quotas.** Retain Redis endpoint throttles and add per-action limits keyed by
+- [x] **S4-2 Add layered quotas.** Retain Redis endpoint throttles and add per-action limits keyed by
       trusted IP plus client/session/email-hash where available. Add a global emergency cap and alerts
       for ticket creation, reset/link emails, bytes uploaded and orphan count.
-- [ ] **S4-3 Remove large files from Node memory.** Replace `memoryStorage()` for public uploads with
+- [x] **S4-3 Remove large files from Node memory.** Replace `memoryStorage()` for public uploads with
       bounded temporary/quarantine storage or streaming. Enforce maximum total request bytes, file
       count and per-file size at both Caddy and API. Clean temp files on every success/error path.
-- [ ] **S4-4 Enforce limits at the attachment service boundary.** The same count, per-file, total-byte,
+- [x] **S4-4 Enforce limits at the attachment service boundary.** The same count, per-file, total-byte,
       MIME and quarantine rules must run inside `AttachmentsService`, not only the HTTP controller, so
       inbound-mail and future callers cannot bypass them. Until scanning is ready, reject public
       uploads and quarantine/retry inbound attachments with an observable failure; never silently drop
       them or make them downloadable.
-- [ ] **S4-5 Add malware scanning.** Scan the quarantined bytes with ClamAV/an approved scanner before
+- [x] **S4-5 Add malware scanning.** Scan the quarantined bytes with ClamAV/an approved scanner before
       moving to permanent storage or creating an adoptable attachment. Production fails closed when
       the scanner is unavailable. Keep MIME allowlist, magic-byte checks and extension denylist as
       defense in depth. Define policies for encrypted archives, nested/archive bombs, scanner signature
       freshness, CPU/memory/concurrency and ensure the scanner has no public port.
-- [ ] **S4-6 Reconcile and scan existing storage.** Before launch, compare DB attachment rows to files
-      in both directions, quarantine mismatches, and scan every existing downloadable file. Handle
-      write-then-DB-failure, partial multi-file upload and concurrent adoption without orphaning or
-      exposing bytes.
-- [ ] **S4-7 Add orphan cleanup.** Implement an idempotent maintenance job using existing BullMQ (or
+- [~] **S4-6 Reconcile and scan existing storage.** Before launch, compare DB attachment rows to files
+  in both directions, quarantine mismatches, and scan every existing downloadable file. Handle
+  write-then-DB-failure, partial multi-file upload and concurrent adoption without orphaning or
+  exposing bytes.
+- [x] **S4-7 Add orphan cleanup.** Implement an idempotent maintenance job using existing BullMQ (or
       an approved host scheduler) that deletes DB rows and files for unclaimed attachments older than
       the agreed TTL (initial recommendation: 24 hours). Retry partial FS/DB failures safely and emit
       counts/bytes, never filenames containing customer data.
-- [ ] **S4-8 Add storage monitoring.** Alert on disk usage, upload rejection rate, scanner failures,
-      orphan bytes and cleanup failures. Document the emergency action that disables public upload
-      without disabling staff ticket access.
-- [ ] **S4-9 Test abuse and cleanup.** Cover spoofed MIME, executable text, EICAR, encrypted/nested
-      archive and archive-bomb policy, scanner outage/stale signatures, oversized/multi-file HTTP and
-      inbound-mail requests, cross-action challenge replay, distributed-key behavior, orphan expiry,
-      adoption races and file/row partial-failure recovery.
+- [~] **S4-8 Add storage monitoring.** Alert on disk usage, upload rejection rate, scanner failures,
+  orphan bytes and cleanup failures. Document the emergency action that disables public upload
+  without disabling staff ticket access.
+- [~] **S4-9 Test abuse and cleanup.** Cover spoofed MIME, executable text, EICAR, encrypted/nested
+  archive and archive-bomb policy, scanner outage/stale signatures, oversized/multi-file HTTP and
+  inbound-mail requests, cross-action challenge replay, distributed-key behavior, orphan expiry,
+  adoption races and file/row partial-failure recovery.
 
 **S4 acceptance**
 
@@ -596,20 +599,28 @@ External service/container/config additions in this batch require approval befor
       or localhost `TELECOM_HD_PUBLIC_URL` and a localhost/MailHog `TELECOM_HD_SMTP_HOST` in production —
       so a prod deploy cannot silently boot with the dev localhost origin (which would break the CSRF
       allowlist + magic-link/reset URLs) or a dev mail host (which would black-hole reset/login mail).
-      Unit-tested; no inbound-webhook secret exists in this codebase, so none is required. The rest of
-      S5 (canonical edge, firewall, edge logging, DB audit, runtime patching) is separate VM/infra work.)_
-- [ ] **S5-8 Add a separate DB-aware go-live audit.** Run only on the VM with read-only DB credentials.
-      Fail when any enabled staff hash matches a shipped/default password, when demo identities remain
-      enabled, or when bootstrap/reset/session invariants are unsafe. Keep this separate from the
-      environment-only preflight and print aggregate findings only.
-- [ ] **S5-9 Make public builds deterministic.** Ensure the public deploy command rebuilds web/API
-      when build-time URL/config changes, renders the intended compose stack and proves the browser
-      bundle calls same-origin `/api`. Tag API/web images immutably with a release ID and record a
-      non-secret config checksum; do not reuse an unknown stale tailnet image.
-- [ ] **S5-10 Patch runtimes deliberately.** After approval, update Caddy, Node base images and the
-      PostgreSQL minor release to current supported security patches, one risk domain at a time.
-      Review release notes, back up first, run targeted tests, verify migrations/restore, and retain a
-      rollback image/tag. Do not combine these upgrades with functional auth changes in one commit.
+      Preflight and the boot guard also require a strong `TELECOM_HD_INBOUND_WEBHOOK_SECRET`, along
+      with the Alaris/JWT/encryption secrets. Bootstrap credentials are forbidden in `.env.prod` and
+      are accepted only by the removed one-shot helper. VM execution remains part of S6.)_
+- [~] **S5-8 Add a separate DB-aware go-live audit.** Run only on the VM with read-only DB credentials.
+  Fail when any enabled staff hash matches a shipped/default password, when demo identities remain
+  enabled, or when bootstrap/reset/session invariants are unsafe. Keep this separate from the
+  environment-only preflight and print aggregate findings only.
+  _(Implemented as the aggregate-only production-readiness/ownership/template/storage audits;
+  execution against the live production database is still required.)_
+- [~] **S5-9 Make public builds deterministic.** Ensure the public deploy command rebuilds web/API
+  when build-time URL/config changes, renders the intended compose stack and proves the browser
+  bundle calls same-origin `/api`. Tag API/web images immutably with a release ID and record a
+  non-secret config checksum; do not reuse an unknown stale tailnet image.
+  _(Implemented: `deploy-prod.sh` requires the exact clean fetched `origin/main`, derives a
+  non-secret `NEXT_PUBLIC_\*`digest via`scripts/web-build-id.sh`, and gives each release/config
+  variant an immutable web tag. The VM compose render and browser-bundle proof remain pending.)\_
+- [~] **S5-10 Patch runtimes deliberately.** After approval, update Caddy, Node base images and the
+  PostgreSQL minor release to current supported security patches, one risk domain at a time.
+  Review release notes, back up first, run targeted tests, verify migrations/restore, and retain a
+  rollback image/tag. Do not combine these upgrades with functional auth changes in one commit.
+  _(Production runtime and application dependency pins are explicit in the release candidate;
+  image pull/scan and live restore evidence remain a VM gate.)_
 
 **S5 acceptance**
 
@@ -625,23 +636,24 @@ External service/container/config additions in this batch require approval befor
 
 ## 🔴 S6 — Verification, staged release and rollback
 
-- [ ] **S6-1 Run targeted gates per batch.** Start with file/module-scoped unit and integration tests,
-      then API/web typecheck, lint and build. Ask before the heavy Docker reset/rebuild and
-      `make verify-full` gate.
-- [ ] **S6-2 Replace the incompatible production smoke path.** Add mandatory `scripts/smoke-prod.sh`
-      using a cookie jar, CSRF flow and an approved temporary real test account; it must not use demo
-      credentials, parse JWT JSON, assume Swagger or print webhook secrets. Update dev `smoke.sh`,
-      diagnostics and e2e separately. Update `scripts/verify.sh` so production verification fails—not
-      silently skips—when the target stack/smoke prerequisites are absent.
+- [~] **S6-1 Run targeted gates per batch.** Start with file/module-scoped unit and integration tests,
+  then API/web typecheck, lint and build. Ask before the heavy Docker reset/rebuild and
+  `make verify-full` gate.
+  _(Targeted security suites and API/web typecheck/lint are green; the exact final-commit full
+  gate and production container evidence must still be recorded.)_
+- [~] **S6-2 Replace the incompatible production smoke path.** Add mandatory `scripts/smoke-prod.sh`
+  using a cookie jar, CSRF flow and an approved temporary real test account; it must not use demo
+  credentials, parse JWT JSON, assume Swagger or print webhook secrets. Update dev `smoke.sh`,
+  diagnostics and e2e separately. Update `scripts/verify.sh` so production verification fails—not
+  silently skips—when the target stack/smoke prerequisites are absent.
+  _(`scripts/smoke-prod.sh` implements the cookie-only/CSRF/refresh/logout contract without
+  printing secrets. It still must pass through the approved production HTTPS edge.)_
 - [~] **S6-3 Apply migrations to a fresh database.** Prove every migration applies from zero and
   upgrades a restored production-shaped copy. Prefer expand/contract migrations compatible with
   the previous image; document the forward-fix boundary and never test destructive rollback live.
-  _(From-zero proof done locally: `prisma migrate deploy` applied the full chain — including the
-  new `20260716180000_normalize_user_email_ownership` — to a fresh empty DB with "All migrations
-  have been successfully applied", then `npm run seed` populated it and `npm run audit:ownership`
-  reported CLEAN (0 duplicate/un-normalized/ambiguous, 1 expected orphan: the Alaris system ticket
-  `alaris@system.internal`, which has no registered user). **Still open (VM):** upgrading a
-  restored production-shaped copy behind the allowlist + documenting the forward-fix boundary.)_
+  _(From-zero proof done locally on disposable PostgreSQL 15: all 31 migrations applied, seed
+  succeeded and the ownership audit reported CLEAN. **Still open (VM):** upgrade and audit a restored
+  production-shaped copy behind the allowlist.)_
 - [ ] **S6-4 Run the security repro matrix behind the allowlist.** At minimum, prove anonymous/email-only
       client list/detail/reply/download fail; Client A cannot access/mutate Client B; secrets never
       appear in JSON/logs; old sessions fail after password/role/disable/logout; wrong-origin or
@@ -651,16 +663,23 @@ External service/container/config additions in this batch require approval befor
 - [ ] **S6-5 Run dependency/image and external web checks.** Use approved tooling to scan production
       dependencies/images and run a non-destructive DAST/baseline scan against the allowlisted staging
       route. Triage every HIGH/CRITICAL finding before proceeding.
-- [ ] **S6-6 Rehearse rollback and kill switch.** Deploy immutable image tags plus config checksum and
-      auto-abort on failed smoke. Prove the named tunnel can be stopped/disabled within the agreed
-      minute-level objective while Tailscale remains alive. Rollback restores code/images/config only;
-      never restore rotated secrets. Record migration boundary, forward-fix and restore owner.
+- [~] **S6-6 Rehearse rollback and kill switch.** Deploy immutable image tags plus config checksum and
+  auto-abort on failed smoke. Prove the named tunnel can be stopped/disabled within the agreed
+  minute-level objective while Tailscale remains alive. Before the migration boundary, rollback
+  must prove old services healthy and BullMQ resumed; after it, fail closed and finish forward or
+  restore the exact DB/uploads/Redis triplet plus matching immutable images. Never restore rotated
+  secrets. Record migration boundary, forward-fix and restore owner.
+  _(The deploy helper implements the boundary traps, immutable tags, queue pause/drain, exact
+  backup triplet provenance and owner-only recovery manifest. An attended VM rehearsal and edge
+  kill-switch timing are still required.)_
 - [ ] **S6-7 Stage exposure.** Deploy first behind the existing owner CIDRs, then a small support pilot.
       Observe auth failures, 4xx/5xx, latency, queues, disk, database and scanner metrics for an agreed
       soak period. Expand public policy only after the review sign-off.
-- [ ] **S6-8 Update truth docs.** Mark this goal honestly, update `docs/GO_LIVE_STATUS.md`, deploy/access
-      runbooks and API/database/architecture docs. Remove stale claims that email-only ownership,
-      Quick Tunnel or deferred AV are production-safe.
+- [~] **S6-8 Update truth docs.** Mark this goal honestly, update `docs/GO_LIVE_STATUS.md`, deploy/access
+  runbooks and API/database/architecture docs. Remove stale claims that email-only ownership,
+  Quick Tunnel or deferred AV are production-safe.
+  _(Release-candidate docs describe the implemented controls and keep public GO blocked; this
+  item closes only after exact VM/edge evidence is linked.)_
 
 ---
 
@@ -688,8 +707,9 @@ Public launch is allowed only when every item below is checked:
 ## References
 
 - Local evidence: `apps/api/src/auth/`, `apps/api/src/modules/tickets/`,
-  `apps/api/src/modules/attachments/`, `infra/caddy/`, `docker-compose.public.yml`,
-  `scripts/preflight.sh`, `deploy.md`, `docs/GO_LIVE_STATUS.md`.
+  `apps/api/src/modules/attachments/`, `infra/caddy/`, `docker-compose.prod.yml`,
+  `docker-compose.proxy.yml`, `scripts/preflight.sh`, `scripts/deploy-prod.sh`, `docs/DEPLOY.md` and
+  `docs/GO_LIVE_STATUS.md`.
 - OWASP: Authentication, CSRF Prevention and File Upload Cheat Sheets.
 - Cloudflare: production Named Tunnel, visitor-IP restoration, Turnstile server-side validation and
   WAF rate-limiting documentation.

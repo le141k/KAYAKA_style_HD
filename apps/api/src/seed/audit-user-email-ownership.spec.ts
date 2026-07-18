@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { auditUserEmailOwnership } from './audit-user-email-ownership';
+import { auditUserEmailOwnership, isPreMigrationOwnershipClean } from './audit-user-email-ownership';
 import type { PrismaClient } from '@prisma/client';
 
 /**
@@ -80,5 +80,31 @@ describe('auditUserEmailOwnership (S2-2)', () => {
     const a = await auditUserEmailOwnership(client);
     expect(a.totals.ambiguousGroups).toBe(0);
     expect(a.clean).toBe(false); // un-normalized rows still block the UNIQUE invariant
+  });
+
+  it('is NOT clean for any duplicate group because the expression UNIQUE cannot be installed', async () => {
+    const client = mockClient([
+      [{ norm: 'same@x.io', row_count: 2n, user_count: 1n, user_ids: [5] }],
+      [{ groups: 1n, ambiguous: 0n }],
+      [{ c: 0n }],
+      [],
+      [{ ambiguous: 0n, linkable: 0n, orphan: 0n }],
+    ]);
+    const a = await auditUserEmailOwnership(client);
+    expect(a.clean).toBe(false);
+    expect(isPreMigrationOwnershipClean(a)).toBe(false);
+  });
+
+  it('allows a unique case variant only in the pre-migration gate', async () => {
+    const client = mockClient([
+      [],
+      [{ groups: 0n, ambiguous: 0n }],
+      [{ c: 1n }],
+      [],
+      [{ ambiguous: 0n, linkable: 0n, orphan: 0n }],
+    ]);
+    const a = await auditUserEmailOwnership(client);
+    expect(a.clean).toBe(false);
+    expect(isPreMigrationOwnershipClean(a)).toBe(true);
   });
 });

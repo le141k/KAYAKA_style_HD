@@ -20,12 +20,15 @@ Consumed by: `AuthController`, `JwtAuthGuard`.
 ```ts
 login(email: string, password: string, ip?: string): Promise<LoginResult>
 // LoginResult = { accessToken, refreshToken, staff: AuthStaff }
+// Internal service result: AuthController stores the JWT pair only in HttpOnly cookies and returns
+// `{staff}` to the browser. No JWT appears in login/refresh JSON.
 // Validates credentials, issues JWT pair, persists argon2-hashed refresh token, updates lastLoginAt.
 // S3-7: before validating, asserts the caller is under the login-abuse throttle (LoginThrottleService,
 // keyed by trusted client IP + HMAC(email)); records a failure on bad credentials and clears the
 // counter on success. Over the threshold it throws a generic 429 (never an account-lock). Fail-open:
 // a Redis outage does not block logins. Both the throttle 429 and the credential failure are generic
 // so nothing about account existence or lock state is disclosed.
+// Legacy Staff.failedLoginAttempts/lockedUntil columns are not read or written at runtime.
 
 refresh(rawRefreshToken: string): Promise<TokenPair>
 // S3-3: looks up EXACTLY ONE row by the token's opaque `jti` (no Argon2 scan), verifies
@@ -66,10 +69,10 @@ forgotPassword(email: string): Promise<void>
 // logged in any environment. The token is delivered in a URL fragment (#token=…).
 
 resetPassword(token: string, newPassword: string): Promise<void>
-// Atomic single-use consume (S1-5): a conditional updateMany on
-// (tokenHash, usedAt IS NULL, not expired) must affect exactly one row before the
-// password is changed, so concurrent/replayed use changes the password at most once.
-// On success updates passwordHash and revokes all active refresh tokens in one tx.
+// The token stores Staff.authVersion at issuance. One transaction conditionally consumes the
+// unused/live token, updates only an enabled Staff whose authVersion still matches, increments the
+// version, and revokes refresh/reset siblings. An admin disable/password/logout race therefore
+// either wins first and rejects reset, or runs after reset and remains authoritative.
 // Invariant: MAIL_SERVICE_TOKEN is bound to a real MailService in AuthModule via a NARROW
 // acyclic adapter — AuthModule registers only the 'mail' producer queue and provides
 // MailService locally, WITHOUT importing MailModule (that would pull the
@@ -88,6 +91,10 @@ gracefully):
   counter can never persist without a TTL. Used by `AuthService.login`.
 - `TokenBlocklistService` (`auth/token-blocklist.service.ts`) — Redis jti blocklist for revoked
   access tokens (defense-in-depth atop the authoritative DB `authVersion` check); **fail-open**.
+- `CsrfService` (`auth/csrf.service.ts`) — HKDF-separated HMAC signing for the readable
+  double-submit cookie. `CsrfGuard` requires an exact same origin plus matching valid
+  `X-CSRF-Token` on cookie-authenticated mutations; login/client-verify require exact origin even
+  before a cookie exists.
 
 ---
 
@@ -150,9 +157,11 @@ Consumed by: `TicketsController`, `AlarisService`, `InboundMailService`.
 Constructor: `(prisma: PrismaService, usersService: UsersService, slaService: SlaService, eventEmitter: EventEmitter2)`
 
 ```ts
-createTicket(dto: CreateTicketDto, creatorStaffId?: number): Promise<Ticket>
+createTicket(dto: InternalCreateTicketInput, creatorStaffId?: number): Promise<Ticket>
 // Resolves/creates requester User by email, generates mask (TT-XXXXXX),
 // creates first TicketPost, resolves default status/priority, writes CREATE audit log.
+// Trusted inbound callers may set incomingMessageId (not part of the HTTP schema).
+// A duplicate non-empty ID returns the existing ticket without audit/mail/events.
 // SLA wiring (implemented): calls slaService.resolvePlanForTicket(orgId) to set slaPlanId,
 // then slaService.computeDueDates(slaPlanId, now) to set dueAt + resolutionDueAt.
 // Fires eventEmitter.emit('ticket.created', { ticketId }) on completion.
@@ -168,12 +177,15 @@ getTicket(id: number): Promise<TicketDetail>
 getTicketByMask(mask: string): Promise<TicketDetail>
 // Same as getTicket but looks up by human-readable mask, e.g. "TT-000042".
 
-reply(ticketId: number, dto: ReplyTicketDto, staffId?: number): Promise<TicketPost | TicketNote>
-// Appends post, bumps totalReplies + lastReplyAt + lastActivityAt;
-// sets firstResponseAt on first staff reply. If dto.isNote is true, delegates to addNote().
+reply(ticketId: number, dto: InternalReplyTicketInput, staffId?: number): Promise<TicketPost | TicketNote>
+// Atomically appends the post, adopts attachments, updates counters/status and writes audit.
+// Sets firstResponseAt on first staff reply. Trusted inbound callers may set
+// incomingMessageId; a duplicate returns the exact existing post with no side effects.
+// If dto.isNote is true, delegates to addNote() and forwards attachmentIds.
 
-addNote(ticketId: number, contents: string, staffId?: number): Promise<TicketNote>
-// Internal-only note; sets ticket.hasNotes = true.
+addNote(ticketId: number, contents: string, staffId?: number, attachmentIds?: number[]): Promise<TicketNote>
+// Internal-only note; note creation, attachment adoption, ticket flags and audit
+// commit in one transaction.
 
 assign(ticketId: number, dto: AssignTicketDto, staffId: number): Promise<Ticket>
 changePriority(ticketId: number, dto: ChangePriorityDto, staffId: number): Promise<Ticket>
@@ -255,13 +267,16 @@ Verified client (customer) auth (S2). Consumed by `ClientAuthController` and `Cl
 requestLink(rawEmail: string): Promise<void>
 // Always resolves (no enumeration). Queues a single-use magic-link only when the
 // normalized email maps to EXACTLY ONE User.id that owns ≥1 ticket. Fragment URL;
-// invalidates the token if mail dispatch fails.
+// invalidates the token if mail dispatch fails. A per-owner PostgreSQL advisory xact
+// lock makes the mail cap + invalidate-old/create-new transition race-safe.
 
 verify(rawToken: string): Promise<{ sessionToken: string; expiresAt: Date }>
-// Atomic single-use consume (updateMany count===1) → opens a ClientSession.
+// Atomic single-use consume → opens a version-stamped ClientSession only when the user
+// is enabled and token.clientAuthVersion still matches User.clientAuthVersion.
 
 resolveSession(rawSession: string): Promise<{ userId: number } | null>
-// Hash-lookup; null if revoked/expired. Used by ClientAuthGuard (fails closed 503 on error).
+// Hash-lookup; null if revoked/expired/disabled/version-stale. Used by ClientAuthGuard
+// (fails closed 503 on storage error).
 
 logout(rawSession): Promise<void>          // revoke the session
 cleanupExpired(): Promise<{tokens; sessions}> // idempotent TTL sweep (scheduled hourly, S2-11)
@@ -270,7 +285,7 @@ cleanupExpired(): Promise<{tokens; sessions}> // idempotent TTL sweep (scheduled
 `@ClientAuthenticated()` = `@Public()` + `@UseGuards(ClientAuthGuard)`; `@CurrentClient()` injects
 `{ userId }`. Client ticket routes authorize by `Ticket.userId === client.userId`.
 
-> **Email ownership identity (S2-2).** `normalizeEmail` (trim + lowercase) is canonical in
+> **Email ownership identity (S2-2).** `normalizeEmail` (explicit ASCII trim + lowercase) is canonical in
 > `common/email.util.ts` (re-exported from `client-auth.service` for back-compat). `UsersService`
 > normalizes on every `UserEmail` read/write (`findByEmail`/`findOrCreate`/`create`/`addEmail`), so
 > all owner resolution — incl. `resolveUnambiguousOwner` and ticket create/inbound mail routing
@@ -278,8 +293,15 @@ cleanupExpired(): Promise<{tokens; sessions}> // idempotent TTL sweep (scheduled
 > `20260716180000_normalize_user_email_ownership` normalizes existing rows (non-colliding) and
 > backfills `Ticket.userId` for unambiguous emails. `auditUserEmailOwnership`
 > (`seed/audit-user-email-ownership.ts`, `npm run audit:ownership`) is a READ-ONLY report of
-> case-insensitive duplicate groups + ambiguous/orphan tickets; its `clean` flag gates enforcing a
-> DB-level case-insensitive `UNIQUE(email)` (deferred until prod data is audited).
+> case-insensitive duplicate groups + ambiguous/orphan tickets. Migration
+> `20260717000000_client_identity_invariant` fails and rolls back unless that audit is CLEAN, then
+> installs the normalized CHECK/expression UNIQUE. Owner lookup uses DB `lower(btrim(...))` and
+> fails closed on every legacy case/whitespace collision even before the invariant is installed.
+
+> `User.clientAuthVersion` is stamped into every client login token/session. User enable-state and
+> email mutations share the same per-user advisory xact lock as issuance/verification, bump the
+> version and revoke active auth material in the same transaction. An old link/session therefore
+> remains invalid after disable → re-enable or email removal.
 
 > **Reset-mail adapter (S1-3).** `AuthModule` does NOT import `MailModule` (that would pull the
 > Mail→Tickets→Sla→Mail module-load cycle at boot). It registers the `mail` queue and provides a
@@ -309,14 +331,29 @@ sendTemplateStrict(to: string | string[], templateKey: string, locale: string, v
 
 ## InboundMailService (`apps/api/src/modules/mail/inbound.service.ts`)
 
-Implements `OnModuleInit` / `OnModuleDestroy`. No public methods — driven entirely by lifecycle hooks.
+Implements `OnModuleInit` / `OnModuleDestroy`; `ingestRawMessage` is also shared by the
+secret-authenticated MTA/PIPE controller.
 
 - On init: queries `EmailQueue` for enabled IMAP queues, connects via `imapflow`, starts a
   60-second `setInterval` poll.
-- Per message: threads replies into existing tickets by matching `TT-XXXXXX` mask in the subject
-  line (calls `TicketsService.reply()`); creates new tickets for unthreaded messages.
-- TODO: replace `setInterval` with IMAP IDLE push; implement `passwordEnc` decryption for stored
-  IMAP credentials.
+- A process-local poll lock prevents overlapping interval/direct polls. State is checkpointed
+  after every UID as `{uidValidity, watermark, failures}` in `Setting`. A failed message remains a
+  durable retry gap and is moved to `Helpdesk-Processing-Errors` after three failed processing
+  attempts; a failed move stays pending, while later UIDs continue. A UID that has disappeared
+  from INBOX is retained as a bounded terminal `missing` record after three lookup attempts.
+  A UIDVALIDITY change pauses that queue instead of reusing an unsafe watermark; operations must
+  inspect the mailbox and reset `imap/state:<queueId>` deliberately.
+- MIME source bytes, parsed subject/body/addresses/references/filenames and parser concurrency are
+  bounded. Database regex rules accept only a small non-backtracking subset; unsafe expressions
+  fail closed.
+- Per message: threads replies by RFC references first, then by an owned `TT-XXXXXX` subject
+  mask, and creates a new ticket otherwise. Threading requires normalized sender membership in
+  the ticket requester, linked `UserEmail`, or `TicketRecipient` set; possession of a Message-ID
+  or mask alone is never authorization. The receiving MTA must enforce its normal anti-spoofing
+  policy because the application sees the RFC `From` identity supplied by that trusted ingress.
+- The parsed/synthetic Message-ID is passed only through internal TicketsService inputs; a partial
+  unique DB index makes concurrent IMAP/webhook redelivery an idempotent no-op.
+- TODO: replace `setInterval` with IMAP IDLE push.
 
 ---
 

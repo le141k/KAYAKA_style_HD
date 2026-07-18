@@ -8,12 +8,14 @@ import {
   OnModuleDestroy,
 } from '@nestjs/common';
 import { createHash, randomBytes } from 'crypto';
+import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
 import { MAIL_SERVICE_TOKEN, type ResetMailer } from '../../auth/auth.service';
 // Re-exported for back-compat with existing importers; canonical home is common/email.util.
 export { normalizeEmail } from '../../common/email.util';
 import { normalizeEmail } from '../../common/email.util';
+import { lockClientIdentity } from '../../common/client-auth-lock';
 
 /** Verified client principal resolved from a session cookie. */
 export interface ClientPrincipal {
@@ -27,6 +29,10 @@ const MAGIC_LINK_WINDOW_MS = 15 * 60 * 1000;
 const MAGIC_LINK_MAX_PER_WINDOW = 3;
 /** Client session TTL: 7 days. */
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+interface ResolvedOwner {
+  userId: number;
+  clientAuthVersion: number;
+}
 
 function sha256(raw: string): string {
   return createHash('sha256').update(raw).digest('hex');
@@ -77,22 +83,31 @@ export class ClientAuthService implements OnModuleInit, OnModuleDestroy {
    * Resolve an email to exactly one owning `User.id`, or null if it is ambiguous /
    * unknown / owns no tickets. Ownership is by `User.id`; the email is only the lookup.
    */
-  private async resolveUnambiguousOwner(normalizedEmail: string): Promise<number | null> {
-    const userEmails = await this.prisma.userEmail.findMany({
-      where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
-      select: { userId: true },
-    });
+  private async resolveUnambiguousOwner(
+    db: PrismaService | Prisma.TransactionClient,
+    normalizedEmail: string,
+  ): Promise<ResolvedOwner | null> {
+    // Query every legacy row by the DB's canonical expression. A Prisma insensitive
+    // equality does not trim stored values and could select the normalized row while
+    // missing a whitespace variant owned by somebody else. Until the invariant migration
+    // is installed, that would turn dirty data into an account-takeover ambiguity.
+    const userEmails = await db.$queryRaw<{ userId: number }[]>`
+      SELECT "userId"
+      FROM "UserEmail"
+      -- Keep the trim characters a SQL constant (rather than a bind parameter) so Postgres
+      -- can use UserEmail_email_normalized_key for this public request path.
+      WHERE lower(btrim("email", E' \\t\\n\\r\\f\\x0B')) = ${normalizedEmail}
+    `;
     const userIds = [...new Set(userEmails.map((u) => u.userId))];
     if (userIds.length !== 1) return null; // unknown or ambiguous → fail closed
     const userId = userIds[0]!;
-    // Blocker #5: never issue a login link for a disabled user.
-    const user = await this.prisma.user.findUnique({
+    const user = await db.user.findUnique({
       where: { id: userId },
-      select: { isEnabled: true },
+      select: { isEnabled: true, clientAuthVersion: true },
     });
     if (!user || !user.isEnabled) return null;
-    const ticketCount = await this.prisma.ticket.count({ where: { userId } });
-    return ticketCount > 0 ? userId : null;
+    const ticketCount = await db.ticket.count({ where: { userId } });
+    return ticketCount > 0 ? { userId, clientAuthVersion: user.clientAuthVersion } : null;
   }
 
   /**
@@ -102,36 +117,52 @@ export class ClientAuthService implements OnModuleInit, OnModuleDestroy {
    */
   async requestLink(rawEmail: string): Promise<void> {
     const email = normalizeEmail(rawEmail);
-    const userId = await this.resolveUnambiguousOwner(email);
-    if (userId === null) return; // generic response, no email, no enumeration
+    const initialOwner = await this.resolveUnambiguousOwner(this.prisma, email);
+    if (initialOwner === null) return; // generic response, no email, no enumeration
 
-    // Mail-bomb protection (blocker): bound how many links a single owner is sent per window,
-    // on top of the per-IP @Throttle on the endpoint. Silently stop once the cap is hit —
-    // still a generic 202, so nothing about the account is disclosed.
-    const recentLinks = await this.prisma.clientLoginToken.count({
-      where: { userId, createdAt: { gt: new Date(Date.now() - MAGIC_LINK_WINDOW_MS) } },
-    });
-    if (recentLinks >= MAGIC_LINK_MAX_PER_WINDOW) return;
+    // Serialize all issuance for one owner. The second in-transaction resolution closes
+    // the gap where an email is removed/reassigned after the public lookup but before create.
+    // It also makes the per-owner cap and invalidate-old/create-new sequence race-safe.
+    const issued = await this.prisma.$transaction(async (tx) => {
+      await lockClientIdentity(tx, initialOwner.userId);
+      const owner = await this.resolveUnambiguousOwner(tx, email);
+      if (!owner || owner.userId !== initialOwner.userId) return null;
 
-    await this.prisma.clientLoginToken.updateMany({
-      where: { userId, usedAt: null },
-      data: { usedAt: new Date() },
-    });
+      const recentLinks = await tx.clientLoginToken.count({
+        where: {
+          userId: owner.userId,
+          createdAt: { gt: new Date(Date.now() - MAGIC_LINK_WINDOW_MS) },
+        },
+      });
+      if (recentLinks >= MAGIC_LINK_MAX_PER_WINDOW) return null;
 
-    const rawToken = randomBytes(32).toString('hex');
-    const tokenHash = sha256(rawToken);
-    const expiresAt = new Date(Date.now() + LOGIN_TOKEN_TTL_MS);
-    const created = await this.prisma.clientLoginToken.create({
-      data: { userId, tokenHash, email, expiresAt },
+      const now = new Date();
+      await tx.clientLoginToken.updateMany({
+        where: { userId: owner.userId, usedAt: null },
+        data: { usedAt: now },
+      });
+
+      const rawToken = randomBytes(32).toString('hex');
+      const created = await tx.clientLoginToken.create({
+        data: {
+          userId: owner.userId,
+          clientAuthVersion: owner.clientAuthVersion,
+          tokenHash: sha256(rawToken),
+          email,
+          expiresAt: new Date(Date.now() + LOGIN_TOKEN_TTL_MS),
+        },
+      });
+      return { id: created.id, rawToken, userId: owner.userId };
     });
+    if (!issued) return;
 
     // Deliver the raw token in a URL fragment so it never reaches proxy/access logs (S2-5).
     // Path is `/verify` — the (client) Next.js route group serves at the root, matching the
     // `/reset-password` precedent (NOT `/client/verify`, which would 404).
-    const verifyUrl = `${this.config.TELECOM_HD_PUBLIC_URL}/verify#token=${rawToken}`;
+    const verifyUrl = `${this.config.TELECOM_HD_PUBLIC_URL}/verify#token=${issued.rawToken}`;
 
     if (!this.mailService) {
-      await this.invalidateToken(created.id);
+      await this.invalidateToken(issued.id);
       if (this.config.NODE_ENV === 'production') {
         this.logger.error('Client login mailer is not configured; no email sent');
       }
@@ -144,9 +175,20 @@ export class ClientAuthService implements OnModuleInit, OnModuleDestroy {
       });
     } catch {
       // Fail closed: invalidate the freshly issued token; stay generic; never log the link.
-      await this.invalidateToken(created.id);
-      this.logger.error(`Client login-link dispatch failed for userId ${userId}`);
+      await this.invalidateToken(issued.id);
+      this.logger.error(`Client login-link dispatch failed for userId ${issued.userId}`);
     }
+  }
+
+  /**
+   * Detach identity lookup, token issuance and SMTP from the public response path.
+   * Every caller receives the same immediate 202 after challenge/quota checks; a
+   * known owner can no longer be inferred from database or mail latency.
+   */
+  queueRequestLink(rawEmail: string): void {
+    void this.requestLink(rawEmail).catch(() => {
+      this.logger.error('Client login-link background dispatch failed');
+    });
   }
 
   private async invalidateToken(id: string): Promise<void> {
@@ -162,42 +204,76 @@ export class ClientAuthService implements OnModuleInit, OnModuleDestroy {
    */
   async verify(rawToken: string): Promise<{ sessionToken: string; expiresAt: Date }> {
     const tokenHash = sha256(rawToken);
+    return this.prisma.$transaction(async (tx) => {
+      const candidate = await tx.clientLoginToken.findUnique({
+        where: { tokenHash },
+        select: { userId: true },
+      });
+      if (!candidate) throw new UnauthorizedException('Invalid or expired login link');
 
-    // Conditional consume: exactly one caller flips usedAt from NULL for a live token.
-    const consumed = await this.prisma.clientLoginToken.updateMany({
-      where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
-      data: { usedAt: new Date() },
-    });
-    if (consumed.count !== 1) {
-      throw new UnauthorizedException('Invalid or expired login link');
-    }
-    const token = await this.prisma.clientLoginToken.findUnique({ where: { tokenHash } });
-    if (!token) {
-      throw new UnauthorizedException('Invalid or expired login link');
-    }
+      // User identity mutations take the same lock, so a disable/email removal cannot
+      // interleave between the final version check and session creation.
+      await lockClientIdentity(tx, candidate.userId);
+      const token = await tx.clientLoginToken.findUnique({
+        where: { tokenHash },
+        include: { user: { select: { isEnabled: true, clientAuthVersion: true } } },
+      });
+      const now = new Date();
+      if (
+        !token ||
+        token.usedAt !== null ||
+        token.expiresAt <= now ||
+        !token.user.isEnabled ||
+        token.clientAuthVersion !== token.user.clientAuthVersion
+      ) {
+        throw new UnauthorizedException('Invalid or expired login link');
+      }
 
-    const rawSession = randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
-    await this.prisma.clientSession.create({
-      data: { userId: token.userId, tokenHash: sha256(rawSession), email: token.email, expiresAt },
+      const consumed = await tx.clientLoginToken.updateMany({
+        where: {
+          id: token.id,
+          usedAt: null,
+          expiresAt: { gt: now },
+          clientAuthVersion: token.user.clientAuthVersion,
+        },
+        data: { usedAt: now },
+      });
+      if (consumed.count !== 1) {
+        throw new UnauthorizedException('Invalid or expired login link');
+      }
+
+      const rawSession = randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
+      await tx.clientSession.create({
+        data: {
+          userId: token.userId,
+          clientAuthVersion: token.clientAuthVersion,
+          tokenHash: sha256(rawSession),
+          email: token.email,
+          expiresAt,
+        },
+      });
+      this.logger.log(`Client session opened for userId ${token.userId}`);
+      return { sessionToken: rawSession, expiresAt };
     });
-    this.logger.log(`Client session opened for userId ${token.userId}`);
-    return { sessionToken: rawSession, expiresAt };
   }
 
   /** Resolve a raw session cookie to a client principal, or null if invalid. */
   async resolveSession(rawSession: string): Promise<ClientPrincipal | null> {
     const session = await this.prisma.clientSession.findUnique({
       where: { tokenHash: sha256(rawSession) },
-      include: { user: { select: { isEnabled: true } } },
+      include: { user: { select: { isEnabled: true, clientAuthVersion: true } } },
     });
     if (!session || session.revokedAt !== null || session.expiresAt < new Date()) {
       return null;
     }
-    // Blocker #5: a user disabled AFTER login loses access immediately, even though the
-    // 7-day session cookie hasn't expired. (Sessions are bound to a stable `userId`, so an
-    // email change does not transfer or invalidate them — the same person stays signed in.)
-    if (!session.user || !session.user.isEnabled) {
+    // A user disabled or identity-changed AFTER login loses access immediately, even though
+    // the 7-day cookie has not expired: both enabled state and the durable version must match.
+    if (
+      !session.user ||
+      !session.user.isEnabled ||
+      session.clientAuthVersion !== session.user.clientAuthVersion
+    ) {
       return null;
     }
     // Best-effort last-seen bump (never blocks the request path).

@@ -22,6 +22,10 @@ export interface TokenPair {
   refreshToken: string;
 }
 
+export type RefreshResult =
+  | { accessToken: string; refreshToken: string; refreshRotated: true }
+  | { accessToken: string; refreshRotated: false };
+
 export interface LoginResult extends TokenPair {
   staff: AuthStaff;
 }
@@ -45,12 +49,6 @@ export interface ResetMailer {
 
 /** Token used to inject the reset mailer (MailService) into AuthService. */
 export const MAIL_SERVICE_TOKEN = Symbol('MAIL_SERVICE_TOKEN');
-
-// D2 — per-account lockout thresholds (env-overridable). The per-IP throttler
-// stops a single host hammering login; this stops a distributed brute-force from
-// many IPs against one account.
-const LOGIN_MAX_ATTEMPTS = Number(process.env['TELECOM_HD_LOGIN_MAX_ATTEMPTS']) || 5;
-const LOGIN_LOCK_MINUTES = Number(process.env['TELECOM_HD_LOGIN_LOCK_MINUTES']) || 15;
 
 /**
  * Grace window for refresh rotation (S3-3). If a token's jti is found already-revoked
@@ -103,56 +101,12 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // D2: reject while the account is locked, regardless of whether the supplied
-    // password is correct — this is what blunts a distributed brute-force.
-    if (staff.lockedUntil && staff.lockedUntil.getTime() > Date.now()) {
-      throw new UnauthorizedException(
-        'Account temporarily locked due to repeated failed login attempts. Try again later.',
-      );
-    }
-
     const ok = await verifyPassword(staff.passwordHash, password);
     if (!ok) {
-      await this.registerFailedLogin(staff);
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // Successful auth clears any accumulated failure state.
-    if (staff.failedLoginAttempts > 0 || staff.lockedUntil) {
-      await this.prisma.staff.update({
-        where: { id: staff.id },
-        data: { failedLoginAttempts: 0, lockedUntil: null },
-      });
-    }
-
     return staff;
-  }
-
-  /**
-   * D2 — record a failed login: increment the counter and, once it crosses the
-   * threshold, set `lockedUntil` and reset the counter so the next window starts
-   * fresh after the lock expires. Best-effort: a DB hiccup here must not turn a
-   * wrong password into a 500.
-   */
-  private async registerFailedLogin(staff: { id: number; failedLoginAttempts: number }): Promise<void> {
-    const attempts = staff.failedLoginAttempts + 1;
-    const locking = attempts >= LOGIN_MAX_ATTEMPTS;
-    try {
-      await this.prisma.staff.update({
-        where: { id: staff.id },
-        data: locking
-          ? {
-              failedLoginAttempts: 0,
-              lockedUntil: new Date(Date.now() + LOGIN_LOCK_MINUTES * 60_000),
-            }
-          : { failedLoginAttempts: attempts },
-      });
-      if (locking) {
-        this.logger.warn(`Staff ${staff.id} locked for ${LOGIN_LOCK_MINUTES}m after ${attempts} failures`);
-      }
-    } catch (err) {
-      this.logger.error(`Failed to record login failure for staff ${staff.id}`, err as Error);
-    }
   }
 
   /** Log in, issue tokens, persist hashed refresh token. */
@@ -189,7 +143,7 @@ export class AuthService {
       data: { lastLoginAt: new Date() },
     });
 
-    this.logger.log(`Staff ${staff.email} logged in`);
+    this.logger.log(`Staff ${staff.id} logged in`);
     return { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, staff: principal };
   }
 
@@ -199,7 +153,7 @@ export class AuthService {
    * verifies its hash, and rotates it with a conditional CAS. Exactly one concurrent
    * caller wins; a genuine later replay of an already-rotated token revokes the family.
    */
-  async refresh(rawRefreshToken: string): Promise<TokenPair> {
+  async refresh(rawRefreshToken: string): Promise<RefreshResult> {
     let payload: { sub: number; jti: string; fid?: string };
     try {
       payload = this.jwt.verify<{ sub: number; jti: string; fid?: string }>(rawRefreshToken, {
@@ -245,10 +199,31 @@ export class AuthService {
       throw new UnauthorizedException('Session has been invalidated');
     }
 
-    // Atomic rotation via CAS: exactly one caller flips revokedAt NULL→now for this jti.
-    const consumed = await this.prisma.refreshToken.updateMany({
-      where: { jti: row.jti, revokedAt: null },
-      data: { revokedAt: new Date() },
+    // Prepare the successor outside the transaction (JWT signing + Argon2 are CPU
+    // work), then atomically consume the parent and persist the successor. A crash
+    // can no longer burn the only refresh token without storing its replacement.
+    const principal = this.buildPrincipal(staff);
+    const tokens = await this.issueTokens(principal, staff.id, staff.authVersion, row.familyId);
+    const successorHash = await hashPassword(tokens.refreshToken);
+    const successorExpiresAt = new Date(Date.now() + this.config.TELECOM_HD_JWT_REFRESH_TTL * 1000);
+    const consumed = await this.prisma.$transaction(async (tx) => {
+      const result = await tx.refreshToken.updateMany({
+        where: { jti: row.jti, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      if (result.count === 1) {
+        await tx.refreshToken.create({
+          data: {
+            staffId: staff.id,
+            jti: tokens.refreshJti,
+            familyId: row.familyId,
+            tokenHash: successorHash,
+            expiresAt: successorExpiresAt,
+            authVersion: staff.authVersion,
+          },
+        });
+      }
+      return result;
     });
 
     if (consumed.count !== 1) {
@@ -267,22 +242,17 @@ export class AuthService {
         );
         throw new UnauthorizedException('Refresh token reuse detected; all sessions have been revoked');
       }
-      // Concurrent loser: fail WITHOUT revoking the winner's freshly created session.
-      throw new UnauthorizedException('Refresh token already rotated');
+      // Concurrent browser-tab loser: issue only a fresh access cookie. The winner
+      // owns the persisted rotated refresh token; omitting Set-Cookie for refresh
+      // ensures this later response cannot overwrite or delete the winner's cookie.
+      return { accessToken: tokens.accessToken, refreshRotated: false };
     }
 
-    // Winner: issue a new pair in the SAME family, stamped with the current authVersion.
-    const principal = this.buildPrincipal(staff);
-    const tokens = await this.issueTokens(principal, staff.id, staff.authVersion, row.familyId);
-    await this.persistRefreshToken(
-      staff.id,
-      tokens.refreshToken,
-      tokens.refreshJti,
-      row.familyId,
-      staff.authVersion,
-    );
-
-    return { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken };
+    return {
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      refreshRotated: true,
+    };
   }
 
   /**
@@ -331,6 +301,19 @@ export class AuthService {
   // ─────────────────────────── Password reset ────────────────────────────────
 
   /**
+   * Start reset issuance after the HTTP response path has been detached. This
+   * removes the account-existence/SMTP timing oracle while keeping all failures
+   * fail-safe: a background failure is logged without a token or email address.
+   */
+  queuePasswordReset(email: string): void {
+    void this.forgotPassword(email).catch((err: unknown) => {
+      this.logger.error(
+        `Password-reset background task failed (${err instanceof Error ? err.name : 'UnknownError'})`,
+      );
+    });
+  }
+
+  /**
    * Initiate a password-reset flow.
    * Always returns without error to avoid user enumeration — if the email does not
    * match any staff member, no email is sent but the response is identical.
@@ -345,19 +328,31 @@ export class AuthService {
       return;
     }
 
-    // Invalidate any prior unused reset tokens for this staff so only the latest
-    // link is valid (a "resend" shouldn't leave multiple live tokens).
-    await this.prisma.passwordReset.updateMany({
-      where: { staffId: staff.id, usedAt: null },
-      data: { usedAt: new Date() },
-    });
+    // Indexed opportunistic cleanup bounds consumed/expired-row accumulation.
+    // Failure is non-fatal: issuance correctness does not depend on cleanup.
+    void this.prisma.passwordReset
+      .deleteMany({ where: { expiresAt: { lt: new Date() } } })
+      .catch(() => undefined);
 
     const rawToken = randomBytes(32).toString('hex');
     const tokenHash = createHash('sha256').update(rawToken).digest('hex');
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
+    const issuedAt = new Date();
     const reset = await this.prisma.passwordReset.create({
-      data: { staffId: staff.id, tokenHash, expiresAt },
+      // Stamp the security state that authorized this link. Any later password,
+      // role, email, disable or logout-all change increments authVersion and makes
+      // this link unusable even if it raced with the revocation cleanup.
+      // Start INACTIVE. The row becomes active (`usedAt = NULL`) only after SMTP
+      // accepts the message and a locked transaction revalidates Staff security
+      // state. A crash can therefore create an unusable link, never a live unmailed one.
+      data: {
+        staffId: staff.id,
+        tokenHash,
+        expiresAt,
+        authVersion: staff.authVersion,
+        usedAt: issuedAt,
+      },
     });
 
     // Deliver the raw token in a URL FRAGMENT (#token=…) so it never lands in proxy
@@ -368,7 +363,6 @@ export class AuthService {
       // No mailer wired. In the running app MailModule always provides one, so this
       // is a misconfiguration in production — fail closed by invalidating the token
       // and logging a diagnostic that NEVER contains the raw link.
-      await this.invalidateReset(reset.id);
       if (this.config.NODE_ENV === 'production') {
         this.logger.error('Password-reset mailer is not configured; no email sent');
       }
@@ -376,26 +370,63 @@ export class AuthService {
     }
 
     try {
-      // Strict dispatch throws if the mail cannot be enqueued/sent.
+      // Strict dispatch performs bounded inline SMTP and throws on failure. It is
+      // already off the HTTP response path (queuePasswordReset), so latency cannot
+      // reveal whether the account exists.
       await this.mailService.sendTemplateStrict(email, 'password_reset', 'en', {
         firstName: staff.firstName ?? '',
         resetUrl,
         expiresInHours: '1',
       });
+      const activated = await this.activateDeliveredReset(reset.id, staff.id, staff.authVersion);
+      if (!activated) {
+        this.logger.warn(`Delivered password-reset link was superseded for staffId ${staff.id}`);
+      }
     } catch {
-      // Fail closed: invalidate the freshly-issued token so no live token dangles for
-      // an email that never arrived. Keep the response generic (no enumeration) and
-      // never log the raw link.
-      await this.invalidateReset(reset.id);
+      // The token is still inactive. Keep the response generic and never log the link.
       this.logger.error(`Password-reset dispatch failed for staffId ${staff.id}`);
     }
   }
 
-  /** Invalidate a single still-unused reset token (idempotent). */
-  private async invalidateReset(id: number): Promise<void> {
-    await this.prisma.passwordReset.updateMany({
-      where: { id, usedAt: null },
-      data: { usedAt: new Date() },
+  /**
+   * Activate one SMTP-accepted reset while holding the Staff row lock. Issuance,
+   * reset consumption and security-state changes are thereby serialized. A later
+   * already-active request wins over a slower older SMTP delivery.
+   */
+  private async activateDeliveredReset(
+    resetId: number,
+    staffId: number,
+    issuedAuthVersion: number,
+  ): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<
+        Array<{ id: number; authVersion: number; isEnabled: boolean }>
+      >`SELECT "id", "authVersion", "isEnabled" FROM "Staff" WHERE "id" = ${staffId} FOR UPDATE`;
+      const current = rows[0];
+      if (!current?.isEnabled || current.authVersion !== issuedAuthVersion) return false;
+
+      const newerActive = await tx.passwordReset.findFirst({
+        where: { staffId, id: { gt: resetId }, usedAt: null, expiresAt: { gt: new Date() } },
+        select: { id: true },
+      });
+      if (newerActive) return false;
+
+      const now = new Date();
+      await tx.passwordReset.updateMany({
+        where: { staffId, usedAt: null },
+        data: { usedAt: now },
+      });
+      const activated = await tx.passwordReset.updateMany({
+        where: {
+          id: resetId,
+          staffId,
+          authVersion: issuedAuthVersion,
+          usedAt: { not: null },
+          expiresAt: { gt: now },
+        },
+        data: { usedAt: null },
+      });
+      return activated.count === 1;
     });
   }
 
@@ -409,60 +440,70 @@ export class AuthService {
   async resetPassword(token: string, newPassword: string): Promise<void> {
     const tokenHash = createHash('sha256').update(token).digest('hex');
 
+    // Cheap indexed rejection BEFORE Argon2. The nonce has 256 bits of entropy,
+    // so timing here reveals no guessable account state; it only prevents invalid
+    // traffic from consuming the expensive password-hash budget.
+    const candidate = await this.prisma.passwordReset.findUnique({ where: { tokenHash } });
+    const precheckNow = new Date();
+    if (!candidate || candidate.usedAt !== null || candidate.expiresAt <= precheckNow) {
+      throw new BadRequestException('Invalid or expired reset token');
+    }
+
     // Hash the new password BEFORE the race so the atomic consume→apply window stays
     // tiny (argon2 is deliberately slow).
     const passwordHash = await hashPassword(newPassword);
 
-    // Atomically consume the token (S1-5): only an unused, unexpired token is claimed, and
-    // exactly one concurrent caller can flip usedAt from NULL to now. A second (replayed or
-    // parallel) request updates zero rows and is rejected, so the password changes exactly
-    // once — closing the check-to-write gap of the prior find-then-update.
-    const consumed = await this.prisma.passwordReset.updateMany({
-      where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
-      data: { usedAt: new Date() },
-    });
+    // Consume + compare authVersion + change password in ONE transaction. The
+    // conditional staff update is the ordering point against an admin password
+    // change/disable/logout: either reset wins first and the later admin change wins,
+    // or the security change bumps authVersion first and this transaction rolls back.
+    const staffId = await this.prisma.$transaction(async (tx) => {
+      const now = new Date();
+      // Match activation's lock order (Staff then PasswordReset) to avoid a
+      // reset-vs-delivery deadlock and serialize security-state changes.
+      const lockedStaff = await tx.$queryRaw<Array<{ id: number }>>`
+        SELECT "id" FROM "Staff" WHERE "id" = ${candidate.staffId} FOR UPDATE
+      `;
+      if (!lockedStaff[0]) {
+        throw new BadRequestException('Invalid or expired reset token');
+      }
+      const record = await tx.passwordReset.findUnique({ where: { tokenHash } });
+      if (!record || record.usedAt !== null || record.expiresAt <= now) {
+        throw new BadRequestException('Invalid or expired reset token');
+      }
 
-    if (consumed.count !== 1) {
-      throw new BadRequestException('Invalid or expired reset token');
-    }
+      const consumed = await tx.passwordReset.updateMany({
+        where: { id: record.id, usedAt: null, expiresAt: { gt: now } },
+        data: { usedAt: now },
+      });
+      if (consumed.count !== 1) {
+        throw new BadRequestException('Invalid or expired reset token');
+      }
 
-    const record = await this.prisma.passwordReset.findUnique({ where: { tokenHash } });
-    if (!record) {
-      // Unreachable — we just consumed this exact hash — but fail safe.
-      throw new BadRequestException('Invalid or expired reset token');
-    }
-
-    // Blocker #7: never re-set the password of a DISABLED staff account via a stale link.
-    // (Disable also burns pending reset tokens via revokeAllForStaff; this is defense-in-depth.)
-    const target = await this.prisma.staff.findUnique({
-      where: { id: record.staffId },
-      select: { isEnabled: true },
-    });
-    if (!target || !target.isEnabled) {
-      throw new BadRequestException('Invalid or expired reset token');
-    }
-
-    // Deliberate fail-safe: the token is already consumed above, OUTSIDE this transaction.
-    // If the password write below fails (e.g. the staff row was deleted between issue and
-    // reset), the token stays burned and the user must request a new link — we never change
-    // a password without having consumed the token.
-    await this.prisma.$transaction([
-      this.prisma.staff.update({
-        where: { id: record.staffId },
-        // Bump authVersion too so any still-valid access token is rejected at once (S3-2).
+      const changed = await tx.staff.updateMany({
+        where: { id: record.staffId, isEnabled: true, authVersion: record.authVersion },
         data: { passwordHash, authVersion: { increment: 1 } },
-      }),
-      // Revoke all active refresh tokens so existing sessions are invalidated.
-      this.prisma.refreshToken.updateMany({
+      });
+      if (changed.count !== 1) {
+        // Throwing rolls the token consume back too; the generic response reveals no state.
+        throw new BadRequestException('Invalid or expired reset token');
+      }
+
+      await tx.refreshToken.updateMany({
         where: { staffId: record.staffId, revokedAt: null },
-        data: { revokedAt: new Date() },
-      }),
-    ]);
+        data: { revokedAt: now },
+      });
+      await tx.passwordReset.updateMany({
+        where: { staffId: record.staffId, usedAt: null },
+        data: { usedAt: now },
+      });
+      return record.staffId;
+    });
 
     // Add main's central Redis access-token cutoff so an already-issued access JWT cannot
     // continue working for its remaining TTL (complements the DB authVersion check).
-    await this.sessions?.revokeAllForStaff(record.staffId);
-    this.logger.log(`Password reset completed for staffId ${record.staffId}`);
+    await this.sessions?.revokeAllForStaff(staffId);
+    this.logger.log(`Password reset completed for staffId ${staffId}`);
   }
 
   // ─────────────────────── private helpers ───────────────────────

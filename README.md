@@ -12,7 +12,7 @@ A modern, production-oriented rewrite of the legacy **Kayako Classic** helpdesk
 
 | Layer         | Tech                                                                        |
 | ------------- | --------------------------------------------------------------------------- |
-| Backend       | Node 22, TypeScript (strict), NestJS 10, Prisma 6, PostgreSQL 16            |
+| Backend       | Node 22, TypeScript (strict), NestJS 11, Prisma 6, PostgreSQL 16            |
 | Queues        | Redis + BullMQ (mail fetch, SLA breaches, escalations, auto-close)          |
 | Mail          | imapflow + mailparser (inbound), Nodemailer (outbound)                      |
 | Auth          | JWT access + refresh, argon2id password hashing, RBAC permission guards     |
@@ -88,13 +88,20 @@ npm run test:e2e           # Playwright E2E
 
 ## Production deploy
 
-The dev `docker-compose.yml` (demo seed + demo creds over http) is for local work.
-For production use the **separate** `docker-compose.prod.yml`:
+The dev `docker-compose.yml` (demo seed + demo credentials over HTTP) is for local work only.
+Production is installed exclusively through the audited internal deploy helper:
 
 ```bash
-cp .env.prod.example .env.prod      # then replace EVERY placeholder secret
-docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+cp .env.prod.example .env.prod
+chmod 600 .env.prod                 # replace every placeholder except disabled optional keys
+git fetch origin main && git switch main && git pull --ff-only origin main
+./scripts/deploy-prod.sh
 ```
+
+Do not run the production Compose files directly. That bypasses the quiesced backup/restore proof,
+pre-migration audits, Redis cutover and internal-only edge gate. The first deployment prompts for
+the administrator credential in a removed one-shot container; it is never stored in `.env.prod`.
+See `docs/DEPLOY.md` for the required host checks, rollback metadata and separate HTTPS-edge gate.
 
 What the prod profile enforces:
 
@@ -103,7 +110,7 @@ What the prod profile enforces:
 - **The API refuses to boot with placeholder/default secrets** (`assertProductionSecrets`):
   `change-me`, `dev-secret`, `…0000`, `example` JWT/Alaris values are rejected — so a careless
   `cp .env.prod.example .env.prod` without edits fails fast instead of running insecure.
-- **No demo seed.** The prod command runs `migrate deploy` then `main` only, and `seed.ts`
+- **No demo seed.** The API runs `migrate deploy` then `main` only, and `seed.ts`
   hard-refuses (non-zero exit) to create the demo `admin@23telecom.example / demo1234` under
   `NODE_ENV=production` unless `TELECOM_HD_SEED=1` is explicitly set.
 - **No published ports** — `api` (4000) and `web` (3000) are only `expose`d on the internal
@@ -111,23 +118,11 @@ What the prod profile enforces:
 
 ### Reverse proxy + TLS
 
-Front both services with nginx/Traefik/Caddy on the same docker network and terminate HTTPS
-there. Example nginx vhost:
-
-```nginx
-server {
-  listen 443 ssl;
-  server_name help.example.com;
-  ssl_certificate     /etc/letsencrypt/live/help.example.com/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/help.example.com/privkey.pem;
-
-  location /api/ { proxy_pass http://api:4000;  proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
-  location /     { proxy_pass http://web:3000;  proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
-}
-```
-
-`NEXT_PUBLIC_API_URL` is baked into the web image at build time — set it to the public origin
-(e.g. `https://help.example.com`) in `.env.prod` before `up --build`.
+The base deployment publishes no host ports. Caddy/nginx/Cloudflare configuration is a separate
+reviewed gate because the correct trusted client IP depends on the real proxy-hop topology. Keep
+`NEXT_PUBLIC_API_URL` empty for same-origin `/api`; the deploy helper gives each build-time
+`NEXT_PUBLIC_*` variant its own image tag. Do not start `docker-compose.proxy.yml` until the edge,
+firewall and external smoke checklist in `docs/DEPLOY.md` is complete.
 
 ## Alaris integration (stub)
 

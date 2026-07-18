@@ -4,7 +4,6 @@ import { chromium } from '@playwright/test';
 import { mkdirSync } from 'node:fs';
 
 const WEB = 'http://localhost:3000';
-const API = 'http://localhost:4000';
 const OUT = new URL('../docs/screenshots/', import.meta.url).pathname;
 mkdirSync(OUT, { recursive: true });
 
@@ -20,24 +19,25 @@ const shots = [
   ['admin-alaris', '/admin/alaris', true],
 ];
 
-const res = await fetch(`${API}/api/auth/login`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ email: 'admin@23telecom.example', password: 'demo1234' }),
-});
-const { accessToken } = await res.json();
-console.log('token acquired:', !!accessToken);
-
 const browser = await chromium.launch({ headless: true });
 const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-await ctx.addInitScript((t) => {
-  try { localStorage.setItem('auth_token', t); } catch {}
-}, accessToken);
-await ctx.addCookies([{ name: 'auth_token', value: accessToken, url: WEB }]);
-
 const page = await ctx.newPage();
-for (const [name, path] of shots) {
+let authenticated = false;
+
+async function login() {
+  await page.goto(`${WEB}/login`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.fill('#email', 'admin@23telecom.example');
+  await page.fill('#password', 'demo1234');
+  await Promise.all([
+    page.waitForURL('**/staff/**', { timeout: 60000 }),
+    page.locator('form button[type="submit"]').click(),
+  ]);
+  authenticated = true;
+}
+
+for (const [name, path, requiresAuth] of shots) {
   try {
+    if (requiresAuth && !authenticated) await login();
     await page.goto(`${WEB}${path}`, { waitUntil: 'networkidle', timeout: 60000 });
     await page.waitForTimeout(1500); // settle animations
     await page.screenshot({ path: `${OUT}${name}.png`, fullPage: true });

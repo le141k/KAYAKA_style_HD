@@ -40,7 +40,7 @@ export class NotificationService {
         staffName,
       });
 
-      this.logger.debug(`Assignment notification sent to ${staff.email} for ticket ${ticket.mask}`);
+      this.logger.debug(`Assignment notification sent for ticket ${ticket.mask}`);
     } catch (err) {
       this.logger.error(`Failed to send assignment notification for ticket ${ticketId}: ${String(err)}`);
     }
@@ -78,10 +78,8 @@ export class NotificationService {
               name: staffName,
               staffName,
             });
-          } catch (err) {
-            this.logger.error(
-              `Failed to send watcher notification to ${w.staff.email} for ticket ${ticket.mask}: ${String(err)}`,
-            );
+          } catch {
+            this.logger.error(`Failed to send watcher notification for ticket ${ticket.mask}`);
           }
         }),
       );

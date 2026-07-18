@@ -1,4 +1,15 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Post, Res, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Inject,
+  Ip,
+  Post,
+  Res,
+  UseGuards,
+} from '@nestjs/common';
 import type { Response } from 'express';
 import { Throttle } from '@nestjs/throttler';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
@@ -6,8 +17,16 @@ import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import { Public } from '../../auth/auth.decorators';
 import { ClientPortalGuard } from '../../auth/client-portal.guard';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
+import { AbuseQuotaService } from '../../security/abuse-quota.service';
+import { TurnstileService } from '../../security/turnstile.service';
 import { ClientAuthService, type ClientPrincipal } from './client-auth.service';
-import { ClientAuthenticated, CurrentClient, CLIENT_SESSION_COOKIE } from './client-auth.decorators';
+import {
+  DEV_CLIENT_SESSION_COOKIE,
+  LEGACY_PROD_CLIENT_SESSION_COOKIE,
+  PROD_CLIENT_SESSION_COOKIE,
+  clientSessionCookieName,
+} from './client-auth.cookies';
+import { ClientAuthenticated, CurrentClient } from './client-auth.decorators';
 import { RequestLinkSchema, VerifyClientSchema, type RequestLinkDto, type VerifyClientDto } from './dto';
 
 @ApiTags('client-auth')
@@ -18,21 +37,35 @@ import { RequestLinkSchema, VerifyClientSchema, type RequestLinkDto, type Verify
 export class ClientAuthController {
   constructor(
     private readonly clientAuth: ClientAuthService,
+    private readonly turnstile: TurnstileService,
+    private readonly abuseQuota: AbuseQuotaService,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
   private setSessionCookie(res: Response, token: string, expiresAt: Date): void {
-    res.cookie(CLIENT_SESSION_COOKIE, token, {
+    res.cookie(clientSessionCookieName(this.config), token, {
       httpOnly: true,
       secure: this.config.NODE_ENV === 'production',
       sameSite: 'lax',
-      path: '/api', // host-only (no Domain); available to the API only
+      path: '/', // required by the __Host- prefix; host-only (no Domain)
       expires: expiresAt,
     });
   }
 
   private clearSessionCookie(res: Response): void {
-    res.clearCookie(CLIENT_SESSION_COOKIE, { path: '/api' });
+    const options = {
+      httpOnly: true,
+      secure: this.config.NODE_ENV === 'production',
+      sameSite: 'lax' as const,
+    };
+    for (const name of [
+      DEV_CLIENT_SESSION_COOKIE,
+      LEGACY_PROD_CLIENT_SESSION_COOKIE,
+      PROD_CLIENT_SESSION_COOKIE,
+    ]) {
+      res.clearCookie(name, { ...options, path: '/api' });
+      res.clearCookie(name, { ...options, path: '/' });
+    }
   }
 
   /**
@@ -44,8 +77,18 @@ export class ClientAuthController {
   @HttpCode(HttpStatus.ACCEPTED)
   @Throttle({ default: { limit: 3, ttl: 60000 } })
   @ApiOperation({ summary: 'Request a client login link (always 202, no enumeration)' })
-  async requestLink(@Body(new ZodValidationPipe(RequestLinkSchema)) dto: RequestLinkDto) {
-    await this.clientAuth.requestLink(dto.email);
+  async requestLink(@Body(new ZodValidationPipe(RequestLinkSchema)) dto: RequestLinkDto, @Ip() ip: string) {
+    await this.turnstile.verify(dto.challengeToken, 'request-link', ip);
+    await this.abuseQuota.consume({
+      action: 'request-link',
+      ip,
+      identity: dto.email,
+      windowSeconds: 600,
+      globalLimit: 300,
+      ipLimit: 10,
+      identityLimit: 5,
+    });
+    this.clientAuth.queueRequestLink(dto.email);
     return { message: 'If that email owns any tickets, a sign-in link has been sent.' };
   }
 
@@ -91,7 +134,7 @@ export class ClientAuthController {
     for (const part of header.split(';')) {
       const eq = part.indexOf('=');
       if (eq === -1) continue;
-      if (part.slice(0, eq).trim() === CLIENT_SESSION_COOKIE) {
+      if (part.slice(0, eq).trim() === clientSessionCookieName(this.config)) {
         return decodeURIComponent(part.slice(eq + 1).trim()) || undefined;
       }
     }

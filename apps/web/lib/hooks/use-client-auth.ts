@@ -11,15 +11,19 @@
  */
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { fetchWithCsrf } from '@/lib/api';
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
 /** A client-domain fetch. Throws `{ status }` on a non-2xx response. */
 export async function clientFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`, {
+  const res = await fetchWithCsrf(`${API_URL}${path}`, {
     ...init,
     credentials: 'include',
-    headers: { 'Content-Type': 'application/json', ...(init?.headers as Record<string, string>) },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(init?.headers as Record<string, string>),
+    },
   });
   if (!res.ok) {
     const err = new Error(`HTTP ${res.status}`) as Error & { status: number };
@@ -66,10 +70,10 @@ export function useClientSession() {
 /** Request a sign-in link. Always resolves 202 — never reveals whether the email exists. */
 export function useRequestClientLink() {
   return useMutation({
-    mutationFn: (email: string) =>
+    mutationFn: ({ email, challengeToken }: { email: string; challengeToken: string }) =>
       clientFetch<{ message: string }>('/client-auth/request-link', {
         method: 'POST',
-        body: JSON.stringify({ email }),
+        body: JSON.stringify({ email, challengeToken }),
       }),
   });
 }
