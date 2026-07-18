@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { EmailQueueService } from './email-queue.service';
+import { ReconcileEmailQueueSchema } from './dto';
 import type { PrismaService } from '../../prisma/prisma.service';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -338,17 +339,17 @@ describe('EmailQueueService', () => {
       (prisma.setting.findUnique as ReturnType<typeof vi.fn>)
         .mockResolvedValueOnce(null) // state:<id> absent
         .mockResolvedValueOnce({ value: 400 }); // legacy bare watermark
-      await expect(service.reconcile(1, { mode: 'RESUME_MIGRATED' }, 42)).rejects.toBeInstanceOf(
-        BadRequestException,
-      );
+      // Assert the SPECIFIC refusal path (no UIDVALIDITY) — not just the exception type,
+      // which the no-cursor test below shares.
+      await expect(service.reconcile(1, { mode: 'RESUME_MIGRATED' }, 42)).rejects.toThrow(/no UIDVALIDITY/i);
       expect(prisma.emailQueue.update).not.toHaveBeenCalled();
     });
 
     it('RESUME_MIGRATED: refuses when no legacy cursor exists at all', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCursorBefore());
       (prisma.setting.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      await expect(service.reconcile(1, { mode: 'RESUME_MIGRATED' }, 42)).rejects.toBeInstanceOf(
-        BadRequestException,
+      await expect(service.reconcile(1, { mode: 'RESUME_MIGRATED' }, 42)).rejects.toThrow(
+        /No legacy IMAP cursor found/i,
       );
       expect(prisma.emailQueue.update).not.toHaveBeenCalled();
     });
@@ -433,6 +434,30 @@ describe('EmailQueueService', () => {
       const out = await service.health(new Date('2026-07-18T12:00:00.000Z'));
       expect(out.alerts).toEqual([]);
       expect(out.ledger.backlog).toBe(0);
+    });
+  });
+
+  describe('ReconcileEmailQueueSchema (cutover gates)', () => {
+    it('accepts RESUME_MIGRATED with no extra fields', () => {
+      expect(ReconcileEmailQueueSchema.safeParse({ mode: 'RESUME_MIGRATED' }).success).toBe(true);
+    });
+
+    it('rejects FROM_NOW without confirm + reason (the discard safety gate)', () => {
+      expect(ReconcileEmailQueueSchema.safeParse({ mode: 'FROM_NOW' }).success).toBe(false);
+      expect(ReconcileEmailQueueSchema.safeParse({ mode: 'FROM_NOW', confirm: true }).success).toBe(false);
+      expect(ReconcileEmailQueueSchema.safeParse({ mode: 'FROM_NOW', reason: 'x' }).success).toBe(false);
+      expect(
+        ReconcileEmailQueueSchema.safeParse({ mode: 'FROM_NOW', confirm: true, reason: 'clean cutover' })
+          .success,
+      ).toBe(true);
+    });
+
+    it('rejects BACKFILL without a positive backfillLimit (else it silently equals FROM_NOW)', () => {
+      expect(ReconcileEmailQueueSchema.safeParse({ mode: 'BACKFILL' }).success).toBe(false);
+      expect(ReconcileEmailQueueSchema.safeParse({ mode: 'BACKFILL', backfillLimit: 0 }).success).toBe(false);
+      expect(ReconcileEmailQueueSchema.safeParse({ mode: 'BACKFILL', backfillLimit: 500 }).success).toBe(
+        true,
+      );
     });
   });
 });

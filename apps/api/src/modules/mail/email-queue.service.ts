@@ -124,11 +124,13 @@ export class EmailQueueService {
       }
       // Rewind past still-pending UIDs so a message the legacy poller had not finished is
       // re-fetched; the ledger's Message-ID idempotency makes any already-created ticket a
-      // no-op. Never rewind above the watermark, never below 0.
+      // no-op. Never rewind above the watermark, never below 0. `reduce` (not a spread) so a
+      // large failures array can't blow the argument-count limit.
+      const minPending = legacy.pendingUids.reduce((m, u) => Math.min(m, u), Number.POSITIVE_INFINITY);
       const resumeCursor =
         legacy.pendingUids.length > 0
-          ? Math.max(Math.min(legacy.watermark, Math.min(...legacy.pendingUids) - 1), 0)
-          : legacy.watermark;
+          ? Math.max(Math.min(legacy.watermark, minPending - 1), 0)
+          : Math.max(legacy.watermark, 0);
       data = {
         uidValidity: legacy.uidValidity,
         lastSeenUid: BigInt(resumeCursor),
@@ -203,7 +205,8 @@ export class EmailQueueService {
       state &&
       typeof state === 'object' &&
       typeof state.watermark === 'number' &&
-      Number.isSafeInteger(state.watermark)
+      Number.isSafeInteger(state.watermark) &&
+      state.watermark >= 0
     ) {
       const uidValidity =
         typeof state.uidValidity === 'string' && /^\d+$/.test(state.uidValidity)

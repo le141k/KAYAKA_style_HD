@@ -34,4 +34,26 @@ describe('serializeBigInt', () => {
     const input = { a: 1, b: { c: 'x' } };
     expect(serializeBigInt(input)).toBe(input);
   });
+
+  it('does NOT recurse into class instances / non-plain objects (e.g. a cyclic Response)', () => {
+    // Simulate the Express Response returned by an @Res({ passthrough: true }) handler:
+    // a class instance with a self-reference. Must be returned untouched, not traversed.
+    class FakeResponse {
+      req: unknown = null;
+      self: unknown = null;
+    }
+    const res = new FakeResponse();
+    res.self = res; // cyclic
+    res.req = { res };
+    expect(() => serializeBigInt(res)).not.toThrow();
+    expect(serializeBigInt(res)).toBe(res);
+  });
+
+  it('does not stack-overflow on a self-referential PLAIN object (cycle guard)', () => {
+    const a: Record<string, unknown> = { uid: 5n };
+    a.self = a; // plain-object cycle
+    expect(() => serializeBigInt(a)).not.toThrow();
+    const out = serializeBigInt(a) as Record<string, unknown>;
+    expect(out.uid).toBe('5');
+  });
 });

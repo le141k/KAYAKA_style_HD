@@ -206,6 +206,18 @@ describe('InboundMailService — parser rule helpers', () => {
       const criteria = [{ field: 'subject', op: 'ends_with', value: 'SPAM' }];
       expect(service.evaluateCriteria(parsedBase, criteria, 'ALL')).toBe(true);
     });
+
+    it('op:regex — a safe start-anchored pattern matches', () => {
+      const criteria = [{ field: 'subject', op: 'regex', value: '^Hello' }];
+      expect(service.evaluateCriteria(parsedBase, criteria, 'ALL')).toBe(true);
+    });
+
+    it('op:regex — a catastrophic-backtracking pattern is rejected by the ReDoS guard (no match, no hang)', () => {
+      // `(a+)+$` is classic ReDoS. isSafeRuleRegex must reject it (groups disallowed) BEFORE
+      // it is compiled, so an attacker-controlled inbound body can never trigger backtracking.
+      const criteria = [{ field: 'subject', op: 'regex', value: '(a+)+$' }];
+      expect(service.evaluateCriteria(parsedBase, criteria, 'ALL')).toBe(false);
+    });
   });
 
   // ─── applyParserRules ──────────────────────────────────────────────────────
@@ -396,7 +408,7 @@ describe('InboundMailService — parser rule helpers', () => {
       // Deterministic synthetic id → a retry of the same bytes dedups to the same post.
       expect(arg.incomingMessageId).toMatch(/^<inbound-[0-9a-f]{64}@23telecom\.local>$/);
       expect(prisma.ticketPost.findFirst).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { messageId: arg.incomingMessageId } }),
+        expect.objectContaining({ where: { messageId: { in: [arg.incomingMessageId] } } }),
       );
     });
 
@@ -452,6 +464,23 @@ describe('InboundMailService — parser rule helpers', () => {
       const out = await svc.processRawMessage(Buffer.from(maskEmail('cc@acme.example')), 1);
       expect(out.state).toBe('PROCESSED');
       expect(svc.ticketsService.reply).toHaveBeenCalledTimes(1);
+    });
+
+    it('authorizes a mask reply by a linked USER-ACCOUNT email that differs from requesterEmail', async () => {
+      // Exercises the ticket.user.emails branch of senderCanReply specifically: the sender is
+      // NOT the requesterEmail and NOT a recipient — only the linked account email matches.
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 5,
+        requesterEmail: 'someone-else@acme.example',
+        user: { emails: [{ email: 'owner@acme.example' }] },
+        recipients: [],
+      });
+      const svc = svcOf();
+      const out = await svc.processRawMessage(Buffer.from(maskEmail('owner@acme.example')), 1);
+      expect(out.state).toBe('PROCESSED');
+      expect(svc.ticketsService.reply).toHaveBeenCalledTimes(1);
+      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
     });
 
     it('IN-10: an unresolved mask → new ticket (never a silent thread)', async () => {
@@ -623,9 +652,11 @@ describe('InboundMailService — parser rule helpers', () => {
       );
       await poll(makeLedgerClient([1, 2], { uidValidity: 9n, uidNext: 50 }));
       expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
-      expect(prisma.emailQueue.update).toHaveBeenCalledWith(
+      // The halt is a generation-gated updateMany (so a stale poll can't clobber a
+      // freshly-reconciled OK state), not an unconditional update.
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 1 },
+          where: expect.objectContaining({ id: 1, uidValidity: 7n }),
           data: expect.objectContaining({ syncState: 'NEEDS_RECONCILIATION' }),
         }),
       );
@@ -673,7 +704,13 @@ describe('InboundMailService — parser rule helpers', () => {
         uidValidity: 7n,
       });
       (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mockClear();
-      await bootstrap({ getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }) });
+      // Give the client a REAL mailbox so the assertion genuinely guards the
+      // `uidValidity !== null` early-return: were it removed, bootstrap would proceed to the
+      // CAS updateMany (uidValidity 7n, uidNext 10 → high-water 9). With the guard, it must not.
+      await bootstrap({
+        mailbox: { uidValidity: 7n, uidNext: 10, exists: 9 },
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+      });
       expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
     });
 
@@ -707,6 +744,7 @@ describe('InboundMailService — parser rule helpers', () => {
       (svc as unknown as { connections: Map<number, unknown> }).connections;
     const row = (over: Record<string, unknown> = {}) => ({
       id: 1,
+      emailAddress: 'q1@example.com',
       host: 'imap.example',
       port: 993,
       useTls: true,
@@ -812,8 +850,21 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(claimProcessing?.leaseExpiresAt).toEqual({ lt: expect.any(Date) });
     });
 
+    it('increments attempts in the CLAIM CAS (so a lease-exceeded flow still counts)', async () => {
+      stageDelivery({ attempts: 1 });
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await drain();
+      // The FIRST updateMany is the claim; it must advance attempts, not only the settle.
+      const claim = (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        data: { attempts?: unknown };
+      };
+      expect(claim.data.attempts).toEqual({ increment: 1 });
+    });
+
     it('a transient failure below the limit → RETRY with backoff (raw retained)', async () => {
-      stageDelivery({ attempts: 0 });
+      // `attempts: 1` is the value AFTER the claim increment (the mock findUnique returns the
+      // post-claim row); the settle re-uses it, so RETRY records attempts:1.
+      stageDelivery({ attempts: 1 });
       (
         service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }
       ).ticketsService.createTicket = vi.fn();
@@ -828,13 +879,33 @@ describe('InboundMailService — parser rule helpers', () => {
     });
 
     it('exhausted attempts → QUARANTINED (never discarded; raw MIME kept)', async () => {
-      stageDelivery({ attempts: 4 }); // maxAttempts = 5 → this attempt quarantines
+      stageDelivery({ attempts: 5 }); // post-claim value == maxAttempts → this failure quarantines
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('still bad'));
       await drain();
       expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
           data: expect.objectContaining({ state: 'QUARANTINED', attempts: 5 }),
+        }),
+      );
+    });
+
+    it('a delivery whose attempts exceed the budget is FAST-quarantined without reprocessing', async () => {
+      // Simulates a message whose processing repeatedly outlived the lease: each reclaim
+      // incremented attempts past the budget, so the terminal write never landed. On the next
+      // claim it must quarantine at once, WITHOUT running the slow routing again.
+      stageDelivery({ attempts: 7 }); // > maxAttempts (5)
+      const createTicket = vi.fn();
+      (
+        service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }
+      ).ticketsService.createTicket = createTicket;
+      await drain();
+      expect(createTicket).not.toHaveBeenCalled();
+      expect(prisma.ticketPost.findFirst).not.toHaveBeenCalled(); // routing never entered
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ state: 'QUARANTINED' }),
         }),
       );
     });
@@ -846,6 +917,45 @@ describe('InboundMailService — parser rule helpers', () => {
         expect.objectContaining({
           where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
           data: expect.objectContaining({ state: 'QUARANTINED' }),
+        }),
+      );
+    });
+
+    it('CF1: an IMAP re-fetch of header-less mail the LEGACY poller already ticketed is deduped, not duplicated', async () => {
+      // The pre-ledger poller stamped `<imap-<queueId>-<uidValidity>-<uid>@helpdesk.invalid>`
+      // on header-less mail. A RESUME_MIGRATED re-fetch hashes to a DIFFERENT synthetic id, so
+      // dedup must ALSO match the legacy transport form — else it creates a duplicate ticket.
+      const headerless = Buffer.from('From: a@b.example\r\nSubject: hi\r\n\r\nbody'); // no Message-ID
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, departmentId: null },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 55,
+        rawMime: headerless,
+        attempts: 1,
+        transport: 'IMAP',
+        queueId: 5,
+        uidValidity: 42n,
+        uid: 75n,
+      });
+      const legacyId = '<imap-5-42-75@helpdesk.invalid>';
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ where }: { where: { messageId?: { in?: string[] } } }) =>
+          (where?.messageId?.in ?? []).includes(legacyId)
+            ? Promise.resolve({ id: 900, ticketId: 90 })
+            : Promise.resolve(null),
+      );
+      const createTicket = vi.fn();
+      (
+        service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }
+      ).ticketsService.createTicket = createTicket;
+      await drain();
+      expect(createTicket).not.toHaveBeenCalled(); // deduped — no duplicate ticket
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ state: 'SKIPPED', ticketId: 90 }),
         }),
       );
     });

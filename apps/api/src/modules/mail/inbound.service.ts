@@ -64,6 +64,7 @@ const MAX_REFERENCES = 50;
 const MAX_REFERENCE_CHARS = 8_192;
 const MAX_ADDRESSES = 100;
 const MAX_ATTACHMENTS = 10;
+const MAX_RULE_PATTERN_CHARS = 128;
 // At most two MIME trees are materialized concurrently; excess parse work is bounded
 // so a burst of large messages cannot exhaust memory.
 const MAX_CONCURRENT_PARSERS = 2;
@@ -137,15 +138,20 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const configuredFrom = this.normalizeConfiguredMailbox(this.config.TELECOM_HD_MAIL_FROM ?? '');
     if (configuredFrom) this.ownAddresses.add(configuredFrom);
 
-    // A1: surface enabled queues whose transport we don't poll (e.g. PIPE) instead of
-    // silently ignoring them — their mail is fed via POST /api/inbound/pipe.
-    const enabledNonImap = await this.prisma.emailQueue.findMany({
-      where: { isEnabled: true, type: { not: 'IMAP' } },
+    // Seed loop-suppression from EVERY enabled queue (IMAP + non-IMAP) BEFORE the
+    // TELECOM_HD_IMAP_ENABLED early-return, so a self-loop from one of our own addresses is
+    // suppressed even when the poller is disabled and mail arrives only via the PIPE webhook.
+    const enabledQueues = await this.prisma.emailQueue.findMany({
+      where: { isEnabled: true },
       select: { id: true, emailAddress: true, type: true },
     });
-    for (const q of enabledNonImap) {
+    for (const q of enabledQueues) {
       const address = normalizeEmail(q.emailAddress);
       if (address) this.ownAddresses.add(address);
+    }
+    // A1: surface enabled queues whose transport we don't poll (e.g. PIPE) instead of
+    // silently ignoring them — their mail is fed via POST /api/inbound/pipe.
+    for (const q of enabledQueues.filter((x) => x.type !== 'IMAP')) {
       this.logger.warn(
         `EmailQueue ${q.id} (${q.emailAddress}, type=${q.type}) is enabled but not IMAP — ` +
           `the poller will not fetch it. Use the inbound webhook (POST /api/inbound/pipe) for PIPE/MTA delivery.`,
@@ -172,10 +178,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const queues = await this.prisma.emailQueue.findMany({
       where: { isEnabled: true, type: 'IMAP' },
     });
-    for (const queue of queues) {
-      const address = normalizeEmail(queue.emailAddress);
-      if (address) this.ownAddresses.add(address);
-    }
+    // (addresses already seeded into ownAddresses above, before the early-return)
     if (queues.length === 0) {
       this.logger.log('No enabled IMAP queues — inbound mail polling disabled (drain active for PIPE)');
       return;
@@ -289,9 +292,12 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       const baseline = Math.max(highWater - backfill, 0);
       // CAS on uidValidity IS NULL so two pods bootstrapping the same fresh queue can't
       // write different baselines — the first wins, the loser's updateMany matches 0 rows.
-      // The per-queue override is consumed here (cleared) so it never re-applies.
+      // Also gate on `cursorGeneration` (read in the same snapshot): if an operator
+      // reconciled between our read and this write (bumping the generation and possibly
+      // choosing a different policy), our stale baseline/policy matches 0 rows and their
+      // newer intent stands. The per-queue override is consumed here (cleared).
       const cas = await this.prisma.emailQueue.updateMany({
-        where: { id: queueId, uidValidity: null },
+        where: { id: queueId, uidValidity: null, cursorGeneration: queue.cursorGeneration },
         data: {
           lastSeenUid: BigInt(baseline),
           uidValidity,
@@ -352,6 +358,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     if (!this.config.TELECOM_HD_IMAP_ENABLED) return;
     let enabled: Array<{
       id: number;
+      emailAddress: string;
       host: string;
       port: number;
       useTls: boolean;
@@ -361,7 +368,15 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     try {
       enabled = await this.prisma.emailQueue.findMany({
         where: { isEnabled: true, type: 'IMAP' },
-        select: { id: true, host: true, port: true, useTls: true, username: true, passwordEnc: true },
+        select: {
+          id: true,
+          emailAddress: true,
+          host: true,
+          port: true,
+          useTls: true,
+          username: true,
+          passwordEnc: true,
+        },
       });
     } catch (err) {
       this.logger.error(`IMAP reconcile query failed: ${String(err)}`);
@@ -415,7 +430,12 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       });
       // Only fingerprint a connection that actually established (connectQueue swallows
       // connect errors) so a failed connect is retried next cycle.
-      if (this.connections.has(q.id)) this.connectionFingerprints.set(q.id, fingerprint);
+      if (this.connections.has(q.id)) {
+        this.connectionFingerprints.set(q.id, fingerprint);
+        // A queue enabled after startup is now polled — add its address to the self-loop set.
+        const address = normalizeEmail(q.emailAddress);
+        if (address) this.ownAddresses.add(address);
+      }
     }
   }
 
@@ -428,7 +448,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     passwordEnc: string;
   }): string {
     return createHash('sha256')
-      .update(`${q.host} ${q.port} ${q.useTls} ${q.username} ${q.passwordEnc}`)
+      .update(`${q.host}\u0000${q.port}\u0000${q.useTls}\u0000${q.username}\u0000${q.passwordEnc}`)
       .digest('hex');
   }
 
@@ -469,9 +489,16 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         if (uidValidity !== queue.uidValidity) {
           // Fail-closed: the server reset its UID space. Do NOT auto-advance (that could
           // skip mail in the new space) — halt and require an explicit operator decision.
+          // Gate on the snapshot's cursorGeneration + uidValidity so a STALE poll (whose
+          // snapshot predates an operator reconcile that already moved the queue to a new
+          // generation) can't clobber the freshly-reconciled OK state with a halt.
           const msg = `UIDVALIDITY changed ${queue.uidValidity} → ${uidValidity}`;
-          await this.prisma.emailQueue.update({
-            where: { id: queueId },
+          await this.prisma.emailQueue.updateMany({
+            where: {
+              id: queueId,
+              cursorGeneration: queue.cursorGeneration,
+              uidValidity: queue.uidValidity,
+            },
             data: { syncState: 'NEEDS_RECONCILIATION', lastError: msg },
           });
           this.logger.error(`IMAP queue ${queueId}: ${msg} — queue halted (NEEDS_RECONCILIATION)`);
@@ -708,7 +735,16 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           { state: 'PROCESSING', leaseExpiresAt: { lt: now } }, // reclaim expired lease
         ],
       },
-      data: { state: 'PROCESSING', leaseOwner: leaseToken, leaseExpiresAt: leaseUntil },
+      // Increment `attempts` in the CLAIM itself, NOT only in the lease-fenced settle: a
+      // delivery whose processing consistently outlives the lease would otherwise have every
+      // settle rejected (wrong lease owner) and its attempt-count never advance → retried
+      // forever, never quarantined. Counting per claim guarantees the budget is exhausted.
+      data: {
+        state: 'PROCESSING',
+        leaseOwner: leaseToken,
+        leaseExpiresAt: leaseUntil,
+        attempts: { increment: 1 },
+      },
     });
     if (claim.count === 0) return; // another worker holds a live lease, or already terminal
 
@@ -734,8 +770,47 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    // `attempts` was already incremented by the claim above. If it now exceeds the budget,
+    // earlier claims kept losing their terminal write (processing outlived the lease) — do a
+    // FAST quarantine now (a millisecond write, comfortably inside the fresh lease) instead
+    // of running the slow processing again and losing another terminal write.
+    if (delivery.attempts > this.maxAttempts) {
+      await settle({
+        state: 'QUARANTINED',
+        lastError: `exhausted ${this.maxAttempts} attempts (processing repeatedly exceeded the lease)`,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
+      this.logger.error(
+        `Inbound delivery ${deliveryId}: QUARANTINED — ${delivery.attempts} claims exhausted the attempt budget`,
+      );
+      return;
+    }
+
+    // For an IMAP delivery, also dedup against the LEGACY transport Message-ID form
+    // (`<imap-<queueId>-<uidValidity>-<uid>@helpdesk.invalid>`) that the pre-ledger poller
+    // stamped on header-less mail — otherwise a RESUME_MIGRATED re-fetch of already-ticketed
+    // header-less mail would miss dedup (it now hashes to a different synthetic id) and
+    // duplicate the ticket.
+    const legacyDedupIds: string[] = [];
+    if (
+      delivery.transport === 'IMAP' &&
+      delivery.queueId != null &&
+      delivery.uidValidity != null &&
+      delivery.uid != null
+    ) {
+      legacyDedupIds.push(
+        `<imap-${delivery.queueId}-${delivery.uidValidity}-${delivery.uid}@helpdesk.invalid>`,
+      );
+    }
+
     try {
-      const outcome = await this.processRawMessage(Buffer.from(delivery.rawMime), departmentId, deliveryId);
+      const outcome = await this.processRawMessage(
+        Buffer.from(delivery.rawMime),
+        departmentId,
+        deliveryId,
+        legacyDedupIds,
+      );
       await settle({
         state: outcome.state,
         ticketId: outcome.ticketId ?? null,
@@ -746,7 +821,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         leaseExpiresAt: null,
       });
     } catch (err) {
-      const attempts = delivery.attempts + 1;
+      const attempts = delivery.attempts; // already incremented by the claim CAS
       // A malformed / oversized message fails deterministically — quarantine it at once
       // (raw MIME retained) instead of burning every retry on an error that cannot pass.
       if (this.isPermanentProcessingError(err) || attempts >= this.maxAttempts) {
@@ -788,6 +863,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     source: Buffer | string,
     departmentId: number | undefined,
     deliveryId?: number,
+    legacyDedupIds: string[] = [],
   ): Promise<ProcessOutcome> {
     // Reject oversized raw before parsing (an IMAP fetch capped at the size limit + 1 byte
     // arrives here truncated; the PIPE path already rejects at ingress).
@@ -857,9 +933,11 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     }
 
     // Secondary fast dedup: if a post already bears this Message-ID it was ingested before
-    // (e.g. a retry after the post was created). Returns the existing ids for observability.
+    // (e.g. a retry after the post was created, or — via `legacyDedupIds` — the pre-ledger
+    // poller already ticketed this exact IMAP UID). Returns the existing ids for observability.
+    const dedupIds = [effectiveMessageId, ...legacyDedupIds];
     const existing = await this.prisma.ticketPost.findFirst({
-      where: { messageId: effectiveMessageId },
+      where: { messageId: { in: dedupIds } },
       select: { id: true, ticketId: true },
     });
     if (existing) {
@@ -1375,6 +1453,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       case 'ends_with':
         return fieldVal.toLowerCase().endsWith(target.toLowerCase());
       case 'regex': {
+        // JavaScript RegExp has no execution timeout, so a catastrophic-backtracking pattern
+        // in a DB parser rule + an attacker-controlled inbound body would block the event
+        // loop (full-API DoS). Only run patterns from a safe, linear-time subset.
+        if (!this.isSafeRuleRegex(target)) return false;
         try {
           return new RegExp(target, 'i').test(fieldVal);
         } catch {
@@ -1384,6 +1466,68 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       default:
         return false;
     }
+  }
+
+  /**
+   * Accept only a small, linear-time regex subset for DB parser rules: bounded length, no
+   * groups/alternation/`{}` quantifiers, at most one simple quantifier, no backreferences or
+   * Unicode-property escapes, and an unbounded `*`/`+` only when start-anchored. Prevents
+   * ReDoS from a privileged-but-easily-mistaken rule pattern. (Preserved from main.)
+   */
+  private isSafeRuleRegex(pattern: string): boolean {
+    if (!pattern || pattern.length > MAX_RULE_PATTERN_CHARS) return false;
+    let escaped = false;
+    let inClass = false;
+    let classHasCharacter = false;
+    let canQuantify = false;
+    let quantifiers = 0;
+    let hasUnboundedQuantifier = false;
+
+    for (let i = 0; i < pattern.length; i += 1) {
+      const char = pattern[i]!;
+      if (escaped) {
+        if (/\d/.test(char) || char === 'k' || char === 'p' || char === 'P') return false;
+        escaped = false;
+        if (inClass) classHasCharacter = true;
+        else canQuantify = true;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (inClass) {
+        if (char === ']') {
+          if (!classHasCharacter) return false;
+          inClass = false;
+          canQuantify = true;
+        } else {
+          classHasCharacter = true;
+        }
+        continue;
+      }
+      if (char === '[') {
+        inClass = true;
+        classHasCharacter = false;
+        canQuantify = false;
+        continue;
+      }
+      if ('()|{}'.includes(char)) return false;
+      if (char === '*' || char === '+' || char === '?') {
+        if (!canQuantify || quantifiers >= 1) return false;
+        quantifiers += 1;
+        if (char === '*' || char === '+') hasUnboundedQuantifier = true;
+        canQuantify = false;
+        continue;
+      }
+      if (char === '^' || char === '$') {
+        canQuantify = false;
+        continue;
+      }
+      canQuantify = true;
+    }
+
+    return !escaped && !inClass && (!hasUnboundedQuantifier || pattern.startsWith('^'));
   }
 
   private extractField(parsed: ParsedEmail, field: string): string {

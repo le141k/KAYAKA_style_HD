@@ -56,5 +56,16 @@ export const ReconcileEmailQueueSchema = z
         });
       }
     }
+    if (v.mode === 'BACKFILL' && (v.backfillLimit === undefined || v.backfillLimit < 1)) {
+      // A 0/absent backfill imports nothing → identical to FROM_NOW's skip-unprocessed-mail
+      // effect, which must go through FROM_NOW's confirm+reason gate. So BACKFILL must
+      // actually backfill (limit ≥ 1); use FROM_NOW to intentionally discard-and-skip.
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['backfillLimit'],
+        message:
+          'BACKFILL requires backfillLimit ≥ 1 (a 0/absent limit imports nothing — use FROM_NOW with confirm+reason to intentionally skip)',
+      });
+    }
   });
 export type ReconcileEmailQueueDto = z.infer<typeof ReconcileEmailQueueSchema>;
