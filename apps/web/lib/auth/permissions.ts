@@ -46,6 +46,7 @@ export const ADMIN_TAB_PERMISSIONS: Record<string, PermissionKey> = {
   '/admin/workflows': PERMISSIONS.ADMIN_WORKFLOW,
   '/admin/staff': PERMISSIONS.STAFF_MANAGE,
   '/admin/custom-fields': PERMISSIONS.ADMIN_CUSTOMFIELDS,
+  '/admin/mail': PERMISSIONS.ADMIN_MAIL,
   '/admin/alaris': PERMISSIONS.ADMIN_ALARIS,
 };
 
