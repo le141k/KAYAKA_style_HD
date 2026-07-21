@@ -390,13 +390,14 @@ state = PROCESSING`): a **0-row settle** means the lease was lost mid-processing
   watermark forward before clearing the halt.
 - **Routing / idempotency (content-aware):** de-dups by an _effective_ Message-ID — the RFC id, or
   a deterministic `<inbound-<sha256>@23telecom.local>` synthesised when absent. The synthetic id is
-  **seeded from the delivery's unique `transportKey`** (not the raw bytes), so two INDEPENDENT
-  header-less messages with identical bytes (different UID/queue) do NOT collapse into one (which
-  would silently drop the second); a retry of the same delivery reuses the same transport key → same
-  id → still a no-op. The effective id is claimed **atomically** by stamping it on this ledger row
-  (unique `InboundDelivery.messageId`): a same-id, **same-content** delivery is a genuine re-delivery
-  → `SKIPPED`; a same-id, **DIFFERENT-content** delivery (reused / spoofed Message-ID) is treated as
-  a permanent error → **`QUARANTINED`** for operator review (never silently skipped). The id is also
+  **seeded from a queue-scoped CONTENT identity** (`imap:<queueId>:<contentHash>` for IMAP; the
+  transport key for PIPE), so it is stable across a re-fetch of the same message (a `BACKFILL` after a
+  UIDVALIDITY reset dedups instead of double-ticketing) yet distinct per queue (identical bytes to two
+  queues are BOTH ticketed, never silently collapsed). The effective id is claimed **atomically** by
+  stamping it on this ledger row (unique `InboundDelivery.messageId`): a conflict means another
+  delivery already owns that id — a shared RFC Message-ID (e.g. a message CC'd to two polled mailboxes,
+  whose copies differ only in per-hop trace headers) or a same queue+content synthetic id **is the
+  same logical message**, so the duplicate is `SKIPPED` (never quarantined as a spoof). The id is also
   written atomically with the ticket/post create (`TicketsService.reply()` / `createTicket()` accept
   an internal `incomingMessageId`); a unique `TicketPost.messageId` plus the ledger's unique
   `messageId`/`transportKey` make redelivery an idempotent no-op. A `RESUME_MIGRATED` re-fetch of

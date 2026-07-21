@@ -334,8 +334,7 @@ describe('InboundMailService — parser rule helpers', () => {
       opts?: {
         deliveryId?: number;
         legacyDedupIds?: string[];
-        transportKey?: string;
-        contentHash?: string;
+        syntheticSeed?: string;
       },
     ) => Promise<{ state: string; ticketId?: number; postId?: number }>;
     ticketsService: {
@@ -403,51 +402,48 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(svc.ticketsService.reply).not.toHaveBeenCalled();
     });
 
-    it('a same-Message-ID delivery with DIFFERENT content is QUARANTINED (throws), not skipped', async () => {
+    it('a same-Message-ID delivery is SKIPPED, not quarantined, even when the raw bytes differ', async () => {
+      // A message CC'd to two IMAP-polled mailboxes gets per-hop Received/Delivered-To trace
+      // headers, so the two stored copies differ byte-for-byte while sharing one Message-ID.
+      // It is ONE logical message → SKIP the second copy; NEVER quarantine it as a "spoof".
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (prisma.inboundDelivery.update as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
-      // Another delivery already owns this Message-ID, but with different content.
-      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: 5,
-        contentHash: 'other-content-hash',
-      });
       const svc = svcOf();
-      await expect(
-        svc.processRawMessage(Buffer.from(rawEmail), 1, { deliveryId: 77, contentHash: 'my-content-hash' }),
-      ).rejects.toThrow(/different content|reused|spoof/i);
+      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1, { deliveryId: 77 });
+      expect(out.state).toBe('SKIPPED');
       expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
       expect(svc.ticketsService.reply).not.toHaveBeenCalled();
     });
 
-    it('a same-Message-ID delivery with IDENTICAL content is SKIPPED (genuine re-delivery)', async () => {
-      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (prisma.inboundDelivery.update as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
-      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: 5,
-        contentHash: 'same-hash',
-      });
-      const svc = svcOf();
-      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1, {
-        deliveryId: 77,
-        contentHash: 'same-hash',
-      });
-      expect(out.state).toBe('SKIPPED');
-      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
-    });
-
-    it('scopes the synthetic id by transport key so identical-byte header-less mail does not collapse', async () => {
+    it('scopes the synthetic id per queue so identical-byte mail to DIFFERENT queues is both ticketed', async () => {
       const noId = ['From: a@b.example', 'To: s@t.example', 'Subject: hi', '', 'body', ''].join('\r\n');
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       const svc = svcOf();
-      // Same raw bytes, two DIFFERENT deliveries (distinct transport keys) → distinct ids →
-      // both create a ticket, neither is silently collapsed into the other.
-      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 1, transportKey: 'imap:1:100:5' });
-      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 2, transportKey: 'imap:2:200:9' });
+      // Same raw bytes, two queues (distinct seeds) → distinct ids → both create a ticket.
+      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 1, syntheticSeed: 'imap:1:HASH' });
+      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 2, syntheticSeed: 'imap:2:HASH' });
       const calls = (svc.ticketsService.createTicket as ReturnType<typeof vi.fn>).mock.calls as Array<
         [{ incomingMessageId: string }]
       >;
       expect(calls).toHaveLength(2);
       expect(calls[0]![0].incomingMessageId).not.toBe(calls[1]![0].incomingMessageId);
+    });
+
+    it('a content-stable seed makes a re-fetch of the SAME header-less mail dedup to one id', async () => {
+      const noId = ['From: a@b.example', 'To: s@t.example', 'Subject: hi', '', 'body', ''].join('\r\n');
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = svcOf();
+      // Same queue + same content but re-fetched under a new UID (UIDVALIDITY reset + BACKFILL)
+      // → same content-scoped seed → same synthetic id, so the second is deduped, not doubled.
+      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 1, syntheticSeed: 'imap:1:HASH' });
+      const first = (svc.ticketsService.createTicket as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
+        incomingMessageId: string;
+      };
+      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 2, syntheticSeed: 'imap:1:HASH' });
+      const second = (svc.ticketsService.createTicket as ReturnType<typeof vi.fn>).mock.calls[1]![0] as {
+        incomingMessageId: string;
+      };
+      expect(first.incomingMessageId).toBe(second.incomingMessageId);
     });
 
     it('synthesises a deterministic Message-ID from content when the mail carries none', async () => {

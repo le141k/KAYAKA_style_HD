@@ -52,25 +52,6 @@ interface ProcessOutcome {
 /** Ticket mask pattern used to thread inbound replies, e.g. TT-000042 */
 const MASK_RE = /TT-\d{6,}/i;
 
-/**
- * A second delivery presented a Message-ID already owned by another delivery, but with
- * DIFFERENT content (reused / spoofed Message-ID). Treated as a permanent processing error
- * so the delivery is QUARANTINED (raw MIME retained) for operator review instead of being
- * silently skipped as a duplicate or retried forever.
- */
-class InboundMessageIdConflictError extends ConflictException {
-  constructor(
-    readonly messageId: string,
-    readonly priorDeliveryId: number,
-    readonly contentHash: string,
-  ) {
-    super(
-      `Message-ID ${messageId} was already accepted with different content ` +
-        `(prior delivery #${priorDeliveryId}); quarantined for review (reused/spoofed Message-ID).`,
-    );
-  }
-}
-
 // Parser-amplification bounds — reject pathological MIME before it reaches routing,
 // storage, or the regex parser rules (preserved from the security baseline).
 const MAX_SUBJECT_CHARS = 500;
@@ -992,12 +973,20 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         });
     }, InboundMailService.LEASE_MS / 2);
     heartbeat.unref?.();
+    // Synthetic-id seed for header-less mail: a QUEUE-SCOPED CONTENT identity, not the raw
+    // UID. For IMAP use `imap:<queueId>:<contentHash>` — stable across a UIDVALIDITY reset +
+    // BACKFILL re-fetch (same queue+bytes → same id → deduped, no double ticket) yet distinct
+    // per queue (identical bytes to two queues → two ids → both ticketed, no silent collapse).
+    // For PIPE the transport key already encodes queue + the caller's externalId/content.
+    const syntheticSeed =
+      delivery.transport === 'IMAP'
+        ? `imap:${delivery.queueId ?? '-'}:${delivery.contentHash}`
+        : delivery.transportKey;
     try {
       const outcome = await this.processRawMessage(Buffer.from(delivery.rawMime), departmentId, {
         deliveryId,
         legacyDedupIds,
-        transportKey: delivery.transportKey,
-        contentHash: delivery.contentHash,
+        syntheticSeed,
       });
       await settle({
         state: outcome.state,
@@ -1055,16 +1044,14 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     opts: {
       deliveryId?: number;
       legacyDedupIds?: string[];
-      /** Unique transport key of this delivery — scopes the synthetic id for header-less
-       *  mail so two INDEPENDENT identical-byte messages (different UID / queue) do not
-       *  collapse into one (which would silently drop the second). */
-      transportKey?: string;
-      /** Content hash captured at acceptance — used to tell a genuine re-delivery from a
-       *  Message-ID reuse with different content on a claim conflict. */
-      contentHash?: string;
+      /** Queue-scoped CONTENT identity used to synthesize the effective Message-ID for
+       *  header-less mail — stable across a re-fetch of the same message (so a BACKFILL
+       *  re-import dedups) yet distinct per queue (so identical bytes to two queues are both
+       *  ticketed, never silently collapsed). Falls back to the raw bytes when absent. */
+      syntheticSeed?: string;
     } = {},
   ): Promise<ProcessOutcome> {
-    const { deliveryId, legacyDedupIds = [], transportKey, contentHash } = opts;
+    const { deliveryId, legacyDedupIds = [], syntheticSeed } = opts;
     // Reject oversized raw before parsing (an IMAP fetch capped at the size limit + 1 byte
     // arrives here truncated; the PIPE path already rejects at ingress).
     const sourceBytes = typeof source === 'string' ? Buffer.byteLength(source) : source.length;
@@ -1100,29 +1087,24 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     }
 
     // Effective Message-ID: the real (normalized) RFC id, or a deterministic synthetic one
-    // when the message carries none. The synthetic id is derived from THIS delivery's unique
-    // transport key (not the raw content) so two INDEPENDENT header-less messages with
-    // identical bytes — a duplicated newsletter to the same mailbox (two UIDs), or the same
-    // bytes to two different queues — get DISTINCT ids and are BOTH ticketed, never silently
-    // collapsed. A retry of the same delivery reuses the same transport key → same id → still
-    // idempotent. (Falls back to a content hash only when no transport key is available.)
+    // when the message carries none. The synthetic id is seeded from a QUEUE-SCOPED CONTENT
+    // identity (`imap:<queueId>:<contentHash>` for IMAP; the transport key for PIPE), so it is
+    // stable across a re-fetch of the same message (a BACKFILL after a UIDVALIDITY reset dedups
+    // instead of double-ticketing) yet distinct per queue (identical bytes to two queues are
+    // BOTH ticketed, never silently collapsed). Falls back to the raw bytes when no seed given.
     const rawBuf = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
     const realMessageId = this.normalizeMessageId(parsed.messageId);
-    // Seed the synthetic id from the transport key (unique per delivery) when available, else
-    // from the raw bytes (single hash — the historical form, kept identical for callers with
-    // no transport key). Both are deterministic, so a retry re-derives the same id.
-    const syntheticSeed: string | Buffer = transportKey ?? rawBuf;
+    const seed: string | Buffer = syntheticSeed ?? rawBuf;
     const effectiveMessageId =
-      realMessageId ??
-      `<inbound-${createHash('sha256').update(syntheticSeed).digest('hex')}@23telecom.local>`;
-    const myContentHash = contentHash ?? createHash('sha256').update(rawBuf).digest('hex');
+      realMessageId ?? `<inbound-${createHash('sha256').update(seed).digest('hex')}@23telecom.local>`;
 
-    // ATOMIC dedup claim (race-safe): stamp the effective Message-ID + parsed identity on
-    // THIS ledger row. The unique index on `messageId` means only one delivery can own it.
-    // A synthetic (transport-scoped) id can only conflict with THIS row on a retry, so a
-    // conflict here always means a REAL Message-ID shared by another delivery. Compare the
-    // content: identical bytes = a genuine re-delivery (IMAP+PIPE) → SKIP; DIFFERENT bytes =
-    // a reused/spoofed Message-ID → QUARANTINE (never silently drop) for operator review.
+    // ATOMIC dedup claim (race-safe): stamp the effective Message-ID + parsed identity on THIS
+    // ledger row. The unique index on `messageId` means only one delivery can own it — a
+    // concurrent IMAP+PIPE (or two-poller) duplicate loses the race with P2002 and is SKIPPED,
+    // instead of both check-then-act creating a ticket. A shared Message-ID (real RFC id, or a
+    // same queue+content synthetic id) IS the same logical message — e.g. a message CC'd to two
+    // polled mailboxes gets per-hop trace headers that differ byte-for-byte but is still ONE
+    // message — so a conflict is a duplicate to SKIP, never a spoof to quarantine.
     if (deliveryId != null) {
       try {
         await this.prisma.inboundDelivery.update({
@@ -1136,13 +1118,6 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         });
       } catch (err) {
         if (this.isUniqueViolation(err)) {
-          const prior = await this.prisma.inboundDelivery.findUnique({
-            where: { messageId: effectiveMessageId },
-            select: { id: true, contentHash: true },
-          });
-          if (prior && prior.contentHash !== myContentHash) {
-            throw new InboundMessageIdConflictError(effectiveMessageId, prior.id, myContentHash);
-          }
           this.logger.log(`Inbound: duplicate message ${effectiveMessageId} from ${fromEmail} — skipped`);
           return { state: 'SKIPPED' };
         }
@@ -1572,14 +1547,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     return authorized.some((email) => Boolean(email) && normalizeEmail(email ?? '') === sender);
   }
 
-  /** Deterministic input failures (malformed / oversized MIME, Message-ID collision) —
-   *  retrying cannot help, so quarantine at once (raw MIME retained). */
+  /** Deterministic input failures (malformed / oversized MIME) — retrying cannot help, so
+   *  quarantine at once (raw MIME retained). */
   private isPermanentProcessingError(err: unknown): boolean {
-    return (
-      err instanceof BadRequestException ||
-      err instanceof PayloadTooLargeException ||
-      err instanceof InboundMessageIdConflictError
-    );
+    return err instanceof BadRequestException || err instanceof PayloadTooLargeException;
   }
 
   // ─────────────────── parser rules (unchanged) ───────────────────
