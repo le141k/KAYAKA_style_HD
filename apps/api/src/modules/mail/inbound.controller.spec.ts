@@ -34,19 +34,19 @@ describe('InboundController (A1 webhook)', () => {
   it('ingests the raw message when the secret matches (no delivery id → content-hash idempotency)', async () => {
     const res = await ctx.controller.pipe(SECRET, undefined, { raw: RAW });
     expect(res).toEqual({ accepted: true });
-    expect(ctx.inbound.ingestRawMessage).toHaveBeenCalledWith(RAW, undefined, undefined);
+    expect(ctx.inbound.ingestRawMessage).toHaveBeenCalledWith(RAW, undefined, undefined, undefined);
   });
 
   it('passes an explicit x-inbound-delivery-id through as the idempotency key', async () => {
     await ctx.controller.pipe(SECRET, '  mta-42  ', { raw: RAW });
-    expect(ctx.inbound.ingestRawMessage).toHaveBeenCalledWith(RAW, undefined, 'mta-42');
+    expect(ctx.inbound.ingestRawMessage).toHaveBeenCalledWith(RAW, undefined, 'mta-42', undefined);
   });
 
   it('#8: accepts a raw Buffer body (message/rfc822) byte-for-byte', async () => {
     const buf = Buffer.from(RAW, 'utf8');
     const res = await ctx.controller.pipe(SECRET, undefined, buf);
     expect(res).toEqual({ accepted: true });
-    expect(ctx.inbound.ingestRawMessage).toHaveBeenCalledWith(buf, undefined, undefined);
+    expect(ctx.inbound.ingestRawMessage).toHaveBeenCalledWith(buf, undefined, undefined, undefined);
   });
 
   it('#8: rejects an empty raw Buffer body with 400', async () => {

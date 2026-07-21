@@ -1,4 +1,6 @@
+import { timingSafeEqual } from 'node:crypto';
 import express from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
@@ -15,8 +17,24 @@ async function bootstrap(): Promise<void> {
   // the limit for every other JSON route.
   const app = await NestFactory.create(AppModule, { bufferLogs: true, bodyParser: false });
   const inboundLimit = `${config.TELECOM_HD_INBOUND_MAX_SIZE_MB}mb`;
-  // Route-specific parsers FIRST (registration order wins): raw bytes for an MTA that
-  // POSTs the message verbatim, or a large JSON `{ raw }` body.
+  // Validate the inbound-webhook shared secret BEFORE the large body parsers below, so an
+  // unauthenticated caller is rejected in constant time without us buffering up to the
+  // inbound size limit. The controller re-checks the secret (defence in depth); this guard
+  // only closes the "buffer-then-reject" amplification window on the ingress path.
+  const inboundSecret = Buffer.from(config.TELECOM_HD_INBOUND_WEBHOOK_SECRET, 'utf8');
+  app.use('/api/inbound/pipe', (req: Request, res: Response, next: NextFunction) => {
+    const headerVal = req.headers['x-inbound-secret'];
+    const providedStr = Array.isArray(headerVal) ? headerVal[0] : headerVal;
+    const provided = Buffer.from(typeof providedStr === 'string' ? providedStr : '', 'utf8');
+    const ok = provided.byteLength === inboundSecret.byteLength && timingSafeEqual(provided, inboundSecret);
+    if (!ok) {
+      res.status(403).json({ statusCode: 403, message: 'Invalid inbound webhook secret' });
+      return;
+    }
+    next();
+  });
+  // Route-specific parsers (registration order wins): raw bytes for an MTA that POSTs the
+  // message verbatim, or a large JSON `{ raw }` body. Only reached after the secret check.
   app.use(
     '/api/inbound/pipe',
     express.raw({ type: ['message/rfc822', 'application/octet-stream'], limit: inboundLimit }),

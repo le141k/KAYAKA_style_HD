@@ -70,6 +70,7 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'FROM_NOW',
   TELECOM_HD_IMAP_BACKFILL_LIMIT: 0,
   TELECOM_HD_INBOUND_MAX_ATTEMPTS: 5,
+  TELECOM_HD_INBOUND_RAW_RETENTION_DAYS: 30,
   TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined,
 };
 
@@ -330,7 +331,12 @@ describe('InboundMailService — parser rule helpers', () => {
     processRawMessage: (
       m: Buffer,
       d: number | undefined,
-      deliveryId?: number,
+      opts?: {
+        deliveryId?: number;
+        legacyDedupIds?: string[];
+        transportKey?: string;
+        contentHash?: string;
+      },
     ) => Promise<{ state: string; ticketId?: number; postId?: number }>;
     ticketsService: {
       createTicket: ReturnType<typeof vi.fn>;
@@ -374,7 +380,7 @@ describe('InboundMailService — parser rule helpers', () => {
     it('#4: stamps the effective Message-ID + envelope + subject on the ledger row (atomic claim)', async () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       const svc = svcOf();
-      await svc.processRawMessage(Buffer.from(rawEmail), 1, 77);
+      await svc.processRawMessage(Buffer.from(rawEmail), 1, { deliveryId: 77 });
       expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 77 },
@@ -391,10 +397,57 @@ describe('InboundMailService — parser rule helpers', () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (prisma.inboundDelivery.update as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
       const svc = svcOf();
-      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1, 77);
+      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1, { deliveryId: 77 });
       expect(out.state).toBe('SKIPPED');
       expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
       expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+    });
+
+    it('a same-Message-ID delivery with DIFFERENT content is QUARANTINED (throws), not skipped', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.inboundDelivery.update as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      // Another delivery already owns this Message-ID, but with different content.
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 5,
+        contentHash: 'other-content-hash',
+      });
+      const svc = svcOf();
+      await expect(
+        svc.processRawMessage(Buffer.from(rawEmail), 1, { deliveryId: 77, contentHash: 'my-content-hash' }),
+      ).rejects.toThrow(/different content|reused|spoof/i);
+      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+      expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+    });
+
+    it('a same-Message-ID delivery with IDENTICAL content is SKIPPED (genuine re-delivery)', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.inboundDelivery.update as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 5,
+        contentHash: 'same-hash',
+      });
+      const svc = svcOf();
+      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1, {
+        deliveryId: 77,
+        contentHash: 'same-hash',
+      });
+      expect(out.state).toBe('SKIPPED');
+      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+    });
+
+    it('scopes the synthetic id by transport key so identical-byte header-less mail does not collapse', async () => {
+      const noId = ['From: a@b.example', 'To: s@t.example', 'Subject: hi', '', 'body', ''].join('\r\n');
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = svcOf();
+      // Same raw bytes, two DIFFERENT deliveries (distinct transport keys) → distinct ids →
+      // both create a ticket, neither is silently collapsed into the other.
+      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 1, transportKey: 'imap:1:100:5' });
+      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 2, transportKey: 'imap:2:200:9' });
+      const calls = (svc.ticketsService.createTicket as ReturnType<typeof vi.fn>).mock.calls as Array<
+        [{ incomingMessageId: string }]
+      >;
+      expect(calls).toHaveLength(2);
+      expect(calls[0]![0].incomingMessageId).not.toBe(calls[1]![0].incomingMessageId);
     });
 
     it('synthesises a deterministic Message-ID from content when the mail carries none', async () => {
@@ -615,16 +668,21 @@ describe('InboundMailService — parser rule helpers', () => {
     it('fail-closed: a fetch error stops the poll WITHOUT advancing the cursor', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
       await poll(makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 }, { fetchOneThrowsAt: 101 }));
-      // 101 failed before acceptance → nothing accepted, cursor NOT advanced.
+      // 101 failed before acceptance → nothing accepted, cursor NOT advanced. (A liveness
+      // stamp updateMany may run — assert specifically that no cursor-advancing write happened.)
       expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
-      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: expect.anything() }) }),
+      );
     });
 
     it('fail-closed: a ledger DB error during accept does NOT advance the cursor', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
       (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('db down'));
       await poll(makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 }));
-      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: expect.anything() }) }),
+      );
     });
 
     it('idempotent: a duplicate transport key (P2002) is a no-op and the cursor still advances', async () => {
@@ -689,10 +747,15 @@ describe('InboundMailService — parser rule helpers', () => {
         mailbox: { uidValidity: 7n, uidNext: 501, exists: 500 },
         getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
       });
-      // Bootstrap is a CAS on `uidValidity IS NULL` (two-pod safe) → updateMany.
+      // Bootstrap is a CAS on `uidValidity IS NULL` + generation + non-halted state
+      // (two-pod safe) → updateMany.
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 1, uidValidity: null },
+          where: expect.objectContaining({
+            id: 1,
+            uidValidity: null,
+            syncState: { in: ['OK', 'BOOTSTRAPPING'] },
+          }),
           data: expect.objectContaining({ lastSeenUid: 500n, uidValidity: 7n, syncState: 'OK' }),
         }),
       );
@@ -729,7 +792,11 @@ describe('InboundMailService — parser rule helpers', () => {
 
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 1, uidValidity: null },
+          where: expect.objectContaining({
+            id: 1,
+            uidValidity: null,
+            syncState: { in: ['OK', 'BOOTSTRAPPING'] },
+          }),
           data: expect.objectContaining({ lastSeenUid: 9n, uidValidity: 7n, syncState: 'OK' }),
         }),
       );
@@ -1043,6 +1110,43 @@ describe('InboundMailService — parser rule helpers', () => {
 
     it('accepts an ordinary external message', () => {
       expect(call({ from: 'x' }, 'customer@acme.example')).toBe(false);
+    });
+  });
+
+  // ─── hardening: retention prune + zero-queue supervisor ──────────────────────
+
+  describe('pruneRawMime (retention)', () => {
+    it('nulls raw MIME for terminal deliveries older than the retention window; keeps quarantined', async () => {
+      const svc = makeInboundService(prisma as unknown as PrismaService);
+      await (svc as unknown as { pruneRawMime: () => Promise<void> }).pruneRawMime();
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            state: { in: ['PROCESSED', 'SKIPPED'] },
+            rawPrunedAt: null,
+          }),
+          data: expect.objectContaining({ rawMime: null }),
+        }),
+      );
+    });
+
+    it('does nothing when retention is disabled (0 days)', async () => {
+      const cfg = { ...TEST_CONFIG, TELECOM_HD_INBOUND_RAW_RETENTION_DAYS: 0 };
+      const svc = makeInboundService(prisma as unknown as PrismaService, cfg);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockClear();
+      await (svc as unknown as { pruneRawMime: () => Promise<void> }).pruneRawMime();
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('onModuleInit — zero-queue supervisor', () => {
+    it('starts the poll supervisor even with no IMAP queues so a later queue is picked up', async () => {
+      const cfg = { ...TEST_CONFIG, TELECOM_HD_IMAP_ENABLED: true };
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]); // zero queues
+      const svc = makeInboundService(prisma as unknown as PrismaService, cfg);
+      await svc.onModuleInit();
+      expect((svc as unknown as { pollHandle: unknown }).pollHandle).not.toBeNull();
+      await svc.onModuleDestroy();
     });
   });
 });

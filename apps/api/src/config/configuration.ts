@@ -104,6 +104,10 @@ const schema = z.object({
   // Max processing attempts before an inbound delivery is QUARANTINED (raw MIME is
   // always retained for replay — a quarantine never discards a message).
   TELECOM_HD_INBOUND_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  // Raw-MIME retention (days). A terminal PROCESSED/SKIPPED delivery older than this has its
+  // inline raw MIME pruned (metadata + contentHash kept) to bound the ledger's on-disk growth.
+  // QUARANTINED deliveries are NEVER pruned (raw MIME is needed to replay). 0 disables pruning.
+  TELECOM_HD_INBOUND_RAW_RETENTION_DAYS: z.coerce.number().int().min(0).max(3650).default(30),
   // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_FIELD_ENCRYPTION_KEY: z.string().optional(),

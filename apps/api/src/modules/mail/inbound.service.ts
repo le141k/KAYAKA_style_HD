@@ -52,6 +52,25 @@ interface ProcessOutcome {
 /** Ticket mask pattern used to thread inbound replies, e.g. TT-000042 */
 const MASK_RE = /TT-\d{6,}/i;
 
+/**
+ * A second delivery presented a Message-ID already owned by another delivery, but with
+ * DIFFERENT content (reused / spoofed Message-ID). Treated as a permanent processing error
+ * so the delivery is QUARANTINED (raw MIME retained) for operator review instead of being
+ * silently skipped as a duplicate or retried forever.
+ */
+class InboundMessageIdConflictError extends ConflictException {
+  constructor(
+    readonly messageId: string,
+    readonly priorDeliveryId: number,
+    readonly contentHash: string,
+  ) {
+    super(
+      `Message-ID ${messageId} was already accepted with different content ` +
+        `(prior delivery #${priorDeliveryId}); quarantined for review (reused/spoofed Message-ID).`,
+    );
+  }
+}
+
 // Parser-amplification bounds — reject pathological MIME before it reaches routing,
 // storage, or the regex parser rules (preserved from the security baseline).
 const MAX_SUBJECT_CHARS = 500;
@@ -105,6 +124,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   private readonly connectionFingerprints = new Map<number, string>();
   private pollHandle: ReturnType<typeof setInterval> | null = null;
   private drainHandle: ReturnType<typeof setInterval> | null = null;
+  private pruneHandle: ReturnType<typeof setInterval> | null = null;
   /** Throttle repeated "queue halted" logs to once per interval per queue. */
   private readonly haltLogged = new Set<number>();
   /** This process's id (diagnostics). Lease ownership uses a fresh per-claim token. */
@@ -134,24 +154,19 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async onModuleInit(): Promise<void> {
-    // Seed loop-suppression addresses: our configured MAIL_FROM plus every enabled queue.
-    const configuredFrom = this.normalizeConfiguredMailbox(this.config.TELECOM_HD_MAIL_FROM ?? '');
-    if (configuredFrom) this.ownAddresses.add(configuredFrom);
+    // Seed loop-suppression addresses (our MAIL_FROM + every enabled queue) BEFORE the
+    // TELECOM_HD_IMAP_ENABLED early-return, so a self-loop is suppressed even when the
+    // poller is disabled and mail arrives only via the PIPE webhook. The set is rebuilt on
+    // every supervisor cycle (reconcileConnections) so a queue address change is reflected.
+    await this.refreshOwnAddresses();
 
-    // Seed loop-suppression from EVERY enabled queue (IMAP + non-IMAP) BEFORE the
-    // TELECOM_HD_IMAP_ENABLED early-return, so a self-loop from one of our own addresses is
-    // suppressed even when the poller is disabled and mail arrives only via the PIPE webhook.
-    const enabledQueues = await this.prisma.emailQueue.findMany({
-      where: { isEnabled: true },
-      select: { id: true, emailAddress: true, type: true },
-    });
-    for (const q of enabledQueues) {
-      const address = normalizeEmail(q.emailAddress);
-      if (address) this.ownAddresses.add(address);
-    }
     // A1: surface enabled queues whose transport we don't poll (e.g. PIPE) instead of
     // silently ignoring them — their mail is fed via POST /api/inbound/pipe.
-    for (const q of enabledQueues.filter((x) => x.type !== 'IMAP')) {
+    const nonImap = await this.prisma.emailQueue.findMany({
+      where: { isEnabled: true, type: { not: 'IMAP' } },
+      select: { id: true, emailAddress: true, type: true },
+    });
+    for (const q of nonImap) {
       this.logger.warn(
         `EmailQueue ${q.id} (${q.emailAddress}, type=${q.type}) is enabled but not IMAP — ` +
           `the poller will not fetch it. Use the inbound webhook (POST /api/inbound/pipe) for PIPE/MTA delivery.`,
@@ -170,6 +185,18 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(`Inbound startup drain error: ${String(err)}`),
     );
 
+    // Raw-MIME retention: prune terminal deliveries' inline blobs hourly (and once now) so the
+    // ledger's on-disk footprint stays bounded. Independent of IMAP (PIPE deliveries too).
+    this.pruneHandle = setInterval(() => {
+      void this.pruneRawMime().catch((err: unknown) =>
+        this.logger.error(`Inbound retention prune error: ${String(err)}`),
+      );
+    }, 60 * 60_000);
+    this.pruneHandle.unref?.();
+    void this.pruneRawMime().catch((err: unknown) =>
+      this.logger.error(`Inbound startup retention prune error: ${String(err)}`),
+    );
+
     if (!this.config.TELECOM_HD_IMAP_ENABLED) {
       this.logger.log('IMAP polling disabled (TELECOM_HD_IMAP_ENABLED=false) — drain active for PIPE');
       return;
@@ -178,12 +205,11 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const queues = await this.prisma.emailQueue.findMany({
       where: { isEnabled: true, type: 'IMAP' },
     });
-    // (addresses already seeded into ownAddresses above, before the early-return)
-    if (queues.length === 0) {
-      this.logger.log('No enabled IMAP queues — inbound mail polling disabled (drain active for PIPE)');
-      return;
-    }
 
+    // Connect any queues that exist now. Do NOT early-return when there are zero — the
+    // poll supervisor below (reconcileConnections, run each cycle) connects queues created
+    // or enabled AFTER startup, so a first IMAP queue added at runtime is polled without an
+    // API restart (previously a zero-queue boot left the supervisor unstarted forever).
     const encKey = this.config.TELECOM_HD_FIELD_ENCRYPTION_KEY;
     for (const queue of queues) {
       let plainPassword: string;
@@ -208,12 +234,45 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       void this.pollAll().catch((err: unknown) => this.logger.error(`IMAP poll error: ${String(err)}`));
     }, 60_000);
 
-    this.logger.log(`IMAP inbound polling started for ${queues.length} queue(s)`);
+    this.logger.log(
+      `IMAP inbound polling supervisor started (${queues.length} queue(s) connected at boot; ` +
+        `reconnects + newly enabled queues handled each cycle)`,
+    );
+  }
+
+  /**
+   * Rebuild the self-loop suppression set from the CURRENT enabled queues (+ MAIL_FROM).
+   * Called at init and on every supervisor cycle so an emailAddress change — which does not
+   * change a connection fingerprint — is reflected without an API restart. Replaces the set
+   * atomically (no await between clear and refill) and keeps the old set on a DB error
+   * rather than blanking loop suppression.
+   */
+  private async refreshOwnAddresses(): Promise<void> {
+    const configuredFrom = this.normalizeConfiguredMailbox(this.config.TELECOM_HD_MAIL_FROM ?? '');
+    let rows: Array<{ emailAddress: string }>;
+    try {
+      rows = await this.prisma.emailQueue.findMany({
+        where: { isEnabled: true },
+        select: { emailAddress: true },
+      });
+    } catch (err) {
+      this.logger.error(`ownAddresses refresh failed (keeping prior set): ${String(err)}`);
+      return;
+    }
+    const next = new Set<string>();
+    if (configuredFrom) next.add(configuredFrom);
+    for (const r of rows) {
+      const address = normalizeEmail(r.emailAddress);
+      if (address) next.add(address);
+    }
+    this.ownAddresses.clear();
+    for (const address of next) this.ownAddresses.add(address);
   }
 
   async onModuleDestroy(): Promise<void> {
     if (this.pollHandle) clearInterval(this.pollHandle);
     if (this.drainHandle) clearInterval(this.drainHandle);
+    if (this.pruneHandle) clearInterval(this.pruneHandle);
     // Release any queued parse waiters so pending drains reject rather than hang on shutdown.
     const shutdownError = new ServiceUnavailableException('Inbound parser is shutting down');
     for (const waiter of this.parserWaiters.splice(0)) waiter.reject(shutdownError);
@@ -244,6 +303,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       });
       await client.connect();
       this.connections.set(queueId, client);
+      await this.stampQueue(queueId, { lastConnectedAt: new Date() });
       this.logger.log(`IMAP connected to queue ${queueId} (${opts.host}:${opts.port})`);
       // Capture the baseline SYNCHRONOUSLY at activation (not on the first 60s poll) so
       // mail arriving between connect and the first poll is not skipped (P0-2).
@@ -297,7 +357,16 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       // choosing a different policy), our stale baseline/policy matches 0 rows and their
       // newer intent stands. The per-queue override is consumed here (cleared).
       const cas = await this.prisma.emailQueue.updateMany({
-        where: { id: queueId, uidValidity: null, cursorGeneration: queue.cursorGeneration },
+        // Only a never-bootstrapped, non-halted queue is a valid bootstrap target: gate on
+        // uidValidity IS NULL + the read generation + syncState ∈ {OK, BOOTSTRAPPING}. A
+        // queue halted (NEEDS_RECONCILIATION) between our read and this write is excluded, so
+        // bootstrap flips syncState → OK only from the transient/never-bootstrapped states.
+        where: {
+          id: queueId,
+          uidValidity: null,
+          cursorGeneration: queue.cursorGeneration,
+          syncState: { in: ['OK', 'BOOTSTRAPPING'] },
+        },
         data: {
           lastSeenUid: BigInt(baseline),
           uidValidity,
@@ -356,6 +425,9 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    */
   private async reconcileConnections(): Promise<void> {
     if (!this.config.TELECOM_HD_IMAP_ENABLED) return;
+    // Rebuild loop-suppression addresses each cycle so a queue's emailAddress change (which
+    // does not alter its connection fingerprint) is reflected without an API restart.
+    await this.refreshOwnAddresses();
     let enabled: Array<{
       id: number;
       emailAddress: string;
@@ -429,12 +501,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         auth: { user: q.username, pass: plainPassword },
       });
       // Only fingerprint a connection that actually established (connectQueue swallows
-      // connect errors) so a failed connect is retried next cycle.
+      // connect errors) so a failed connect is retried next cycle. (Self-loop addresses are
+      // rebuilt for ALL enabled queues at the top of this cycle by refreshOwnAddresses.)
       if (this.connections.has(q.id)) {
         this.connectionFingerprints.set(q.id, fingerprint);
-        // A queue enabled after startup is now polled — add its address to the self-loop set.
-        const address = normalizeEmail(q.emailAddress);
-        if (address) this.ownAddresses.add(address);
       }
     }
   }
@@ -561,12 +631,56 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
             this.logger.warn(`IMAP queue ${queueId}: cursor CAS skipped (queue reconciled mid-poll)`);
           }
         }
+        // Operator liveness: stamp the poll time (and accept time when this cycle accepted
+        // anything). Advisory only — a separate write, never part of the cursor CAS.
+        await this.stampQueue(queueId, {
+          lastPollAt: new Date(),
+          ...(cursor > lastUid ? { lastAcceptedAt: new Date() } : {}),
+        });
       } finally {
         lock.release();
       }
     }
 
     await this.drainDeliveries();
+  }
+
+  /**
+   * Raw-MIME retention: null out the inline `rawMime` of terminal (PROCESSED/SKIPPED)
+   * deliveries older than TELECOM_HD_INBOUND_RAW_RETENTION_DAYS, keeping their metadata +
+   * contentHash. QUARANTINED rows are never touched (raw MIME is required to replay). Bounds
+   * the ledger's on-disk footprint without an external object store. 0 days disables it.
+   */
+  private async pruneRawMime(): Promise<void> {
+    const days = this.config.TELECOM_HD_INBOUND_RAW_RETENTION_DAYS;
+    if (!days || days <= 0) return;
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000);
+    const res = await this.prisma.inboundDelivery.updateMany({
+      where: {
+        state: { in: ['PROCESSED', 'SKIPPED'] },
+        rawPrunedAt: null,
+        createdAt: { lt: cutoff },
+      },
+      data: { rawMime: null, rawPrunedAt: new Date() },
+    });
+    if (res.count > 0) {
+      this.logger.log(
+        `Inbound retention: pruned inline raw MIME from ${res.count} terminal delivery(ies) older than ${days}d`,
+      );
+    }
+  }
+
+  /** Best-effort advisory write of a queue's liveness timestamps. Never throws (a failed
+   *  liveness stamp must not break a poll) and touches only the given columns. */
+  private async stampQueue(
+    queueId: number,
+    data: { lastConnectedAt?: Date; lastPollAt?: Date; lastAcceptedAt?: Date },
+  ): Promise<void> {
+    try {
+      await this.prisma.emailQueue.updateMany({ where: { id: queueId }, data });
+    } catch (err) {
+      this.logger.warn(`IMAP queue ${queueId}: liveness stamp failed — ${String(err)}`);
+    }
   }
 
   /**
@@ -584,6 +698,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   ): Promise<void> {
     const transportKey = `imap:${queueId}:${uidValidity}:${uid}`;
     const contentHash = createHash('sha256').update(source).digest('hex');
+    // The IMAP fetch caps the body at MAX_SIZE+1 bytes; a source at/over the ceiling was
+    // TRUNCATED — its retained raw MIME is incomplete, so flag it (the drain quarantines a
+    // truncated delivery without partially ticketing it; replay must re-fetch the original).
+    const truncated = source.length > this.config.TELECOM_HD_INBOUND_MAX_SIZE_MB * 1024 * 1024;
     try {
       await this.prisma.inboundDelivery.create({
         data: {
@@ -596,6 +714,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           contentHash,
           rawMime: new Uint8Array(source),
           sizeBytes: source.length,
+          truncated,
           state: 'ACCEPTED',
         },
       });
@@ -617,19 +736,41 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     source: Buffer | string,
     departmentId: number | undefined,
     externalId?: string,
+    queueId?: number,
   ): Promise<void> {
     const buf = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
     if (buf.length > this.config.TELECOM_HD_INBOUND_MAX_SIZE_MB * 1024 * 1024) {
       throw new PayloadTooLargeException('Inbound message exceeds the configured size limit');
     }
+
+    // Optional explicit queue binding (`x-inbound-queue-id`): resolve the queue so its
+    // department routes this message and the delivery records which queue it belongs to
+    // (reliable binding for a multi-queue MTA, instead of always the global default).
+    let boundQueueId: number | null = null;
+    let deptForDelivery = departmentId ?? null;
+    if (queueId != null) {
+      const q = await this.prisma.emailQueue.findUnique({
+        where: { id: queueId },
+        select: { id: true, departmentId: true },
+      });
+      if (!q) throw new BadRequestException(`Unknown inbound queue id ${queueId}`);
+      boundQueueId = q.id;
+      if (deptForDelivery == null) deptForDelivery = q.departmentId ?? null;
+    }
+
     const contentHash = createHash('sha256').update(buf).digest('hex');
-    const transportKey = externalId ? `pipe:-:${externalId}` : `pipe:-:sha256:${contentHash}`;
+    const keyQueue = boundQueueId ?? '-';
+    const transportKey = externalId
+      ? `pipe:${keyQueue}:${externalId}`
+      : `pipe:${keyQueue}:sha256:${contentHash}`;
 
     let deliveryId: number | null = null;
     try {
       const created = await this.prisma.inboundDelivery.create({
         data: {
           transport: 'PIPE',
+          queueId: boundQueueId,
+          departmentId: deptForDelivery,
           transportKey,
           externalId: externalId ?? null,
           contentHash,
@@ -660,7 +801,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       }
       throw err;
     }
-    await this.processDelivery(deliveryId, departmentId);
+    await this.processDelivery(deliveryId, deptForDelivery ?? undefined);
   }
 
   // ─────────────────── drain (process ledger) ───────────────────
@@ -731,7 +872,12 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       where: {
         id: deliveryId,
         OR: [
-          { state: { in: ['ACCEPTED', 'RETRY'] } },
+          { state: 'ACCEPTED' },
+          // A RETRY is only claimable once its backoff has elapsed. Enforce the schedule
+          // in the CLAIM CAS itself (not only in the drain's pre-select) so any caller —
+          // an inline ingest, a future direct call, or a racing worker — can never claim a
+          // not-yet-due RETRY and burn an attempt early.
+          { state: 'RETRY', OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
           { state: 'PROCESSING', leaseExpiresAt: { lt: now } }, // reclaim expired lease
         ],
       },
@@ -752,12 +898,22 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     if (!delivery) return;
 
     // All terminal/retry writes are CAS-gated on OUR lease token so a claim that reclaimed
-    // an expired lease can't be overwritten by the original stalled flow.
-    const settle = (data: Record<string, unknown>) =>
-      this.prisma.inboundDelivery.updateMany({
+    // an expired lease can't be overwritten by the original stalled flow. A 0-row settle
+    // means our lease was stolen (processing outlived it and another worker reclaimed) —
+    // surface it instead of silently discarding the result; the winner will settle it.
+    const settle = async (data: Record<string, unknown>) => {
+      const res = await this.prisma.inboundDelivery.updateMany({
         where: { id: deliveryId, leaseOwner: leaseToken, state: 'PROCESSING' },
         data,
       });
+      if (res.count === 0) {
+        this.logger.warn(
+          `Inbound delivery ${deliveryId}: settle no-op — lease lost mid-processing ` +
+            `(reclaimed by another worker); result dropped, the current owner will settle it.`,
+        );
+      }
+      return res;
+    };
 
     if (!delivery.rawMime) {
       await settle({
@@ -767,6 +923,22 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         leaseExpiresAt: null,
       });
       this.logger.error(`Inbound delivery ${deliveryId}: missing rawMime — quarantined`);
+      return;
+    }
+
+    // A truncated (oversized) IMAP fetch has incomplete raw bytes — never partially ticket it.
+    // Quarantine at once with a clear reason; a faithful replay must re-fetch the original.
+    if (delivery.truncated) {
+      await settle({
+        state: 'QUARANTINED',
+        lastError:
+          'oversized: the fetched raw MIME is truncated at the size ceiling — re-fetch the original message to replay',
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
+      this.logger.error(
+        `Inbound delivery ${deliveryId}: QUARANTINED — oversized/truncated IMAP fetch (${delivery.sizeBytes} bytes)`,
+      );
       return;
     }
 
@@ -804,13 +976,29 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
+    // Heartbeat: keep extending OUR lease while a healthy-but-slow message is processed
+    // (a large parse + attachment upload can approach the lease window). CAS-gated on our
+    // token so it no-ops the instant we lose the lease; unref'd so it never holds the event
+    // loop open; always cleared in `finally`. This closes the window where a long-but-live
+    // flow's lease expired and another worker reclaimed and reprocessed it.
+    const heartbeat = setInterval(() => {
+      void this.prisma.inboundDelivery
+        .updateMany({
+          where: { id: deliveryId, leaseOwner: leaseToken, state: 'PROCESSING' },
+          data: { leaseExpiresAt: new Date(Date.now() + InboundMailService.LEASE_MS) },
+        })
+        .catch(() => {
+          /* transient; the next tick retries, and settle is CAS-fenced regardless */
+        });
+    }, InboundMailService.LEASE_MS / 2);
+    heartbeat.unref?.();
     try {
-      const outcome = await this.processRawMessage(
-        Buffer.from(delivery.rawMime),
-        departmentId,
+      const outcome = await this.processRawMessage(Buffer.from(delivery.rawMime), departmentId, {
         deliveryId,
         legacyDedupIds,
-      );
+        transportKey: delivery.transportKey,
+        contentHash: delivery.contentHash,
+      });
       await settle({
         state: outcome.state,
         ticketId: outcome.ticketId ?? null,
@@ -849,6 +1037,8 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           `Inbound delivery ${deliveryId}: retry ${attempts}/${this.maxAttempts} in ${backoffMs}ms — ${String(err)}`,
         );
       }
+    } finally {
+      clearInterval(heartbeat);
     }
   }
 
@@ -862,9 +1052,19 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   private async processRawMessage(
     source: Buffer | string,
     departmentId: number | undefined,
-    deliveryId?: number,
-    legacyDedupIds: string[] = [],
+    opts: {
+      deliveryId?: number;
+      legacyDedupIds?: string[];
+      /** Unique transport key of this delivery — scopes the synthetic id for header-less
+       *  mail so two INDEPENDENT identical-byte messages (different UID / queue) do not
+       *  collapse into one (which would silently drop the second). */
+      transportKey?: string;
+      /** Content hash captured at acceptance — used to tell a genuine re-delivery from a
+       *  Message-ID reuse with different content on a claim conflict. */
+      contentHash?: string;
+    } = {},
   ): Promise<ProcessOutcome> {
+    const { deliveryId, legacyDedupIds = [], transportKey, contentHash } = opts;
     // Reject oversized raw before parsing (an IMAP fetch capped at the size limit + 1 byte
     // arrives here truncated; the PIPE path already rejects at ingress).
     const sourceBytes = typeof source === 'string' ? Buffer.byteLength(source) : source.length;
@@ -900,18 +1100,29 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     }
 
     // Effective Message-ID: the real (normalized) RFC id, or a deterministic synthetic one
-    // derived from the content hash when the message carries none. Used for BOTH dedup and
-    // the stored post id, so a retry (or IMAP+PIPE double-delivery) is idempotent even for
-    // mail with no Message-ID (closes the out-of-order-without-Message-ID dup gap).
+    // when the message carries none. The synthetic id is derived from THIS delivery's unique
+    // transport key (not the raw content) so two INDEPENDENT header-less messages with
+    // identical bytes — a duplicated newsletter to the same mailbox (two UIDs), or the same
+    // bytes to two different queues — get DISTINCT ids and are BOTH ticketed, never silently
+    // collapsed. A retry of the same delivery reuses the same transport key → same id → still
+    // idempotent. (Falls back to a content hash only when no transport key is available.)
     const rawBuf = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
     const realMessageId = this.normalizeMessageId(parsed.messageId);
+    // Seed the synthetic id from the transport key (unique per delivery) when available, else
+    // from the raw bytes (single hash — the historical form, kept identical for callers with
+    // no transport key). Both are deterministic, so a retry re-derives the same id.
+    const syntheticSeed: string | Buffer = transportKey ?? rawBuf;
     const effectiveMessageId =
-      realMessageId ?? `<inbound-${createHash('sha256').update(rawBuf).digest('hex')}@23telecom.local>`;
+      realMessageId ??
+      `<inbound-${createHash('sha256').update(syntheticSeed).digest('hex')}@23telecom.local>`;
+    const myContentHash = contentHash ?? createHash('sha256').update(rawBuf).digest('hex');
 
     // ATOMIC dedup claim (race-safe): stamp the effective Message-ID + parsed identity on
-    // THIS ledger row. The partial-unique index on `messageId` means only one delivery
-    // can own it — a concurrent IMAP+PIPE (or two-poller) duplicate loses the race with
-    // P2002 and is SKIPPED, instead of both check-then-act creating a ticket.
+    // THIS ledger row. The unique index on `messageId` means only one delivery can own it.
+    // A synthetic (transport-scoped) id can only conflict with THIS row on a retry, so a
+    // conflict here always means a REAL Message-ID shared by another delivery. Compare the
+    // content: identical bytes = a genuine re-delivery (IMAP+PIPE) → SKIP; DIFFERENT bytes =
+    // a reused/spoofed Message-ID → QUARANTINE (never silently drop) for operator review.
     if (deliveryId != null) {
       try {
         await this.prisma.inboundDelivery.update({
@@ -925,6 +1136,13 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         });
       } catch (err) {
         if (this.isUniqueViolation(err)) {
+          const prior = await this.prisma.inboundDelivery.findUnique({
+            where: { messageId: effectiveMessageId },
+            select: { id: true, contentHash: true },
+          });
+          if (prior && prior.contentHash !== myContentHash) {
+            throw new InboundMessageIdConflictError(effectiveMessageId, prior.id, myContentHash);
+          }
           this.logger.log(`Inbound: duplicate message ${effectiveMessageId} from ${fromEmail} — skipped`);
           return { state: 'SKIPPED' };
         }
@@ -1354,9 +1572,14 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     return authorized.some((email) => Boolean(email) && normalizeEmail(email ?? '') === sender);
   }
 
-  /** Deterministic input failures (malformed / oversized MIME) — retrying cannot help. */
+  /** Deterministic input failures (malformed / oversized MIME, Message-ID collision) —
+   *  retrying cannot help, so quarantine at once (raw MIME retained). */
   private isPermanentProcessingError(err: unknown): boolean {
-    return err instanceof BadRequestException || err instanceof PayloadTooLargeException;
+    return (
+      err instanceof BadRequestException ||
+      err instanceof PayloadTooLargeException ||
+      err instanceof InboundMessageIdConflictError
+    );
   }
 
   // ─────────────────── parser rules (unchanged) ───────────────────

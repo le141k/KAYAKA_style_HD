@@ -52,6 +52,7 @@ export class InboundController {
     @Headers('x-inbound-secret') secret: string | undefined,
     @Headers('x-inbound-delivery-id') deliveryId: string | undefined,
     @Body() body: InboundPipeBody | Buffer,
+    @Headers('x-inbound-queue-id') queueId?: string,
   ) {
     const expected = this.config.TELECOM_HD_INBOUND_WEBHOOK_SECRET;
     let secretOk = false;
@@ -76,12 +77,21 @@ export class InboundController {
       throw new BadRequestException('Missing message body (raw RFC822 bytes or JSON { raw })');
     }
 
-    // Department is resolved downstream (parser rules / default); the webhook is a
-    // single ingress so it does not carry a per-queue department. An optional
-    // `x-inbound-delivery-id` header gives the MTA an explicit idempotency key (else
-    // the ledger de-dups by content hash).
+    // An optional `x-inbound-delivery-id` header gives the MTA an explicit idempotency key
+    // (else the ledger de-dups by content hash). An optional `x-inbound-queue-id` binds the
+    // message to a specific queue (its department routes it, and the delivery records the
+    // queue) — reliable routing for a multi-queue MTA; absent, the department is resolved
+    // downstream by parser rules / the default department.
     const externalId = deliveryId && deliveryId.trim().length > 0 ? deliveryId.trim() : undefined;
-    await this.inbound.ingestRawMessage(raw, undefined, externalId);
+    let boundQueueId: number | undefined;
+    if (queueId && queueId.trim().length > 0) {
+      const parsed = Number(queueId.trim());
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new BadRequestException('x-inbound-queue-id must be a positive integer');
+      }
+      boundQueueId = parsed;
+    }
+    await this.inbound.ingestRawMessage(raw, undefined, externalId, boundQueueId);
     return { accepted: true };
   }
 }

@@ -101,8 +101,12 @@ enum InboundDeliveryState {
 
 // Per-queue IMAP sync health. NEEDS_RECONCILIATION halts polling (fail-closed) after a
 // UIDVALIDITY change so an operator explicitly chooses FROM_NOW or a bounded BACKFILL.
+// BOOTSTRAPPING is transient: a queue an operator reconciled with FROM_NOW/BACKFILL sits
+// here until the poller fixes its high-water baseline and flips it to OK via the
+// generation-guarded CAS — so health never reports a queue OK before it has a cursor.
 enum EmailQueueSyncState {
   OK
+  BOOTSTRAPPING
   NEEDS_RECONCILIATION
 }
 
@@ -774,6 +778,13 @@ model EmailQueue {
   bootstrapPolicy       EmailQueueBootstrapPolicy?
   bootstrapBackfillLimit Int?
 
+  // Operator liveness signal (advisory; not part of any CAS). The supervisor stamps
+  // lastConnectedAt on a successful IMAP connect, the poller lastPollAt each cycle, and
+  // the accept path lastAcceptedAt when a message is durably recorded.
+  lastConnectedAt DateTime?
+  lastPollAt      DateTime?
+  lastAcceptedAt  DateTime?
+
   inboundDeliveries InboundDelivery[]
 }
 
@@ -814,8 +825,14 @@ model InboundDelivery {
 
   // Durable raw MIME so a failed/quarantined delivery can be replayed. Inline for
   // bounded messages; `rawStorageKey` is used when externalised to object storage.
+  // `rawMime` is pruned (set NULL) for terminal PROCESSED/SKIPPED deliveries older than
+  // the retention window; QUARANTINED rows keep it (needed for replay). `truncated` marks
+  // an IMAP fetch that hit the size ceiling — its raw bytes are incomplete (replay must
+  // re-fetch the original), so it is quarantined rather than partially ticketed.
   rawMime       Bytes?
   rawStorageKey String?
+  rawPrunedAt   DateTime?
+  truncated     Boolean          @default(false)
   sizeBytes     Int              @default(0)
 
   // Lifecycle
@@ -837,6 +854,24 @@ model InboundDelivery {
 
   @@index([state, nextAttemptAt])
   @@index([queueId, uidValidity, uid])
+}
+
+/// Durable audit trail for inbound operator actions (reconcile / quarantine replay). Kept
+/// separate from RbacAuditLog (staff/group RBAC) so mail-ops history is queryable on its
+/// own with the queue/delivery it targeted, the acting staff, and the operator's reason.
+model InboundAuditLog {
+  id           Int      @id @default(autoincrement())
+  actorStaffId Int? // null for system/scheduled actions
+  actorEmail   String   @default("")
+  action       String // e.g. mail.reconcile, mail.quarantine_replay
+  queueId      Int?
+  deliveryId   Int?
+  reason       String?
+  metadata     Json     @default("{}")
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([queueId])
 }
 
 model EmailTemplate {

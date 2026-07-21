@@ -300,6 +300,30 @@ export class TicketsService {
           },
         });
 
+        // LIFE-03: persist CC/BCC recipients AND the CREATE audit inside the SAME
+        // transaction as the ticket + first post + attachment links. Writing them
+        // after commit left a crash window in which a ticket could exist with no
+        // recipients / no audit row — and the P2002 retry path returns the existing
+        // ticket, so a follow-up delivery would never re-create them. Atomic now.
+        const allRecipients = [
+          ...(dto.ccEmails ?? []).map((email) => ({ email, role: 'CC' as const })),
+          ...(dto.bccEmails ?? []).map((email) => ({ email, role: 'BCC' as const })),
+        ];
+        if (allRecipients.length > 0) {
+          await tx.ticketRecipient.createMany({
+            data: allRecipients.map((r) => ({ ticketId: created.id, email: r.email, role: r.role })),
+            skipDuplicates: true,
+          });
+        }
+        await this.writeAudit(
+          created.id,
+          'CREATE',
+          creatorStaffId,
+          creatorActor,
+          { newValue: updatedTicket.mask },
+          tx,
+        );
+
         return [created, updatedTicket] as const;
       });
       updated = transactionTicket;
@@ -314,26 +338,10 @@ export class TicketsService {
       throw err;
     }
 
-    const ticket = updated;
     const mask = updated.mask;
 
-    // Persist CC/BCC recipients
-    const allRecipients = [
-      ...(dto.ccEmails ?? []).map((email) => ({ email, role: 'CC' as const })),
-      ...(dto.bccEmails ?? []).map((email) => ({ email, role: 'BCC' as const })),
-    ];
-    if (allRecipients.length > 0) {
-      await this.prisma.ticketRecipient.createMany({
-        data: allRecipients.map((r) => ({ ticketId: ticket.id, email: r.email, role: r.role })),
-        skipDuplicates: true,
-      });
-    }
-
-    // Write audit log
-    await this.writeAudit(ticket.id, 'CREATE', creatorStaffId, creatorActor, {
-      newValue: mask,
-    });
-
+    // Recipients + CREATE audit are now written INSIDE the create transaction above
+    // (LIFE-03), so a crash after commit can never leave them missing.
     this.logger.log(`Ticket ${mask} created`);
 
     // Emit domain event

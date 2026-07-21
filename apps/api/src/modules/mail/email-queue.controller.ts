@@ -78,7 +78,7 @@ export class EmailQueueController {
     @Body(new ZodValidationPipe(ReconcileEmailQueueSchema)) dto: ReconcileEmailQueueDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.emailQueueService.reconcile(id, dto, staff.staffId);
+    return this.emailQueueService.reconcile(id, dto, { staffId: staff.staffId, email: staff.email });
   }
 
   @Get('inbound/health')
@@ -98,7 +98,10 @@ export class EmailQueueController {
   @Post('inbound/quarantine/:deliveryId/replay')
   @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
   @ApiOperation({ summary: 'Replay a quarantined inbound delivery (reset to ACCEPTED)' })
-  replayQuarantined(@Param('deliveryId', ParseIntPipe) deliveryId: number) {
-    return this.emailQueueService.replayQuarantined(deliveryId);
+  replayQuarantined(@Param('deliveryId', ParseIntPipe) deliveryId: number, @CurrentStaff() staff: AuthStaff) {
+    return this.emailQueueService.replayQuarantined(deliveryId, {
+      staffId: staff.staffId,
+      email: staff.email,
+    });
   }
 }

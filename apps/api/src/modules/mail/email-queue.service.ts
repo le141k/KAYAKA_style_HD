@@ -1,8 +1,23 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  Optional,
+  type OnModuleDestroy,
+  type OnModuleInit,
+} from '@nestjs/common';
 import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { encryptField } from '../../common/field-encrypt.util';
 import type { CreateEmailQueueDto, ReconcileEmailQueueDto, UpdateEmailQueueDto } from './dto';
+import { InboundAuditService } from './inbound-audit.service';
+
+/** Actor performing an audited operator action (reconcile / replay). */
+export interface InboundActor {
+  staffId?: number;
+  email?: string;
+}
 
 /** Fields that are always omitted from responses (stored password). */
 const SAFE_SELECT = {
@@ -25,13 +40,47 @@ const SAFE_SELECT = {
   cursorGeneration: true,
   bootstrapPolicy: true,
   bootstrapBackfillLimit: true,
+  lastConnectedAt: true,
+  lastPollAt: true,
+  lastAcceptedAt: true,
 } as const;
 
 @Injectable()
-export class EmailQueueService {
+export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(EmailQueueService.name);
+  private healthAlertHandle: ReturnType<typeof setInterval> | null = null;
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional() private readonly inboundAudit?: InboundAuditService,
+  ) {}
+
+  /** Emit inbound health alerts on a schedule so a halted queue / quarantine backlog /
+   *  stalled processing surfaces in the logs (and any log-based monitor) without an operator
+   *  polling the health endpoint. Unref'd so it never keeps the process alive. */
+  onModuleInit(): void {
+    this.healthAlertHandle = setInterval(() => {
+      void this.emitHealthAlerts();
+    }, 5 * 60_000);
+    this.healthAlertHandle.unref?.();
+  }
+
+  onModuleDestroy(): void {
+    if (this.healthAlertHandle) clearInterval(this.healthAlertHandle);
+  }
+
+  private async emitHealthAlerts(): Promise<void> {
+    try {
+      const { alerts } = await this.health();
+      for (const a of alerts) {
+        const line = `INBOUND ALERT [${a.severity}] ${a.kind}: ${a.message}`;
+        if (a.severity === 'critical') this.logger.error(line);
+        else this.logger.warn(line);
+      }
+    } catch (err) {
+      this.logger.error(`Inbound health alert emit failed: ${String(err)}`);
+    }
+  }
 
   /** List all email queues (passwordEnc excluded). */
   list() {
@@ -64,15 +113,55 @@ export class EmailQueueService {
     });
   }
 
-  /** Update an existing email queue (partial). Password is encrypted at rest if provided. */
+  /** Update an existing email queue (partial). Password is encrypted at rest if provided.
+   *
+   *  Mailbox-identity guard: changing host / port / username / TLS on an IMAP queue that
+   *  already has a cursor makes the old UID cursor meaningless — and DANGEROUS if the new
+   *  server happens to advertise the same UIDVALIDITY (the poller would resume at the stale
+   *  UID and silently skip the new mailbox's earlier messages). So an identity change resets
+   *  the cursor and HALTS the queue (NEEDS_RECONCILIATION, generation bumped) — the operator
+   *  must then reconcile explicitly (FROM_NOW / BACKFILL). A password-only change is exempt. */
   async update(id: number, dto: UpdateEmailQueueDto) {
-    await this.get(id); // throws NotFoundException when missing
+    const current = await this.prisma.emailQueue.findUnique({
+      where: { id },
+      select: {
+        type: true,
+        host: true,
+        port: true,
+        username: true,
+        useTls: true,
+        uidValidity: true,
+      },
+    });
+    if (!current) throw new NotFoundException(`EmailQueue #${id} not found`);
+
     const { password, ...rest } = dto;
     const data: Record<string, unknown> = { ...rest };
     if (password !== undefined) {
       const encKey = process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
       data.passwordEnc = encryptField(password, encKey);
     }
+
+    const identityChanged =
+      current.type === 'IMAP' &&
+      ((rest.host !== undefined && rest.host !== current.host) ||
+        (rest.port !== undefined && rest.port !== current.port) ||
+        (rest.username !== undefined && rest.username !== current.username) ||
+        (rest.useTls !== undefined && rest.useTls !== current.useTls));
+    if (identityChanged && current.uidValidity !== null) {
+      data.uidValidity = null;
+      data.lastSeenUid = BigInt(0);
+      data.syncState = 'NEEDS_RECONCILIATION';
+      data.lastError =
+        'Mailbox identity changed (host/username/port/TLS) — cursor reset; run reconcile to resume polling safely';
+      data.cursorGeneration = { increment: 1 };
+      data.bootstrapPolicy = null;
+      data.bootstrapBackfillLimit = null;
+      this.logger.warn(
+        `EmailQueue ${id}: mailbox identity changed — cursor reset + halted (NEEDS_RECONCILIATION), reconcile required`,
+      );
+    }
+
     return this.prisma.emailQueue.update({
       where: { id },
       data,
@@ -98,12 +187,18 @@ export class EmailQueueService {
    *    UID (requires confirm + reason — it can skip mail that arrived unprocessed).
    *  - `BACKFILL` re-bootstraps and additionally rewinds by `backfillLimit`.
    */
-  async reconcile(id: number, dto: ReconcileEmailQueueDto, actorStaffId?: number) {
+  async reconcile(id: number, dto: ReconcileEmailQueueDto, actor?: InboundActor) {
+    const actorStaffId = actor?.staffId;
     const before = await this.prisma.emailQueue.findUnique({
       where: { id },
-      select: { uidValidity: true, lastSeenUid: true, syncState: true, cursorGeneration: true },
+      select: { type: true, uidValidity: true, lastSeenUid: true, syncState: true, cursorGeneration: true },
     });
     if (!before) throw new NotFoundException(`EmailQueue #${id} not found`);
+    // Reconcile is an IMAP-cursor operation; refuse it on a non-IMAP (PIPE/POP3) queue so a
+    // mistaken call cannot stamp a UID cursor onto a queue that has no UID space.
+    if (before.type !== 'IMAP') {
+      throw new BadRequestException(`Reconcile applies only to IMAP queues (queue #${id} is ${before.type})`);
+    }
 
     let data: Prisma.EmailQueueUpdateInput;
     let detail: Record<string, unknown> = {};
@@ -147,10 +242,12 @@ export class EmailQueueService {
         pendingUids: legacy.pendingUids,
       };
     } else if (dto.mode === 'FROM_NOW') {
+      // BOOTSTRAPPING (not OK) until the poller fixes the high-water baseline: the queue is
+      // reconciled but has no cursor yet, so health must not report it healthy in the window.
       data = {
         uidValidity: null,
         lastSeenUid: BigInt(0),
-        syncState: 'OK',
+        syncState: 'BOOTSTRAPPING',
         lastError: null,
         cursorGeneration: { increment: 1 },
         bootstrapPolicy: 'FROM_NOW',
@@ -161,7 +258,7 @@ export class EmailQueueService {
       data = {
         uidValidity: null,
         lastSeenUid: BigInt(0),
-        syncState: 'OK',
+        syncState: 'BOOTSTRAPPING',
         lastError: null,
         cursorGeneration: { increment: 1 },
         bootstrapPolicy: 'BACKFILL',
@@ -181,6 +278,32 @@ export class EmailQueueService {
         `after={uidValidity:${after.uidValidity?.toString() ?? 'null'},lastSeenUid:${after.lastSeenUid.toString()},` +
         `syncState:${after.syncState},gen:${after.cursorGeneration}} detail=${JSON.stringify(detail)}`,
     );
+
+    // Durable audit row (actor + reason + before/after cursor) — survives log rotation and is
+    // queryable per queue. BigInt fields are stringified so the JSONB metadata is serialisable.
+    await this.inboundAudit?.log({
+      actorStaffId,
+      actorEmail: actor?.email,
+      action: 'mail.reconcile',
+      queueId: id,
+      reason: dto.reason ?? null,
+      metadata: {
+        mode: dto.mode,
+        before: {
+          uidValidity: before.uidValidity?.toString() ?? null,
+          lastSeenUid: before.lastSeenUid.toString(),
+          syncState: before.syncState,
+          cursorGeneration: before.cursorGeneration,
+        },
+        after: {
+          uidValidity: after.uidValidity?.toString() ?? null,
+          lastSeenUid: after.lastSeenUid.toString(),
+          syncState: after.syncState,
+          cursorGeneration: after.cursorGeneration,
+        },
+        detail,
+      },
+    });
 
     return { reconciled: true, mode: dto.mode, queue: after, detail };
   }
@@ -264,7 +387,7 @@ export class EmailQueueService {
    * Replay a quarantined delivery: reset it to ACCEPTED (attempts 0, lease cleared) so
    * the drain reprocesses it. The raw MIME was retained, so nothing was lost.
    */
-  async replayQuarantined(deliveryId: number) {
+  async replayQuarantined(deliveryId: number, actor?: InboundActor) {
     const reset = await this.prisma.inboundDelivery.updateMany({
       where: { id: deliveryId, state: 'QUARANTINED' },
       data: { state: 'ACCEPTED', attempts: 0, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null },
@@ -272,6 +395,15 @@ export class EmailQueueService {
     if (reset.count === 0) {
       throw new NotFoundException(`Quarantined delivery #${deliveryId} not found`);
     }
+    await this.inboundAudit?.log({
+      actorStaffId: actor?.staffId ?? null,
+      actorEmail: actor?.email,
+      action: 'mail.quarantine_replay',
+      deliveryId,
+    });
+    this.logger.warn(
+      `AUDIT inbound quarantine replay delivery=${deliveryId} actorStaffId=${actor?.staffId ?? 'system'}`,
+    );
     return { replayed: true };
   }
 
@@ -294,6 +426,9 @@ export class EmailQueueService {
         uidValidity: true,
         cursorGeneration: true,
         bootstrapPolicy: true,
+        lastConnectedAt: true,
+        lastPollAt: true,
+        lastAcceptedAt: true,
       },
     });
 
