@@ -36,9 +36,11 @@ NEEDS_RECONCILIATION`) for an explicit operator `FROM_NOW` / bounded `BACKFILL` 
   crash mid-processing never strands a delivery in `PROCESSING`. Success → `PROCESSED`, transient
   error → `RETRY` (backoff), attempts exhausted → `QUARANTINED`. A quarantine **never discards** —
   the raw MIME stays for replay.
-- **Upgrade/cutover** is safe: the migration halts every already-enabled IMAP queue
-  (`NEEDS_RECONCILIATION`, legacy cursor copied) so the deploy can't FROM_NOW over an in-flight
-  cursor; an operator reconciles explicitly (FROM_NOW or bounded BACKFILL).
+- **Upgrade/cutover** is safe: the ledger migration halts every already-enabled IMAP queue
+  (`NEEDS_RECONCILIATION`) so the deploy can't FROM_NOW over an in-flight cursor; the later
+  `20260721010000_inbound_hardening` migration extends the same halt to already-**disabled** IMAP
+  queues (a disabled queue re-enabled after upgrade would otherwise FROM_NOW over its legacy cursor).
+  An operator reconciles explicitly (RESUME_MIGRATED, FROM_NOW, or bounded BACKFILL).
 - **Idempotency** is primarily the transport key; processing additionally de-dups by an _effective_
   Message-ID (the RFC id, else a deterministic `<inbound-<sha256>@23telecom.local>` from the
   content hash), written **atomically** with the ticket/post create — so retries never double-post
@@ -48,7 +50,7 @@ NEEDS_RECONCILIATION`) for an explicit operator `FROM_NOW` / bounded `BACKFILL` 
 
 - Mail is durable (replayable), idempotent, and the cursor is provably fail-closed; both transports
   share the ledger.
-- New table + `EmailQueue` cursor columns (migration `20260717000000_inbound_delivery_ledger`); the
+- New table + `EmailQueue` cursor columns (migration `20260718000000_inbound_delivery_ledger`); the
   legacy `Setting` `imap/lastSeenUid:<id>` watermark is superseded.
 - Raw MIME is stored inline (bounded); very large messages should later externalise to object
   storage via `rawStorageKey`. Full single-transaction atomicity of ticket counters/audit with the
@@ -57,3 +59,25 @@ NEEDS_RECONCILIATION`) for an explicit operator `FROM_NOW` / bounded `BACKFILL` 
   transport-key claim, not the lock.
 - A live-IMAP (GreenMail/Dovecot) rehearsal covering EXPUNGE, reconnect and `UIDVALIDITY` remains a
   required pre-cutover manual gate; the unit suite models the same invariants with a fake ImapFlow.
+
+## Rollback / cutover-back
+
+Rollback is **forward-only, not reversible in place.** The new poller writes its cursor **only** to
+`EmailQueue.lastSeenUid` (+ `uidValidity` / `cursorGeneration`) and **never** writes back the legacy
+`Setting` `imap/lastSeenUid:<id>` / `imap/state:<id>` watermark. **There is no dual-write.** Once the
+ledger cursor has advanced past the legacy watermark, rolling the API binary back to the pre-ledger
+build is **unsafe**: the old build would resume from the stale `Setting` watermark and re-fetch —
+worse, if `Setting` was never carried forward it could FROM_NOW/`1:*` — silently skipping or
+double-handling everything ingested since cutover.
+
+The supported strategy is therefore:
+
+1. **Take a full PostgreSQL backup immediately before the deploy** (schema + data).
+2. Deploy forward. Do not expect to downgrade the binary against a ledger-advanced database.
+3. If a rollback is genuinely required, **restore the pre-deploy backup** and accept re-processing
+   from that point. Re-fetching already-handled mail is safe: **Message-ID idempotency** (the unique
+   `InboundDelivery.messageId` / `TicketPost.messageId` claim, plus the effective/synthetic id) makes
+   a re-fetch of an already-ticketed message a no-op rather than a duplicate.
+
+This restore-and-reprocess path **MUST be rehearsed against a real PostgreSQL instance before
+cutover** — do not treat rollback as a theoretical option validated only in unit tests.
