@@ -11,7 +11,7 @@ COPY package.json package-lock.json* ./
 COPY apps/api/package.json apps/api/package.json
 COPY apps/web/package.json apps/web/package.json
 COPY packages/shared/package.json packages/shared/package.json
-RUN npm ci
+RUN npm ci --omit=optional
 
 FROM node:22.23.1-alpine3.23 AS build
 WORKDIR /app
@@ -29,7 +29,7 @@ COPY package.json package-lock.json* ./
 COPY apps/api/package.json apps/api/package.json
 COPY apps/web/package.json apps/web/package.json
 COPY packages/shared/package.json packages/shared/package.json
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --omit=optional
 
 FROM node:22.23.1-alpine3.23 AS runner
 ENV NODE_ENV=production

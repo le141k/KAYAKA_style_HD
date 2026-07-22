@@ -151,6 +151,9 @@ WEB_BUILD_CHECKSUM="$(scripts/web-build-id.sh --full "$ENV_FILE")"
 export TELECOM_HD_WEB_BUILD_ID="${WEB_BUILD_CHECKSUM:0:16}"
 echo "[deploy-prod] release=${RELEASE_ID} public-config-sha256=${PUBLIC_CONFIG_CHECKSUM} web-build=${TELECOM_HD_WEB_BUILD_ID}"
 
+echo '[deploy-prod] validating the production dependency audit before any Docker or ingress action'
+npm audit --package-lock-only --omit=dev --omit=optional --audit-level=high
+
 echo '[deploy-prod] 2/12 inventorying the existing dedicated Compose project'
 PROJECT_SERVICES="$(
   docker ps -a --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
