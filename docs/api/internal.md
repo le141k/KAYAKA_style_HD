@@ -346,20 +346,28 @@ UNIQUE `transportKey` before it is processed.
   `EmailQueue` — the queue's department routes the message and the delivery records the queue
   (unknown id → 400); the `transportKey` is scoped by the bound queue (`pipe:<queueId|->:…`).
   `pollNow()` — run one accept+drain cycle now (ops / live-IMAP verification).
-- **Accept phase (IMAP, per queue):** discovers new UIDs uid-only, then `fetchOne` each in
-  ascending order (source capped at `TELECOM_HD_INBOUND_MAX_SIZE_MB`) and `create`s an
+- **Accept phase (IMAP, per queue):** discovers new UIDs uid-only, then `fetchOne`s each
+  (source capped at `TELECOM_HD_INBOUND_MAX_SIZE_MB`) and accepts it in a short DB transaction
+  whose row lock rechecks `isEnabled`, type, `syncState`, `mailboxEpoch`, `cursorGeneration`, and
+  UIDVALIDITY. The transport key is `imap:<queueId>:<mailboxEpoch>:<uidValidity>:<uid>`; a stale
+  poller cannot insert after a reconcile/identity cutover. It `create`s an
   `InboundDelivery` (state `ACCEPTED`, raw MIME stored) — `client.fetch(range, query, { uid: true })`
   with `{ uid: true }` as the **third** arg (real UID range). The `EmailQueue.lastSeenUid` cursor
-  advances via a **monotonic CAS** (`updateMany where lastSeenUid < cursor`) ONLY after durable
-  acceptance; a fetch/DB error stops the poll without advancing (**fail-closed** — no silent loss).
-  A duplicate `transportKey` (`P2002`) is an idempotent no-op (multi-poller / re-poll safe; a
-  best-effort Postgres advisory lock avoids concurrent fetching but is not required for correctness).
+  advances via a fixed-snapshot CAS ONLY after durable acceptance; the safe frontier never crosses
+  the lowest failed UID, even when a higher UID was accepted first (**fail-closed** — no silent
+  loss). A duplicate transport key is a no-op only when its full epoch/UID/content identity matches;
+  any mismatch halts the queue with a durable collision audit.
 - **Bootstrap barrier:** the starting cursor is captured **synchronously at connect** (not the
   first 60 s poll) via `TELECOM_HD_IMAP_BOOTSTRAP_POLICY` `FROM_NOW` (high-water, imports nothing)
   or `BACKFILL` (rewinds by `TELECOM_HD_IMAP_BACKFILL_LIMIT`). Never fails open to `1:*`.
 - **UIDVALIDITY:** on a server UID-space reset the queue flips to
   `EmailQueue.syncState = NEEDS_RECONCILIATION` and polling **halts** (fail-closed) until an
   operator re-bootstraps (clear `uidValidity`).
+- **Explicit reconcile:** the API requires `expectedCursorGeneration` and returns
+  server-computed `allowedModes` from its typed `reconcileCause`. FROM_NOW/BACKFILL moves the
+  queue to `BOOTSTRAPPING`, captures UIDVALIDITY plus exact `UIDNEXT - 1` under the mailbox lock,
+  and writes the baseline in a second epoch/generation CAS before returning success. BACKFILL
+  enumerates actual existing UIDs under that same lock; it never uses `boundary - N`.
 - **Drain phase:** a `setInterval` (30 s, plus one **startup drain** for crash recovery) processes
   `ACCEPTED`/`RETRY` deliveries in id order; claims each with a **lease** (CAS: `ACCEPTED`, a
   `RETRY` whose `nextAttemptAt` is due, or a `PROCESSING` whose `leaseExpiresAt` passed →
@@ -425,20 +433,18 @@ the inbound operator actions. Injects `InboundAuditService` (`@Optional()`).
 list() / get(id) / create(dto) / delete(id)
 
 update(id, dto): Promise<SafeQueue>
-// Mailbox-identity guard: on an IMAP queue that already has a cursor (uidValidity != null),
-// changing host/port/username/useTls resets the cursor (uidValidity=null, lastSeenUid=0),
-// HALTS the queue (syncState=NEEDS_RECONCILIATION), bumps cursorGeneration and clears any
-// per-queue bootstrap intent — the stale UID cursor must not resume against a different
-// mailbox (dangerous if the new server reuses the old UIDVALIDITY). Password-only change: exempt.
+// Mailbox-identity guard: changing host/port/username/useTls or crossing the IMAP boundary
+// uses an optimistic CAS to bump mailboxEpoch + cursorGeneration, clear the cursor, and halt
+// with MAILBOX_IDENTITY_CHANGED — including before first bootstrap. Password-only change: exempt.
 
 reconcile(id, dto, actor?): Promise<{ reconciled, mode, queue, detail }>
 // Refuses a non-IMAP queue (400). RESUME_MIGRATED reads the legacy Setting cursor
 // (imap/state:<id> primary — UIDVALIDITY+watermark rewound past still-pending UIDs; or the bare
 // imap/lastSeenUid:<id> fallback, refused when it has no UIDVALIDITY) → OK. FROM_NOW/BACKFILL
-// clear the cursor and leave the queue BOOTSTRAPPING (not OK) until the poller fixes the baseline.
-// Every branch bumps cursorGeneration (invalidating an in-flight stale poller's CAS) and writes a
-// durable InboundAuditLog row (action mail.reconcile, actor + reason + before/after cursor) plus a
-// structured warn log line.
+// require a server-allowed typed cause + expectedCursorGeneration, synchronously capture an
+// exact IMAP baseline under lock, and return success only after the second CAS writes it. Every
+// accepted request has mail.reconcile_requested plus exactly one completed/failed audit row in
+// the same state-transition transactions.
 
 health(now?): Promise<{ queues[], ledger, alerts[], checkedAt }>
 // Per-IMAP-queue sync state + liveness (lastConnectedAt/lastPollAt/lastAcceptedAt) and the ledger

@@ -34,6 +34,10 @@ export type UpdateEmailQueueDto = z.infer<typeof UpdateEmailQueueSchema>;
 export const ReconcileEmailQueueSchema = z
   .object({
     mode: z.enum(['RESUME_MIGRATED', 'FROM_NOW', 'BACKFILL']),
+    // The operator UI reads this from the queue returned by the server and sends it
+    // back unchanged.  Requiring it turns a stale tab / double click into HTTP 409
+    // rather than a last-write-wins cursor transition.
+    expectedCursorGeneration: z.number().int().nonnegative(),
     reason: z.string().trim().min(1).max(500).optional(),
     confirm: z.boolean().optional(),
     backfillLimit: z.number().int().nonnegative().max(100_000).optional(),

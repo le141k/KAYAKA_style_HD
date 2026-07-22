@@ -22,7 +22,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { decryptField } from '../../common/field-encrypt.util';
 import { normalizeEmail } from '../../common/email.util';
 import { stripQuotedReply } from './quoted-reply.util';
-import type { EmailParserRule } from '@prisma/client';
+import { Prisma, type EmailParserRule } from '@prisma/client';
 
 /** Parsed email fields used for rule evaluation */
 interface ParsedEmail {
@@ -47,6 +47,59 @@ interface ProcessOutcome {
   state: 'PROCESSED' | 'SKIPPED';
   ticketId?: number;
   postId?: number;
+}
+
+/** Immutable DB snapshot handed from the reconcile CAS to the IMAP probe. */
+export interface ReconcileMailboxSnapshot {
+  id: number;
+  host: string;
+  port: number;
+  username: string;
+  passwordEnc: string;
+  useTls: boolean;
+  mailboxEpoch: number;
+  cursorGeneration: number;
+}
+
+/** Exact IMAP snapshot used to complete FROM_NOW/BACKFILL. */
+export interface ReconcileMailboxBaseline {
+  uidValidity: bigint;
+  /** UIDNEXT - 1 observed while the mailbox lock was held. */
+  boundary: number;
+  /** Durable cursor: boundary for FROM_NOW, predecessor of the selected N UIDs for BACKFILL. */
+  cursor: number;
+  /** Existing UID values selected for BACKFILL; empty for FROM_NOW. */
+  selectedUids: number[];
+}
+
+/** The queue changed after a poll fetched bytes but before it could durably accept them. */
+class StaleImapAcceptSnapshotError extends Error {
+  constructor(queueId: number) {
+    super(`IMAP queue ${queueId} changed before delivery acceptance`);
+    this.name = 'StaleImapAcceptSnapshotError';
+  }
+}
+
+/** A supposedly identical IMAP transport identity carried different bytes: halt, never skip. */
+class ImapTransportCollisionError extends Error {
+  constructor(queueId: number, transportKey: string) {
+    super(`IMAP transport collision on queue ${queueId}: ${transportKey}`);
+    this.name = 'ImapTransportCollisionError';
+  }
+}
+
+/** Fixed poll snapshot used by the acceptance fence; never re-read mutable queue fields. */
+interface ImapAcceptSnapshot {
+  id: number;
+  type: 'IMAP' | 'PIPE' | 'POP3';
+  isEnabled: boolean;
+  /** Configured receiving mailbox; persisted as the trusted envelope fallback for routing. */
+  emailAddress: string;
+  departmentId: number | null;
+  syncState: 'OK' | 'BOOTSTRAPPING' | 'NEEDS_RECONCILIATION';
+  mailboxEpoch: number;
+  cursorGeneration: number;
+  uidValidity: bigint | null;
 }
 
 /** Ticket mask pattern used to thread inbound replies, e.g. TT-000042 */
@@ -295,6 +348,111 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Capture the exact server-side boundary for an operator reconcile.  This runs before
+   * the endpoint returns success; it never delegates a FROM_NOW decision to the next
+   * sixty-second poll.  A matching live connection is safe to reuse, otherwise a short
+   * connection is made from the CAS snapshot's credentials so a stale pre-update socket
+   * can never establish a new mailbox baseline.
+   */
+  async captureReconcileBaseline(
+    snapshot: ReconcileMailboxSnapshot,
+    mode: 'FROM_NOW' | 'BACKFILL',
+    backfillLimit: number,
+  ): Promise<ReconcileMailboxBaseline> {
+    const expectedFingerprint = this.connectionFingerprint(snapshot);
+    let client = this.connections.get(snapshot.id);
+    let temporary = false;
+    if (
+      !client ||
+      (client as { usable?: boolean }).usable === false ||
+      this.connectionFingerprints.get(snapshot.id) !== expectedFingerprint
+    ) {
+      let pass: string;
+      try {
+        pass = decryptField(snapshot.passwordEnc, this.config.TELECOM_HD_FIELD_ENCRYPTION_KEY);
+      } catch (err) {
+        this.logger.error(
+          `IMAP reconcile credential decrypt failed for queue ${snapshot.id}: ${String(err)}`,
+        );
+        // The durable queue error/health endpoint is operator-visible.  Do not persist
+        // driver text here: it can contain a hostname, username, or authentication detail.
+        throw new ServiceUnavailableException('IMAP credentials could not be decrypted');
+      }
+      try {
+        const { ImapFlow: ImapFlowCtor } = await import('imapflow');
+        client = new ImapFlowCtor({
+          host: snapshot.host,
+          port: snapshot.port,
+          secure: snapshot.useTls,
+          auth: { user: snapshot.username, pass },
+          logger: false,
+        });
+        await client.connect();
+        temporary = true;
+      } catch (err) {
+        this.logger.error(`IMAP reconcile connection failed for queue ${snapshot.id}: ${String(err)}`);
+        throw new ServiceUnavailableException('Unable to connect to IMAP mailbox');
+      }
+    }
+
+    const active = client;
+    if (!active) throw new ServiceUnavailableException('IMAP client was not created');
+    let lock: Awaited<ReturnType<ImapFlow['getMailboxLock']>> | undefined;
+    try {
+      lock = await active.getMailboxLock('INBOX');
+      const { uidValidity, uidNext } = this.readMailboxState(active);
+      // UIDNEXT is the only permitted FROM_NOW boundary.  EXISTS is a message count and
+      // fetch('*') races with arrivals; neither is an equivalent replacement.
+      if (
+        uidValidity === undefined ||
+        uidNext === undefined ||
+        !Number.isSafeInteger(uidNext) ||
+        uidNext < 1
+      ) {
+        throw new ServiceUnavailableException(
+          'IMAP server did not provide a valid UIDVALIDITY/UIDNEXT snapshot',
+        );
+      }
+      const boundary = uidNext - 1;
+      if (mode === 'FROM_NOW') {
+        return { uidValidity, boundary, cursor: boundary, selectedUids: [] };
+      }
+      if (!Number.isSafeInteger(backfillLimit) || backfillLimit < 1) {
+        throw new BadRequestException('BACKFILL requires a positive bounded UID count');
+      }
+
+      // SEARCH under the SAME mailbox lock gives actual existing UIDs.  They can be sparse
+      // after EXPUNGE, so `boundary - N` is not a valid backfill boundary.  Filtering at the
+      // captured UIDNEXT boundary excludes mail delivered after the snapshot; it will be
+      // fetched normally once the durable cursor is committed.
+      const found = boundary === 0 ? [] : await active.search({ uid: `1:${boundary}` }, { uid: true });
+      if (found === false) throw new ServiceUnavailableException('IMAP SEARCH did not return a UID set');
+      const selectedUids = found
+        .filter(
+          (uid): uid is number =>
+            typeof uid === 'number' && Number.isSafeInteger(uid) && uid > 0 && uid <= boundary,
+        )
+        .sort((a, b) => a - b)
+        .slice(-backfillLimit);
+      const oldestSelected = selectedUids[0];
+      const cursor = oldestSelected === undefined ? boundary : oldestSelected - 1;
+      return { uidValidity, boundary, cursor, selectedUids };
+    } finally {
+      try {
+        lock?.release();
+      } finally {
+        if (temporary) {
+          try {
+            await active.logout();
+          } catch {
+            // The baseline is already captured; a failed LOGOUT must not change it.
+          }
+        }
+      }
+    }
+  }
+
+  /**
    * Record the starting cursor for a never-bootstrapped queue (uidValidity IS NULL).
    * FROM_NOW records the current high-water UID and imports nothing; BACKFILL rewinds
    * the cursor by up to TELECOM_HD_IMAP_BACKFILL_LIMIT so the most-recent existing
@@ -302,7 +460,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    */
   private async bootstrapQueue(queueId: number, client: ImapFlow): Promise<void> {
     const queue = await this.prisma.emailQueue.findUnique({ where: { id: queueId } });
-    if (!queue || queue.uidValidity !== null) return; // already bootstrapped
+    if (!queue || queue.type !== 'IMAP' || !queue.isEnabled || queue.uidValidity !== null) return; // already bootstrapped
     if (queue.syncState === 'NEEDS_RECONCILIATION') {
       // Halted (e.g. upgraded from a legacy cursor) — never auto-FROM_NOW over it; an
       // operator must reconcile explicitly (choose FROM_NOW or a bounded BACKFILL).
@@ -311,6 +469,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       );
       return;
     }
+    // Explicit P0-B reconcile owns BOOTSTRAPPING and commits its UIDNEXT baseline
+    // synchronously.  The background supervisor may bootstrap only a brand-new healthy
+    // queue; it must never complete a failed/in-progress operator request behind their back.
+    if (queue.syncState !== 'OK' || queue.reconcileCause !== null) return;
     const lock = await client.getMailboxLock('INBOX');
     try {
       const { uidValidity, uidNext, exists } = this.readMailboxState(client);
@@ -344,9 +506,13 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         // bootstrap flips syncState → OK only from the transient/never-bootstrapped states.
         where: {
           id: queueId,
+          type: 'IMAP',
+          isEnabled: true,
           uidValidity: null,
           cursorGeneration: queue.cursorGeneration,
-          syncState: { in: ['OK', 'BOOTSTRAPPING'] },
+          mailboxEpoch: queue.mailboxEpoch,
+          syncState: 'OK',
+          reconcileCause: null,
         },
         data: {
           lastSeenUid: BigInt(baseline),
@@ -505,13 +671,13 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
 
   private async pollQueue(queueId: number, client: ImapFlow): Promise<void> {
     const queue = await this.prisma.emailQueue.findUnique({ where: { id: queueId } });
-    if (!queue || !queue.isEnabled) return;
+    if (!queue || !queue.isEnabled || queue.type !== 'IMAP') return;
 
-    if (queue.syncState === 'NEEDS_RECONCILIATION') {
+    if (queue.syncState !== 'OK') {
       if (!this.haltLogged.has(queueId)) {
         this.logger.error(
-          `IMAP queue ${queueId} halted (NEEDS_RECONCILIATION): ${queue.lastError ?? 'UIDVALIDITY change'} — ` +
-            `operator must choose FROM_NOW or a bounded BACKFILL (clear uidValidity to re-bootstrap).`,
+          `IMAP queue ${queueId} is ${queue.syncState}: ${queue.lastError ?? queue.reconcileCause ?? 'reconcile required'} — ` +
+            `operator action is required before polling resumes.`,
         );
         this.haltLogged.add(queueId);
       }
@@ -544,31 +710,43 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           // snapshot predates an operator reconcile that already moved the queue to a new
           // generation) can't clobber the freshly-reconciled OK state with a halt.
           const msg = `UIDVALIDITY changed ${queue.uidValidity} → ${uidValidity}`;
-          await this.prisma.emailQueue.updateMany({
-            where: {
-              id: queueId,
-              cursorGeneration: queue.cursorGeneration,
-              uidValidity: queue.uidValidity,
-            },
-            data: { syncState: 'NEEDS_RECONCILIATION', lastError: msg },
-          });
-          this.logger.error(`IMAP queue ${queueId}: ${msg} — queue halted (NEEDS_RECONCILIATION)`);
+          const halted = await this.haltImapSnapshot(queue, 'UIDVALIDITY_CHANGED', msg);
+          if (halted)
+            this.logger.error(`IMAP queue ${queueId}: ${msg} — queue halted (NEEDS_RECONCILIATION)`);
+          else
+            this.logger.warn(`IMAP queue ${queueId}: UIDVALIDITY halt skipped because its snapshot is stale`);
           return;
         }
 
         // Cursor is a BigInt column (IMAP UIDs are unsigned 32-bit). UID values are well
         // within 2^53, so we compute in Number and store back as BigInt.
         const lastUid = Number(queue.lastSeenUid);
-        // Discover new UIDs first (uid-only), then fetch+accept each in ascending order
-        // so out-of-order server responses can't make the cursor leapfrog a gap.
+        // Discover new UIDs first (uid-only).  Some servers can yield that stream out of
+        // order; acceptance records every durable result and the later safe-frontier logic
+        // accounts for both failed and still-unattempted lower UIDs.
         const uids: number[] = [];
+        const seenUids = new Set<number>();
         for await (const m of client.fetch(`${lastUid + 1}:*`, { uid: true }, { uid: true })) {
-          if (typeof m.uid === 'number' && m.uid > lastUid) uids.push(m.uid);
+          // Compare to the FIXED batch-start cursor, never a moving processed maximum.
+          // A server may emit high UIDs before lower ones; accepting the high row must not
+          // silently authorise the cursor to jump over a later failure at the lower UID.
+          if (typeof m.uid === 'number' && m.uid > lastUid && !seenUids.has(m.uid)) {
+            seenUids.add(m.uid);
+            uids.push(m.uid);
+          }
         }
-        uids.sort((a, b) => a - b);
 
-        let cursor = lastUid;
-        for (const uid of uids) {
+        let processedMax = lastUid;
+        // A server is permitted to yield UID discovery results out of order.  This is the
+        // lowest UID that is either failed OR still unattempted after a failure stopped the
+        // batch.  Treating only the throwing UID as a failure would let `103` fail after
+        // `102` succeeded while an undispatched `101` sits later in the result stream, and
+        // a cursor=102 would silently skip 101 on the next poll.
+        let lowestUnresolvedUid: number | null = null;
+        let acceptedCount = 0;
+        for (let index = 0; index < uids.length; index += 1) {
+          const uid = uids[index];
+          if (uid === undefined) continue;
           try {
             const msg = await client.fetchOne(
               String(uid),
@@ -580,17 +758,32 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
             );
             if (!msg || !msg.source) {
               // Vanished (EXPUNGE) between discovery and fetch — nothing to accept.
-              cursor = uid;
+              processedMax = Math.max(processedMax, uid);
               continue;
             }
-            await this.acceptImapMessage(queueId, queue.departmentId ?? null, uidValidity, uid, msg.source);
-            cursor = uid; // advance ONLY after durable acceptance
+            await this.acceptImapMessage(queue, uidValidity, uid, msg.source);
+            acceptedCount += 1;
+            processedMax = Math.max(processedMax, uid); // only after durable acceptance
           } catch (err) {
             // Fetch or DB failure → FAIL-CLOSED: stop without advancing past this UID.
             this.logger.error(`IMAP queue ${queueId}: accept failed at uid=${uid} — ${String(err)}`);
+            // Include every UID we have already discovered but will no longer attempt in
+            // this batch.  The cursor is a contiguous acknowledgement frontier, not merely
+            // the maximum successful UID.
+            const lowestRemaining = uids
+              .slice(index + 1)
+              .reduce((lowest, candidate) => Math.min(lowest, candidate), uid);
+            lowestUnresolvedUid =
+              lowestUnresolvedUid === null ? lowestRemaining : Math.min(lowestUnresolvedUid, lowestRemaining);
             break;
           }
         }
+
+        // Safe frontier.  In particular, if UID 103 was accepted first and UID 101 then
+        // fails, keep the cursor at 100; the durable 103 row will be an idempotent retry on
+        // the next poll, rather than silently skipping 101.
+        const cursor =
+          lowestUnresolvedUid === null ? processedMax : Math.min(processedMax, lowestUnresolvedUid - 1);
 
         if (cursor > lastUid) {
           // Monotonic, generation-guarded CAS: advance only if nothing reconciled the
@@ -600,8 +793,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           const cas = await this.prisma.emailQueue.updateMany({
             where: {
               id: queueId,
-              lastSeenUid: { lt: BigInt(cursor) },
+              type: 'IMAP',
+              lastSeenUid: queue.lastSeenUid,
               cursorGeneration: queue.cursorGeneration,
+              mailboxEpoch: queue.mailboxEpoch,
               uidValidity: queue.uidValidity,
               syncState: 'OK',
               isEnabled: true,
@@ -616,7 +811,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         // anything). Advisory only — a separate write, never part of the cursor CAS.
         await this.stampQueue(queueId, {
           lastPollAt: new Date(),
-          ...(cursor > lastUid ? { lastAcceptedAt: new Date() } : {}),
+          ...(acceptedCount > 0 ? { lastAcceptedAt: new Date() } : {}),
         });
       } finally {
         lock.release();
@@ -671,25 +866,62 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    * quarantined later by the drain if it cannot be processed.
    */
   private async acceptImapMessage(
-    queueId: number,
-    departmentId: number | null,
+    snapshot: ImapAcceptSnapshot,
     uidValidity: bigint,
     uid: number,
     source: Buffer,
-  ): Promise<void> {
-    const transportKey = `imap:${queueId}:${uidValidity}:${uid}`;
+  ): Promise<'accepted' | 'duplicate'> {
+    if (
+      snapshot.type !== 'IMAP' ||
+      !snapshot.isEnabled ||
+      snapshot.syncState !== 'OK' ||
+      snapshot.uidValidity === null ||
+      snapshot.uidValidity !== uidValidity
+    ) {
+      throw new StaleImapAcceptSnapshotError(snapshot.id);
+    }
+
+    const transportKey = `imap:${snapshot.id}:${snapshot.mailboxEpoch}:${uidValidity}:${uid}`;
     const contentHash = createHash('sha256').update(source).digest('hex');
     // The IMAP fetch caps the body at MAX_SIZE+1 bytes; a source at/over the ceiling was
     // TRUNCATED — its retained raw MIME is incomplete, so flag it (the drain quarantines a
     // truncated delivery without partially ticketing it; replay must re-fetch the original).
     const truncated = source.length > this.config.TELECOM_HD_INBOUND_MAX_SIZE_MB * 1024 * 1024;
-    try {
-      await this.prisma.inboundDelivery.create({
+
+    return this.prisma.$transaction(async (tx) => {
+      // This row lock is the acceptance fence.  If identity/reconcile won first, the
+      // conditional SELECT finds no row and no ledger delivery is inserted.  If acceptance
+      // obtains the lock first, it is durably accepted before the new boundary — which is
+      // safe; the concurrent identity/reconcile update waits and subsequently bumps epoch.
+      const current = await tx.$queryRaw<Array<{ id: number }>>(Prisma.sql`
+        SELECT "id"
+        FROM "EmailQueue"
+        WHERE "id" = ${snapshot.id}
+          AND "isEnabled" = true
+          AND "type" = 'IMAP'
+          AND "syncState" = 'OK'
+          AND "mailboxEpoch" = ${snapshot.mailboxEpoch}
+          AND "cursorGeneration" = ${snapshot.cursorGeneration}
+          AND "uidValidity" = ${snapshot.uidValidity}
+        FOR UPDATE
+      `);
+      if (current.length !== 1) throw new StaleImapAcceptSnapshotError(snapshot.id);
+
+      // `createMany(skipDuplicates)` maps to INSERT .. ON CONFLICT DO NOTHING.  It avoids
+      // poisoning a PostgreSQL transaction with P2002 before we can inspect the conflicting
+      // row.  At accept time messageId is NULL, so the only expected unique conflict is the
+      // canonical transport key; a missing/different prior row is treated fail-closed below.
+      const created = await tx.inboundDelivery.createMany({
         data: {
           transport: 'IMAP',
-          queueId,
-          departmentId, // snapshot at acceptance
+          queueId: snapshot.id,
+          departmentId: snapshot.departmentId, // snapshot at acceptance
+          // IMAP does not always expose the original SMTP envelope recipient in MIME.  The
+          // configured queue address is the trusted receiving-mailbox fallback used by the
+          // deterministic routing policy (not a header-derived guess).
+          envelopeTo: snapshot.emailAddress,
           transportKey,
+          mailboxEpoch: snapshot.mailboxEpoch,
           uidValidity,
           uid: BigInt(uid),
           contentHash,
@@ -698,11 +930,114 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           truncated,
           state: 'ACCEPTED',
         },
+        skipDuplicates: true,
       });
-    } catch (err) {
-      if (this.isUniqueViolation(err)) return; // already accepted — idempotent
-      throw err;
-    }
+      if (created.count === 1) return 'accepted';
+
+      const prior = await tx.inboundDelivery.findUnique({
+        where: { transportKey },
+        select: { queueId: true, mailboxEpoch: true, uidValidity: true, uid: true, contentHash: true },
+      });
+      const isExactRetry =
+        prior?.queueId === snapshot.id &&
+        prior.mailboxEpoch === snapshot.mailboxEpoch &&
+        prior.uidValidity === uidValidity &&
+        prior.uid === BigInt(uid) &&
+        prior.contentHash === contentHash;
+      if (isExactRetry) return 'duplicate';
+
+      // A different body for the same epoch+UID means a corrupt server/transport identity;
+      // never consume it as a duplicate.  Halt the exact snapshot and write durable audit in
+      // the same transaction.  If the conditional halt loses its CAS, a newer epoch already
+      // owns the queue and this stale poller must simply fail closed.
+      const msg =
+        `IMAP transport collision for ${transportKey}: existing delivery identity/content differs; ` +
+        `queue halted for explicit reconcile`;
+      const halted = await tx.emailQueue.updateMany({
+        where: {
+          id: snapshot.id,
+          type: 'IMAP',
+          isEnabled: true,
+          syncState: 'OK',
+          mailboxEpoch: snapshot.mailboxEpoch,
+          cursorGeneration: snapshot.cursorGeneration,
+          uidValidity: snapshot.uidValidity,
+        },
+        data: {
+          syncState: 'NEEDS_RECONCILIATION',
+          reconcileCause: 'TRANSPORT_COLLISION',
+          reconcileRequestedAt: null,
+          lastError: msg,
+        },
+      });
+      if (halted.count !== 1) throw new StaleImapAcceptSnapshotError(snapshot.id);
+      await tx.inboundAuditLog.create({
+        data: {
+          action: 'mail.transport_collision',
+          queueId: snapshot.id,
+          reason: 'IMAP transport identity reused with different content',
+          metadata: {
+            transportKey,
+            mailboxEpoch: snapshot.mailboxEpoch,
+            uidValidity: uidValidity.toString(),
+            uid,
+            attemptedContentHash: contentHash,
+            prior: prior
+              ? {
+                  queueId: prior.queueId,
+                  mailboxEpoch: prior.mailboxEpoch,
+                  uidValidity: prior.uidValidity?.toString() ?? null,
+                  uid: prior.uid?.toString() ?? null,
+                  contentHash: prior.contentHash,
+                }
+              : null,
+          } as Prisma.InputJsonValue,
+        },
+      });
+      throw new ImapTransportCollisionError(snapshot.id, transportKey);
+    });
+  }
+
+  /** Set a typed UIDVALIDITY halt plus its durable audit atomically. */
+  private async haltImapSnapshot(
+    snapshot: ImapAcceptSnapshot,
+    cause: 'UIDVALIDITY_CHANGED',
+    message: string,
+  ): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const halt = await tx.emailQueue.updateMany({
+        where: {
+          id: snapshot.id,
+          type: 'IMAP',
+          isEnabled: true,
+          syncState: 'OK',
+          mailboxEpoch: snapshot.mailboxEpoch,
+          cursorGeneration: snapshot.cursorGeneration,
+          uidValidity: snapshot.uidValidity,
+        },
+        data: {
+          syncState: 'NEEDS_RECONCILIATION',
+          reconcileCause: cause,
+          reconcileRequestedAt: null,
+          lastError: message,
+        },
+      });
+      if (halt.count !== 1) return false;
+      await tx.inboundAuditLog.create({
+        data: {
+          action: 'mail.reconcile_failed',
+          queueId: snapshot.id,
+          reason: message,
+          metadata: {
+            cause,
+            mailboxEpoch: snapshot.mailboxEpoch,
+            cursorGeneration: snapshot.cursorGeneration,
+            uidValidity: snapshot.uidValidity?.toString() ?? null,
+          } as Prisma.InputJsonValue,
+        },
+      });
+      return true;
+    });
   }
 
   // ─────────────────── PIPE ingress ───────────────────

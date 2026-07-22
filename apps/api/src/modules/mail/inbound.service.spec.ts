@@ -75,7 +75,7 @@ const TEST_CONFIG: AppConfig = {
 };
 
 function makePrismaMock() {
-  return {
+  const prisma = {
     emailQueue: {
       findMany: vi.fn().mockResolvedValue([]),
       findUnique: vi.fn(),
@@ -89,6 +89,7 @@ function makePrismaMock() {
     ticket: { findUnique: vi.fn() },
     inboundDelivery: {
       create: vi.fn().mockResolvedValue({ id: 1 }),
+      createMany: vi.fn().mockResolvedValue({ count: 1 }),
       findMany: vi.fn().mockResolvedValue([]),
       findUnique: vi.fn(),
       update: vi.fn().mockResolvedValue({}),
@@ -100,8 +101,13 @@ function makePrismaMock() {
       upsert: vi.fn().mockResolvedValue({}),
     },
     // Advisory-lock raw query — default to "lock acquired".
-    $queryRaw: vi.fn().mockResolvedValue([{ locked: true }]),
-  } as unknown as PrismaService;
+    $queryRaw: vi.fn().mockResolvedValue([{ id: 1 }]),
+    inboundAuditLog: { create: vi.fn().mockResolvedValue({ id: 1 }) },
+  } as unknown as Record<string, unknown>;
+  (prisma as { $transaction: ReturnType<typeof vi.fn> }).$transaction = vi.fn(async (arg: unknown) =>
+    typeof arg === 'function' ? (arg as (tx: unknown) => Promise<unknown>)(prisma) : arg,
+  );
+  return prisma as unknown as PrismaService;
 }
 
 function makeInboundService(prisma: PrismaService, config: AppConfig = TEST_CONFIG): InboundMailService {
@@ -588,13 +594,17 @@ describe('InboundMailService — parser rule helpers', () => {
     function queue(over: Record<string, unknown> = {}) {
       return {
         id: 1,
+        type: 'IMAP',
         isEnabled: true,
+        emailAddress: 'support@example.com',
         departmentId: null,
-        lastSeenUid: 100,
+        lastSeenUid: 100n,
         uidValidity: 7n,
         syncState: 'OK',
         lastError: null,
         cursorGeneration: 0,
+        mailboxEpoch: 1,
+        reconcileCause: null,
         ...over,
       };
     }
@@ -614,15 +624,16 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(client.fetch).toHaveBeenCalledWith('101:*', expect.anything(), { uid: true });
       expect(client.fetchOne).toHaveBeenCalledWith('102', expect.anything(), { uid: true });
 
-      expect(prisma.inboundDelivery.create).toHaveBeenCalledTimes(2);
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledTimes(2);
       // The ACTUAL raw bytes / hash / size must be persisted (durable, replayable) — not
       // just the transport key.
       const src102 = imapSrc(102);
-      expect(prisma.inboundDelivery.create).toHaveBeenCalledWith(
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
             transport: 'IMAP',
-            transportKey: 'imap:1:7:102',
+            transportKey: 'imap:1:1:7:102',
+            mailboxEpoch: 1,
             rawMime: new Uint8Array(src102),
             contentHash: createHash('sha256').update(src102).digest('hex'),
             sizeBytes: src102.length,
@@ -633,8 +644,9 @@ describe('InboundMailService — parser rule helpers', () => {
         expect.objectContaining({
           where: expect.objectContaining({
             id: 1,
-            lastSeenUid: { lt: 102n },
+            lastSeenUid: 100n,
             cursorGeneration: 0,
+            mailboxEpoch: 1,
             syncState: 'OK',
           }),
           data: { lastSeenUid: 102n },
@@ -642,20 +654,22 @@ describe('InboundMailService — parser rule helpers', () => {
       );
     });
 
-    it('#10: snapshots the queue department onto the delivery at acceptance', async () => {
+    it('#10: snapshots the queue department and trusted receiving mailbox onto the delivery at acceptance', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
         queue({ departmentId: 4 }),
       );
       await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
-      expect(prisma.inboundDelivery.create).toHaveBeenCalledWith(
-        expect.objectContaining({ data: expect.objectContaining({ departmentId: 4 }) }),
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ departmentId: 4, envelopeTo: 'support@example.com' }),
+        }),
       );
     });
 
     it('processes out-of-order UIDs and advances the cursor to the max (no loss)', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
       await poll(makeLedgerClient([103, 101], { uidValidity: 7n, uidNext: 104 }));
-      expect(prisma.inboundDelivery.create).toHaveBeenCalledTimes(2);
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledTimes(2);
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({ data: { lastSeenUid: 103n } }),
       );
@@ -666,24 +680,44 @@ describe('InboundMailService — parser rule helpers', () => {
       await poll(makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 }, { fetchOneThrowsAt: 101 }));
       // 101 failed before acceptance → nothing accepted, cursor NOT advanced. (A liveness
       // stamp updateMany may run — assert specifically that no cursor-advancing write happened.)
-      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
       expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
-        expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: expect.anything() }) }),
+        expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: 101n }) }),
+      );
+
+      // A new generation only starts accepting after its own reconcile baseline.  Once that
+      // baseline is durable, the same UID is a new epoch transport identity and is accepted
+      // by the new poller — the stale poller's rejected fetch did not consume it.
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        queue({ mailboxEpoch: 2, cursorGeneration: 1, lastSeenUid: 100n, uidValidity: 7n }),
+      );
+      await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ transportKey: 'imap:1:2:7:101' }) }),
       );
     });
 
     it('fail-closed: a ledger DB error during accept does NOT advance the cursor', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
-      (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('db down'));
+      (prisma.inboundDelivery.createMany as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error('db down'),
+      );
       await poll(makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 }));
       expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: expect.anything() }) }),
       );
     });
 
-    it('idempotent: a duplicate transport key (P2002) is a no-op and the cursor still advances', async () => {
+    it('idempotent: an exact duplicate transport identity is a no-op and the cursor still advances', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
-      (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      (prisma.inboundDelivery.createMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        queueId: 1,
+        mailboxEpoch: 1,
+        uidValidity: 7n,
+        uid: 101n,
+        contentHash: createHash('sha256').update(imapSrc(101)).digest('hex'),
+      });
       await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({ data: { lastSeenUid: 101n } }),
@@ -694,7 +728,7 @@ describe('InboundMailService — parser rule helpers', () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
       await poll(makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 }, { vanish: [101] }));
       // 101 vanished (no create), 102 accepted; cursor reaches 102.
-      expect(prisma.inboundDelivery.create).toHaveBeenCalledTimes(1);
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledTimes(1);
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({ data: { lastSeenUid: 102n } }),
       );
@@ -705,7 +739,7 @@ describe('InboundMailService — parser rule helpers', () => {
         queue({ uidValidity: 7n }),
       );
       await poll(makeLedgerClient([1, 2], { uidValidity: 9n, uidNext: 50 }));
-      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
       // The halt is a generation-gated updateMany (so a stale poll can't clobber a
       // freshly-reconciled OK state), not an unconditional update.
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
@@ -723,7 +757,241 @@ describe('InboundMailService — parser rule helpers', () => {
       const client = makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 });
       await poll(client);
       expect(client.getMailboxLock).not.toHaveBeenCalled();
-      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+    });
+
+    it('P1-D barrier: stale poller is fenced after fetch and before ledger insert', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      let releaseFence: ((rows: Array<{ id: number }>) => void) | undefined;
+      const fenceEntered = new Promise<void>((resolve) => {
+        (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementationOnce(
+          () =>
+            new Promise<Array<{ id: number }>>((release) => {
+              releaseFence = release;
+              resolve();
+            }),
+        );
+      });
+      const client = makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 });
+      const running = poll(client);
+      await fenceEntered;
+
+      // Model the concurrent identity/reconcile transition. Its CAS bumps epoch/generation;
+      // the SELECT ... FOR UPDATE fence rechecks the old snapshot after it commits and finds
+      // no matching row. Releasing an old fetch must therefore NOT create a delivery.
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      const queues = await import('./email-queue.service');
+      const queueService = new queues.EmailQueueService(prisma as unknown as PrismaService);
+      await queueService.update(1, { host: 'new-imap.example' });
+      releaseFence?.([]);
+      await running;
+
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            mailboxEpoch: { increment: 1 },
+            cursorGeneration: { increment: 1 },
+          }),
+        }),
+      );
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: 101n }) }),
+      );
+    });
+
+    it('P1-D out-of-order: high UID accepted first does not leapfrog a lower failed UID', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      await poll(makeLedgerClient([103, 101], { uidValidity: 7n, uidNext: 104 }, { fetchOneThrowsAt: 101 }));
+
+      // UID 103 was already durable when lower UID 101 failed. It is safe to re-fetch 103
+      // later as an exact retry; it is NOT safe to write cursor=103 and skip 101.
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledTimes(1);
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ uid: 103n }) }),
+      );
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: expect.anything() }) }),
+      );
+    });
+
+    it('P1-D out-of-order: a higher failure cannot skip a lower UID that the batch has not attempted yet', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      // The server yielded 102, then a failing 103, and only then 101.  Polling stops at
+      // the error, so 101 is known but unattempted.  Advancing to 102 here would silently
+      // lose it on the next `lastSeenUid + 1` range.
+      await poll(
+        makeLedgerClient([102, 103, 101], { uidValidity: 7n, uidNext: 104 }, { fetchOneThrowsAt: 103 }),
+      );
+
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ uid: 102n }) }),
+      );
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: expect.anything() }) }),
+      );
+    });
+
+    it('P0-A collision: same epoch/UID with different bytes halts + audits and never advances cursor', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      (prisma.inboundDelivery.createMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        queueId: 1,
+        mailboxEpoch: 1,
+        uidValidity: 7n,
+        uid: 101n,
+        contentHash: 'different-hash',
+      });
+      await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
+
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            syncState: 'NEEDS_RECONCILIATION',
+            reconcileCause: 'TRANSPORT_COLLISION',
+          }),
+        }),
+      );
+      expect(prisma.inboundAuditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ action: 'mail.transport_collision' }) }),
+      );
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: 101n }) }),
+      );
+    });
+
+    it('P0-A accepts reused UIDVALIDITY/UID in a new mailbox epoch as a new transport delivery', async () => {
+      const findQueue = prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>;
+      findQueue
+        .mockResolvedValueOnce(queue({ mailboxEpoch: 1 }))
+        .mockResolvedValueOnce(queue({ mailboxEpoch: 2 }));
+      await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
+      await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
+      const keys = (prisma.inboundDelivery.createMany as ReturnType<typeof vi.fn>).mock.calls.map(
+        ([arg]) => (arg as { data: { transportKey: string } }).data.transportKey,
+      );
+      expect(keys).toEqual(['imap:1:1:7:101', 'imap:1:2:7:101']);
+    });
+  });
+
+  describe('captureReconcileBaseline — exact synchronous P0-B boundary', () => {
+    const snapshot = {
+      id: 1,
+      host: 'imap.example',
+      port: 993,
+      username: 'support',
+      passwordEnc: '',
+      useTls: true,
+      mailboxEpoch: 2,
+      cursorGeneration: 5,
+    };
+
+    function attachLiveClient(client: unknown) {
+      const internals = service as unknown as {
+        connections: Map<number, unknown>;
+        connectionFingerprints: Map<number, string>;
+        connectionFingerprint: (queue: typeof snapshot) => string;
+      };
+      internals.connections.set(1, client);
+      internals.connectionFingerprints.set(1, internals.connectionFingerprint(snapshot));
+    }
+
+    it('FROM_NOW persists UIDNEXT-1 exactly; it never substitutes EXISTS or a wildcard fallback', async () => {
+      const client = {
+        mailbox: { uidValidity: 7n, uidNext: 101, exists: 4 },
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        search: vi.fn(),
+      };
+      attachLiveClient(client);
+      await expect(service.captureReconcileBaseline(snapshot, 'FROM_NOW', 0)).resolves.toEqual({
+        uidValidity: 7n,
+        boundary: 100,
+        cursor: 100,
+        selectedUids: [],
+      });
+      expect(client.search).not.toHaveBeenCalled();
+    });
+
+    it('P0-B barrier: a UID delivered after the captured FROM_NOW boundary is accepted by the next poll', async () => {
+      const client = {
+        mailbox: { uidValidity: 7n, uidNext: 101, exists: 100 },
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        search: vi.fn(),
+        // eslint-disable-next-line @typescript-eslint/require-await
+        fetch: vi.fn(function* () {
+          yield { uid: 101 };
+        }),
+        fetchOne: vi
+          .fn()
+          .mockResolvedValue({
+            uid: 101,
+            source: Buffer.from('From: sender@example.com\r\n\r\narrived after boundary'),
+          }),
+      };
+      attachLiveClient(client);
+
+      const baseline = await service.captureReconcileBaseline(snapshot, 'FROM_NOW', 0);
+      expect(baseline).toMatchObject({ boundary: 100, cursor: 100 });
+
+      // Simulate APPEND after UIDNEXT was snapshotted, but before the next poll starts.
+      // The committed boundary stays 100, therefore UID 101 must be fetched rather than
+      // folded into the discarded history.
+      client.mailbox.uidNext = 102;
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        type: 'IMAP',
+        isEnabled: true,
+        emailAddress: 'support@example.com',
+        departmentId: null,
+        lastSeenUid: 100n,
+        uidValidity: 7n,
+        syncState: 'OK',
+        lastError: null,
+        cursorGeneration: 5,
+        mailboxEpoch: 2,
+        reconcileCause: null,
+      });
+      await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        client,
+      );
+
+      expect(client.fetch).toHaveBeenCalledWith('101:*', expect.anything(), { uid: true });
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ uid: 101n, transportKey: 'imap:1:2:7:101' }),
+        }),
+      );
+    });
+
+    it('BACKFILL chooses the last N existing sparse UIDs below the SAME UIDNEXT boundary', async () => {
+      const client = {
+        mailbox: { uidValidity: 7n, uidNext: 101, exists: 5 },
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        // 101 arrived after the snapshot; it must not be included in the discarded/backfill set.
+        search: vi.fn().mockResolvedValue([2, 90, 95, 100, 101]),
+      };
+      attachLiveClient(client);
+      await expect(service.captureReconcileBaseline(snapshot, 'BACKFILL', 2)).resolves.toEqual({
+        uidValidity: 7n,
+        boundary: 100,
+        cursor: 94,
+        selectedUids: [95, 100],
+      });
+      expect(client.search).toHaveBeenCalledWith({ uid: '1:100' }, { uid: true });
+    });
+
+    it('fails closed when UIDNEXT is absent instead of falling back to 1:*', async () => {
+      const client = {
+        mailbox: { uidValidity: 7n, exists: 99 },
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        search: vi.fn(),
+      };
+      attachLiveClient(client);
+      await expect(service.captureReconcileBaseline(snapshot, 'FROM_NOW', 0)).rejects.toThrow(
+        /UIDVALIDITY\/UIDNEXT/i,
+      );
+      expect(client.search).not.toHaveBeenCalled();
     });
   });
 
@@ -737,7 +1005,13 @@ describe('InboundMailService — parser rule helpers', () => {
     it('FROM_NOW records high-water and imports nothing', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 1,
+        type: 'IMAP',
+        isEnabled: true,
         uidValidity: null,
+        syncState: 'OK',
+        reconcileCause: null,
+        mailboxEpoch: 1,
+        cursorGeneration: 0,
       });
       await bootstrap({
         mailbox: { uidValidity: 7n, uidNext: 501, exists: 500 },
@@ -750,7 +1024,7 @@ describe('InboundMailService — parser rule helpers', () => {
           where: expect.objectContaining({
             id: 1,
             uidValidity: null,
-            syncState: { in: ['OK', 'BOOTSTRAPPING'] },
+            syncState: 'OK',
           }),
           data: expect.objectContaining({ lastSeenUid: 500n, uidValidity: 7n, syncState: 'OK' }),
         }),
@@ -760,6 +1034,8 @@ describe('InboundMailService — parser rule helpers', () => {
     it('does nothing when the queue is already bootstrapped (uidValidity set)', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 1,
+        type: 'IMAP',
+        isEnabled: true,
         uidValidity: 7n,
       });
       (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mockClear();
@@ -776,7 +1052,13 @@ describe('InboundMailService — parser rule helpers', () => {
     it('P0-2: connectQueue captures the baseline DURING connect (not the first poll)', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 1,
+        type: 'IMAP',
+        isEnabled: true,
         uidValidity: null,
+        syncState: 'OK',
+        reconcileCause: null,
+        mailboxEpoch: 1,
+        cursorGeneration: 0,
       });
       // Uses the mocked ImapFlow (uidNext=10 → high-water 9). If connectQueue did not call
       // bootstrapQueue, no baseline would be written and mail arriving before the first
@@ -791,7 +1073,7 @@ describe('InboundMailService — parser rule helpers', () => {
           where: expect.objectContaining({
             id: 1,
             uidValidity: null,
-            syncState: { in: ['OK', 'BOOTSTRAPPING'] },
+            syncState: 'OK',
           }),
           data: expect.objectContaining({ lastSeenUid: 9n, uidValidity: 7n, syncState: 'OK' }),
         }),
