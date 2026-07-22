@@ -61,6 +61,14 @@ export interface Reply {
   is_internal: boolean;
   created_at: string;
   attachments?: Attachment[];
+  /** Server-owned SMTP outcome for a public staff reply; absent for notes/inbound posts. */
+  delivery?: {
+    state: 'QUEUED' | 'PROCESSING' | 'SENT' | 'RETRY' | 'FAILED' | 'AMBIGUOUS';
+    attempts: number;
+    next_attempt_at?: string | null;
+    last_error?: string | null;
+    sent_at?: string | null;
+  };
 }
 
 export interface Ticket {

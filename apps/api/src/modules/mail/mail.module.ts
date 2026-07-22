@@ -8,13 +8,14 @@ import { InboundAuditService } from './inbound-audit.service';
 import { EmailQueueController } from './email-queue.controller';
 import { ParserRulesController } from './parser-rules.controller';
 import { InboundController } from './inbound.controller';
+import { OutboundEmailController } from './outbound-email.controller';
 import { TicketsModule } from '../tickets/tickets.module';
 import { AttachmentsModule } from '../attachments/attachments.module';
 import { loadConfig, APP_CONFIG } from '../../config/configuration';
 
 @Module({
   imports: [forwardRef(() => TicketsModule), BullModule.registerQueue({ name: 'mail' }), AttachmentsModule],
-  controllers: [EmailQueueController, ParserRulesController, InboundController],
+  controllers: [EmailQueueController, ParserRulesController, InboundController, OutboundEmailController],
   providers: [
     { provide: APP_CONFIG, useValue: loadConfig() },
     MailService,

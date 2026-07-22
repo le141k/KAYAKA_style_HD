@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Inject,
   Injectable,
   Logger,
@@ -335,8 +336,24 @@ export class AttachmentsService {
   }
 
   async deleteAttachment(id: number): Promise<void> {
-    const attachment = await this.getAttachmentOrThrow(id);
-    await this.prisma.attachment.delete({ where: { id } });
+    const attachment = await this.prisma.$transaction(async (tx): Promise<Attachment> => {
+      // Serialize direct deletion against outbox snapshot creation. An outbox FK
+      // insert takes a compatible key-share lock; either it commits first and is
+      // observed below, or this delete commits first and the outbox transaction
+      // rolls back instead of creating an email whose attachment silently vanished.
+      await tx.$queryRaw`SELECT "id" FROM "Attachment" WHERE "id" = ${id} FOR UPDATE`;
+      const attachment = await tx.attachment.findUnique({ where: { id } });
+      if (!attachment) throw new NotFoundException(`Attachment ${id} not found`);
+      const snapshotted = await tx.outboundEmailAttachment.findFirst({
+        where: { sourceAttachmentId: id },
+        select: { id: true },
+      });
+      if (snapshotted) {
+        throw new ConflictException('Attachment is retained by a queued or delivered outbound email');
+      }
+      await tx.attachment.delete({ where: { id } });
+      return attachment;
+    });
     try {
       await this.storageService.delete(attachment.storageKey);
     } catch {

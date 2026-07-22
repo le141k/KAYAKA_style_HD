@@ -125,6 +125,26 @@ enum RecipientRole {
   BCC
 }
 
+// Durable transactional outbox for staff-originated public email. A post is not
+// reported as emailed merely because a Redis job was accepted: SENT means the
+// configured SMTP transport accepted the message with its persisted Message-ID.
+enum OutboundEmailState {
+  QUEUED
+  PROCESSING
+  SENT
+  RETRY
+  FAILED
+  AMBIGUOUS
+}
+
+// Kept separate from TicketRecipient's CC/BCC roles because every immutable
+// outbox snapshot also owns its visible To recipients.
+enum OutboundRecipientRole {
+  TO
+  CC
+  BCC
+}
+
 enum ParserRuleType {
   PRE_PARSE
   POST_PARSE
@@ -500,6 +520,7 @@ model Ticket {
   timeEntries     TimeEntry[]
   followUps       FollowUp[]
   inboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimTicket")
+  outboundEmails  OutboundEmail[]
 
   lastReplyAt     DateTime?
   lastActivityAt  DateTime       @default(now())
@@ -550,6 +571,7 @@ model TicketPost {
   ipAddress    String     @default("0.0.0.0")
   attachments  Attachment[]
   inboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimPost")
+  outboundEmail OutboundEmail?
   editedAt     DateTime?
   editedByStaffId Int?
   createdAt    DateTime   @default(now())
@@ -588,6 +610,11 @@ model Attachment {
   // echo it back to adopt these orphans (prevents cross-submitter IDOR). Cleared
   // once the rows are linked to a post.
   claimToken String?
+  // A queued staff email snapshots this attachment's metadata and storage key.
+  // AttachmentsService rejects direct manager deletion while a snapshot exists;
+  // the relation itself cascades only so ticket/post cascade-deletion can remove
+  // the whole coherent graph without a foreign-key deadlock.
+  outboundEmailAttachments OutboundEmailAttachment[] @relation("OutboundEmailAttachmentSource")
   createdAt  DateTime    @default(now())
 
   @@index([ticketId])
@@ -795,6 +822,90 @@ model EmailQueue {
   inboundDeliveries InboundDelivery[]
   routedInboundDeliveries InboundDelivery[] @relation("InboundDeliveryRoutedQueue")
   routedInboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimRoutedQueue")
+  outboundEmails OutboundEmail[]
+}
+
+/**
+ * Immutable, database-backed SMTP command created together with the staff post.
+ * BullMQ carries only this row's id as an accelerator; PostgreSQL remains the
+ * authoritative queue and is scanned on worker startup/recovery.
+ */
+model OutboundEmail {
+  id            String             @id @default(cuid())
+  ticket        Ticket             @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId      Int
+  post          TicketPost         @relation(fields: [postId], references: [id], onDelete: Cascade)
+  postId        Int                @unique
+  emailQueue    EmailQueue?        @relation(fields: [emailQueueId], references: [id], onDelete: SetNull)
+  emailQueueId  Int?
+
+  state         OutboundEmailState @default(QUEUED)
+  // Generated before the ticket transaction commits. It is reused by every
+  // retry/manual retry so an ambiguous SMTP outcome never gets a fresh identity.
+  messageId     String             @unique
+  fromAddress   String
+  replyToAddress String?
+  subject       String
+  htmlBody      String
+  textBody      String
+  inReplyTo     String?
+  references    String[]           @default([])
+
+  recipients    OutboundEmailRecipient[]
+  attachments   OutboundEmailAttachment[]
+
+  attempts      Int                @default(0)
+  nextAttemptAt DateTime?
+  leaseOwner    String?
+  leaseExpiresAt DateTime?
+  // Monotonic claim fence. A stale worker may never settle a later worker's lease.
+  leaseVersion  Int                @default(0)
+  // Bounded/sanitized diagnostic safe for the staff timeline. Never store SMTP
+  // credentials, recipient headers or raw message content here.
+  lastError     String?
+  providerResponse String?
+  acceptedAt    DateTime?
+  sentAt        DateTime?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([ticketId])
+  @@index([state, nextAttemptAt])
+  @@index([leaseExpiresAt])
+}
+
+/** Recipient snapshot. BCC rows are never projected from staff ticket reads. */
+model OutboundEmailRecipient {
+  id              Int                   @id @default(autoincrement())
+  outboundEmail   OutboundEmail         @relation(fields: [outboundEmailId], references: [id], onDelete: Cascade)
+  outboundEmailId String
+  email           String
+  role            OutboundRecipientRole
+  createdAt       DateTime              @default(now())
+
+  @@unique([outboundEmailId, email])
+  @@index([outboundEmailId, role])
+}
+
+/** Immutable metadata/storage snapshot for a staff reply attachment. */
+model OutboundEmailAttachment {
+  id                 Int           @id @default(autoincrement())
+  outboundEmail      OutboundEmail @relation(fields: [outboundEmailId], references: [id], onDelete: Cascade)
+  outboundEmailId    String
+  // Cascade permits ticket/post cascade-delete to remove the outbox snapshot first.
+  // AttachmentsService separately rejects a manager's direct attachment delete while
+  // this relation exists, so a committed queued email cannot lose its bytes.
+  sourceAttachment   Attachment    @relation("OutboundEmailAttachmentSource", fields: [sourceAttachmentId], references: [id], onDelete: Cascade)
+  sourceAttachmentId Int
+  fileName           String
+  mimeType           String
+  size               Int
+  sha1               String
+  storageKey         String
+  createdAt          DateTime      @default(now())
+
+  @@unique([outboundEmailId, sourceAttachmentId])
+  @@index([sourceAttachmentId])
 }
 
 /** Per-queue bootstrap intent chosen by an operator reconcile (see EmailQueue). */

@@ -40,6 +40,13 @@ interface ApiPost {
   createdAt: string;
   staff?: ApiStaffRel | null;
   attachments?: ApiAttachment[];
+  outboundEmail?: {
+    state: 'QUEUED' | 'PROCESSING' | 'SENT' | 'RETRY' | 'FAILED' | 'AMBIGUOUS';
+    attempts: number;
+    nextAttemptAt?: string | null;
+    lastError?: string | null;
+    sentAt?: string | null;
+  } | null;
 }
 interface ApiNote {
   id: number;
@@ -121,6 +128,17 @@ function mapPostToReply(p: ApiPost): Reply {
       mime_type: a.mimeType,
       url: `${API_URL}/attachments/${a.id}/download`,
     })),
+    ...(p.outboundEmail
+      ? {
+          delivery: {
+            state: p.outboundEmail.state,
+            attempts: p.outboundEmail.attempts,
+            next_attempt_at: p.outboundEmail.nextAttemptAt,
+            last_error: p.outboundEmail.lastError,
+            sent_at: p.outboundEmail.sentAt,
+          },
+        }
+      : {}),
   };
 }
 
