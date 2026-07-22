@@ -114,10 +114,17 @@ export class ReportsService {
     return rows;
   }
 
-  async listRuns(reportId: number) {
+  async listRuns(reportId: number, actor: TicketAccessActor) {
+    // A run's rowCount is an aggregate under the runner's department scope. Do
+    // not let a different department use run history as a side-channel for
+    // ticket volume, staff identity, or error diagnostics. Global admins retain
+    // the cross-owner operational view; everyone else sees only their own runs.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return (this.prisma as any).reportRun.findMany({
-      where: { reportId },
+      where: {
+        reportId,
+        ...(actor.isAdmin ? {} : { staffId: actor.staffId }),
+      },
       orderBy: { createdAt: 'desc' },
       take: 50,
     });

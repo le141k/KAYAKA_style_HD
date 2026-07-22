@@ -17,13 +17,10 @@ import type {
   UpdateStaffGroupDto,
   ListStaffQueryDto,
 } from './dto';
-import type { Staff, StaffGroup } from '@prisma/client';
+import type { Prisma, Staff, StaffGroup } from '@prisma/client';
 
 /** Safe staff shape — never exposes passwordHash or the internal lockout/authVersion columns. */
-export type SafeStaff = Omit<
-  Staff,
-  'passwordHash' | 'failedLoginAttempts' | 'lockedUntil' | 'authVersion'
->;
+export type SafeStaff = Omit<Staff, 'passwordHash' | 'failedLoginAttempts' | 'lockedUntil' | 'authVersion'>;
 
 type SafeStaffWithGroup = SafeStaff & { staffGroup: StaffGroup };
 
@@ -78,11 +75,41 @@ export class StaffService {
    * existing helpers and their small, focused queries remain unchanged; the
    * database lock is held until the full operation completes.
    */
-  private async withRbacMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+  private async withRbacMutationLock<T>(operation: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
     return this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(${RBAC_MUTATION_LOCK_KEY})`;
-      return operation();
+      return operation(tx);
     });
+  }
+
+  /**
+   * DepartmentStaff is an authorization allow-list, not profile metadata. A
+   * delegated staff.manage role must never mint ticket access by editing its own
+   * (or another person's) departmentIds.  Validate the complete replacement in
+   * the same transaction that writes it, so a malformed/unknown id cannot leave
+   * an employee with a partially deleted scope.
+   */
+  private async validateDepartmentAssignments(
+    departmentIds: number[],
+    actor: AuthStaff | undefined,
+    tx: Prisma.TransactionClient,
+  ): Promise<number[]> {
+    if (actor && !actor.isAdmin) {
+      throw new ForbiddenException('Only a global administrator may change department assignments');
+    }
+    const uniqueIds = [...new Set(departmentIds)];
+    if (uniqueIds.length !== departmentIds.length) {
+      throw new ConflictException('Department assignments must not contain duplicates');
+    }
+    if (uniqueIds.length === 0) return uniqueIds;
+    const departments = await tx.department.findMany({
+      where: { id: { in: uniqueIds } },
+      select: { id: true },
+    });
+    if (departments.length !== uniqueIds.length) {
+      throw new NotFoundException('One or more departments not found');
+    }
+    return uniqueIds;
   }
 
   /**
@@ -304,22 +331,23 @@ export class StaffService {
     const { password, departmentIds, ...rest } = dto;
     const passwordHash = await hashPassword(password);
 
-    const { staff, group } = await this.withRbacMutationLock(async () => {
+    const { staff, group } = await this.withRbacMutationLock(async (tx) => {
       // Check uniqueness while the RBAC lock is held, so the verified target
       // group cannot change between authorization and assignment.
-      const exists = await this.prisma.staff.findFirst({
+      const exists = await tx.staff.findFirst({
         where: { OR: [{ email: dto.email }, { username: dto.username }] },
       });
       if (exists) throw new ConflictException('Email or username already in use');
 
       const group = await this.assertCanAssignGroup(dto.staffGroupId, actor);
-      const staff = await this.prisma.staff.create({
+      const validatedDepartmentIds = await this.validateDepartmentAssignments(departmentIds, actor, tx);
+      const staff = await tx.staff.create({
         data: {
           ...rest,
           passwordHash,
-          departments: departmentIds.length
+          departments: validatedDepartmentIds.length
             ? {
-                create: departmentIds.map((departmentId) => ({ departmentId })),
+                create: validatedDepartmentIds.map((departmentId) => ({ departmentId })),
               }
             : undefined,
         },
@@ -344,7 +372,7 @@ export class StaffService {
     const { password, departmentIds, ...rest } = dto;
     const passwordHash = password ? await hashPassword(password) : undefined;
 
-    return this.withRbacMutationLock(async () => {
+    return this.withRbacMutationLock(async (tx) => {
       const before = await this.get(id); // validate exists (+ current group)
       this.assertCanManageStaffTarget(before, actor);
 
@@ -375,16 +403,18 @@ export class StaffService {
       if (sessionInvalidating) data['authVersion'] = { increment: 1 };
 
       if (departmentIds !== undefined) {
-        // Replace department assignments while the staff/RBAC mutation is serialized.
-        await this.prisma.departmentStaff.deleteMany({ where: { staffId: id } });
-        if (departmentIds.length) {
-          await this.prisma.departmentStaff.createMany({
-            data: departmentIds.map((departmentId) => ({ staffId: id, departmentId })),
+        const validatedDepartmentIds = await this.validateDepartmentAssignments(departmentIds, actor, tx);
+        // Replacement is one transaction: a bad ID or a failed insert leaves the
+        // previous authorization scope intact rather than half-deleting it.
+        await tx.departmentStaff.deleteMany({ where: { staffId: id } });
+        if (validatedDepartmentIds.length) {
+          await tx.departmentStaff.createMany({
+            data: validatedDepartmentIds.map((departmentId) => ({ staffId: id, departmentId })),
           });
         }
       }
 
-      const updated = await this.prisma.staff.update({
+      const updated = await tx.staff.update({
         where: { id },
         data,
         select: SAFE_STAFF_SELECT,

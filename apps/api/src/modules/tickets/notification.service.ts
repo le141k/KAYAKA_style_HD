@@ -25,11 +25,27 @@ export class NotificationService {
     try {
       const [ticket, staff] = await Promise.all([
         this.prisma.ticket.findUnique({ where: { id: ticketId } }),
-        this.prisma.staff.findUnique({ where: { id: staffId } }),
+        this.prisma.staff.findUnique({
+          where: { id: staffId },
+          include: {
+            staffGroup: { select: { isAdmin: true } },
+            departments: { select: { departmentId: true } },
+          },
+        }),
       ]);
 
       if (!ticket || !staff) return;
       if (!staff.email) return;
+      // Assignment can be changed by a system workflow and an existing owner
+      // can lose a department membership later. Never use an asynchronous email
+      // notification as a second, stale ticket-read channel.
+      if (
+        !staff.staffGroup.isAdmin &&
+        !staff.departments.some((membership) => membership.departmentId === ticket.departmentId)
+      ) {
+        this.logger.warn(`Skipped out-of-scope assignment notification for ticket ${ticket.id}`);
+        return;
+      }
 
       const staffName = `${staff.firstName} ${staff.lastName}`.trim() || staff.email;
 
@@ -60,12 +76,26 @@ export class NotificationService {
 
       // Load watchers with their staff details
       const watchers = await this.prisma.ticketWatcher.findMany({
-        where: { ticketId },
+        where: {
+          ticketId,
+          staff: {
+            is: {
+              isEnabled: true,
+              OR: [
+                { staffGroup: { is: { isAdmin: true } } },
+                { departments: { some: { departmentId: ticket.departmentId } } },
+              ],
+            },
+          },
+        },
         include: {
           staff: { select: { id: true, email: true, firstName: true, lastName: true, isEnabled: true } },
         },
       });
 
+      // The SQL predicate above evaluates membership at send time. This closes
+      // stale watcher rows after a ticket move or a DepartmentStaff revocation;
+      // `isEnabled` remains a defensive projection check for old test doubles.
       const enabledWatchers = watchers.filter((w) => w.staff.isEnabled);
 
       await Promise.all(

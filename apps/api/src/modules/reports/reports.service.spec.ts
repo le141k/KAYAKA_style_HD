@@ -200,6 +200,28 @@ describe('ReportsService', () => {
     });
   });
 
+  describe('listRuns', () => {
+    it('scopes run history to the requesting non-admin staff member', async () => {
+      await service.listRuns(4, REPORT_RUNNER);
+
+      expect(prisma.reportRun.findMany).toHaveBeenCalledWith({
+        where: { reportId: 4, staffId: REPORT_RUNNER.staffId },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      });
+    });
+
+    it('allows a global administrator to inspect operational run history', async () => {
+      await service.listRuns(4, { ...REPORT_RUNNER, isAdmin: true });
+
+      expect(prisma.reportRun.findMany).toHaveBeenCalledWith({
+        where: { reportId: 4 },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      });
+    });
+  });
+
   // ─── dashboard ───────────────────────────────────────────────────────────────
 
   describe('dashboard', () => {
@@ -293,10 +315,10 @@ describe('ReportsService', () => {
       const runs = [{ id: 1, reportId: 5, rowCount: 10 }];
       (prisma.reportRun.findMany as ReturnType<typeof vi.fn>).mockResolvedValue(runs);
 
-      const result = await service.listRuns(5);
+      const result = await service.listRuns(5, REPORT_RUNNER);
       expect(result).toEqual(runs);
       expect(prisma.reportRun.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { reportId: 5 } }),
+        expect.objectContaining({ where: { reportId: 5, staffId: REPORT_RUNNER.staffId } }),
       );
     });
   });

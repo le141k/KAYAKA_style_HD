@@ -76,7 +76,10 @@ Required invariants:
   the verified forward-only migration boundary, with compare-and-swap updates and aggregate-only logs.
 - `TELECOM_HD_UPLOAD_DIR` is exactly `/app/uploads`. This is the sole durable Compose volume mount for
   attachments and inbound raw MIME; another path is rejected by preflight and API production startup.
-- Keep global IMAP polling explicitly safe until the inbound canary gate: `TELECOM_HD_IMAP_ENABLED=false`,
+- Keep global IMAP polling explicitly safe until the inbound canary gate: `TELECOM_HD_IMAP_ENABLED=false`.
+  `scripts/deploy-prod.sh` now rejects a release env with it enabled, so a stale production
+  file cannot consume a mailbox before the live canary proof. Enable it only after the
+  documented queue-by-queue canary gate has completed successfully.
   `TELECOM_HD_IMAP_BOOTSTRAP_POLICY=FROM_NOW`, `TELECOM_HD_IMAP_BACKFILL_LIMIT=0`,
   `TELECOM_HD_INBOUND_MAX_ATTEMPTS=5`, and `TELECOM_HD_INBOUND_RAW_RETENTION_DAYS=30`. Queue connection
   settings are stored in the database; `BACKFILL` requires a deliberate non-zero bounded limit.

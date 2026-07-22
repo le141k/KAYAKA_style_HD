@@ -378,6 +378,18 @@ fi
 printf '\n%s\n' '--- 5. Inbound-mail global safety gates ---'
 check_bool TELECOM_HD_IMAP_ENABLED
 
+# A release starts API workers immediately after the forward-only migration
+# boundary.  Letting a pre-existing env file set this true would consume live
+# mail before the mandatory real-IMAP canary/reconcile matrix has been proved.
+# The reviewed post-deploy canary procedure is the only place that may enable
+# polling, one explicitly reconciled queue at a time.
+IMAP_ENABLED="$(get_val TELECOM_HD_IMAP_ENABLED)"
+if is_true "$IMAP_ENABLED"; then
+  fail 'TELECOM_HD_IMAP_ENABLED — must be false during deploy; enable only after the documented IMAP canary gate'
+else
+  ok 'TELECOM_HD_IMAP_ENABLED — fail-closed for deployment; IMAP canary remains operator-gated'
+fi
+
 IMAP_BOOTSTRAP_POLICY="$(get_val TELECOM_HD_IMAP_BOOTSTRAP_POLICY)"
 case "$IMAP_BOOTSTRAP_POLICY" in
   FROM_NOW|BACKFILL) ok 'TELECOM_HD_IMAP_BOOTSTRAP_POLICY — explicit safe mode' ;;

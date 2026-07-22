@@ -74,8 +74,8 @@ export class ReportsController {
 
   @RequirePermissions(PERMISSIONS.REPORT_RUN)
   @Get(':id/runs')
-  listRuns(@Param('id', ParseIntPipe) id: number) {
-    return this.reports.listRuns(id);
+  listRuns(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
+    return this.reports.listRuns(id, staff);
   }
 
   @RequirePermissions(PERMISSIONS.REPORT_MANAGE)

@@ -15,13 +15,21 @@ function makeMailMock(): MailService {
   return { sendTemplate: vi.fn().mockResolvedValue(undefined) } as unknown as MailService;
 }
 
-const MOCK_TICKET = { id: 1, mask: 'TT-000001', subject: 'Network issue', requesterEmail: 'u@u.com' };
+const MOCK_TICKET = {
+  id: 1,
+  mask: 'TT-000001',
+  subject: 'Network issue',
+  requesterEmail: 'u@u.com',
+  departmentId: 1,
+};
 const MOCK_STAFF = {
   id: 5,
   email: 'staff@example.com',
   firstName: 'Alex',
   lastName: 'Smith',
   isEnabled: true,
+  staffGroup: { isAdmin: false },
+  departments: [{ departmentId: 1 }],
 };
 
 describe('NotificationService', () => {
@@ -65,6 +73,18 @@ describe('NotificationService', () => {
       (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
       await service.notifyOnAssign(1, 999);
+      expect(mail.sendTemplate).not.toHaveBeenCalled();
+    });
+
+    it('does not disclose a ticket through an out-of-scope assignment notification', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_TICKET,
+        departmentId: 2,
+      });
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
+
+      await service.notifyOnAssign(1, 5);
+
       expect(mail.sendTemplate).not.toHaveBeenCalled();
     });
 
@@ -128,6 +148,31 @@ describe('NotificationService', () => {
         expect.any(String),
         expect.any(String),
         expect.any(Object),
+      );
+    });
+
+    it('queries watcher membership against the ticket department at send time', async () => {
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...MOCK_TICKET,
+        departmentId: 2,
+      });
+      (prisma.ticketWatcher.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      await service.notifyWatchersOnUserReply(1);
+
+      expect(prisma.ticketWatcher.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            ticketId: 1,
+            staff: expect.objectContaining({
+              is: expect.objectContaining({
+                OR: expect.arrayContaining([
+                  expect.objectContaining({ departments: { some: { departmentId: 2 } } }),
+                ]),
+              }),
+            }),
+          }),
+        }),
       );
     });
 

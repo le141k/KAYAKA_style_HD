@@ -3,6 +3,7 @@
  * changes must go through the validated change-helpers / assign() (so notification,
  * audit + SLA fire and dangling FKs are rejected), not a raw FK-blind update.
  */
+import { ForbiddenException } from '@nestjs/common';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { TicketsService } from './tickets.service';
 import type { PrismaService } from '../../prisma/prisma.service';
@@ -17,6 +18,7 @@ function makePrisma(macroActions: unknown[]) {
     ticket: {
       findUnique: vi.fn().mockResolvedValue({ id: 1, mask: 'TT-000001' }),
       findUniqueOrThrow: vi.fn().mockResolvedValue({ id: 1, mask: 'TT-000001' }),
+      findFirst: vi.fn().mockResolvedValue({ id: 1, mask: 'TT-000001', firstResponseAt: null }),
       update: vi.fn(),
     },
     macro: {
@@ -30,7 +32,7 @@ function makePrisma(macroActions: unknown[]) {
   } as unknown as PrismaService;
 }
 
-function makeService(prisma: PrismaService): TicketsService {
+function makeService(prisma: PrismaService, access?: Record<string, unknown>): TicketsService {
   return new TicketsService(
     prisma,
     {} as unknown as UsersService,
@@ -38,6 +40,9 @@ function makeService(prisma: PrismaService): TicketsService {
     { emit: vi.fn() } as unknown as EventEmitter2,
     {} as unknown as MailService,
     {} as unknown as AdminService,
+    undefined,
+    undefined,
+    access as never,
   );
 }
 
@@ -100,5 +105,29 @@ describe('applyMacro — action routing (H8-1/H8-5)', () => {
     await service.applyMacro(1, { macroId: 9 }, 5);
 
     expect(spy).toHaveBeenCalledWith(1, { departmentId: 3 }, 5);
+  });
+
+  it('does not let ticket.edit impersonate ticket.reply through a macro', async () => {
+    arm([]);
+    (prisma.macro.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 9,
+      title: 'Reply macro',
+      replyText: 'A customer-facing reply',
+      actions: [],
+    });
+    service = makeService(prisma, {
+      ticketWhere: vi.fn().mockResolvedValue({}),
+      fenceTicketMutation: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(
+      service.applyMacro(1, { macroId: 9 }, 5, {
+        staffId: 5,
+        email: 'agent@example.test',
+        isAdmin: false,
+        permissions: ['ticket.edit'],
+      }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(prisma.ticket.update).not.toHaveBeenCalled();
   });
 });

@@ -13,7 +13,7 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { WorkflowService } from './workflow.service';
-import { RequirePermissions } from '../../auth/auth.decorators';
+import { RequireGlobalAdmin, RequirePermissions } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
@@ -35,6 +35,7 @@ import {
 
 @ApiTags('admin/workflow')
 @Controller('admin/workflows')
+@RequireGlobalAdmin()
 export class WorkflowController {
   constructor(private readonly workflowService: WorkflowService) {}
 
@@ -82,6 +83,7 @@ export class WorkflowController {
 
 @ApiTags('admin/workflow')
 @Controller('admin/macro-categories')
+@RequireGlobalAdmin()
 export class MacroCategoryController {
   constructor(private readonly workflowService: WorkflowService) {}
 
@@ -129,6 +131,7 @@ export class MacroCategoryController {
 
 @ApiTags('admin/workflow')
 @Controller('admin/macros')
+@RequireGlobalAdmin()
 export class MacroController {
   constructor(private readonly workflowService: WorkflowService) {}
 

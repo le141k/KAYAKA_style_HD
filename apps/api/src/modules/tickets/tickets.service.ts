@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -17,6 +18,8 @@ import { AttachmentsService } from '../attachments/attachments.service';
 import { NotificationService } from './notification.service';
 import { formatTicketMask } from './ticket-mask.util';
 import { normalizeEmail } from '../../common/email.util';
+import type { AuthStaff } from '../../auth/auth.decorators';
+import { PERMISSIONS } from '../../auth/permissions';
 import { TicketAccessPolicy, type TicketAccessActor } from './ticket-access-policy.service';
 import type {
   CreateTicketDto,
@@ -1482,6 +1485,13 @@ export class TicketsService {
         data: { ticketId: target.id },
       });
 
+      // A merge can cross departments. Before moving watcher rows onto the
+      // surviving ticket, discard stale memberships that are not entitled to
+      // its department. Otherwise a later user reply would become an email
+      // side-channel even though the watcher cannot open the target ticket.
+      await this.pruneWatchersOutsideDepartment(tx, sourceTicketId, target.departmentId);
+      await this.pruneWatchersOutsideDepartment(tx, target.id, target.departmentId);
+
       // Re-parent watchers. The watcher PK is (ticketId, staffId), so a watcher
       // already present on the target would collide — move only the non-colliding
       // rows and drop the rest.
@@ -1910,12 +1920,13 @@ export class TicketsService {
     ticketId: number,
     dto: ApplyMacroDto,
     staffId: number,
-    actor?: TicketAccessActor,
+    actor?: AuthStaff,
   ): Promise<Ticket> {
     const ticket = await this.findAccessibleOrThrow(ticketId, actor);
 
     const macro = await this.prisma.macro.findUnique({ where: { id: dto.macroId } });
     if (!macro) throw new NotFoundException(`Macro ${dto.macroId} not found`);
+    this.assertMacroPermissions(macro, actor);
 
     // 1. Post the reply text if present
     if (macro.replyText && macro.replyText.trim()) {
@@ -2118,7 +2129,18 @@ export class TicketsService {
             tx,
           );
           await this.fenceTicketMutation(tx, ticketId, actor, now);
+          const removedWatchers = await this.pruneWatchersOutsideDepartment(tx, ticketId, dto.departmentId);
           const result = await tx.ticket.update({ where: { id: ticketId }, data });
+          if (removedWatchers > 0) {
+            await this.writeAudit(
+              ticketId,
+              'WATCHERS_PRUNED_FOR_DEPARTMENT',
+              staffId,
+              'STAFF',
+              { field: 'watchers', newValue: String(removedWatchers) },
+              tx,
+            );
+          }
           await this.writeAudit(ticketId, 'DEPARTMENT_CHANGE', staffId, 'STAFF', audit, tx);
           return result;
         })
@@ -2325,6 +2347,70 @@ export class TicketsService {
   private requireTicketAccess(actor: TicketAccessActor): TicketAccessPolicy {
     if (this.ticketAccess) return this.ticketAccess;
     throw new ServiceUnavailableException(`Ticket access policy is unavailable for staff ${actor.staffId}`);
+  }
+
+  /**
+   * Keep TicketWatcher rows aligned with the ticket's current department.
+   * Global administrators may watch every department; other staff need a live
+   * DepartmentStaff membership.  Notification delivery repeats this predicate
+   * at send time as a revocation backstop, while this transactional cleanup
+   * preserves a truthful watcher list after moves and cross-department merges.
+   */
+  private async pruneWatchersOutsideDepartment(
+    db: PrismaService | Prisma.TransactionClient,
+    ticketId: number,
+    departmentId: number,
+  ): Promise<number> {
+    const removed = await db.ticketWatcher.deleteMany({
+      where: {
+        ticketId,
+        staff: {
+          is: {
+            staffGroup: { is: { isAdmin: false } },
+            departments: { none: { departmentId } },
+          },
+        },
+      },
+    });
+    return removed.count;
+  }
+
+  /**
+   * Macros are data-driven bundles of privileged ticket actions.  The route's
+   * ticket.edit permission is sufficient only for edit-class actions; it must
+   * never become an implicit grant of reply, note, or assignment authority just
+   * because a global administrator configured a convenient macro earlier.
+   * Trusted system callers deliberately omit an actor and remain explicit about
+   * that bypass; every staff HTTP call supplies the authenticated principal.
+   */
+  private assertMacroPermissions(macro: { replyText: string; actions: unknown }, actor?: AuthStaff): void {
+    if (!actor || actor.isAdmin) return;
+
+    const required = new Set<string>([PERMISSIONS.TICKET_EDIT]);
+    if (macro.replyText.trim()) required.add(PERMISSIONS.TICKET_REPLY);
+    if (Array.isArray(macro.actions)) {
+      for (const action of macro.actions) {
+        if (!action || typeof action !== 'object') continue;
+        switch ((action as { type?: unknown }).type) {
+          case 'assign':
+          case 'change_owner':
+            required.add(PERMISSIONS.TICKET_ASSIGN);
+            break;
+          case 'add_note':
+            required.add(PERMISSIONS.TICKET_NOTE);
+            break;
+          default:
+            // Status/priority/department/tag actions are ticket-edit actions,
+            // already required above. Unknown actions are ignored by execution.
+            break;
+        }
+      }
+    }
+    const held = new Set<string>(actor.permissions);
+    const missing = [...required].filter((permission) => !held.has(permission));
+    if (missing.length > 0) {
+      throw new ForbiddenException(`Applying this macro requires: ${missing.join(', ')}`);
+    }
   }
 
   private async findAccessibleOrThrow(id: number, actor?: TicketAccessActor): Promise<Ticket> {

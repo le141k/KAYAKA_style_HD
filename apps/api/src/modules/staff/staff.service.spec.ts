@@ -37,6 +37,15 @@ function makePrismaMock() {
       deleteMany: vi.fn(),
       createMany: vi.fn(),
     },
+    department: {
+      // Default to a valid lookup for every requested test id. Individual tests
+      // override this when proving the fail-closed unknown-department path.
+      findMany: vi
+        .fn()
+        .mockImplementation(({ where }) =>
+          Promise.resolve((where.id?.in ?? []).map((id: number) => ({ id }))),
+        ),
+    },
     $executeRaw: vi.fn().mockResolvedValue([]),
     // Support BOTH the callback form (withRbacMutationLock advisory lock) and the array form.
     $transaction: vi.fn(),
@@ -424,6 +433,27 @@ describe('StaffService', () => {
         }),
       );
     });
+
+    it('refuses a delegated manager granting department access during create', async () => {
+      (prisma.staff.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.staffGroup.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_GROUP);
+
+      await expect(
+        service.create(
+          {
+            email: 'scope@example.com',
+            username: 'scope',
+            password: 'secret123',
+            staffGroupId: 1,
+            departmentIds: [1],
+            firstName: 'Scope',
+            lastName: 'Escalation',
+          } as any,
+          DELEGATED_STAFF_MANAGER as any,
+        ),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.staff.create).not.toHaveBeenCalled();
+    });
   });
 
   // ─── update ──────────────────────────────────────────────────────────────────
@@ -472,6 +502,31 @@ describe('StaffService', () => {
 
       expect(prisma.departmentStaff.deleteMany).toHaveBeenCalledWith({ where: { staffId: 1 } });
       expect(prisma.departmentStaff.createMany).toHaveBeenCalled();
+    });
+
+    it('refuses a delegated manager expanding its own or another staff department scope', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        staffGroup: MOCK_GROUP,
+      });
+
+      await expect(
+        service.update(1, { departmentIds: [1, 2] } as any, DELEGATED_STAFF_MANAGER as any),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.departmentStaff.deleteMany).not.toHaveBeenCalled();
+    });
+
+    it('validates every department before replacing the existing access scope', async () => {
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...SAFE_STAFF,
+        staffGroup: MOCK_GROUP,
+      });
+      (prisma.department.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: 1 }]);
+
+      await expect(
+        service.update(1, { departmentIds: [1, 404] } as any, { isAdmin: true } as any),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.departmentStaff.deleteMany).not.toHaveBeenCalled();
     });
 
     it('passes isEnabled through to the update payload', async () => {
