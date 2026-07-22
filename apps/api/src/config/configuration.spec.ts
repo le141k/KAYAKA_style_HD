@@ -98,6 +98,20 @@ describe('assertProductionSecrets', () => {
     );
   });
 
+  it('requires the durable production upload mount path exactly', () => {
+    expect(() => assertProductionSecrets(makeConfig({ TELECOM_HD_UPLOAD_DIR: '/tmp/uploads' }))).toThrow(
+      /TELECOM_HD_UPLOAD_DIR.*\/app\/uploads/i,
+    );
+  });
+
+  it('rejects a zero global backfill when BACKFILL is selected', () => {
+    expect(() =>
+      assertProductionSecrets(
+        makeConfig({ TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'BACKFILL', TELECOM_HD_IMAP_BACKFILL_LIMIT: 0 }),
+      ),
+    ).toThrow(/IMAP_BACKFILL_LIMIT.*at least 1/i);
+  });
+
   // S5-7: public URL + SMTP host must be real in production.
   it('rejects the localhost public URL default in production', () => {
     expect(() =>

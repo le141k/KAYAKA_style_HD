@@ -33,7 +33,7 @@ const schema = z.object({
   // MTA/PIPE delivery script. Same entropy requirement as the Alaris secret.
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_INBOUND_WEBHOOK_SECRET: z.string().min(32).default('inbound-dev-secret-change-me-0000'),
-  TELECOM_HD_UPLOAD_DIR: z.string().default('/app/uploads'),
+  TELECOM_HD_UPLOAD_DIR: z.string().min(1).default('/app/uploads'),
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: z.coerce.number().int().min(1).max(25).default(25),
   TELECOM_HD_UPLOAD_TOTAL_MAX_SIZE_MB: z.coerce.number().int().min(1).max(50).default(50),
   // Multipart envelope included. Keep this slightly above the aggregate file-byte
@@ -100,10 +100,13 @@ const schema = z.object({
   // TELECOM_HD_IMAP_BACKFILL_LIMIT most-recent existing messages. Chosen explicitly
   // so a fresh connect can never silently import the whole historical mailbox.
   TELECOM_HD_IMAP_BOOTSTRAP_POLICY: z.enum(['FROM_NOW', 'BACKFILL']).default('FROM_NOW'),
-  TELECOM_HD_IMAP_BACKFILL_LIMIT: z.coerce.number().int().nonnegative().default(0),
+  // A global backfill is deliberately bounded. Per-queue BACKFILL remains an
+  // explicit reconcile action, but a typo in the environment must never turn a
+  // first production connect into an unbounded historical import.
+  TELECOM_HD_IMAP_BACKFILL_LIMIT: z.coerce.number().int().min(0).max(10_000).default(0),
   // Max processing attempts before an inbound delivery is QUARANTINED (raw MIME is
   // always retained for replay — a quarantine never discards a message).
-  TELECOM_HD_INBOUND_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  TELECOM_HD_INBOUND_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
   // Raw-MIME retention (days). A terminal PROCESSED/SKIPPED delivery older than this has its
   // inline raw MIME pruned (metadata + contentHash kept) to bound the ledger's on-disk growth.
   // QUARANTINED deliveries are NEVER pruned (raw MIME is needed to replay). 0 disables pruning.
@@ -166,6 +169,19 @@ export function assertProductionSecrets(cfg: AppConfig): void {
   if (!cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY || !/^[0-9a-f]{64}$/i.test(cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY)) {
     problems.push(
       '  - TELECOM_HD_FIELD_ENCRYPTION_KEY: is required and must be 64 hex chars (256-bit) in production',
+    );
+  }
+
+  // The production Compose volume is mounted only here. Allowing an arbitrary
+  // path would silently split attachments/raw MIME between an ephemeral
+  // container filesystem and the durable upload volume.
+  if (cfg.TELECOM_HD_UPLOAD_DIR !== '/app/uploads') {
+    problems.push('  - TELECOM_HD_UPLOAD_DIR: must be exactly /app/uploads in production');
+  }
+
+  if (cfg.TELECOM_HD_IMAP_BOOTSTRAP_POLICY === 'BACKFILL' && cfg.TELECOM_HD_IMAP_BACKFILL_LIMIT < 1) {
+    problems.push(
+      '  - TELECOM_HD_IMAP_BACKFILL_LIMIT: must be at least 1 when TELECOM_HD_IMAP_BOOTSTRAP_POLICY=BACKFILL',
     );
   }
 
