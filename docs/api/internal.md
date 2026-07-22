@@ -154,10 +154,16 @@ Key invariants beyond CRUD:
 
 Consumed by: `TicketsController`, `AlarisService`, `InboundMailService`.
 
-Constructor: `(prisma: PrismaService, usersService: UsersService, slaService: SlaService, eventEmitter: EventEmitter2)`
+`TicketAccessPolicy` is injected by all staff-facing ticket/recipient/attachment/time/follow-up
+paths. A controller passes its authenticated `TicketAccessActor`; trusted inbound/client/system
+calls omit it. With an actor, all list/detail/mutation predicates are department scoped (empty
+`DepartmentStaff` = unrestricted), cross-ticket operations validate both sides, and an unavailable
+policy fails closed instead of falling back to an unscoped lookup.
+
+Constructor: `(prisma: PrismaService, usersService: UsersService, slaService: SlaService, eventEmitter: EventEmitter2, …, ticketAccess?: TicketAccessPolicy)`
 
 ```ts
-createTicket(dto: InternalCreateTicketInput, creatorStaffId?: number): Promise<Ticket>
+createTicket(dto: InternalCreateTicketInput, creatorStaffId?: number, actor?: TicketAccessActor): Promise<Ticket>
 // Resolves/creates requester User by email, generates mask (TT-XXXXXX),
 // creates first TicketPost, resolves default status/priority, writes CREATE audit log.
 // LIFE-03: the CC/BCC `TicketRecipient` rows AND the CREATE `TicketAuditLog` row are now
@@ -172,23 +178,23 @@ createTicket(dto: InternalCreateTicketInput, creatorStaffId?: number): Promise<T
 // Fires eventEmitter.emit('ticket.created', { ticketId }) on completion.
 // Invariant: every ticket has ≥1 post and a unique mask.
 
-listTickets(query: ListTicketsQueryDto): Promise<{ data: Ticket[]; total: number }>
+listTickets(query: ListTicketsQueryDto, actor?: TicketAccessActor): Promise<{ data: Ticket[]; total: number }>
 // Filters: statusId, priorityId, departmentId, typeId, userId, ownerStaffId,
 // unassigned, search (subject/mask/email/name). Excludes merged-away tickets.
 
-getTicket(id: number): Promise<TicketDetail>
+getTicket(id: number, actor?: TicketAccessActor): Promise<TicketDetail>
 // Includes: posts (with attachments), notes, watchers, tags, auditLogs (last 50).
 
-getTicketByMask(mask: string): Promise<TicketDetail>
+getTicketByMask(mask: string, actor?: TicketAccessActor): Promise<TicketDetail>
 // Same as getTicket but looks up by human-readable mask, e.g. "TT-000042".
 
-reply(ticketId: number, dto: InternalReplyTicketInput, staffId?: number): Promise<TicketPost | TicketNote>
+reply(ticketId: number, dto: InternalReplyTicketInput, staffId?: number, actor?: TicketAccessActor): Promise<TicketPost | TicketNote>
 // Atomically appends the post, adopts attachments, updates counters/status and writes audit.
 // Sets firstResponseAt on first staff reply. Trusted inbound callers may set
 // incomingMessageId; a duplicate returns the exact existing post with no side effects.
 // If dto.isNote is true, delegates to addNote() and forwards attachmentIds.
 
-addNote(ticketId: number, contents: string, staffId?: number, attachmentIds?: number[]): Promise<TicketNote>
+addNote(ticketId: number, contents: string, staffId?: number, attachmentIds?: number[], actor?: TicketAccessActor): Promise<TicketNote>
 // Internal-only note; note creation, attachment adoption, ticket flags and audit
 // commit in one transaction.
 

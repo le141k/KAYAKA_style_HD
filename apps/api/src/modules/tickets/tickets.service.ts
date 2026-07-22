@@ -1,4 +1,11 @@
-import { BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  Optional,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -10,6 +17,7 @@ import { AttachmentsService } from '../attachments/attachments.service';
 import { NotificationService } from './notification.service';
 import { formatTicketMask } from './ticket-mask.util';
 import { normalizeEmail } from '../../common/email.util';
+import { TicketAccessPolicy, type TicketAccessActor } from './ticket-access-policy.service';
 import type {
   CreateTicketDto,
   ReplyTicketDto,
@@ -155,6 +163,7 @@ export class TicketsService {
     private readonly adminService: AdminService,
     @Optional() private readonly attachmentsService?: AttachmentsService,
     @Optional() private readonly notificationService?: NotificationService,
+    @Optional() private readonly ticketAccess?: TicketAccessPolicy,
   ) {}
 
   // ─────────────────────────── Create ───────────────────────────
@@ -190,11 +199,25 @@ export class TicketsService {
     // trusted callers (controllers, alaris/inbound services) set them here.
     dto: InternalCreateTicketInput,
     creatorStaffId?: number,
+    actor?: TicketAccessActor,
   ): Promise<Ticket> {
+    if (actor) {
+      const ticketAccess = this.requireTicketAccess(actor);
+      await ticketAccess.assertCanAccessDepartment(actor, dto.departmentId);
+      if (dto.ownerStaffId != null) {
+        await ticketAccess.assertAssigneeCanHandleDepartments(dto.ownerStaffId, [dto.departmentId]);
+      }
+    }
     const incomingMessageId = this.normalizeIncomingMessageId(dto.incomingMessageId);
     if (incomingMessageId) {
       const existing = await this.findTicketByInboundMessageId(incomingMessageId);
-      if (existing) return existing;
+      if (existing) {
+        // A staff-facing call must not use an idempotency key as an alternate
+        // ticket lookup. HTTP DTOs cannot set this field, but enforcing the
+        // invariant here protects future internal callers too.
+        if (actor) await this.requireTicketAccess(actor).assertCanAccessTicket(actor, existing.id);
+        return existing;
+      }
     }
 
     const creationMode: CreationMode = dto.creationMode ?? 'STAFF';
@@ -632,37 +655,43 @@ export class TicketsService {
 
   // ─────────────────────────── List ───────────────────────────
 
-  async listTickets(query: ListTicketsQueryDto): Promise<{ data: Ticket[]; total: number }> {
+  async listTickets(
+    query: ListTicketsQueryDto,
+    actor?: TicketAccessActor,
+  ): Promise<{ data: Ticket[]; total: number }> {
     const { page, limit, sortBy, sortDir, unassigned, search, sla_breached, ...filters } = query;
 
-    const where: Record<string, unknown> = {};
+    // Keep the caller's filters and department policy as separate AND terms.
+    // Assigning `departmentId` directly onto an existing scope object would let a
+    // query parameter replace `{ in: allowedDepartments }` with an arbitrary id.
+    const requestedWhere: Record<string, unknown> = {};
 
-    if (filters.statusId !== undefined) where['statusId'] = filters.statusId;
-    if (filters.priorityId !== undefined) where['priorityId'] = filters.priorityId;
-    if (filters.departmentId !== undefined) where['departmentId'] = filters.departmentId;
-    if (filters.typeId !== undefined) where['typeId'] = filters.typeId;
-    if (filters.userId !== undefined) where['userId'] = filters.userId;
-    if (filters.isResolved !== undefined) where['isResolved'] = filters.isResolved;
+    if (filters.statusId !== undefined) requestedWhere['statusId'] = filters.statusId;
+    if (filters.priorityId !== undefined) requestedWhere['priorityId'] = filters.priorityId;
+    if (filters.departmentId !== undefined) requestedWhere['departmentId'] = filters.departmentId;
+    if (filters.typeId !== undefined) requestedWhere['typeId'] = filters.typeId;
+    if (filters.userId !== undefined) requestedWhere['userId'] = filters.userId;
+    if (filters.isResolved !== undefined) requestedWhere['isResolved'] = filters.isResolved;
 
-    if (filters.ownerStaffId !== undefined) where['ownerStaffId'] = filters.ownerStaffId;
-    if (unassigned) where['ownerStaffId'] = null;
+    if (filters.ownerStaffId !== undefined) requestedWhere['ownerStaffId'] = filters.ownerStaffId;
+    if (unassigned) requestedWhere['ownerStaffId'] = null;
 
     // SLA breach is computed server-side: unresolved tickets whose dueAt is in the
     // past. (Previously filtered client-side, which broke counts across pages.)
     if (sla_breached) {
-      where['isResolved'] = false;
-      where['dueAt'] = { lt: new Date() };
+      requestedWhere['isResolved'] = false;
+      requestedWhere['dueAt'] = { lt: new Date() };
     }
 
     if (filters.createdAfter || filters.createdBefore) {
-      where['createdAt'] = {
+      requestedWhere['createdAt'] = {
         ...(filters.createdAfter ? { gte: filters.createdAfter } : {}),
         ...(filters.createdBefore ? { lte: filters.createdBefore } : {}),
       };
     }
 
     if (search) {
-      where['OR'] = [
+      requestedWhere['OR'] = [
         { subject: { contains: search, mode: 'insensitive' } },
         { mask: { contains: search } },
         { requesterEmail: { contains: search, mode: 'insensitive' } },
@@ -671,7 +700,16 @@ export class TicketsService {
     }
 
     // Exclude merged-away tickets from the main list
-    where['mergedIntoId'] = null;
+    requestedWhere['mergedIntoId'] = null;
+
+    const where: Prisma.TicketWhereInput = actor
+      ? {
+          AND: [
+            await this.requireTicketAccess(actor).ticketWhere(actor),
+            requestedWhere as Prisma.TicketWhereInput,
+          ],
+        }
+      : (requestedWhere as Prisma.TicketWhereInput);
 
     const [data, total] = await Promise.all([
       this.prisma.ticket.findMany({
@@ -700,9 +738,8 @@ export class TicketsService {
 
   // ─────────────────────────── Get ───────────────────────────
 
-  async getTicket(id: number): Promise<TicketDetail> {
-    const ticket = await this.prisma.ticket.findUnique({
-      where: { id },
+  async getTicket(id: number, actor?: TicketAccessActor): Promise<TicketDetail> {
+    const query = {
       include: {
         status: true,
         priority: true,
@@ -743,7 +780,13 @@ export class TicketsService {
         auditLogs: { orderBy: { createdAt: 'desc' }, take: 50 },
         recipients: { orderBy: { addedAt: 'asc' } },
       },
-    });
+    } as const;
+    const ticket = actor
+      ? await this.prisma.ticket.findFirst({
+          ...query,
+          where: { AND: [{ id }, await this.requireTicketAccess(actor).ticketWhere(actor)] },
+        })
+      : await this.prisma.ticket.findUnique({ ...query, where: { id } });
 
     if (!ticket) throw new NotFoundException(`Ticket ${id} not found`);
     ticket.customFields = (await this.adminService.decryptCustomFields(
@@ -753,9 +796,8 @@ export class TicketsService {
     return ticket as unknown as TicketDetail;
   }
 
-  async getTicketByMask(mask: string): Promise<TicketDetail> {
-    const ticket = await this.prisma.ticket.findUnique({
-      where: { mask },
+  async getTicketByMask(mask: string, actor?: TicketAccessActor): Promise<TicketDetail> {
+    const query = {
       include: {
         status: true,
         priority: true,
@@ -787,7 +829,13 @@ export class TicketsService {
         tags: { select: { name: true } },
         auditLogs: { orderBy: { createdAt: 'desc' }, take: 50 },
       },
-    });
+    } as const;
+    const ticket = actor
+      ? await this.prisma.ticket.findFirst({
+          ...query,
+          where: { AND: [{ mask }, await this.requireTicketAccess(actor).ticketWhere(actor)] },
+        })
+      : await this.prisma.ticket.findUnique({ ...query, where: { mask } });
 
     if (!ticket) throw new NotFoundException(`Ticket ${mask} not found`);
     ticket.customFields = (await this.adminService.decryptCustomFields(
@@ -805,25 +853,39 @@ export class TicketsService {
     // controller forces STAFF + real ip; inbound mail passes EMAIL explicitly.
     dto: InternalReplyTicketInput,
     staffId?: number,
+    actor?: TicketAccessActor,
   ): Promise<TicketPost | TicketNote> {
     const incomingMessageId = this.normalizeIncomingMessageId(dto.incomingMessageId);
     if (dto.isNote) {
       if (incomingMessageId) {
         throw new BadRequestException('Inbound Message-ID cannot be assigned to an internal note');
       }
-      return this.addNote(ticketId, dto.contents, staffId, dto.attachmentIds);
+      return actor
+        ? this.addNote(ticketId, dto.contents, staffId, dto.attachmentIds, actor)
+        : this.addNote(ticketId, dto.contents, staffId, dto.attachmentIds);
     }
+
+    // Fast-path ordinary redelivery before doing any ticket/author work. The
+    // inbound-only unique index remains the concurrency-safe arbiter below; do
+    // not let a spoofed staff outbound threading Message-ID suppress this mail.
+    // Staff-facing calls authorize their requested ticket before looking at a
+    // duplicate key. This prevents a future caller from turning a known
+    // Message-ID into an alternate read path for another department.
+    const actorTicket = actor ? await this.findAccessibleOrThrow(ticketId, actor) : undefined;
 
     // Fast-path ordinary redelivery before doing any ticket/author work. The
     // inbound-only unique index remains the concurrency-safe arbiter below; do
     // not let a spoofed staff outbound threading Message-ID suppress this mail.
     if (incomingMessageId) {
       const existing = await this.findPostByInboundMessageId(incomingMessageId);
-      if (existing) return existing;
+      if (existing) {
+        if (actor && existing.ticketId !== ticketId)
+          throw new NotFoundException(`Ticket ${ticketId} not found`);
+        return existing;
+      }
     }
 
-    const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
-    if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
+    const ticket = actorTicket ?? (await this.findAccessibleOrThrow(ticketId));
 
     if (dto.attachmentIds?.length && !this.attachmentsService) {
       throw new BadRequestException('Attachment service is unavailable');
@@ -995,7 +1057,11 @@ export class TicketsService {
     } catch (err) {
       if (incomingMessageId && this.isUniqueConstraintViolation(err)) {
         const existing = await this.findPostByInboundMessageId(incomingMessageId);
-        if (existing) return existing;
+        if (existing) {
+          if (actor && existing.ticketId !== ticketId)
+            throw new NotFoundException(`Ticket ${ticketId} not found`);
+          return existing;
+        }
       }
       throw err;
     }
@@ -1042,8 +1108,9 @@ export class TicketsService {
     contents: string,
     staffId?: number,
     attachmentIds?: number[],
+    actor?: TicketAccessActor,
   ): Promise<TicketNote> {
-    await this.findOrThrow(ticketId);
+    await this.findAccessibleOrThrow(ticketId, actor);
     if (attachmentIds?.length && !this.attachmentsService) {
       throw new BadRequestException('Attachment service is unavailable');
     }
@@ -1085,17 +1152,30 @@ export class TicketsService {
   async bulkAction(
     dto: BulkTicketActionDto,
     staffId: number,
+    actor?: TicketAccessActor,
   ): Promise<{ updated: number; failed: number[] }> {
     // Pre-validate: ids that don't exist (or were merged away) are reported in
     // `failed[]` and never touched. Bulk ops apply a direct field update + audit
     // atomically (no per-ticket notification/event spam — that's by design for a
     // batch); the resolved-status side effect is preserved inline.
+    const uniqueIds = [...new Set(dto.ids)];
+    const policyWhere = actor ? await this.requireTicketAccess(actor).ticketWhere(actor) : undefined;
     const existing = await this.prisma.ticket.findMany({
-      where: { id: { in: dto.ids }, mergedIntoId: null },
-      select: { id: true, isResolved: true, slaPlanId: true },
+      where: policyWhere
+        ? {
+            AND: [{ id: { in: uniqueIds }, mergedIntoId: null }, policyWhere],
+          }
+        : { id: { in: uniqueIds }, mergedIntoId: null },
+      select: { id: true, departmentId: true, isResolved: true, slaPlanId: true },
     });
     const existingIds = new Set(existing.map((t) => t.id));
-    const failed = dto.ids.filter((id) => !existingIds.has(id));
+    const failed = uniqueIds.filter((id) => !existingIds.has(id));
+    // Staff HTTP bulk requests are deliberately all-or-nothing.  Otherwise a
+    // single hidden department id would let an agent mutate the visible subset
+    // and use `failed[]` as a cross-department existence oracle.
+    if (actor && failed.length > 0) {
+      throw new NotFoundException('One or more tickets not found');
+    }
     if (existing.length === 0) return { updated: 0, failed };
 
     let status: { markAsResolved: boolean } | null = null;
@@ -1108,7 +1188,13 @@ export class TicketsService {
     }
     // E3: validate the bulk assignee once before the transaction (clean 404 vs FK 500).
     if (dto.action === 'assignee' && dto.ownerStaffId != null) {
-      await this.assertAssignableStaff(dto.ownerStaffId);
+      if (actor) {
+        await this.requireTicketAccess(actor).assertAssigneeCanHandleDepartments(dto.ownerStaffId, [
+          ...new Set(existing.map((ticket) => ticket.departmentId)),
+        ]);
+      } else {
+        await this.assertAssignableStaff(dto.ownerStaffId);
+      }
     }
 
     const now = new Date();
@@ -1157,13 +1243,24 @@ export class TicketsService {
     return { updated: existing.length, failed };
   }
 
-  async assign(ticketId: number, dto: AssignTicketDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
+  async assign(
+    ticketId: number,
+    dto: AssignTicketDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
 
     // E3: validate the assignee exists (and is enabled) up front — a bad id would
     // otherwise surface as an opaque FK 500 from the update below.
     if (dto.ownerStaffId != null) {
-      await this.assertAssignableStaff(dto.ownerStaffId);
+      if (actor) {
+        await this.requireTicketAccess(actor).assertAssigneeCanHandleDepartments(dto.ownerStaffId, [
+          ticket.departmentId,
+        ]);
+      } else {
+        await this.assertAssignableStaff(dto.ownerStaffId);
+      }
     }
 
     const updated = await this.prisma.ticket.update({
@@ -1191,8 +1288,13 @@ export class TicketsService {
 
   // ─────────────────────────── Status / Priority / Type ───────────────────────────
 
-  async changeStatus(ticketId: number, dto: ChangeStatusDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
+  async changeStatus(
+    ticketId: number,
+    dto: ChangeStatusDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
     const status = await this.prisma.ticketStatus.findUnique({ where: { id: dto.statusId } });
     if (!status) throw new NotFoundException(`Status ${dto.statusId} not found`);
 
@@ -1247,8 +1349,13 @@ export class TicketsService {
     return updated;
   }
 
-  async changePriority(ticketId: number, dto: ChangePriorityDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
+  async changePriority(
+    ticketId: number,
+    dto: ChangePriorityDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
 
     const updated = await this.prisma.ticket.update({
       where: { id: ticketId },
@@ -1264,8 +1371,13 @@ export class TicketsService {
     return updated;
   }
 
-  async changeType(ticketId: number, dto: ChangeTypeDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
+  async changeType(
+    ticketId: number,
+    dto: ChangeTypeDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
 
     const updated = await this.prisma.ticket.update({
       where: { id: ticketId },
@@ -1287,9 +1399,14 @@ export class TicketsService {
    * Merge the source ticket into the target ticket.
    * All posts from source are re-parented to the target; source is marked merged.
    */
-  async merge(sourceTicketId: number, dto: MergeTicketDto, staffId: number): Promise<Ticket> {
-    const source = await this.findOrThrow(sourceTicketId);
-    const target = await this.findOrThrow(dto.targetTicketId);
+  async merge(
+    sourceTicketId: number,
+    dto: MergeTicketDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const source = await this.findAccessibleOrThrow(sourceTicketId, actor);
+    const target = await this.findAccessibleOrThrow(dto.targetTicketId, actor);
 
     if (source.id === target.id) {
       throw new BadRequestException('Cannot merge a ticket into itself');
@@ -1376,8 +1493,13 @@ export class TicketsService {
    * Creates a new ticket with the given subject and moves the selected posts to it.
    * Writes SPLIT audit entries on both tickets.
    */
-  async split(sourceTicketId: number, dto: SplitTicketDto, staffId: number): Promise<Ticket> {
-    const source = await this.findOrThrow(sourceTicketId);
+  async split(
+    sourceTicketId: number,
+    dto: SplitTicketDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const source = await this.findAccessibleOrThrow(sourceTicketId, actor);
 
     if (!dto.postIds.length) {
       throw new BadRequestException('postIds must not be empty');
@@ -1396,6 +1518,16 @@ export class TicketsService {
     const statusId = await this.defaultStatusId();
     const priorityId = source.priorityId;
     const departmentId = dto.departmentId ?? source.departmentId;
+
+    if (actor) {
+      const ticketAccess = this.requireTicketAccess(actor);
+      // The actor must be authorized for both the source and the target
+      // department: a split is otherwise a cross-department exfiltration path.
+      await ticketAccess.assertCanAccessDepartment(actor, departmentId);
+      if (source.ownerStaffId != null) {
+        await ticketAccess.assertAssigneeCanHandleDepartments(source.ownerStaffId, [departmentId]);
+      }
+    }
 
     const now = new Date();
 
@@ -1472,8 +1604,16 @@ export class TicketsService {
 
   // ─────────────────────────── Watchers ───────────────────────────
 
-  async addWatcher(ticketId: number, dto: WatcherDto): Promise<void> {
-    await this.findOrThrow(ticketId);
+  async addWatcher(ticketId: number, dto: WatcherDto, actor?: TicketAccessActor): Promise<void> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
+    if (actor) {
+      // A watcher receives ticket activity; allowing a restricted staff member
+      // to add an out-of-department watcher would leak the same data via
+      // notifications even though direct detail access is blocked.
+      await this.requireTicketAccess(actor).assertAssigneeCanHandleDepartments(dto.staffId, [
+        ticket.departmentId,
+      ]);
+    }
     await this.prisma.ticketWatcher.upsert({
       where: { ticketId_staffId: { ticketId, staffId: dto.staffId } },
       create: { ticketId, staffId: dto.staffId },
@@ -1481,7 +1621,8 @@ export class TicketsService {
     });
   }
 
-  async removeWatcher(ticketId: number, staffId: number): Promise<void> {
+  async removeWatcher(ticketId: number, staffId: number, actor?: TicketAccessActor): Promise<void> {
+    if (actor) await this.findAccessibleOrThrow(ticketId, actor);
     await this.prisma.ticketWatcher.deleteMany({ where: { ticketId, staffId } });
   }
 
@@ -1493,14 +1634,17 @@ export class TicketsService {
    * is the backbone of the 23T broker model: a client ticket shows its supplier
    * ticket(s) and vice-versa.
    */
-  async listLinks(ticketId: number): Promise<
+  async listLinks(
+    ticketId: number,
+    actor?: TicketAccessActor,
+  ): Promise<
     Array<{
       linkId: number;
       linkType: string;
       ticket: { id: number; mask: string; subject: string; status: string | null; isResolved: boolean };
     }>
   > {
-    await this.findOrThrow(ticketId);
+    await this.findAccessibleOrThrow(ticketId, actor);
     const counterpart = {
       select: {
         id: true,
@@ -1510,8 +1654,16 @@ export class TicketsService {
         status: { select: { title: true } },
       },
     } as const;
+    const counterpartScope = actor ? await this.requireTicketAccess(actor).ticketWhere(actor) : undefined;
     const links = await this.prisma.ticketLink.findMany({
-      where: { OR: [{ sourceId: ticketId }, { targetId: ticketId }] },
+      where: counterpartScope
+        ? {
+            OR: [
+              { sourceId: ticketId, target: { is: counterpartScope } },
+              { targetId: ticketId, source: { is: counterpartScope } },
+            ],
+          }
+        : { OR: [{ sourceId: ticketId }, { targetId: ticketId }] },
       include: { source: counterpart, target: counterpart },
     });
     // Inverse label so the counterpart reads correctly from the other side.
@@ -1536,12 +1688,13 @@ export class TicketsService {
   async addLink(
     ticketId: number,
     dto: LinkTicketDto,
+    actor?: TicketAccessActor,
   ): Promise<{ linkId: number; linkType: string; targetId: number }> {
     if (dto.targetId === ticketId) {
       throw new BadRequestException('A ticket cannot be linked to itself');
     }
-    await this.findOrThrow(ticketId);
-    await this.findOrThrow(dto.targetId);
+    await this.findAccessibleOrThrow(ticketId, actor);
+    await this.findAccessibleOrThrow(dto.targetId, actor);
 
     // Reject a duplicate in either direction (the @@unique only covers one).
     const existing = await this.prisma.ticketLink.findFirst({
@@ -1560,11 +1713,17 @@ export class TicketsService {
     return { linkId: link.id, linkType: link.linkType, targetId: link.targetId };
   }
 
-  async removeLink(ticketId: number, linkId: number): Promise<void> {
+  async removeLink(ticketId: number, linkId: number, actor?: TicketAccessActor): Promise<void> {
     // Scope the delete to links that actually involve this ticket (either end).
     const link = await this.prisma.ticketLink.findUnique({ where: { id: linkId } });
     if (!link || (link.sourceId !== ticketId && link.targetId !== ticketId)) {
       throw new NotFoundException(`Link ${linkId} not found on ticket ${ticketId}`);
+    }
+    // A link exposes and changes both sides.  Checking just the route ticket
+    // would let Department A delete an A↔B relationship without B access.
+    if (actor) {
+      await this.findAccessibleOrThrow(link.sourceId, actor);
+      await this.findAccessibleOrThrow(link.targetId, actor);
     }
     await this.prisma.ticketLink.delete({ where: { id: linkId } });
   }
@@ -1580,39 +1739,42 @@ export class TicketsService {
     clientTicketId: number,
     dto: SpawnSupplierDto,
     staffId: number,
+    actor?: TicketAccessActor,
   ): Promise<{ ticket: Ticket; linkId: number; clientTicketId: number }> {
-    const client = await this.findOrThrow(clientTicketId);
+    const client = await this.findAccessibleOrThrow(clientTicketId, actor);
     // Prefer a "Vendor Issue" type; fall back to leaving it unset.
     const vendorType = await this.prisma.ticketType.findFirst({
       where: { title: { in: ['Vendor Issue', 'Vendor', 'Supplier Issue'] } },
       select: { id: true },
     });
 
-    const supplier = await this.createTicket(
-      {
-        subject: dto.subject ?? `[Supplier] ${client.subject}`,
-        contents: dto.contents,
-        isHtml: false,
-        departmentId: client.departmentId,
-        ...(vendorType ? { typeId: vendorType.id } : {}),
-        requesterEmail: dto.supplierEmail,
-        requesterName: dto.supplierName ?? '',
-        creationMode: 'STAFF',
-        ipAddress: '0.0.0.0',
-        customFields: {},
-        tags: [],
-      },
-      staffId,
-    );
+    const supplierInput = {
+      subject: dto.subject ?? `[Supplier] ${client.subject}`,
+      contents: dto.contents,
+      isHtml: false,
+      departmentId: client.departmentId,
+      ...(vendorType ? { typeId: vendorType.id } : {}),
+      requesterEmail: dto.supplierEmail,
+      requesterName: dto.supplierName ?? '',
+      creationMode: 'STAFF' as const,
+      ipAddress: '0.0.0.0',
+      customFields: {},
+      tags: [],
+    };
+    const supplier = actor
+      ? await this.createTicket(supplierInput, staffId, actor)
+      : await this.createTicket(supplierInput, staffId);
 
-    const link = await this.addLink(clientTicketId, { targetId: supplier.id, linkType: 'supplier' });
+    const link = actor
+      ? await this.addLink(clientTicketId, { targetId: supplier.id, linkType: 'supplier' }, actor)
+      : await this.addLink(clientTicketId, { targetId: supplier.id, linkType: 'supplier' });
     return { ticket: supplier, linkId: link.linkId, clientTicketId };
   }
 
   // ─────────────────────────── Tags ───────────────────────────
 
-  async addTag(ticketId: number, dto: TagDto): Promise<void> {
-    await this.findOrThrow(ticketId);
+  async addTag(ticketId: number, dto: TagDto, actor?: TicketAccessActor): Promise<void> {
+    await this.findAccessibleOrThrow(ticketId, actor);
     await this.prisma.ticket.update({
       where: { id: ticketId },
       data: {
@@ -1626,8 +1788,8 @@ export class TicketsService {
     });
   }
 
-  async removeTag(ticketId: number, tagName: string): Promise<void> {
-    await this.findOrThrow(ticketId);
+  async removeTag(ticketId: number, tagName: string, actor?: TicketAccessActor): Promise<void> {
+    await this.findAccessibleOrThrow(ticketId, actor);
     const tag = await this.prisma.ticketTag.findUnique({ where: { name: tagName } });
     if (!tag) return; // idempotent
     await this.prisma.ticket.update({
@@ -1644,8 +1806,13 @@ export class TicketsService {
    * Each action in actions[] is executed (set_status / set_priority / assign / add_tag /
    * change_status / change_priority / change_owner / add_tag — tolerates both naming schemes).
    */
-  async applyMacro(ticketId: number, dto: ApplyMacroDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
+  async applyMacro(
+    ticketId: number,
+    dto: ApplyMacroDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
 
     const macro = await this.prisma.macro.findUnique({ where: { id: dto.macroId } });
     if (!macro) throw new NotFoundException(`Macro ${dto.macroId} not found`);
@@ -1767,7 +1934,8 @@ export class TicketsService {
       if (ticketUpdate['statusId']) {
         const sid = ticketUpdate['statusId'] as number;
         if (await this.prisma.ticketStatus.findUnique({ where: { id: sid } })) {
-          await this.changeStatus(ticketId, { statusId: sid }, staffId);
+          if (actor) await this.changeStatus(ticketId, { statusId: sid }, staffId, actor);
+          else await this.changeStatus(ticketId, { statusId: sid }, staffId);
         } else {
           this.logger.warn(`Macro ${macro.id}: skipped set_status — status ${sid} not found`);
         }
@@ -1775,7 +1943,8 @@ export class TicketsService {
       if (ticketUpdate['priorityId']) {
         const pid = ticketUpdate['priorityId'] as number;
         if (await this.prisma.ticketPriority.findUnique({ where: { id: pid } })) {
-          await this.changePriority(ticketId, { priorityId: pid }, staffId);
+          if (actor) await this.changePriority(ticketId, { priorityId: pid }, staffId, actor);
+          else await this.changePriority(ticketId, { priorityId: pid }, staffId);
         } else {
           this.logger.warn(`Macro ${macro.id}: skipped set_priority — priority ${pid} not found`);
         }
@@ -1783,7 +1952,8 @@ export class TicketsService {
       if (ticketUpdate['departmentId']) {
         const did = ticketUpdate['departmentId'] as number;
         if (await this.prisma.department.findUnique({ where: { id: did } })) {
-          await this.changeDepartment(ticketId, { departmentId: did }, staffId);
+          if (actor) await this.changeDepartment(ticketId, { departmentId: did }, staffId, actor);
+          else await this.changeDepartment(ticketId, { departmentId: did }, staffId);
         } else {
           this.logger.warn(`Macro ${macro.id}: skipped change_department — department ${did} not found`);
         }
@@ -1791,9 +1961,11 @@ export class TicketsService {
       if ('ownerStaffId' in ticketUpdate) {
         const oid = ticketUpdate['ownerStaffId'] as number | null;
         if (oid == null) {
-          await this.assign(ticketId, { ownerStaffId: null }, staffId);
+          if (actor) await this.assign(ticketId, { ownerStaffId: null }, staffId, actor);
+          else await this.assign(ticketId, { ownerStaffId: null }, staffId);
         } else if (await this.prisma.staff.findUnique({ where: { id: oid } })) {
-          await this.assign(ticketId, { ownerStaffId: oid }, staffId);
+          if (actor) await this.assign(ticketId, { ownerStaffId: oid }, staffId, actor);
+          else await this.assign(ticketId, { ownerStaffId: oid }, staffId);
         } else {
           this.logger.warn(`Macro ${macro.id}: skipped assign — staff ${oid} not found`);
         }
@@ -1814,8 +1986,21 @@ export class TicketsService {
   /**
    * Change the department a ticket belongs to.
    */
-  async changeDepartment(ticketId: number, dto: ChangeDepartmentDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
+  async changeDepartment(
+    ticketId: number,
+    dto: ChangeDepartmentDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
+
+    if (actor) {
+      const ticketAccess = this.requireTicketAccess(actor);
+      await ticketAccess.assertCanAccessDepartment(actor, dto.departmentId);
+      if (ticket.ownerStaffId != null) {
+        await ticketAccess.assertAssigneeCanHandleDepartments(ticket.ownerStaffId, [dto.departmentId]);
+      }
+    }
 
     const dept = await this.prisma.department.findUnique({ where: { id: dto.departmentId } });
     if (!dept) throw new NotFoundException(`Department ${dto.departmentId} not found`);
@@ -2020,6 +2205,28 @@ export class TicketsService {
     const t = await this.prisma.ticket.findUnique({ where: { id } });
     if (!t) throw new NotFoundException(`Ticket ${id} not found`);
     return t;
+  }
+
+  /**
+   * Trusted mail/workflow calls deliberately omit an actor and retain their
+   * system path.  Every staff HTTP controller supplies one; fail closed if its
+   * policy provider is unexpectedly absent rather than silently falling back to
+   * an unscoped lookup.
+   */
+  private requireTicketAccess(actor: TicketAccessActor): TicketAccessPolicy {
+    if (this.ticketAccess) return this.ticketAccess;
+    throw new ServiceUnavailableException(`Ticket access policy is unavailable for staff ${actor.staffId}`);
+  }
+
+  private async findAccessibleOrThrow(id: number, actor?: TicketAccessActor): Promise<Ticket> {
+    if (!actor) return this.findOrThrow(id);
+    const ticket = await this.prisma.ticket.findFirst({
+      where: {
+        AND: [{ id }, await this.requireTicketAccess(actor).ticketWhere(actor)],
+      },
+    });
+    if (!ticket) throw new NotFoundException(`Ticket ${id} not found`);
+    return ticket;
   }
 
   /** E3: a ticket can only be assigned to an existing, enabled staff member. */

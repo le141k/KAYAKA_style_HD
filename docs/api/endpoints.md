@@ -47,6 +47,13 @@ All routes are under the `/api` global prefix.
 > `POST /api/tickets/public` (create) and `POST /api/attachments/upload/public` remain gated by
 > `ClientPortalGuard` (fail-closed **404 in production** until S4 abuse controls land; override
 > with `TELECOM_HD_CLIENT_PORTAL_ENABLED=true`, not before S4). Dev/test are unaffected.
+>
+> **Staff department scope (ACL-01).** Permission is necessary but not sufficient for every
+> staff ticket route below, ticket recipients, ticket-linked attachment download, time entries and
+> follow-ups. Administrators and staff with no `DepartmentStaff` assignments are unrestricted;
+> otherwise the API applies the department predicate in SQL and returns the same 404 for a missing
+> or inaccessible ticket. A bulk request is all-or-nothing, links/merges require both ticket sides,
+> and assigning or moving a ticket validates the assignee and target department.
 
 ## Client auth (verified customer sessions — S2)
 

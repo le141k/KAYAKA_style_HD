@@ -25,14 +25,14 @@ export class FollowUpsController {
     @Body(new ZodValidationPipe(CreateFollowUpSchema)) dto: CreateFollowUpDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.followUpsService.create(id, staff.staffId, dto);
+    return this.followUpsService.create(id, staff.staffId, dto, staff);
   }
 
   @Get('tickets/:id/follow-ups')
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   @ApiOperation({ summary: 'List follow-ups for a ticket (ordered by due date)' })
-  list(@Param('id', ParseIntPipe) id: number) {
-    return this.followUpsService.listForTicket(id);
+  list(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
+    return this.followUpsService.listForTicket(id, staff);
   }
 
   @Patch('follow-ups/:id')
@@ -44,7 +44,7 @@ export class FollowUpsController {
     @CurrentStaff() staff: AuthStaff,
   ) {
     const canManageOthers = staff.isAdmin || staff.permissions.includes(PERMISSIONS.STAFF_MANAGE);
-    return this.followUpsService.setCompleted(id, dto.completed, staff.staffId, canManageOthers);
+    return this.followUpsService.setCompleted(id, dto.completed, staff.staffId, canManageOthers, staff);
   }
 
   @Delete('follow-ups/:id')
@@ -52,6 +52,6 @@ export class FollowUpsController {
   @ApiOperation({ summary: 'Delete a follow-up (owner, or admin/STAFF_MANAGE)' })
   remove(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
     const canManageOthers = staff.isAdmin || staff.permissions.includes(PERMISSIONS.STAFF_MANAGE);
-    return this.followUpsService.remove(id, staff.staffId, canManageOthers);
+    return this.followUpsService.remove(id, staff.staffId, canManageOthers, staff);
   }
 }

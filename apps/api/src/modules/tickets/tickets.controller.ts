@@ -184,22 +184,25 @@ export class TicketsController {
   @Get()
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   @ApiOperation({ summary: 'List tickets with filters and pagination' })
-  list(@Query(new ZodValidationPipe(ListTicketsQuerySchema)) query: ListTicketsQueryDto) {
-    return this.ticketsService.listTickets(query);
+  list(
+    @Query(new ZodValidationPipe(ListTicketsQuerySchema)) query: ListTicketsQueryDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.ticketsService.listTickets(query, staff);
   }
 
   @Get(':id')
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   @ApiOperation({ summary: 'Get a ticket by numeric ID (with posts, notes, watchers, tags)' })
-  get(@Param('id', ParseIntPipe) id: number) {
-    return this.ticketsService.getTicket(id);
+  get(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
+    return this.ticketsService.getTicket(id, staff);
   }
 
   @Get('by-mask/:mask')
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   @ApiOperation({ summary: 'Get a ticket by its human-readable mask (e.g. TT-000042)' })
-  getByMask(@Param('mask') mask: string) {
-    return this.ticketsService.getTicketByMask(mask);
+  getByMask(@Param('mask') mask: string, @CurrentStaff() staff: AuthStaff) {
+    return this.ticketsService.getTicketByMask(mask, staff);
   }
 
   @Post()
@@ -208,7 +211,11 @@ export class TicketsController {
   @ApiOperation({ summary: 'Create a ticket (staff)' })
   create(@Body() dto: CreateTicketDto, @CurrentStaff() staff: AuthStaff, @Ip() ip: string) {
     // Force a trusted creationMode + real client IP — never from the request body.
-    return this.ticketsService.createTicket({ ...dto, creationMode: 'STAFF', ipAddress: ip }, staff.staffId);
+    return this.ticketsService.createTicket(
+      { ...dto, creationMode: 'STAFF', ipAddress: ip },
+      staff.staffId,
+      staff,
+    );
   }
 
   @Post('bulk')
@@ -226,7 +233,7 @@ export class TicketsController {
     ) {
       throw new ForbiddenException('Bulk (un)assignment requires the ticket.assign permission');
     }
-    return this.ticketsService.bulkAction(dto, staff.staffId);
+    return this.ticketsService.bulkAction(dto, staff.staffId, staff);
   }
 
   @Post(':id/reply')
@@ -239,7 +246,12 @@ export class TicketsController {
     @Ip() ip: string,
   ) {
     // Trusted creationMode + real client IP — never from the request body.
-    return this.ticketsService.reply(id, { ...dto, creationMode: 'STAFF', ipAddress: ip }, staff.staffId);
+    return this.ticketsService.reply(
+      id,
+      { ...dto, creationMode: 'STAFF', ipAddress: ip },
+      staff.staffId,
+      staff,
+    );
   }
 
   @Post(':id/notes')
@@ -250,7 +262,7 @@ export class TicketsController {
     @Body(new ZodValidationPipe(AddNoteSchema)) dto: AddNoteDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.addNote(id, dto.contents, staff.staffId, dto.attachmentIds);
+    return this.ticketsService.addNote(id, dto.contents, staff.staffId, dto.attachmentIds, staff);
   }
 
   @Patch(':id/assign')
@@ -261,7 +273,7 @@ export class TicketsController {
     @Body(new ZodValidationPipe(AssignTicketSchema)) dto: AssignTicketDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.assign(id, dto, staff.staffId);
+    return this.ticketsService.assign(id, dto, staff.staffId, staff);
   }
 
   @Patch(':id/status')
@@ -272,7 +284,7 @@ export class TicketsController {
     @Body(new ZodValidationPipe(ChangeStatusSchema)) dto: ChangeStatusDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.changeStatus(id, dto, staff.staffId);
+    return this.ticketsService.changeStatus(id, dto, staff.staffId, staff);
   }
 
   @Patch(':id/priority')
@@ -283,7 +295,7 @@ export class TicketsController {
     @Body(new ZodValidationPipe(ChangePrioritySchema)) dto: ChangePriorityDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.changePriority(id, dto, staff.staffId);
+    return this.ticketsService.changePriority(id, dto, staff.staffId, staff);
   }
 
   @Patch(':id/type')
@@ -294,7 +306,7 @@ export class TicketsController {
     @Body(new ZodValidationPipe(ChangeTypeSchema)) dto: ChangeTypeDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.changeType(id, dto, staff.staffId);
+    return this.ticketsService.changeType(id, dto, staff.staffId, staff);
   }
 
   @Post(':id/merge')
@@ -306,7 +318,7 @@ export class TicketsController {
     @Body(new ZodValidationPipe(MergeTicketSchema)) dto: MergeTicketDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.merge(id, dto, staff.staffId);
+    return this.ticketsService.merge(id, dto, staff.staffId, staff);
   }
 
   @Post(':id/split')
@@ -318,7 +330,7 @@ export class TicketsController {
     @Body(new ZodValidationPipe(SplitTicketSchema)) dto: SplitTicketDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.split(id, dto, staff.staffId);
+    return this.ticketsService.split(id, dto, staff.staffId, staff);
   }
 
   @Post(':id/apply-macro')
@@ -330,7 +342,7 @@ export class TicketsController {
     @Body(new ZodValidationPipe(ApplyMacroSchema)) dto: ApplyMacroDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.applyMacro(id, dto, staff.staffId);
+    return this.ticketsService.applyMacro(id, dto, staff.staffId, staff);
   }
 
   @Patch(':id/department')
@@ -341,7 +353,7 @@ export class TicketsController {
     @Body(new ZodValidationPipe(ChangeDepartmentSchema)) dto: ChangeDepartmentDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.changeDepartment(id, dto, staff.staffId);
+    return this.ticketsService.changeDepartment(id, dto, staff.staffId, staff);
   }
 
   // ─────────────────── Watchers ───────────────────
@@ -353,16 +365,21 @@ export class TicketsController {
   addWatcher(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(WatcherSchema)) dto: WatcherDto,
+    @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.addWatcher(id, dto);
+    return this.ticketsService.addWatcher(id, dto, staff);
   }
 
   @Delete(':id/watchers/:staffId')
   @RequirePermissions(PERMISSIONS.TICKET_EDIT)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Remove a watcher from a ticket' })
-  removeWatcher(@Param('id', ParseIntPipe) id: number, @Param('staffId', ParseIntPipe) staffId: number) {
-    return this.ticketsService.removeWatcher(id, staffId);
+  removeWatcher(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('staffId', ParseIntPipe) staffId: number,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.ticketsService.removeWatcher(id, staffId, staff);
   }
 
   // ─────────────────── Ticket links (client ↔ supplier) ───────────────────
@@ -370,8 +387,8 @@ export class TicketsController {
   @Get(':id/links')
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   @ApiOperation({ summary: 'List tickets linked to this one (client ↔ supplier counterpart)' })
-  listLinks(@Param('id', ParseIntPipe) id: number) {
-    return this.ticketsService.listLinks(id);
+  listLinks(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
+    return this.ticketsService.listLinks(id, staff);
   }
 
   @Post(':id/links')
@@ -380,16 +397,21 @@ export class TicketsController {
   addLink(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(LinkTicketSchema)) dto: LinkTicketDto,
+    @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.addLink(id, dto);
+    return this.ticketsService.addLink(id, dto, staff);
   }
 
   @Delete(':id/links/:linkId')
   @RequirePermissions(PERMISSIONS.TICKET_EDIT)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Remove a link between two tickets' })
-  removeLink(@Param('id', ParseIntPipe) id: number, @Param('linkId', ParseIntPipe) linkId: number) {
-    return this.ticketsService.removeLink(id, linkId);
+  removeLink(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('linkId', ParseIntPipe) linkId: number,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.ticketsService.removeLink(id, linkId, staff);
   }
 
   @Post(':id/spawn-supplier')
@@ -400,7 +422,7 @@ export class TicketsController {
     @Body(new ZodValidationPipe(SpawnSupplierSchema)) dto: SpawnSupplierDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.ticketsService.spawnSupplierTicket(id, dto, staff.staffId);
+    return this.ticketsService.spawnSupplierTicket(id, dto, staff.staffId, staff);
   }
 
   // ─────────────────── Tags ───────────────────
@@ -409,15 +431,23 @@ export class TicketsController {
   @RequirePermissions(PERMISSIONS.TICKET_EDIT)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Add a tag to a ticket' })
-  addTag(@Param('id', ParseIntPipe) id: number, @Body(new ZodValidationPipe(TagSchema)) dto: TagDto) {
-    return this.ticketsService.addTag(id, dto);
+  addTag(
+    @Param('id', ParseIntPipe) id: number,
+    @Body(new ZodValidationPipe(TagSchema)) dto: TagDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.ticketsService.addTag(id, dto, staff);
   }
 
   @Delete(':id/tags/:name')
   @RequirePermissions(PERMISSIONS.TICKET_EDIT)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Remove a tag from a ticket' })
-  removeTag(@Param('id', ParseIntPipe) id: number, @Param('name') name: string) {
-    return this.ticketsService.removeTag(id, name);
+  removeTag(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('name') name: string,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.ticketsService.removeTag(id, name, staff);
   }
 }
