@@ -623,12 +623,19 @@ deleteTemplate(id): Promise<void>
 ```ts
 list(): Promise<Report[]>
 create(dto: { title, kind, definition }): Promise<Report>
-run(id: number): Promise<AggregatedRows>   // executes stored report definition
-execute(def: Definition): Promise<AggregatedRows>  // ad-hoc execution
-dashboard(): Promise<{ total, resolved, byStatus, byPriority }>
+run(id: number, actor: TicketAccessActor): Promise<AggregatedRows>
+execute(def: Definition, actor: TicketAccessActor): Promise<AggregatedRows>
+dashboard(actor: TicketAccessActor): Promise<{ total, resolved, byStatus, byPriority }>
 ```
 
 Definition schema supports: `source: 'tickets'`, `groupBy?: statusId|priorityId|departmentId|typeId|ownerStaffId|creationMode`, `filters`, `metric: 'count'`.
+
+`ReportCompiler.compile()` requires a `TicketAccessActor` and derives its `TicketWhereInput` scope
+from `TicketAccessPolicy`; it applies it directly for `tickets`, and through the parent `ticket`
+relation for `ticketPosts` / `ticketAuditLogs`. There is no unscoped compiler execution path.
+`ReportSchedule.ownerStaffId` is mandatory for new schedules;
+the worker re-loads that owner, checks enabled + `report.run`, derives its current department scope,
+and disables unsafe legacy/revoked schedules before any recipient email is sent.
 
 ---
 

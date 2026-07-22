@@ -18,6 +18,13 @@ function makePrismaMock() {
     reportRun: {
       create: vi.fn().mockResolvedValue({ id: 1 }),
     },
+    staff: {
+      findUnique: vi.fn().mockResolvedValue({
+        id: 7,
+        isEnabled: true,
+        staffGroup: { isAdmin: false, permissions: ['report.run'] },
+      }),
+    },
   } as unknown as PrismaService;
 }
 
@@ -94,6 +101,7 @@ describe('ReportScheduleProcessor', () => {
       {
         id: 1,
         reportId: 42,
+        ownerStaffId: 7,
         cron: '0 * * * *',
         recipients: [],
         isEnabled: true,
@@ -104,12 +112,13 @@ describe('ReportScheduleProcessor', () => {
 
     await processor.process(makeJob());
 
-    expect(compiler.compile).toHaveBeenCalledTimes(1);
+    expect(compiler.compile).toHaveBeenCalledWith(VALID_DEFINITION, { staffId: 7, isAdmin: false });
     expect(prisma.reportRun.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           reportId: 42,
           triggeredBy: 'schedule',
+          staffId: 7,
           rowCount: 2,
           error: null,
         }),
@@ -125,6 +134,7 @@ describe('ReportScheduleProcessor', () => {
       {
         id: 7,
         reportId: 1,
+        ownerStaffId: 7,
         cron: '0 0 * * *',
         recipients: [],
         isEnabled: true,
@@ -154,6 +164,7 @@ describe('ReportScheduleProcessor', () => {
       {
         id: 2,
         reportId: 5,
+        ownerStaffId: 7,
         cron: '*/5 * * * *',
         recipients: ['admin@example.com', 'manager@example.com'],
         isEnabled: true,
@@ -180,6 +191,7 @@ describe('ReportScheduleProcessor', () => {
       {
         id: 3,
         reportId: 10,
+        ownerStaffId: 7,
         cron: '0 9 * * 1',
         recipients: [],
         isEnabled: true,
@@ -203,6 +215,62 @@ describe('ReportScheduleProcessor', () => {
     expect(prisma.reportSchedule.update).toHaveBeenCalled();
   });
 
+  it('fails closed, does not send mail, and disables a legacy ownerless schedule', async () => {
+    (prisma.reportSchedule.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 30,
+        reportId: 10,
+        ownerStaffId: null,
+        cron: '0 9 * * 1',
+        recipients: ['recipient@example.com'],
+        isEnabled: true,
+        format: 'json',
+        report: { id: 10, title: 'Legacy', definition: VALID_DEFINITION },
+      },
+    ]);
+
+    await processor.process(makeJob());
+
+    expect(compiler.compile).not.toHaveBeenCalled();
+    expect(mail.send).not.toHaveBeenCalled();
+    expect(prisma.reportRun.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ error: expect.stringContaining('no owner'), rowCount: 0 }),
+      }),
+    );
+    expect(prisma.reportSchedule.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 30 }, data: expect.objectContaining({ isEnabled: false }) }),
+    );
+  });
+
+  it('fails closed and disables a schedule when its owner loses report.run', async () => {
+    (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 7,
+      isEnabled: true,
+      staffGroup: { isAdmin: false, permissions: [] },
+    });
+    (prisma.reportSchedule.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 31,
+        reportId: 10,
+        ownerStaffId: 7,
+        cron: '0 9 * * 1',
+        recipients: ['recipient@example.com'],
+        isEnabled: true,
+        format: 'json',
+        report: { id: 10, title: 'Revoked', definition: VALID_DEFINITION },
+      },
+    ]);
+
+    await processor.process(makeJob());
+
+    expect(compiler.compile).not.toHaveBeenCalled();
+    expect(mail.send).not.toHaveBeenCalled();
+    expect(prisma.reportSchedule.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 31 }, data: expect.objectContaining({ isEnabled: false }) }),
+    );
+  });
+
   // ─── Invalid definition → error stored ───────────────────────────────────
 
   it('stores parse error when report definition is invalid', async () => {
@@ -210,6 +278,7 @@ describe('ReportScheduleProcessor', () => {
       {
         id: 4,
         reportId: 20,
+        ownerStaffId: 7,
         cron: '0 * * * *',
         recipients: [],
         isEnabled: true,

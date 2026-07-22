@@ -54,6 +54,8 @@ All routes are under the `/api` global prefix.
 > otherwise the API applies the department predicate in SQL and returns the same 404 for a missing
 > or inaccessible ticket. A bulk request is all-or-nothing, links/merges require both ticket sides,
 > and assigning or moving a ticket validates the assignee and target department.
+> The same SQL predicate applies to `/api/reports/dashboard` and every ticket-derived report run,
+> including `ticketPosts` and `ticketAuditLogs` through their parent ticket.
 
 ## Client auth (verified customer sessions — S2)
 
@@ -237,12 +239,21 @@ pre-disable links or sessions; the customer must request a new link.
 
 ## Reports
 
-| Method | Path                   | Auth                | Body                                   | Returns                                       |
-| ------ | ---------------------- | ------------------- | -------------------------------------- | --------------------------------------------- |
-| GET    | /api/reports/dashboard | 🔒 `ticket.view`    | —                                      | `{total, resolved, byStatus[], byPriority[]}` |
-| GET    | /api/reports           | 🔒 `ticket.view`    | —                                      | `Report[]`                                    |
-| GET    | /api/reports/{id}/run  | 🔒 `ticket.view`    | —                                      | aggregated rows for stored report             |
-| POST   | /api/reports           | 🔒 `admin.settings` | `{title, kind, definition}` (KQL-lite) | Created report                                |
+| Method | Path                   | Auth               | Body                                   | Returns                                                         |
+| ------ | ---------------------- | ------------------ | -------------------------------------- | --------------------------------------------------------------- |
+| GET    | /api/reports/dashboard | 🔒 `ticket.view`   | —                                      | Department-scoped `{total, resolved, byStatus[], byPriority[]}` |
+| GET    | /api/reports           | 🔒 `report.run`    | —                                      | `Report[]`                                                      |
+| GET    | /api/reports/{id}/run  | 🔒 `report.run`    | —                                      | Department-scoped aggregated rows for stored report             |
+| POST   | /api/reports           | 🔒 `report.manage` | `{title, kind, definition}` (KQL-lite) | Created report                                                  |
+
+Scheduled reports record the authenticated creator as `ownerStaffId`. The worker resolves that
+owner's **current** enabled/RBAC/department state before every run; a missing, disabled or
+`report.run`-revoked owner is fail-closed and the schedule is disabled without sending mail.
+Managers can view/change only their own schedules; administrators can manage all schedules. The
+ownership migration disables legacy schedules because their historical owner is unknowable; recreate
+them explicitly after deployment. During rollout, pause old report workers, apply the migration,
+deploy this API/worker version, then resume workers—an old worker must not create or execute an
+ownerless schedule after the migration.
 
 ## Troubleshooter
 

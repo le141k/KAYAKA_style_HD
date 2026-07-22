@@ -7,7 +7,9 @@ import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
 import type { Job } from 'bullmq';
 import { PrismaService } from '../../prisma/prisma.service';
+import { PERMISSIONS } from '../../auth/permissions';
 import { MailService } from '../mail/mail.service';
+import type { TicketAccessActor } from '../tickets/ticket-access-policy.service';
 import { ReportCompiler } from './report-compiler';
 import { ReportDefinitionSchema } from './report-definition.schema';
 import { toCsv } from './reports.utils';
@@ -24,6 +26,9 @@ function advanceNextRunAt(cron: string, from: Date): Date {
     return new Date(from.getTime() + 60 * 60_000);
   }
 }
+
+/** A permanent owner problem: fail closed and stop the schedule until an admin recreates it. */
+class ScheduleOwnerUnavailableError extends Error {}
 
 // concurrency:1 + a long lockDuration so two scans can't overlap and double-send
 // a scheduled report (the nextRunAt "claim" is written only after the email send).
@@ -57,6 +62,7 @@ export class ReportScheduleProcessor extends WorkerHost {
     })) as Array<{
       id: number;
       reportId: number;
+      ownerStaffId: number | null;
       cron: string;
       recipients: string[];
       isEnabled: boolean;
@@ -77,6 +83,7 @@ export class ReportScheduleProcessor extends WorkerHost {
       const start = Date.now();
       let rowCount = 0;
       let errorMsg: string | undefined;
+      let disableSchedule = false;
 
       try {
         // Re-parse stored definition through schema (injection-safe)
@@ -85,7 +92,11 @@ export class ReportScheduleProcessor extends WorkerHost {
           throw new Error(`Invalid report definition: ${JSON.stringify(parsed.error.flatten())}`);
         }
 
-        const rows = await this.compiler.compile(parsed.data);
+        // Scheduled execution has no HTTP principal.  Resolve and re-authorize
+        // the persisted owner at run time; a disabled/de-privileged/missing
+        // owner must never turn this into a global aggregate query.
+        const owner = await this.resolveScheduleOwner(schedule.ownerStaffId);
+        const rows = await this.compiler.compile(parsed.data, owner);
         rowCount = rows.length;
 
         // Send email with results
@@ -109,6 +120,7 @@ export class ReportScheduleProcessor extends WorkerHost {
         }
       } catch (err) {
         errorMsg = err instanceof Error ? err.message : String(err);
+        disableSchedule = err instanceof ScheduleOwnerUnavailableError;
         this.logger.error(`Failed to run scheduled report ${schedule.reportId}: ${errorMsg}`);
       }
 
@@ -121,6 +133,7 @@ export class ReportScheduleProcessor extends WorkerHost {
         data: {
           reportId: schedule.reportId,
           triggeredBy: 'schedule',
+          staffId: schedule.ownerStaffId,
           rowCount,
           durationMs,
           error: errorMsg ?? null,
@@ -131,10 +144,41 @@ export class ReportScheduleProcessor extends WorkerHost {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (this.prisma.reportSchedule as any).update({
         where: { id: schedule.id },
-        data: { lastRunAt: now, nextRunAt },
+        data: {
+          lastRunAt: now,
+          nextRunAt,
+          ...(disableSchedule ? { isEnabled: false } : {}),
+        },
       });
     }
 
     this.logger.debug('Reports schedule-scan complete');
+  }
+
+  private async resolveScheduleOwner(ownerStaffId: number | null): Promise<TicketAccessActor> {
+    if (ownerStaffId === null) {
+      throw new ScheduleOwnerUnavailableError('Scheduled report has no owner and was disabled');
+    }
+
+    const owner = await this.prisma.staff.findUnique({
+      where: { id: ownerStaffId },
+      select: {
+        id: true,
+        isEnabled: true,
+        staffGroup: { select: { isAdmin: true, permissions: true } },
+      },
+    });
+    if (!owner || !owner.isEnabled) {
+      throw new ScheduleOwnerUnavailableError(
+        'Scheduled report owner is unavailable and the schedule was disabled',
+      );
+    }
+    if (!owner.staffGroup.isAdmin && !owner.staffGroup.permissions.includes(PERMISSIONS.REPORT_RUN)) {
+      throw new ScheduleOwnerUnavailableError(
+        'Scheduled report owner no longer has report.run permission and the schedule was disabled',
+      );
+    }
+
+    return { staffId: owner.id, isAdmin: owner.staffGroup.isAdmin };
   }
 }

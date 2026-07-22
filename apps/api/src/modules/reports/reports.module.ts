@@ -18,7 +18,7 @@ import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { BullModule, InjectQueue } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';
 import type { Response } from 'express';
-import { RequirePermissions } from '../../auth/auth.decorators';
+import { CurrentStaff, RequirePermissions, type AuthStaff } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import {
   ReportsService,
@@ -30,6 +30,7 @@ import { ReportCompiler } from './report-compiler';
 import { toCsv } from './reports.utils';
 import { ReportScheduleProcessor } from './report-schedule.processor';
 import { MailModule } from '../mail/mail.module';
+import { TicketAccessModule } from '../tickets/ticket-access.module';
 
 // Re-export service for existing imports
 export { ReportsService } from './reports.service';
@@ -41,12 +42,11 @@ export { ReportsService } from './reports.service';
 export class ReportsController {
   constructor(private readonly reports: ReportsService) {}
 
-  /** UNCHANGED: dashboard endpoint */
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   @Get('dashboard')
   @ApiOperation({ summary: 'Dashboard summary metrics' })
-  dashboard() {
-    return this.reports.dashboard();
+  dashboard(@CurrentStaff() staff: AuthStaff) {
+    return this.reports.dashboard(staff);
   }
 
   @RequirePermissions(PERMISSIONS.REPORT_RUN)
@@ -61,8 +61,9 @@ export class ReportsController {
     @Param('id', ParseIntPipe) id: number,
     @Query('format') format: string,
     @Res({ passthrough: true }) res: Response,
+    @CurrentStaff() staff: AuthStaff,
   ) {
-    const rows = await this.reports.run(id);
+    const rows = await this.reports.run(id, staff);
     if (format === 'csv') {
       res.setHeader('Content-Type', 'text/csv');
       res.setHeader('Content-Disposition', `attachment; filename="report-${id}.csv"`);
@@ -103,37 +104,45 @@ export class ReportsController {
 
   @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
   @Get(':id/schedules')
-  listSchedules(@Param('id', ParseIntPipe) id: number) {
-    return this.reports.listSchedules(id);
+  listSchedules(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
+    return this.reports.listSchedules(id, staff);
   }
 
   @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
   @Post(':id/schedules')
-  async createSchedule(@Param('id', ParseIntPipe) id: number, @Body() body: unknown) {
+  async createSchedule(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: unknown,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
     const parsed = ScheduleCreateSchema.safeParse(body);
     if (!parsed.success) throw new BadRequestException(parsed.error.flatten());
-    return this.reports.createSchedule(id, parsed.data);
+    return this.reports.createSchedule(id, parsed.data, staff);
   }
 
   @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
   @Put('schedules/:scheduleId')
-  async updateSchedule(@Param('scheduleId', ParseIntPipe) scheduleId: number, @Body() body: unknown) {
+  async updateSchedule(
+    @Param('scheduleId', ParseIntPipe) scheduleId: number,
+    @Body() body: unknown,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
     const parsed = ScheduleCreateSchema.partial().safeParse(body);
     if (!parsed.success) throw new BadRequestException(parsed.error.flatten());
-    return this.reports.updateSchedule(scheduleId, parsed.data);
+    return this.reports.updateSchedule(scheduleId, parsed.data, staff);
   }
 
   @RequirePermissions(PERMISSIONS.REPORT_MANAGE)
   @Delete('schedules/:scheduleId')
-  removeSchedule(@Param('scheduleId', ParseIntPipe) scheduleId: number) {
-    return this.reports.removeSchedule(scheduleId);
+  removeSchedule(@Param('scheduleId', ParseIntPipe) scheduleId: number, @CurrentStaff() staff: AuthStaff) {
+    return this.reports.removeSchedule(scheduleId, staff);
   }
 }
 
 // ─── Module ───────────────────────────────────────────────────────────────────
 
 @Module({
-  imports: [BullModule.registerQueue({ name: 'reports' }), MailModule],
+  imports: [BullModule.registerQueue({ name: 'reports' }), MailModule, TicketAccessModule],
   controllers: [ReportsController],
   providers: [ReportsService, ReportCompiler, ReportScheduleProcessor],
   exports: [ReportsService],

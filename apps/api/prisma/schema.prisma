@@ -209,6 +209,7 @@ model Staff {
   timeEntries     TimeEntry[]
   followUps       FollowUp[]
   savedViews      SavedView[]
+  ownedReportSchedules ReportSchedule[] @relation("ReportScheduleOwner")
   lastLoginAt     DateTime?
   // D2 — per-account brute-force lockout (complements the per-IP rate limiter).
   failedLoginAttempts Int    @default(0)
@@ -1297,6 +1298,11 @@ model ReportSchedule {
   id          Int       @id @default(autoincrement())
   report      Report    @relation(fields: [reportId], references: [id], onDelete: Cascade)
   reportId    Int
+  // Scheduled execution has no request principal.  It always runs with this
+  // owner's current RBAC + department scope; legacy ownerless schedules are
+  // disabled by the ownership migration rather than executed globally.
+  ownerStaff  Staff?    @relation("ReportScheduleOwner", fields: [ownerStaffId], references: [id], onDelete: SetNull)
+  ownerStaffId Int?
   cron        String
   recipients  Json      @default("[]")
   isEnabled   Boolean   @default(true)
@@ -1305,6 +1311,7 @@ model ReportSchedule {
   nextRunAt   DateTime?
 
   @@index([reportId])
+  @@index([ownerStaffId])
   // Load: the schedule scanner polls due+enabled schedules every 5 min.
   @@index([isEnabled, nextRunAt])
 }

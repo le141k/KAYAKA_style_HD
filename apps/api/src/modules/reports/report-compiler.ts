@@ -6,7 +6,9 @@
  * GROUPABLE_FIELDS whitelists before being passed to Prisma — no raw SQL ever.
  */
 import { BadRequestException, Injectable } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { TicketAccessPolicy, type TicketAccessActor } from '../tickets/ticket-access-policy.service';
 import {
   ReportDefinition,
   ReportFilter,
@@ -20,6 +22,13 @@ import { resolveDate, bucketDate } from './reports.utils';
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type ReportRow = Record<string, unknown>;
+
+/**
+ * Internal SQL predicate derived by TicketAccessPolicy. Every report source
+ * ultimately belongs to a ticket, so this prevents aggregate counts from
+ * becoming a department-isolation bypass.
+ */
+type TicketReportScope = Prisma.TicketWhereInput;
 
 /**
  * Hard cap on rows pulled into memory for the in-JS "slow path" aggregation.
@@ -117,16 +126,23 @@ function resolveBetween(from: string, to: string): { gte: Date; lt: Date } {
 
 @Injectable()
 export class ReportCompiler {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ticketAccess: TicketAccessPolicy,
+  ) {}
 
-  async compile(def: ReportDefinition): Promise<ReportRow[]> {
+  async compile(def: ReportDefinition, actor: TicketAccessActor): Promise<ReportRow[]> {
+    // Keep the department policy inside the compiler rather than accepting an
+    // arbitrary Prisma `where` from callers. This makes an unscoped report
+    // execution impossible through the public compiler API.
+    const ticketScope = await this.ticketAccess.ticketWhere(actor);
     switch (def.source) {
       case 'tickets':
-        return this.compileTickets(def);
+        return this.compileTickets(def, ticketScope);
       case 'ticketPosts':
-        return this.compileTicketPosts(def);
+        return this.compileTicketPosts(def, ticketScope);
       case 'ticketAuditLogs':
-        return this.compileTicketAuditLogs(def);
+        return this.compileTicketAuditLogs(def, ticketScope);
       default: {
         const _: never = def.source;
         throw new BadRequestException(`Unknown source: ${String(_)}`);
@@ -136,7 +152,7 @@ export class ReportCompiler {
 
   // ─── tickets ──────────────────────────────────────────────────────────────
 
-  private async compileTickets(def: ReportDefinition): Promise<ReportRow[]> {
+  private async compileTickets(def: ReportDefinition, ticketScope: TicketReportScope): Promise<ReportRow[]> {
     // Validate groupBy fields
     const allowedGroup = GROUPABLE_FIELDS['tickets'];
     for (const g of def.groupBy) {
@@ -145,7 +161,9 @@ export class ReportCompiler {
       }
     }
 
-    const where = buildWhere(def.filters, 'tickets');
+    const where: Record<string, unknown> = {
+      AND: [buildWhere(def.filters, 'tickets'), ticketScope],
+    };
 
     const hasBucketGroup = def.groupBy.some((g) => g.includes(':'));
     const hasComputedAgg = def.aggregates.some((a) => a.field && COMPUTED_FIELDS.includes(a.field));
@@ -230,7 +248,10 @@ export class ReportCompiler {
 
   // ─── ticketPosts ──────────────────────────────────────────────────────────
 
-  private async compileTicketPosts(def: ReportDefinition): Promise<ReportRow[]> {
+  private async compileTicketPosts(
+    def: ReportDefinition,
+    ticketScope: TicketReportScope,
+  ): Promise<ReportRow[]> {
     const allowedGroup = GROUPABLE_FIELDS['ticketPosts'];
     for (const g of def.groupBy) {
       if (!allowedGroup.includes(g)) {
@@ -238,7 +259,9 @@ export class ReportCompiler {
       }
     }
 
-    const where = buildWhere(def.filters, 'ticketPosts');
+    const where: Record<string, unknown> = {
+      AND: [buildWhere(def.filters, 'ticketPosts'), { ticket: { is: ticketScope } }],
+    };
     const hasBucketGroup = def.groupBy.some((g) => g.includes(':'));
 
     if (!hasBucketGroup && def.aggregates.every((a) => a.func === 'count')) {
@@ -277,7 +300,10 @@ export class ReportCompiler {
 
   // ─── ticketAuditLogs ──────────────────────────────────────────────────────
 
-  private async compileTicketAuditLogs(def: ReportDefinition): Promise<ReportRow[]> {
+  private async compileTicketAuditLogs(
+    def: ReportDefinition,
+    ticketScope: TicketReportScope,
+  ): Promise<ReportRow[]> {
     const allowedGroup = GROUPABLE_FIELDS['ticketAuditLogs'];
     for (const g of def.groupBy) {
       if (!allowedGroup.includes(g)) {
@@ -285,7 +311,9 @@ export class ReportCompiler {
       }
     }
 
-    const where = buildWhere(def.filters, 'ticketAuditLogs');
+    const where: Record<string, unknown> = {
+      AND: [buildWhere(def.filters, 'ticketAuditLogs'), { ticket: { is: ticketScope } }],
+    };
     const hasBucketGroup = def.groupBy.some((g) => g.includes(':'));
 
     if (!hasBucketGroup && def.aggregates.every((a) => a.func === 'count')) {
