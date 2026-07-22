@@ -163,7 +163,7 @@ createTicket(dto: InternalCreateTicketInput, creatorStaffId?: number): Promise<T
 // LIFE-03: the CC/BCC `TicketRecipient` rows AND the CREATE `TicketAuditLog` row are now
 // written INSIDE the same $transaction as the ticket + first post + attachment links — a
 // crash after commit can no longer leave a ticket with no recipients / no audit row, and
-// the P2002 (duplicate messageId) retry path returns the existing ticket so it never
+// the P2002 (duplicate inboundMessageId) retry path returns the existing ticket so it never
 // re-creates them.
 // Trusted inbound callers may set incomingMessageId (not part of the HTTP schema).
 // A duplicate non-empty ID returns the existing ticket without audit/mail/events.
@@ -408,7 +408,9 @@ state = PROCESSING`): a **0-row settle** means the lease was lost mid-processing
   - content hashes; it deliberately excludes per-hop `Received`, `Return-Path` and `Delivered-To`.
     Same real ID + same semantic content → loser `SKIPPED`; same ID + differing (or legacy unknown)
     semantic content → loser `QUARANTINED` with a durable `mail.message_id_conflict` audit.
-    `TicketPost.messageId` stays the independent retry backstop. Headerless mail has **no logical
+    `TicketPost.inboundMessageId` is the independent inbound retry backstop; non-unique
+    `TicketPost.messageId` remains available only for RFC threading, so a spoofed staff outbound
+    ID cannot suppress an inbound delivery. Headerless mail has **no logical
     content claim**: it receives an internal post key from its exact transport key, so two different
     IMAP UIDs with identical bytes become two tickets, while a retry of one transport remains
     idempotent. A headerless re-fetch after UIDVALIDITY reset may visibly duplicate — this is the

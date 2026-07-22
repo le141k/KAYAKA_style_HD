@@ -284,6 +284,7 @@ export class TicketsService {
                 isHtml: dto.isHtml,
                 creationMode,
                 messageId: incomingMessageId,
+                inboundMessageId: incomingMessageId,
                 ipAddress,
               },
             },
@@ -349,7 +350,7 @@ export class TicketsService {
       });
       updated = transactionTicket;
     } catch (err) {
-      // Concurrent delivery: the partial unique index is the final arbiter. The
+      // Concurrent delivery: the inbound-only unique index is the final arbiter. The
       // losing transaction is fully rolled back; return the winning ticket and
       // skip recipients, audit, events and autoresponder.
       if (incomingMessageId && this.isUniqueConstraintViolation(err)) {
@@ -813,8 +814,9 @@ export class TicketsService {
       return this.addNote(ticketId, dto.contents, staffId, dto.attachmentIds);
     }
 
-    // Fast-path ordinary redelivery before doing any ticket/author work. The DB
-    // unique index remains the concurrency-safe arbiter below.
+    // Fast-path ordinary redelivery before doing any ticket/author work. The
+    // inbound-only unique index remains the concurrency-safe arbiter below; do
+    // not let a spoofed staff outbound threading Message-ID suppress this mail.
     if (incomingMessageId) {
       const existing = await this.findPostByInboundMessageId(incomingMessageId);
       if (existing) return existing;
@@ -901,6 +903,7 @@ export class TicketsService {
             isThirdParty: dto.isThirdParty,
             creationMode: replyCreationMode,
             messageId: incomingMessageId ?? outboundDraft?.messageId,
+            inboundMessageId: incomingMessageId,
             ipAddress: replyIp,
           },
         });
@@ -2075,12 +2078,12 @@ export class TicketsService {
   }
 
   private findPostByInboundMessageId(messageId: string): Promise<TicketPost | null> {
-    return this.prisma.ticketPost.findFirst({ where: { messageId } });
+    return this.prisma.ticketPost.findFirst({ where: { inboundMessageId: messageId } });
   }
 
   private async findTicketByInboundMessageId(messageId: string): Promise<Ticket | null> {
     const post = await this.prisma.ticketPost.findFirst({
-      where: { messageId },
+      where: { inboundMessageId: messageId },
       select: { ticketId: true },
     });
     if (!post) return null;

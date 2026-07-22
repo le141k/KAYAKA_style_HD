@@ -414,13 +414,16 @@ describe('InboundMailService — parser rule helpers', () => {
 
     const svcOf = () => makeInboundService(prisma as unknown as PrismaService) as unknown as RoutingSvc;
 
-    it('skips (SKIPPED) a message whose Message-ID already exists on a post', async () => {
+    it('skips (SKIPPED) a message whose inbound Message-ID already exists on a post', async () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 99, ticketId: 7 });
       const svc = svcOf();
       const out = await svc.processRawMessage(Buffer.from(rawEmail), 1);
       expect(out.state).toBe('SKIPPED');
       expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
       expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+      expect(prisma.ticketPost.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { inboundMessageId: { in: ['<dup-123@acme.example>'] } } }),
+      );
     });
 
     it('creates a ticket (PROCESSED) passing the real Message-ID atomically when it is new', async () => {
@@ -430,6 +433,28 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(out.state).toBe('PROCESSED');
       expect(svc.ticketsService.createTicket).toHaveBeenCalledWith(
         expect.objectContaining({ incomingMessageId: '<dup-123@acme.example>' }),
+      );
+    });
+
+    it('does not let a staff outbound threading Message-ID suppress an inbound delivery', async () => {
+      const spoofedId = '<dup-123@acme.example>';
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ where }: { where: Record<string, unknown> }) => {
+          // Before the split, the generic `messageId` lookup found this staff post and
+          // returned SKIPPED. Only the inbound idempotency column may answer this query.
+          if (where.messageId) return Promise.resolve({ id: 91, ticketId: 9, inboundMessageId: null });
+          return Promise.resolve(null);
+        },
+      );
+      const svc = svcOf();
+      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1);
+
+      expect(out.state).toBe('PROCESSED');
+      expect(svc.ticketsService.createTicket).toHaveBeenCalledWith(
+        expect.objectContaining({ incomingMessageId: spoofedId }),
+      );
+      expect(prisma.ticketPost.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { inboundMessageId: { in: [spoofedId] } } }),
       );
     });
 
@@ -689,7 +714,7 @@ describe('InboundMailService — parser rule helpers', () => {
       // Deterministic synthetic id → a retry of the same bytes dedups to the same post.
       expect(arg.incomingMessageId).toMatch(/^<inbound-[0-9a-f]{64}@23telecom\.local>$/);
       expect(prisma.ticketPost.findFirst).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { messageId: { in: [arg.incomingMessageId] } } }),
+        expect.objectContaining({ where: { inboundMessageId: { in: [arg.incomingMessageId] } } }),
       );
     });
 
@@ -1777,13 +1802,13 @@ describe('InboundMailService — parser rule helpers', () => {
             transportKey: `imap:9:1:77:${where.id}`,
           }),
       );
-      // Behave like TicketPost.messageId's real unique backstop: if production code wrongly
-      // seeds headerless identity from bytes/contentHash, the second lookup finds the first post
-      // and this test turns red rather than false-greening on a stateless mock.
+      // Behave like TicketPost.inboundMessageId's real unique backstop: if production code
+      // wrongly seeds headerless identity from bytes/contentHash, the second lookup finds the
+      // first post and this test turns red rather than false-greening on a stateless mock.
       const seenPostKey = new Map<string, { id: number; ticketId: number }>();
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockImplementation(
-        ({ where }: { where: { messageId?: { in?: string[] }; ticketId?: number } }) => {
-          const key = where.messageId?.in?.[0];
+        ({ where }: { where: { inboundMessageId?: { in?: string[] }; ticketId?: number } }) => {
+          const key = where.inboundMessageId?.in?.[0];
           if (!key) return Promise.resolve(null);
           const existing = seenPostKey.get(key);
           if (existing) return Promise.resolve(existing);
@@ -1964,8 +1989,8 @@ describe('InboundMailService — parser rule helpers', () => {
       });
       const legacyId = '<imap-5-42-75@helpdesk.invalid>';
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockImplementation(
-        ({ where }: { where: { messageId?: { in?: string[] } } }) =>
-          (where?.messageId?.in ?? []).includes(legacyId)
+        ({ where }: { where: { inboundMessageId?: { in?: string[] } } }) =>
+          (where?.inboundMessageId?.in ?? []).includes(legacyId)
             ? Promise.resolve({ id: 900, ticketId: 90 })
             : Promise.resolve(null),
       );

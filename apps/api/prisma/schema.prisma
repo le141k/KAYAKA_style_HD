@@ -579,7 +579,14 @@ model TicketPost {
   isEmailed    Boolean    @default(false)
   isThirdParty Boolean    @default(false)
   creationMode CreationMode @default(WEB)
-  messageId    String?    @unique // RFC Message-ID for threading/idempotency; absent = NULL
+  // RFC Message-ID used only for threading. It is deliberately non-unique: an
+  // untrusted inbound sender may reuse a staff outbound Message-ID, and that
+  // must not suppress the inbound message or prevent it being recorded.
+  messageId        String?
+  // Idempotency identity assigned only to inbound EMAIL posts. This keeps the
+  // inbound deduplication namespace separate from staff/outbound threading IDs.
+  // PostgreSQL UNIQUE permits multiple NULLs, so web/staff/API posts leave it null.
+  inboundMessageId String?    @unique
   ipAddress    String     @default("0.0.0.0")
   attachments  Attachment[]
   inboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimPost")
@@ -589,6 +596,7 @@ model TicketPost {
   createdAt    DateTime   @default(now())
 
   @@index([ticketId])
+  @@index([messageId])
 }
 
 model TicketNote {
