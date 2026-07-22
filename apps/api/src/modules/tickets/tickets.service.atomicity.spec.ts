@@ -42,6 +42,8 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
       ticket: { create: vi.fn(), update: vi.fn() },
       ticketPost: { create: vi.fn() },
       ticketNote: { create: vi.fn() },
+      attachment: { findMany: vi.fn().mockResolvedValue([]) },
+      outboundEmail: { create: vi.fn().mockResolvedValue({ id: 'outbox-1' }) },
       ticketAuditLog: { create: vi.fn().mockResolvedValue({}) },
     };
     prisma = {
@@ -63,7 +65,10 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     };
     users = { findOrCreate: vi.fn().mockResolvedValue({ id: 9 }) };
     emitter = { emit: vi.fn() };
-    mail = { sendTemplate: vi.fn().mockResolvedValue(undefined) };
+    mail = {
+      sendTemplate: vi.fn().mockResolvedValue(undefined),
+      enqueueOutbound: vi.fn().mockResolvedValue(undefined),
+    };
     const sla = {
       resolvePlanForTicket: vi.fn().mockResolvedValue(null),
       computeDueDates: vi.fn(),
@@ -84,11 +89,21 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
   });
 
   it('commits staff post, attachment adoption, counters and audit in one transaction', async () => {
-    const existingTicket = ticket();
+    const existingTicket = ticket({ requesterEmail: 'customer@example.test' });
     const createdPost = post();
     prisma.ticket.findUnique.mockResolvedValue(existingTicket);
     tx.ticketPost.create.mockResolvedValue(createdPost);
     tx.ticket.update.mockResolvedValue(existingTicket);
+    tx.attachment.findMany.mockResolvedValue([
+      {
+        id: 7,
+        fileName: 'reply.txt',
+        mimeType: 'text/plain',
+        size: 12,
+        sha1: 'b'.repeat(40),
+        storageKey: 'tickets/1/reply.txt',
+      },
+    ]);
 
     const result = await service.reply(
       1,
@@ -111,7 +126,6 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
         data: expect.objectContaining({
           totalReplies: { increment: 1 },
           hasAttachments: true,
-          firstResponseAt: expect.any(Date),
         }),
       }),
     );
@@ -123,7 +137,7 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
   });
 
   it('does not update counters, audit or emit when attachment adoption fails', async () => {
-    prisma.ticket.findUnique.mockResolvedValue(ticket());
+    prisma.ticket.findUnique.mockResolvedValue(ticket({ requesterEmail: 'customer@example.test' }));
     tx.ticketPost.create.mockResolvedValue(post());
     attachments.linkToPost.mockRejectedValue(new BadRequestException('claim failed'));
 
@@ -146,6 +160,113 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     expect(tx.ticketAuditLog.create).not.toHaveBeenCalled();
     expect(emitter.emit).not.toHaveBeenCalled();
     expect(mail.sendTemplate).not.toHaveBeenCalled();
+  });
+
+  it('creates staff post, counters, audit and immutable durable outbox in the same transaction', async () => {
+    const existingTicket = ticket({ requesterEmail: 'customer@example.test' });
+    const createdPost = post({ id: 101 });
+    prisma.ticket.findUnique.mockResolvedValue(existingTicket);
+    tx.ticketPost.create.mockResolvedValue(createdPost);
+    tx.ticket.update.mockResolvedValue(existingTicket);
+
+    await service.reply(
+      1,
+      {
+        contents: 'An answer',
+        isHtml: false,
+        isNote: false,
+        isEmailed: true, // hostile/legacy UI value must not claim delivery
+        isThirdParty: false,
+        ccEmails: ['visible@example.test'],
+        bccEmails: ['hidden@example.test'],
+      },
+      5,
+    );
+
+    const postData = tx.ticketPost.create.mock.calls[0]![0].data;
+    const outboxData = tx.outboundEmail.create.mock.calls[0]![0].data;
+    expect(postData.isEmailed).toBe(false);
+    expect(outboxData.postId).toBe(101);
+    expect(outboxData.messageId).toBe(postData.messageId);
+    expect(outboxData.recipients.create).toEqual(
+      expect.arrayContaining([
+        { email: 'customer@example.test', role: 'TO' },
+        { email: 'visible@example.test', role: 'CC' },
+        { email: 'hidden@example.test', role: 'BCC' },
+      ]),
+    );
+    expect(tx.ticket.update).toHaveBeenCalled();
+    expect(tx.ticketAuditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ action: 'REPLY' }) }),
+    );
+    expect(mail.enqueueOutbound).toHaveBeenCalledWith('outbox-1');
+    expect(mail.sendTemplate).not.toHaveBeenCalled();
+  });
+
+  it('refuses a public staff reply with no requester instead of showing a false queued/sent post', async () => {
+    prisma.ticket.findUnique.mockResolvedValue(ticket({ requesterEmail: '' }));
+
+    await expect(
+      service.reply(
+        1,
+        {
+          contents: 'Cannot be delivered',
+          isHtml: false,
+          isNote: false,
+          isEmailed: true,
+          isThirdParty: false,
+        },
+        5,
+      ),
+    ).rejects.toThrow('Ticket has no requester email');
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(tx.ticketPost.create).not.toHaveBeenCalled();
+    expect(tx.outboundEmail.create).not.toHaveBeenCalled();
+  });
+
+  it('snapshots adopted reply attachments inside the same staff-reply outbox transaction', async () => {
+    prisma.ticket.findUnique.mockResolvedValue(ticket({ requesterEmail: 'customer@example.test' }));
+    tx.ticketPost.create.mockResolvedValue(post({ id: 202 }));
+    tx.ticket.update.mockResolvedValue(ticket());
+    tx.attachment.findMany.mockResolvedValue([
+      {
+        id: 7,
+        fileName: 'invoice.pdf',
+        mimeType: 'application/pdf',
+        size: 4096,
+        sha1: 'a'.repeat(40),
+        storageKey: 'tickets/1/invoice.pdf',
+      },
+    ]);
+
+    await service.reply(
+      1,
+      {
+        contents: 'Please see attachment',
+        isHtml: false,
+        isNote: false,
+        isEmailed: false,
+        isThirdParty: false,
+        attachmentIds: [7],
+      },
+      5,
+    );
+
+    expect(tx.attachment.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ postId: 202, ticketId: 1 }) }),
+    );
+    const outboxData = tx.outboundEmail.create.mock.calls[0]![0].data;
+    expect(outboxData.attachments.create).toEqual([
+      {
+        sourceAttachmentId: 7,
+        fileName: 'invoice.pdf',
+        mimeType: 'application/pdf',
+        size: 4096,
+        sha1: 'a'.repeat(40),
+        storageKey: 'tickets/1/invoice.pdf',
+      },
+    ]);
   });
 
   it('commits note, note attachments, ticket flags and audit in one transaction', async () => {

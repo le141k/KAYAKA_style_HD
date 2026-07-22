@@ -11,6 +11,9 @@ import { OrphanCleanupService } from './orphan-cleanup.service';
   imports: [ClientAuthModule],
   controllers: [AttachmentsController],
   providers: [AttachmentsService, StorageService, OrphanCleanupService],
-  exports: [AttachmentsService],
+  // MailModule reads durable outbox attachment snapshots through the same
+  // traversal-safe storage resolver; exporting the service avoids duplicating
+  // filesystem path logic in the SMTP worker.
+  exports: [AttachmentsService, StorageService],
 })
 export class AttachmentsModule {}

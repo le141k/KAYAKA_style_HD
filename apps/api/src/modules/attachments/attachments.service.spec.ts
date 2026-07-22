@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { AttachmentsService } from './attachments.service';
 import type { StorageService } from './storage.service';
 import type { PrismaService } from '../../prisma/prisma.service';
@@ -36,6 +36,10 @@ function makePrismaMock() {
       updateMany: vi.fn(),
       delete: vi.fn(),
     },
+    outboundEmailAttachment: {
+      findFirst: vi.fn().mockResolvedValue(null),
+    },
+    $queryRaw: vi.fn().mockResolvedValue([{ id: 1 }]),
   };
   return {
     ...db,
@@ -418,6 +422,34 @@ describe('AttachmentsService', () => {
       (prisma.attachment.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
       await expect(service.getAttachmentOrThrow(999)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('deleteAttachment', () => {
+    it('deletes an unreferenced attachment under a row lock before removing its bytes', async () => {
+      const attachment = makeAttachment({ id: 7, storageKey: 'tickets/1/file.pdf' });
+      (prisma.attachment.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(attachment);
+      (prisma.attachment.delete as ReturnType<typeof vi.fn>).mockResolvedValue(attachment);
+
+      await service.deleteAttachment(7);
+
+      expect(prisma.$queryRaw).toHaveBeenCalled();
+      expect(prisma.outboundEmailAttachment.findFirst).toHaveBeenCalledWith({
+        where: { sourceAttachmentId: 7 },
+        select: { id: true },
+      });
+      expect(prisma.attachment.delete).toHaveBeenCalledWith({ where: { id: 7 } });
+      expect(storage.delete).toHaveBeenCalledWith('tickets/1/file.pdf');
+    });
+
+    it('rejects direct deletion when a durable outbound snapshot retains the attachment', async () => {
+      (prisma.attachment.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeAttachment({ id: 7 }));
+      (prisma.outboundEmailAttachment.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 99 });
+
+      await expect(service.deleteAttachment(7)).rejects.toThrow(ConflictException);
+
+      expect(prisma.attachment.delete).not.toHaveBeenCalled();
+      expect(storage.delete).not.toHaveBeenCalled();
     });
   });
 

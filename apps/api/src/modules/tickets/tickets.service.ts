@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
@@ -8,6 +9,7 @@ import { AdminService } from '../admin/admin.service';
 import { AttachmentsService } from '../attachments/attachments.service';
 import { NotificationService } from './notification.service';
 import { formatTicketMask } from './ticket-mask.util';
+import { normalizeEmail } from '../../common/email.util';
 import type {
   CreateTicketDto,
   ReplyTicketDto,
@@ -86,6 +88,19 @@ export type InternalReplyTicketInput = ReplyTicketDto & {
   ipAddress?: string;
   incomingMessageId?: string;
 };
+
+interface StaffReplyOutboxDraft {
+  messageId: string;
+  emailQueueId: number | null;
+  fromAddress: string;
+  replyToAddress: string | null;
+  subject: string;
+  htmlBody: string;
+  textBody: string;
+  inReplyTo: string | null;
+  references: string[];
+  recipients: Array<{ email: string; role: 'TO' | 'CC' | 'BCC' }>;
+}
 
 /**
  * A client-safe post. Internal/PII fields (staff `email`, `ipAddress`, `staffId`,
@@ -693,6 +708,19 @@ export class TicketsService {
           include: {
             attachments: true,
             staff: { select: { firstName: true, lastName: true, email: true } },
+            // Safe staff-only delivery projection: recipients (especially BCC),
+            // raw bodies and relay response details remain out of the ticket API.
+            outboundEmail: {
+              select: {
+                id: true,
+                state: true,
+                attempts: true,
+                nextAttemptAt: true,
+                lastError: true,
+                acceptedAt: true,
+                sentAt: true,
+              },
+            },
           },
         },
         notes: {
@@ -733,6 +761,17 @@ export class TicketsService {
           include: {
             attachments: true,
             staff: { select: { firstName: true, lastName: true, email: true } },
+            outboundEmail: {
+              select: {
+                id: true,
+                state: true,
+                attempts: true,
+                nextAttemptAt: true,
+                lastError: true,
+                acceptedAt: true,
+                sentAt: true,
+              },
+            },
           },
         },
         notes: { orderBy: { createdAt: 'asc' } },
@@ -786,7 +825,6 @@ export class TicketsService {
     const replyIp = dto.ipAddress ?? '0.0.0.0';
     const now = new Date();
     const isStaffReply = !!staffId;
-    const firstResponse = isStaffReply && ticket.firstResponseAt === null;
 
     // Capture the author's display name/email on the post so the thread shows
     // who replied (previously left blank → rendered as "—").
@@ -805,6 +843,25 @@ export class TicketsService {
 
     const hasNewAttachments = Boolean(dto.attachmentIds?.length);
 
+    // A public staff reply without a recipient is neither a delivery nor an
+    // internal note. Refuse it rather than creating a timeline entry the UI could
+    // mistake for queued/sent email; the operator can add a note until requester
+    // identity is repaired.
+    if (isStaffReply && !incomingMessageId && !ticket.requesterEmail.trim()) {
+      throw new BadRequestException(
+        'Ticket has no requester email; add an internal note or repair the requester first',
+      );
+    }
+
+    // Staff public replies use a database-backed SMTP command. Build all immutable
+    // snapshots before opening the transaction; the transaction below persists the
+    // post, counters, audit, recipients and attachment snapshots as one unit. An
+    // inbound trusted Message-ID is never repurposed as an outbound command.
+    const outboundDraft =
+      isStaffReply && ticket.requesterEmail && !incomingMessageId
+        ? await this.prepareStaffReplyOutboxDraft(ticket, dto, staffId!, authorName, authorEmail)
+        : undefined;
+
     // Reopen the ticket when a USER (customer) replies to a resolved/closed
     // ticket so it re-surfaces to staff. Staff replies must NOT reopen.
     const reopenData =
@@ -819,8 +876,9 @@ export class TicketsService {
         : {};
 
     let post: TicketPost;
+    let outboundEmailId: string | undefined;
     try {
-      post = await this.prisma.$transaction(async (tx) => {
+      const committed = await this.prisma.$transaction(async (tx) => {
         const createdPost = await tx.ticketPost.create({
           data: {
             ticketId,
@@ -831,10 +889,12 @@ export class TicketsService {
             subject: ticket.subject,
             contents: dto.contents,
             isHtml: dto.isHtml,
-            isEmailed: dto.isEmailed,
+            // A staff post becomes emailed only after the SMTP worker commits
+            // SENT. The HTTP DTO may not manufacture delivery truth.
+            isEmailed: isStaffReply ? false : dto.isEmailed,
             isThirdParty: dto.isThirdParty,
             creationMode: replyCreationMode,
-            messageId: incomingMessageId,
+            messageId: incomingMessageId ?? outboundDraft?.messageId,
             ipAddress: replyIp,
           },
         });
@@ -849,14 +909,47 @@ export class TicketsService {
           );
         }
 
+        let attachmentSnapshots: Array<{
+          sourceAttachmentId: number;
+          fileName: string;
+          mimeType: string;
+          size: number;
+          sha1: string;
+          storageKey: string;
+        }> = [];
+        if (outboundDraft && hasNewAttachments) {
+          const attachmentIds = [...new Set(dto.attachmentIds!)];
+          const attachments = await tx.attachment.findMany({
+            where: { id: { in: attachmentIds }, postId: createdPost.id, ticketId },
+            select: {
+              id: true,
+              fileName: true,
+              mimeType: true,
+              size: true,
+              sha1: true,
+              storageKey: true,
+            },
+          });
+          if (attachments.length !== attachmentIds.length) {
+            throw new BadRequestException('One or more outbound attachments cannot be snapshotted');
+          }
+          this.assertOutboundAttachmentBounds(attachments);
+          attachmentSnapshots = attachments.map((attachment) => ({
+            sourceAttachmentId: attachment.id,
+            fileName: attachment.fileName,
+            mimeType: attachment.mimeType,
+            size: attachment.size,
+            sha1: attachment.sha1,
+            storageKey: attachment.storageKey,
+          }));
+        }
+
         await tx.ticket.update({
           where: { id: ticketId },
           data: {
             totalReplies: { increment: 1 },
             lastReplyAt: now,
             lastActivityAt: now,
-            // Mark first staff response time if not yet set
-            ...(firstResponse && { firstResponseAt: now }),
             // Set hasAttachments if new attachments were linked
             ...(hasNewAttachments && { hasAttachments: true }),
             ...reopenData,
@@ -864,8 +957,32 @@ export class TicketsService {
         });
 
         await this.writeAudit(ticketId, 'REPLY', staffId, isStaffReply ? 'STAFF' : 'USER', {}, tx);
-        return createdPost;
+
+        const outbox = outboundDraft
+          ? await tx.outboundEmail.create({
+              data: {
+                ticketId,
+                postId: createdPost.id,
+                emailQueueId: outboundDraft.emailQueueId,
+                state: 'QUEUED',
+                messageId: outboundDraft.messageId,
+                fromAddress: outboundDraft.fromAddress,
+                replyToAddress: outboundDraft.replyToAddress,
+                subject: outboundDraft.subject,
+                htmlBody: outboundDraft.htmlBody,
+                textBody: outboundDraft.textBody,
+                inReplyTo: outboundDraft.inReplyTo,
+                references: outboundDraft.references,
+                recipients: { create: outboundDraft.recipients },
+                ...(attachmentSnapshots.length ? { attachments: { create: attachmentSnapshots } } : {}),
+              },
+              select: { id: true },
+            })
+          : undefined;
+        return { post: createdPost, outboundEmailId: outbox?.id };
       });
+      post = committed.post;
+      outboundEmailId = committed.outboundEmailId;
     } catch (err) {
       if (incomingMessageId && this.isUniqueConstraintViolation(err)) {
         const existing = await this.findPostByInboundMessageId(incomingMessageId);
@@ -874,67 +991,24 @@ export class TicketsService {
       throw err;
     }
 
-    // Send outbound email to requester when a staff member replies (non-blocking)
-    if (isStaffReply && ticket.requesterEmail) {
-      const requesterName = ticket.requesterName || ticket.requesterEmail;
-      // Load CC/BCC recipients for this ticket
-      const recipients = await this.prisma.ticketRecipient.findMany({ where: { ticketId } });
-      const ccEmails = [
-        ...(dto.ccEmails ?? []),
-        ...recipients.filter((r) => r.role === 'CC').map((r) => r.email),
-      ];
-      const bccEmails = [
-        ...(dto.bccEmails ?? []),
-        ...recipients.filter((r) => r.role === 'BCC').map((r) => r.email),
-      ];
-
-      // RFC threading: reply In-Reply-To the most recent prior post that carries a
-      // Message-ID (the customer's inbound mail), so their MUA threads our reply.
-      const priorMsg = await this.prisma.ticketPost.findFirst({
-        where: { ticketId, id: { not: post.id }, messageId: { not: null }, NOT: { messageId: '' } },
-        orderBy: { createdAt: 'desc' },
-        select: { messageId: true },
-      });
-
-      // Append the staff + queue signature (Kayako EmailQueue.signature is never
-      // appended otherwise). Queue is resolved by the ticket's department.
-      const [staff, queue] = await Promise.all([
-        staffId
-          ? this.prisma.staff.findUnique({ where: { id: staffId }, select: { signature: true } })
-          : null,
-        this.prisma.emailQueue.findFirst({
-          where: { departmentId: ticket.departmentId },
-          select: { signature: true },
-        }),
-      ]);
-      const sig = [staff?.signature, queue?.signature]
-        .map((s) => s?.trim())
-        .filter(Boolean)
-        .join('\n\n');
-      const contents = sig ? `${dto.contents}\n\n--\n${sig}` : dto.contents;
-
-      this.mailService
-        .sendTemplate(
-          ticket.requesterEmail,
-          'ticket_user_reply',
-          'en',
-          {
-            mask: ticket.mask,
-            subject: ticket.subject,
-            contents,
-            // Templates reference {{name}}; keep requesterName too for forward-compat.
-            name: requesterName,
-            requesterName,
-          },
-          {
-            cc: ccEmails.length > 0 ? ccEmails : undefined,
-            bcc: bccEmails.length > 0 ? bccEmails : undefined,
-            ...(priorMsg?.messageId ? { inReplyTo: priorMsg.messageId, references: priorMsg.messageId } : {}),
-          },
-        )
-        .catch((err: unknown) =>
-          this.logger.error(`Reply email failed for ticket ${ticket.mask}: ${String(err)}`),
-        );
+    if (outboundEmailId) {
+      // Redis is only a wake-up accelerator. An enqueue failure leaves the durable
+      // row in QUEUED for MailService's startup/periodic DB recovery scan.
+      const enqueue = (
+        this.mailService as unknown as {
+          enqueueOutbound?: (id: string) => Promise<void>;
+        }
+      ).enqueueOutbound;
+      if (enqueue) {
+        enqueue
+          .call(this.mailService, outboundEmailId)
+          .catch((err: unknown) =>
+            this.logger.error(
+              `Outbox wake-up failed for ticket ${ticket.mask} ` +
+                `(${err instanceof Error && err.name ? err.name.slice(0, 80) : 'UnknownError'})`,
+            ),
+          );
+      }
     }
 
     // Notify watchers when a user (customer) replies
@@ -1761,6 +1835,164 @@ export class TicketsService {
   }
 
   // ─────────────────────────── Helpers ───────────────────────────
+
+  private async prepareStaffReplyOutboxDraft(
+    ticket: Ticket,
+    dto: InternalReplyTicketInput,
+    staffId: number,
+    _authorName?: string,
+    _authorEmail?: string,
+  ): Promise<StaffReplyOutboxDraft> {
+    const [storedRecipients, staff, queue, threadingIds] = await Promise.all([
+      this.prisma.ticketRecipient.findMany({ where: { ticketId: ticket.id } }),
+      this.prisma.staff.findUnique({ where: { id: staffId }, select: { signature: true } }),
+      this.prisma.emailQueue.findFirst({
+        where: { departmentId: ticket.departmentId, isEnabled: true },
+        orderBy: { id: 'asc' },
+        select: { id: true, emailAddress: true, signature: true },
+      }),
+      this.loadThreadingIds(ticket.id),
+    ]);
+
+    const signature = [staff?.signature, queue?.signature]
+      .map((value) => value?.trim())
+      .filter((value): value is string => Boolean(value))
+      .join('\n\n');
+    const contents = signature ? `${dto.contents}\n\n--\n${signature}` : dto.contents;
+    const requesterName = ticket.requesterName || ticket.requesterEmail;
+    const rendered = await this.renderStaffReplyTemplate({
+      mask: ticket.mask,
+      subject: ticket.subject,
+      contents,
+      name: requesterName,
+      requesterName,
+    });
+
+    return {
+      messageId: this.createOutboundMessageId(),
+      emailQueueId: queue?.id ?? null,
+      fromAddress: this.outboundFromAddress(),
+      replyToAddress: queue?.emailAddress ?? null,
+      subject: rendered.subject,
+      htmlBody: rendered.html,
+      textBody: rendered.text,
+      inReplyTo: threadingIds.at(-1) ?? null,
+      references: threadingIds,
+      recipients: this.normalizeOutboundRecipients(ticket.requesterEmail, dto, storedRecipients),
+    };
+  }
+
+  private async loadThreadingIds(ticketId: number): Promise<string[]> {
+    // The optional guard is useful for narrow unit doubles; a real Prisma client
+    // always has findMany and keeps a bounded chain for RFC threading.
+    const repository = this.prisma.ticketPost as unknown as {
+      findMany?: (args: unknown) => Promise<Array<{ messageId: string | null }> | undefined>;
+    };
+    if (!repository.findMany) return [];
+    const posts =
+      (await repository.findMany({
+        where: { ticketId, messageId: { not: null }, NOT: { messageId: '' } },
+        select: { messageId: true },
+        orderBy: { createdAt: 'asc' },
+        take: 20,
+      })) ?? [];
+    return posts
+      .map((post) => post.messageId?.trim())
+      .filter((messageId): messageId is string => Boolean(messageId))
+      .slice(-20);
+  }
+
+  private async renderStaffReplyTemplate(vars: Record<string, string>): Promise<{
+    subject: string;
+    html: string;
+    text: string;
+  }> {
+    const renderer = this.mailService as unknown as {
+      renderTemplateRequired?: (
+        key: string,
+        locale: string,
+        variables: Record<string, string>,
+      ) => Promise<{ subject: string; html: string; text: string }>;
+      renderTemplate?: (
+        key: string,
+        locale: string,
+        variables: Record<string, string>,
+      ) => Promise<{ subject: string; html: string; text: string }>;
+    };
+    if (renderer.renderTemplateRequired) {
+      return renderer.renderTemplateRequired('ticket_user_reply', 'en', vars);
+    }
+    if (renderer.renderTemplate) {
+      return renderer.renderTemplate('ticket_user_reply', 'en', vars);
+    }
+    // Test doubles and a deliberately minimal emergency construction still get a
+    // useful plain snapshot rather than serialising variables as JSON. Production
+    // MailService always provides renderTemplate.
+    return {
+      subject: `Re: [${vars['mask']}] ${vars['subject']}`,
+      html: vars['contents'] ?? '',
+      text: vars['contents'] ?? '',
+    };
+  }
+
+  private normalizeOutboundRecipients(
+    requesterEmail: string,
+    dto: InternalReplyTicketInput,
+    storedRecipients: Array<{ email: string; role: 'CC' | 'BCC' }>,
+  ): Array<{ email: string; role: 'TO' | 'CC' | 'BCC' }> {
+    const recipients = new Map<string, 'TO' | 'CC' | 'BCC'>();
+    const add = (email: string | undefined, role: 'TO' | 'CC' | 'BCC'): void => {
+      if (!email) return;
+      const normalized = normalizeEmail(email);
+      if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(normalized)) {
+        if (role === 'TO') throw new BadRequestException('Requester email is invalid for outbound delivery');
+        return; // A malformed historic CC/BCC row must not poison the main reply.
+      }
+      const existing = recipients.get(normalized);
+      // TO takes precedence over all, CC takes precedence over BCC. That makes a
+      // recipient visible only when explicitly chosen visible and never leaks BCC.
+      if (!existing || (existing === 'BCC' && role !== 'BCC')) recipients.set(normalized, role);
+    };
+    add(requesterEmail, 'TO');
+    for (const email of [
+      ...(dto.ccEmails ?? []),
+      ...storedRecipients.filter((r) => r.role === 'CC').map((r) => r.email),
+    ]) {
+      add(email, 'CC');
+    }
+    for (const email of [
+      ...(dto.bccEmails ?? []),
+      ...storedRecipients.filter((r) => r.role === 'BCC').map((r) => r.email),
+    ]) {
+      add(email, 'BCC');
+    }
+    if (![...recipients.values()].includes('TO')) {
+      throw new BadRequestException('A public staff reply requires a requester recipient');
+    }
+    return [...recipients.entries()].map(([email, role]) => ({ email, role }));
+  }
+
+  private assertOutboundAttachmentBounds(attachments: Array<{ id: number; size: number }>): void {
+    const MAX_OUTBOUND_ATTACHMENTS = 10;
+    const MAX_OUTBOUND_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+    const totalBytes = attachments.reduce((total, attachment) => total + attachment.size, 0);
+    if (attachments.length > MAX_OUTBOUND_ATTACHMENTS || totalBytes > MAX_OUTBOUND_ATTACHMENT_BYTES) {
+      throw new BadRequestException('Outbound attachment count or size limit exceeded');
+    }
+  }
+
+  private outboundFromAddress(): string {
+    const mail = this.mailService as unknown as { getDefaultFromAddress?: () => string };
+    return mail.getDefaultFromAddress?.() ?? 'support@23telecom.invalid';
+  }
+
+  private createOutboundMessageId(): string {
+    const from = this.outboundFromAddress();
+    const address = /<([^>]+)>/.exec(from)?.[1] ?? from;
+    const domain = address.split('@')[1]?.trim().toLowerCase();
+    const safeDomain = domain && /^[a-z0-9.-]+$/i.test(domain) ? domain : '23telecom.invalid';
+    return `<${randomUUID()}@${safeDomain}>`;
+  }
 
   private async findOrThrow(id: number): Promise<Ticket> {
     const t = await this.prisma.ticket.findUnique({ where: { id } });

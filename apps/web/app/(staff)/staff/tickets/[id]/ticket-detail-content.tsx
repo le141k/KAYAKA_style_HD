@@ -58,6 +58,24 @@ type NoteForm = z.infer<typeof noteSchema>;
 
 const MAX_BODY_CHARS = 10_000;
 
+const DELIVERY_LABELS = {
+  QUEUED: 'В очереди',
+  PROCESSING: 'Отправляется',
+  SENT: 'Принято SMTP',
+  RETRY: 'Повторная попытка',
+  FAILED: 'Не доставлено',
+  AMBIGUOUS: 'Требует проверки',
+} as const;
+
+const DELIVERY_COLORS = {
+  QUEUED: 'bg-muted text-muted-foreground',
+  PROCESSING: 'bg-blue-500/10 text-blue-700 dark:text-blue-300',
+  SENT: 'bg-status-resolved/10 text-status-resolved',
+  RETRY: 'bg-status-pending/10 text-status-pending',
+  FAILED: 'bg-destructive/10 text-destructive',
+  AMBIGUOUS: 'bg-status-pending/10 text-status-pending',
+} as const;
+
 export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const { t } = useI18n();
   const ta = t.ticketActions;
@@ -83,6 +101,20 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const [assigneeId, setAssigneeId] = useState<string>('');
   const [departmentId, setDepartmentId] = useState<string>('');
   const [typeId, setTypeId] = useState<string>('');
+
+  // A post is committed before SMTP accepts it, so refresh an open ticket while
+  // its durable outbox command is still changing state. This avoids leaving an
+  // operator looking at a stale "queued" badge after the worker settles it.
+  const fastOutboundRefresh = ticket?.replies?.some(
+    (reply) => reply.delivery?.state === 'QUEUED' || reply.delivery?.state === 'PROCESSING',
+  );
+  const retryOutboundRefresh = ticket?.replies?.some((reply) => reply.delivery?.state === 'RETRY');
+  useEffect(() => {
+    const intervalMs = fastOutboundRefresh ? 5_000 : retryOutboundRefresh ? 30_000 : null;
+    if (!intervalMs) return;
+    const timer = window.setInterval(() => void refetch(), intervalMs);
+    return () => window.clearInterval(timer);
+  }, [fastOutboundRefresh, refetch, retryOutboundRefresh]);
 
   // Snapshot previous assignee/dept for error rollback
   const prevAssigneeRef = useRef<string>('');
@@ -245,7 +277,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
       replyForm.reset();
       setReplyAttachmentIds([]);
       if (typeof window !== 'undefined') localStorage.removeItem(replyDraftKey);
-      toast({ title: 'Ответ отправлен' });
+      toast({ title: 'Ответ поставлен в очередь', description: 'Статус SMTP появится в переписке.' });
     } catch {
       toast({ title: 'Ошибка', description: 'Не удалось отправить ответ', variant: 'destructive' });
     }
@@ -361,6 +393,17 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                         <span className="inline-flex items-center gap-1 rounded-full bg-status-pending/10 px-2 py-0.5 text-[10px] font-semibold text-status-pending">
                           <Lock className="h-2.5 w-2.5" />
                           Внутренняя
+                        </span>
+                      )}
+                      {reply.delivery && (
+                        <span
+                          title={reply.delivery.last_error ?? undefined}
+                          className={cn(
+                            'inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold',
+                            DELIVERY_COLORS[reply.delivery.state],
+                          )}
+                        >
+                          {DELIVERY_LABELS[reply.delivery.state]}
                         </span>
                       )}
                     </div>

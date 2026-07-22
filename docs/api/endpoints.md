@@ -373,3 +373,14 @@ SLA plans, schedules, holidays, and escalation rules. All routes require `admin.
 | GET                 | /api/admin/email-queues/inbound/quarantine                     | 🔒 `mail.view`      | `?page&limit&queueId&reason&messageId&from&to`                       | `{items,total,page,limit}` metadata only; no raw MIME or storage key. Each row reports server replay capability.                                                                                                                                                                       |
 | GET                 | /api/admin/email-queues/inbound/quarantine/{deliveryId}        | 🔒 `mail.view`      | —                                                                    | Metadata, replay capability/block reason and delivery audit history; no raw MIME/storage key.                                                                                                                                                                                          |
 | POST                | /api/admin/email-queues/inbound/quarantine/{deliveryId}/replay | 🔒 `mail.replay`    | `{reason, expectedUpdatedAt}`                                        | Transactional CAS replay + durable audit. Stale/repeated action → 409; truncated MIME → 400/replay blocked.                                                                                                                                                                            |
+
+### Admin / Durable outbound email
+
+`GET /api/tickets/{id}` and `GET /api/tickets/by-mask/{mask}` expose a staff-only
+`post.outboundEmail` projection (`state`, attempts, retry/sent timestamps and
+sanitized error) for a public staff reply. It intentionally excludes body,
+recipient lists and BCC.
+
+| Method | Path                                  | Auth                | Body | Returns                                                                                                                                                               |
+| ------ | ------------------------------------- | ------------------- | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | /api/admin/outbound-emails/{id}/retry | 🔒 `mail.configure` | —    | Requeues only `FAILED`, `AMBIGUOUS` or `RETRY` durable mail using its original Message-ID, recipient and attachment snapshots. `SENT` is never retried by this route. |
