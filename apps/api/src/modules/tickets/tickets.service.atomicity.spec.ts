@@ -48,7 +48,7 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     };
     prisma = {
       ticket: { findUnique: vi.fn(), update: vi.fn() },
-      ticketPost: { findFirst: vi.fn(), create: vi.fn() },
+      ticketPost: { findFirst: vi.fn(), findMany: vi.fn().mockResolvedValue([]), create: vi.fn() },
       ticketNote: { create: vi.fn() },
       ticketAuditLog: { create: vi.fn().mockResolvedValue({}) },
       ticketStatus: { findFirst: vi.fn() },
@@ -201,6 +201,28 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     );
     expect(mail.enqueueOutbound).toHaveBeenCalledWith('outbox-1');
     expect(mail.sendTemplate).not.toHaveBeenCalled();
+  });
+
+  it('filters malformed historic Message-IDs and bounds outbound References', async () => {
+    const id = (character: string) => `<${character.repeat(290)}@example.test>`;
+    const [oldest, older, newer, newest] = ['a', 'b', 'c', 'd'].map(id);
+    prisma.ticketPost.findMany.mockResolvedValue([
+      { messageId: oldest },
+      { messageId: '<bad\r\nBcc: injected@example.test>' },
+      { messageId: older },
+      { messageId: `<${'z'.repeat(600)}@example.test>` },
+      { messageId: newer },
+      { messageId: newest },
+    ]);
+
+    const threadingIds = await (
+      service as unknown as { loadThreadingIds(ticketId: number): Promise<string[]> }
+    ).loadThreadingIds(1);
+
+    // Three legal IDs would exceed the 900-character header cap, so the
+    // chronological suffix contains only the two newest valid entries.
+    expect(threadingIds).toEqual([newer, newest]);
+    expect(threadingIds.join(' ').length).toBeLessThanOrEqual(900);
   });
 
   it('refuses a public staff reply with no requester instead of showing a false queued/sent post', async () => {

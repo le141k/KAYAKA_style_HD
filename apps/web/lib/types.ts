@@ -63,6 +63,8 @@ export interface Reply {
   attachments?: Attachment[];
   /** Server-owned SMTP outcome for a public staff reply; absent for notes/inbound posts. */
   delivery?: {
+    /** Opaque durable outbox id; only used for the permission-gated retry action. */
+    id: string;
     state: 'QUEUED' | 'PROCESSING' | 'SENT' | 'RETRY' | 'FAILED' | 'AMBIGUOUS';
     attempts: number;
     next_attempt_at?: string | null;

@@ -136,6 +136,12 @@ const PUBLIC_USER_SELECT = {
   emails: { select: { email: true, isPrimary: true } },
 } as const;
 
+// These values deliberately stay below the RFC 5322 physical-line limit after
+// the transport adds the header name.  Historic TicketPost rows predate the
+// inbound validator, so never trust their Message-ID values as SMTP headers.
+const MAX_OUTBOUND_THREADING_MESSAGE_ID_CHARS = 512;
+const MAX_OUTBOUND_REFERENCES_CHARS = 900;
+
 @Injectable()
 export class TicketsService {
   private readonly logger = new Logger(TicketsService.name);
@@ -1896,10 +1902,23 @@ export class TicketsService {
         orderBy: { createdAt: 'asc' },
         take: 20,
       })) ?? [];
-    return posts
-      .map((post) => post.messageId?.trim())
-      .filter((messageId): messageId is string => Boolean(messageId))
-      .slice(-20);
+    const validIds = posts
+      .map((post) => this.parseMessageId(post.messageId))
+      .filter((messageId): messageId is string => Boolean(messageId));
+
+    // Keep a chronological suffix: References is a chain, so retaining an
+    // older ID after dropping a newer one would create a misleading thread.
+    // Work backwards so the newest valid ID remains In-Reply-To whenever it
+    // fits, then reverse it back into chronological order for the DB snapshot.
+    const newestFirst: string[] = [];
+    let referenceChars = 0;
+    for (const messageId of [...validIds].reverse()) {
+      const addedChars = messageId.length + (newestFirst.length > 0 ? 1 : 0);
+      if (referenceChars + addedChars > MAX_OUTBOUND_REFERENCES_CHARS) break;
+      newestFirst.push(messageId);
+      referenceChars += addedChars;
+    }
+    return newestFirst.reverse();
   }
 
   private async renderStaffReplyTemplate(vars: Record<string, string>): Promise<{
@@ -2015,27 +2034,42 @@ export class TicketsService {
   private normalizeIncomingMessageId(messageId?: string): string | undefined {
     const normalized = messageId?.trim();
     if (!normalized) return undefined;
-    // RFC 5322 caps a physical line at 998 characters; reject pathological
-    // parser input instead of persisting an unbounded idempotency key.
+    if (!this.parseMessageId(normalized, 998)) throw new BadRequestException('Invalid inbound Message-ID');
+    return normalized;
+  }
+
+  /**
+   * Validate a Message-ID before it is persisted or emitted as an SMTP header.
+   * Unlike inbound input validation, callers that read a legacy database row
+   * receive `undefined` rather than an exception: one corrupt historic post
+   * must not prevent an agent from replying to the ticket.
+   */
+  private parseMessageId(
+    value: string | null | undefined,
+    maxLength = MAX_OUTBOUND_THREADING_MESSAGE_ID_CHARS,
+  ): string | undefined {
+    const normalized = value?.trim();
+    if (
+      !normalized ||
+      normalized.length > maxLength ||
+      !normalized.startsWith('<') ||
+      !normalized.endsWith('>')
+    ) {
+      return undefined;
+    }
     const body = normalized.slice(1, -1);
-    const hasForbiddenCharacter = [...body].some((character) => {
+    if (!body) return undefined;
+    for (const character of body) {
       const codePoint = character.codePointAt(0) ?? 0;
-      return (
+      if (
         character === '<' ||
         character === '>' ||
         /\s/u.test(character) ||
         codePoint <= 0x1f ||
         codePoint === 0x7f
-      );
-    });
-    if (
-      normalized.length > 998 ||
-      !normalized.startsWith('<') ||
-      !normalized.endsWith('>') ||
-      body.length === 0 ||
-      hasForbiddenCharacter
-    ) {
-      throw new BadRequestException('Invalid inbound Message-ID');
+      ) {
+        return undefined;
+      }
     }
     return normalized;
   }

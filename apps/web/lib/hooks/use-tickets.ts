@@ -41,6 +41,7 @@ interface ApiPost {
   staff?: ApiStaffRel | null;
   attachments?: ApiAttachment[];
   outboundEmail?: {
+    id: string;
     state: 'QUEUED' | 'PROCESSING' | 'SENT' | 'RETRY' | 'FAILED' | 'AMBIGUOUS';
     attempts: number;
     nextAttemptAt?: string | null;
@@ -131,6 +132,7 @@ function mapPostToReply(p: ApiPost): Reply {
     ...(p.outboundEmail
       ? {
           delivery: {
+            id: p.outboundEmail.id,
             state: p.outboundEmail.state,
             attempts: p.outboundEmail.attempts,
             next_attempt_at: p.outboundEmail.nextAttemptAt,
@@ -425,6 +427,20 @@ export function useReply(ticketId: number) {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ticketKeys.replies(ticketId) });
       void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });
+    },
+  });
+}
+
+/** Explicit operator action for a terminal outbound delivery. The server owns
+ * authorization and ticket department scope; the client only keeps its views fresh. */
+export function useRetryOutboundEmail(ticketId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (outboundEmailId: string) =>
+      api.post(`/admin/outbound-emails/${encodeURIComponent(outboundEmailId)}/retry`, {}),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });
+      void qc.invalidateQueries({ queryKey: ticketKeys.replies(ticketId) });
     },
   });
 }
