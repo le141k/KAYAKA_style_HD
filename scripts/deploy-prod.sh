@@ -343,7 +343,14 @@ if [[ "$EXISTING_RELEASE" == true ]]; then
     exit 1
   }
 
-  echo '[deploy-prod] 6/12 running schema-compatible pre-migration and worker-idle audits'
+  echo '[deploy-prod] 6/12 validating queue field encryption, then running pre-migration audits'
+  # The old API is stopped and every BullMQ queue is paused at this point. Convert
+  # legacy plaintext IMAP passwords with CAS semantics before the new production
+  # runtime enforces its encryption key. The seed prints aggregate counts only;
+  # any malformed ciphertext, wrong key, or unstable direct DB edit aborts before
+  # migrations/the forward-only boundary and triggers the old-release rollback.
+  "${COMPOSE[@]}" run --rm --no-deps -T api \
+    node dist/seed/reencrypt-email-queue-passwords.js
   "${COMPOSE[@]}" run --rm --no-deps -T api node dist/seed/audit-pre-migration.js
   "${COMPOSE[@]}" run --rm --no-deps -T api \
     node dist/seed/audit-user-email-ownership.js --pre-migration

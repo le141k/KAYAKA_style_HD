@@ -69,7 +69,9 @@ Required invariants:
   `TELECOM_HD_TURNSTILE_HOSTNAME` refer to the same production host.
 - `NEXT_PUBLIC_API_URL` is empty for the recommended same-origin `/api` path.
 - JWT secrets are strong and distinct; DB/Redis passwords are URL-safe; the field-encryption key is
-  64 hexadecimal characters.
+  present and exactly 64 hexadecimal characters. It is mandatory in production: before the new API
+  starts, the deploy helper validates existing encrypted queue credentials and converts any legacy
+  non-empty plaintext `passwordEnc` values with compare-and-swap updates. Its output is aggregate-only.
 - SMTP uses a real authenticated relay. Port 587 uses mandatory STARTTLS
   (`TELECOM_HD_SMTP_SECURE=false`); port 465 uses implicit TLS (`true`).
 - `TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL/PASSWORD` are absent from `.env.prod`; first-install creation is
@@ -120,7 +122,9 @@ For an existing release the helper performs, in order:
 3. pinned image pulls and immutable builds while the old release remains online; the web tag includes
    the digest of its `NEXT_PUBLIC_*` build inputs;
 4. ingress closure, global BullMQ pause, a ten-minute maximum active-job drain, then API/web stop;
-5. schema-compatible template, ownership and worker-idle pre-migration audits;
+5. field-encryption migration/validation after old API stop (legacy queue credentials are converted with
+   CAS; a malformed ciphertext or unstable concurrent change aborts before the migration boundary), then
+   schema-compatible template, ownership and worker-idle pre-migration audits;
 6. one exact, quiesced DB/uploads pair in a unique deployment directory plus real restores into
    disposable targets and exact file-count/byte reconciliation;
 7. live Redis RDB→AOF conversion when needed, a preserved immutable rollback-volume copy, target
