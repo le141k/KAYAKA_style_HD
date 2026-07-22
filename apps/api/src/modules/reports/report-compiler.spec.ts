@@ -3,6 +3,7 @@ import { BadRequestException } from '@nestjs/common';
 import { ReportCompiler, buildWhere } from './report-compiler';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { ReportDefinition } from './report-definition.schema';
+import type { TicketAccessPolicy } from '../tickets/ticket-access-policy.service';
 
 // ─── Prisma mock factory ───────────────────────────────────────────────────────
 
@@ -25,6 +26,13 @@ function makePrismaMock() {
     },
   } as unknown as PrismaService;
 }
+
+function makeTicketAccessMock() {
+  return { ticketWhere: vi.fn().mockResolvedValue({}) };
+}
+
+const UNRESTRICTED_ACTOR = { staffId: 1, isAdmin: true } as const;
+const DEPT_A_ACTOR = { staffId: 10, isAdmin: false } as const;
 
 // ─── buildWhere tests ─────────────────────────────────────────────────────────
 
@@ -103,10 +111,15 @@ describe('buildWhere', () => {
 describe('ReportCompiler', () => {
   let compiler: ReportCompiler;
   let prisma: ReturnType<typeof makePrismaMock>;
+  let ticketAccess: ReturnType<typeof makeTicketAccessMock>;
 
   beforeEach(() => {
     prisma = makePrismaMock();
-    compiler = new ReportCompiler(prisma as unknown as PrismaService);
+    ticketAccess = makeTicketAccessMock();
+    compiler = new ReportCompiler(
+      prisma as unknown as PrismaService,
+      ticketAccess as unknown as TicketAccessPolicy,
+    );
   });
 
   // ─── count groupBy → prisma.groupBy fast path ────────────────────────────
@@ -126,7 +139,7 @@ describe('ReportCompiler', () => {
         limit: 100,
       };
 
-      const rows = await compiler.compile(def);
+      const rows = await compiler.compile(def, UNRESTRICTED_ACTOR);
 
       expect(prisma.ticket.groupBy).toHaveBeenCalledWith(
         expect.objectContaining({ by: ['statusId'], _count: { _all: true } }),
@@ -147,7 +160,7 @@ describe('ReportCompiler', () => {
         limit: 100,
       };
 
-      const rows = await compiler.compile(def);
+      const rows = await compiler.compile(def, UNRESTRICTED_ACTOR);
       expect(rows).toEqual([{ count: 42 }]);
       expect(prisma.ticket.count).toHaveBeenCalled();
     });
@@ -175,7 +188,7 @@ describe('ReportCompiler', () => {
         limit: 100,
       };
 
-      const rows = await compiler.compile(def);
+      const rows = await compiler.compile(def, UNRESTRICTED_ACTOR);
 
       // Should NOT call groupBy
       expect(prisma.ticket.groupBy).not.toHaveBeenCalled();
@@ -203,7 +216,7 @@ describe('ReportCompiler', () => {
         limit: 100,
       };
 
-      const rows = await compiler.compile(def);
+      const rows = await compiler.compile(def, UNRESTRICTED_ACTOR);
       expect(rows).toHaveLength(2);
       const jan = rows.find((r) => r['createdAt:month'] === '2026-01');
       expect(jan?.count).toBe(2);
@@ -231,7 +244,7 @@ describe('ReportCompiler', () => {
         limit: 100,
       };
 
-      const rows = await compiler.compile(def);
+      const rows = await compiler.compile(def, UNRESTRICTED_ACTOR);
       expect(rows).toHaveLength(1);
       expect(rows[0]).toHaveProperty('avgResponse');
       // avg of 3600 and 7200 = 5400
@@ -255,7 +268,7 @@ describe('ReportCompiler', () => {
         limit: 100,
       };
 
-      const rows = await compiler.compile(def);
+      const rows = await compiler.compile(def, UNRESTRICTED_ACTOR);
       expect(rows[0]!.avgResolution).toBe(3600);
     });
   });
@@ -277,7 +290,7 @@ describe('ReportCompiler', () => {
         limit: 100,
       };
 
-      const rows = await compiler.compile(def);
+      const rows = await compiler.compile(def, UNRESTRICTED_ACTOR);
       expect(prisma.ticket.groupBy).toHaveBeenCalledWith(
         expect.objectContaining({ by: ['departmentId', 'statusId'] }),
       );
@@ -299,7 +312,7 @@ describe('ReportCompiler', () => {
         limit: 100,
       };
 
-      const rows = await compiler.compile(def);
+      const rows = await compiler.compile(def, UNRESTRICTED_ACTOR);
       expect(rows).toHaveLength(3);
     });
   });
@@ -322,7 +335,7 @@ describe('ReportCompiler', () => {
         limit: 10,
       };
 
-      const rows = await compiler.compile(def);
+      const rows = await compiler.compile(def, UNRESTRICTED_ACTOR);
       expect(rows).toHaveLength(10);
     });
   });
@@ -339,7 +352,7 @@ describe('ReportCompiler', () => {
         aggregates: [{ func: 'count' }],
         limit: 100,
       };
-      await expect(compiler.compile(def)).rejects.toThrow(BadRequestException);
+      await expect(compiler.compile(def, UNRESTRICTED_ACTOR)).rejects.toThrow(BadRequestException);
     });
 
     it('throws BadRequestException for invalid filter field in buildWhere', () => {
@@ -365,7 +378,7 @@ describe('ReportCompiler', () => {
         limit: 100,
       };
 
-      const rows = await compiler.compile(def);
+      const rows = await compiler.compile(def, UNRESTRICTED_ACTOR);
       expect(prisma.ticketAuditLog.groupBy).toHaveBeenCalled();
       expect(rows[0]).toEqual({ staffId: 1, action: 'REPLY', count: 10 });
     });
@@ -385,15 +398,67 @@ describe('ReportCompiler', () => {
         limit: 100,
       };
 
-      await compiler.compile(def);
+      await compiler.compile(def, UNRESTRICTED_ACTOR);
 
       expect(prisma.ticket.count).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
-            createdAt: expect.objectContaining({ gte: expect.any(Date) }),
+            AND: expect.arrayContaining([
+              expect.objectContaining({
+                createdAt: expect.objectContaining({ gte: expect.any(Date) }),
+              }),
+            ]),
           }),
         }),
       );
+    });
+  });
+
+  describe('department scope', () => {
+    const DEPT_A_SCOPE = { departmentId: { in: [1] } };
+
+    it('keeps a ticket count SQL-scoped even when the report asks for Department B', async () => {
+      const def: ReportDefinition = {
+        source: 'tickets',
+        filters: [{ field: 'departmentId', op: 'eq', value: 2 }],
+        groupBy: [],
+        aggregates: [{ func: 'count' }],
+        limit: 100,
+      };
+
+      ticketAccess.ticketWhere.mockResolvedValue(DEPT_A_SCOPE);
+      await compiler.compile(def, DEPT_A_ACTOR);
+
+      expect(prisma.ticket.count).toHaveBeenCalledWith({
+        where: {
+          AND: [{ departmentId: 2 }, DEPT_A_SCOPE],
+        },
+      });
+    });
+
+    it.each([
+      ['ticketPosts', 'ticketPost', { field: 'authorType', op: 'eq', value: 'STAFF' }],
+      ['ticketAuditLogs', 'ticketAuditLog', { field: 'actorType', op: 'eq', value: 'STAFF' }],
+    ] as const)('scopes %s through its owning ticket relation', async (source, prismaModel, filter) => {
+      const def: ReportDefinition = {
+        source,
+        filters: [filter],
+        groupBy: [],
+        aggregates: [{ func: 'count' }],
+        limit: 100,
+      };
+
+      ticketAccess.ticketWhere.mockResolvedValue(DEPT_A_SCOPE);
+      await compiler.compile(def, DEPT_A_ACTOR);
+
+      expect(prisma[prismaModel].count).toHaveBeenCalledWith({
+        where: {
+          AND: [
+            filter.field === 'authorType' ? { authorType: 'STAFF' } : { actorType: 'STAFF' },
+            { ticket: { is: DEPT_A_SCOPE } },
+          ],
+        },
+      });
     });
   });
 });

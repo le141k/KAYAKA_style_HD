@@ -1,4 +1,7 @@
+import { createHash, randomUUID } from 'node:crypto';
 import {
+  BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   OnModuleDestroy,
@@ -7,10 +10,9 @@ import {
   forwardRef,
   Optional,
   PayloadTooLargeException,
-  BadRequestException,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import type { ImapFlow, FetchMessageObject } from 'imapflow';
+import type { ImapFlow } from 'imapflow';
 import type { AddressObject, ParsedMail } from 'mailparser';
 import { TicketsService } from '../tickets/tickets.service';
 import { MailService } from './mail.service';
@@ -18,10 +20,11 @@ import { AttachmentsService } from '../attachments/attachments.service';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
 import { PrismaService } from '../../prisma/prisma.service';
 import { decryptField } from '../../common/field-encrypt.util';
-import { stripQuotedReply } from './quoted-reply.util';
-import type { EmailParserRule, Prisma } from '@prisma/client';
-import { Readable } from 'node:stream';
 import { normalizeEmail } from '../../common/email.util';
+import { stripQuotedReply } from './quoted-reply.util';
+import { Prisma, type EmailParserRule } from '@prisma/client';
+import { normalizePipeDeliveryId } from './pipe-input.util';
+import { InboundRawStorageService } from './inbound-raw-storage.service';
 
 /** Parsed email fields used for rule evaluation */
 interface ParsedEmail {
@@ -41,10 +44,131 @@ export interface ParserRuleResult {
   tags: string[];
 }
 
+/** Terminal outcome of processing one raw inbound message. */
+interface ProcessOutcome {
+  state: 'PROCESSED' | 'SKIPPED';
+  ticketId?: number;
+  postId?: number;
+}
+
+/** Immutable business route selected before a delivery can create a ticket. */
+interface InboundRoute {
+  queueId?: number;
+  departmentId?: number;
+  /** Customer-automation policy of the queue that actually owns this ticket. */
+  sendAutoresponder?: boolean;
+  /** No configured recipient address matched; receiving queue/default was used explicitly. */
+  fallback: boolean;
+  fallbackReason?: 'RECEIVING_QUEUE' | 'DEFAULT_DEPARTMENT';
+}
+
+/**
+ * Immutable enabled-queue view captured in the same transaction as ledger acceptance.
+ * It lets every CC/BCC transport copy make the documented priority decision without
+ * consulting configuration that an operator may have changed while the delivery waited
+ * in the ledger.
+ */
+interface RoutingSnapshotEntry {
+  id: number;
+  emailAddress: string;
+  departmentId: number | null;
+  routingPriority: number;
+  sendAutoresponder: boolean;
+}
+
+/** Context snapshotted from the ledger row, never inferred from mutable queue state later. */
+interface DeliveryRoutingContext {
+  queueId?: number;
+  transportKey?: string;
+  envelopeTo?: string;
+  routedQueueId?: number;
+  routedDepartmentId?: number;
+  sendAutoresponder?: boolean | null;
+  routingSnapshot?: RoutingSnapshotEntry[];
+}
+
+interface LogicalClaimWinner {
+  messageIdHash: string;
+  route: InboundRoute;
+}
+
+type LogicalClaimResult =
+  | { kind: 'WINNER'; winner: LogicalClaimWinner }
+  | { kind: 'DUPLICATE'; route: InboundRoute }
+  | { kind: 'CONFLICT'; route: InboundRoute; existingSemanticHash: string | null };
+
+/**
+ * A real Message-ID was reused with different logical content, or points at a legacy claim
+ * whose semantic content cannot be reconstructed safely. This is an input/forensics conflict,
+ * not a transient DB error, so the delivery is quarantined (with its raw MIME retained).
+ */
+class SemanticMessageIdConflictError extends BadRequestException {
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+/** Immutable DB snapshot handed from the reconcile CAS to the IMAP probe. */
+export interface ReconcileMailboxSnapshot {
+  id: number;
+  host: string;
+  port: number;
+  username: string;
+  passwordEnc: string;
+  useTls: boolean;
+  mailboxEpoch: number;
+  cursorGeneration: number;
+  configGeneration: number;
+}
+
+/** Exact IMAP snapshot used to complete FROM_NOW/BACKFILL. */
+export interface ReconcileMailboxBaseline {
+  uidValidity: bigint;
+  /** UIDNEXT - 1 observed while the mailbox lock was held. */
+  boundary: number;
+  /** Durable cursor: boundary for FROM_NOW, predecessor of the selected N UIDs for BACKFILL. */
+  cursor: number;
+  /** Existing UID values selected for BACKFILL; empty for FROM_NOW. */
+  selectedUids: number[];
+}
+
+/** The queue changed after a poll fetched bytes but before it could durably accept them. */
+class StaleImapAcceptSnapshotError extends Error {
+  constructor(queueId: number) {
+    super(`IMAP queue ${queueId} changed before delivery acceptance`);
+    this.name = 'StaleImapAcceptSnapshotError';
+  }
+}
+
+/** A supposedly identical IMAP transport identity carried different bytes: halt, never skip. */
+class ImapTransportCollisionError extends Error {
+  constructor(queueId: number, transportKey: string) {
+    super(`IMAP transport collision on queue ${queueId}: ${transportKey}`);
+    this.name = 'ImapTransportCollisionError';
+  }
+}
+
+/** Fixed poll snapshot used by the acceptance fence; never re-read mutable queue fields. */
+interface ImapAcceptSnapshot {
+  id: number;
+  type: 'IMAP' | 'PIPE' | 'POP3';
+  isEnabled: boolean;
+  /** Configured receiving mailbox; persisted as the trusted envelope fallback for routing. */
+  emailAddress: string;
+  departmentId: number | null;
+  sendAutoresponder: boolean;
+  syncState: 'OK' | 'BOOTSTRAPPING' | 'NEEDS_RECONCILIATION';
+  mailboxEpoch: number;
+  cursorGeneration: number;
+  configGeneration: number;
+  uidValidity: bigint | null;
+}
+
 /** Ticket mask pattern used to thread inbound replies, e.g. TT-000042 */
 const MASK_RE = /TT-\d{6,}/i;
 
-const IMAP_ERROR_MAILBOX = 'Helpdesk-Processing-Errors';
+// Parser-amplification bounds — reject pathological MIME before it reaches routing,
+// storage, or the regex parser rules (preserved from the security baseline).
 const MAX_SUBJECT_CHARS = 500;
 const MAX_BODY_CHARS = 100_000;
 const MAX_ADDRESS_CHARS = 320;
@@ -56,25 +180,14 @@ const MAX_REFERENCE_CHARS = 8_192;
 const MAX_ADDRESSES = 100;
 const MAX_ATTACHMENTS = 10;
 const MAX_RULE_PATTERN_CHARS = 128;
+// At most two MIME trees are materialized concurrently; excess parse work is bounded
+// so a burst of large messages cannot exhaust memory.
 const MAX_CONCURRENT_PARSERS = 2;
 const MAX_QUEUED_PARSERS = 32;
-const MAX_PROCESSING_ATTEMPTS = 3;
-const MAX_PENDING_FAILURES = 100;
-const MAX_DEAD_LETTER_RECORDS = 100;
+/** Larger messages live in the existing upload volume, not forever in PostgreSQL rows. */
+const MAX_INLINE_RAW_MIME_BYTES = 1024 * 1024;
 
-interface ImapFailureState {
-  uid: number;
-  status: 'pending' | 'quarantined' | 'missing';
-  attempts: number;
-  lastFailedAt: string;
-}
-
-interface ImapQueueState {
-  uidValidity: string;
-  watermark: number;
-  failures: ImapFailureState[];
-}
-
+/** Minimal ticket shape needed to authorize an inbound reply against its participants. */
 interface ThreadableTicket {
   id: number;
   requesterEmail: string | null;
@@ -83,33 +196,73 @@ interface ThreadableTicket {
 }
 
 /**
- * IMAP inbound mail service.
+ * Inbound mail service — durable, idempotent, fail-closed.
  *
- * When TELECOM_HD_IMAP_ENABLED=true (checked at runtime from the EmailQueue table),
- * this service polls each enabled IMAP queue and:
- *  1. Threads replies by RFC Message-ID / In-Reply-To / References headers.
- *  2. Falls back to TT-XXXXXX mask matching in the subject.
- *  3. Creates new tickets from unthreaded messages and sends autoresponder.
- *  4. Stores RFC Message-ID on created TicketPost.
- *  5. Sends a reply email notification on staff reply.
+ * Every inbound message (IMAP poll or POST /api/inbound/pipe) is first recorded in the
+ * `InboundDelivery` ledger (state ACCEPTED, raw MIME retained) under a UNIQUE transport
+ * key, then processed by the drain. This guarantees:
+ *  - **No silent loss:** the IMAP cursor advances only after a message is durably
+ *    ACCEPTED; a fetch/DB error stops the poll without advancing (fail-closed).
+ *  - **Idempotency:** the unique transport key makes re-delivery a no-op; processing
+ *    de-dups by RFC Message-ID (synthesised from the content hash when the message
+ *    carries none), so a retry after a mid-processing failure never double-posts.
+ *  - **Replay:** a failing message is retried with backoff, then QUARANTINED (never
+ *    discarded — the raw MIME is kept) for operator replay.
+ *  - **Fail-closed UIDVALIDITY:** a server UID-space reset halts the queue
+ *    (NEEDS_RECONCILIATION) for an explicit operator FROM_NOW / BACKFILL decision.
  *
- * TODO: replace polling with IMAP IDLE for push-based notification.
- * A per-queue UID watermark is persisted in the Setting table so a restart does
- * not re-process (and re-ticket) the entire mailbox.
+ * TODO: replace polling with IMAP IDLE; externalise raw MIME for very large messages.
  */
 @Injectable()
 export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(InboundMailService.name);
   private readonly connections: Map<number, ImapFlow> = new Map();
+  /** Fingerprint (host/port/tls/user/password) of each live connection so the supervisor
+   *  reconnects when a queue's credentials or host change, not only when it drops. */
+  private readonly connectionFingerprints = new Map<number, string>();
   private pollHandle: ReturnType<typeof setInterval> | null = null;
-  private pollInProgress = false;
+  private drainHandle: ReturnType<typeof setInterval> | null = null;
+  private pruneHandle: ReturnType<typeof setInterval> | null = null;
+  /** Refresh PIPE loop-suppression addresses even when the IMAP transport is disabled. */
+  private ownAddressHandle: ReturnType<typeof setInterval> | null = null;
+  /** A timer tick shares this promise with manual pollNow calls; cycles never overlap. */
+  private pollAllInFlight: Promise<void> | null = null;
+  /** Drain ticks share one cycle too, so shutdown can wait for claimed work to settle. */
+  private drainInFlight: Promise<void> | null = null;
+  /** One IMAP connection must never be polled twice concurrently in this process. */
   private readonly pollingQueues = new Set<number>();
+  /** Prevent a shutdown from starting a fresh supervisor/poll cycle. */
+  private stopping = false;
+  /** Throttle repeated "queue halted" logs to once per interval per queue. */
+  private readonly haltLogged = new Set<number>();
+  /** This process's id (diagnostics). Lease ownership uses a fresh per-claim token. */
+  private readonly instanceId = randomUUID();
+  /** Delivery ids currently being processed IN THIS process — prevents a slow flow whose
+   *  lease expired from being reclaimed and reprocessed concurrently by our own drain. */
+  private readonly inFlight = new Set<number>();
+  /** Bounded MIME-parse concurrency (permits + FIFO waiters), preserved from the
+   *  security baseline so a burst of large messages cannot exhaust memory. */
   private activeParsers = 0;
-  private readonly parserWaiters: Array<{
-    resolve: () => void;
-    reject: (error: Error) => void;
-  }> = [];
+  private readonly parserWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+  /** Our own mailbox addresses (MAIL_FROM + every configured queue) for loop suppression. */
   private readonly ownAddresses = new Set<string>();
+  /** How long a PROCESSING lease is honoured before another worker may reclaim it. */
+  private static readonly LEASE_MS = 5 * 60_000;
+  /** A raw-MIME stage may be reaped only after this lease, and only under its DB row lock. */
+  private static readonly RAW_STAGING_LEASE_MS = 10 * 60_000;
+
+  private get maxAttempts(): number {
+    return this.config.TELECOM_HD_INBOUND_MAX_ATTEMPTS;
+  }
+
+  /**
+   * The release/canary master gate must fail closed. `AppConfig` always supplies this
+   * boolean at runtime; treating an incomplete hand-built test/config object as disabled
+   * keeps a future bootstrap or direct service caller from accidentally accepting mail.
+   */
+  private get inboundDeliveryEnabled(): boolean {
+    return this.config.TELECOM_HD_INBOUND_DELIVERY_ENABLED === true;
+  }
 
   constructor(
     @Inject(APP_CONFIG) private readonly config: AppConfig,
@@ -117,74 +270,157 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     @Inject(forwardRef(() => TicketsService)) private readonly ticketsService: TicketsService,
     private readonly mailService: MailService,
     @Optional() private readonly attachmentsService?: AttachmentsService,
+    @Optional() private readonly rawStorage?: InboundRawStorageService,
   ) {}
 
   async onModuleInit(): Promise<void> {
-    const mailFrom = this.normalizeConfiguredMailbox(this.config.TELECOM_HD_MAIL_FROM ?? '');
-    if (mailFrom) this.ownAddresses.add(mailFrom);
+    // Do not start supervisor, drain, or retention work when delivery is globally
+    // closed. ACCEPTED/RETRY ledger rows remain durable and operator endpoints remain
+    // available; an attended configuration-only restart is required before processing.
+    if (!this.inboundDeliveryEnabled) {
+      this.logger.warn(
+        'Inbound delivery disabled (TELECOM_HD_INBOUND_DELIVERY_ENABLED=false) — ' +
+          'IMAP, PIPE acceptance, and ledger drain are fail-closed',
+      );
+      return;
+    }
 
-    // A1: surface enabled queues whose transport we don't poll (e.g. PIPE) instead
-    // of silently ignoring them — their mail would otherwise be dropped on the
-    // floor. PIPE/MTA queues are fed via POST /api/inbound/pipe (see controller).
-    const enabledNonImap = await this.prisma.emailQueue.findMany({
+    // Seed loop-suppression addresses (our MAIL_FROM + every enabled queue) BEFORE the
+    // TELECOM_HD_IMAP_ENABLED early-return, so a self-loop is suppressed even when the
+    // poller is disabled and mail arrives only via the PIPE webhook. The set is rebuilt on
+    // every supervisor cycle (reconcileConnections) so a queue address change is reflected.
+    await this.refreshOwnAddresses();
+    this.ownAddressHandle = setInterval(() => {
+      void this.refreshOwnAddresses();
+    }, 60_000);
+    this.ownAddressHandle.unref?.();
+
+    // A1: surface enabled queues whose transport we don't poll (e.g. PIPE) instead of
+    // silently ignoring them — their mail is fed via POST /api/inbound/pipe.
+    const nonImap = await this.prisma.emailQueue.findMany({
       where: { isEnabled: true, type: { not: 'IMAP' } },
       select: { id: true, emailAddress: true, type: true },
     });
-    for (const q of enabledNonImap) {
+    for (const q of nonImap) {
       this.logger.warn(
-        `EmailQueue ${q.id} (type=${q.type}) is enabled but not IMAP — ` +
+        `EmailQueue ${q.id} (${q.emailAddress}, type=${q.type}) is enabled but not IMAP — ` +
           `the poller will not fetch it. Use the inbound webhook (POST /api/inbound/pipe) for PIPE/MTA delivery.`,
       );
     }
 
-    // Only start polling if at least one IMAP queue is enabled
+    // The drain runs regardless of IMAP so PIPE RETRY deliveries always make progress.
+    // Kick once now so any deliveries left PROCESSING by a previous crash are reclaimed
+    // as soon as their lease expires (startup recovery), then every 30 s.
+    this.drainHandle = setInterval(() => {
+      void this.drainDeliveries().catch((err: unknown) =>
+        this.logger.error(`Inbound drain error (${this.errorKind(err)})`),
+      );
+    }, 30_000);
+    void this.drainDeliveries().catch((err: unknown) =>
+      this.logger.error(`Inbound startup drain error (${this.errorKind(err)})`),
+    );
+
+    // Raw-MIME retention: prune terminal deliveries' inline blobs hourly (and once now) so the
+    // ledger's on-disk footprint stays bounded. Independent of IMAP (PIPE deliveries too).
+    this.pruneHandle = setInterval(() => {
+      void this.pruneRawMime().catch((err: unknown) =>
+        this.logger.error(`Inbound retention prune error (${this.errorKind(err)})`),
+      );
+    }, 60 * 60_000);
+    this.pruneHandle.unref?.();
+    void this.pruneRawMime().catch((err: unknown) =>
+      this.logger.error(`Inbound startup retention prune error (${this.errorKind(err)})`),
+    );
+
+    if (!this.config.TELECOM_HD_IMAP_ENABLED) {
+      this.logger.log('IMAP polling disabled (TELECOM_HD_IMAP_ENABLED=false) — drain active for PIPE');
+      return;
+    }
+
     const queues = await this.prisma.emailQueue.findMany({
       where: { isEnabled: true, type: 'IMAP' },
     });
 
-    for (const queue of [...enabledNonImap, ...queues]) {
-      if ('emailAddress' in queue) {
-        const address = normalizeEmail(queue.emailAddress);
-        if (address) this.ownAddresses.add(address);
-      }
-    }
-
-    if (queues.length === 0) {
-      this.logger.log('No enabled IMAP queues — inbound mail polling disabled');
-      return;
-    }
-
-    // Connect to each queue
+    // Connect any queues that exist now. Do NOT early-return when there are zero — the
+    // poll supervisor below (reconcileConnections, run each cycle) connects queues created
+    // or enabled AFTER startup, so a first IMAP queue added at runtime is polled without an
+    // API restart (previously a zero-queue boot left the supervisor unstarted forever).
     const encKey = this.config.TELECOM_HD_FIELD_ENCRYPTION_KEY;
     for (const queue of queues) {
       let plainPassword: string;
       try {
         plainPassword = decryptField(queue.passwordEnc, encKey);
-      } catch {
-        this.logger.error(`Failed to decrypt IMAP password for queue ${queue.id}`);
+      } catch (err) {
+        this.logger.error(`Failed to decrypt IMAP password for queue ${queue.id} (${this.errorKind(err)})`);
         continue;
       }
       await this.connectQueue(queue.id, {
         host: queue.host,
         port: queue.port,
         secure: queue.useTls,
-        auth: {
-          user: queue.username,
-          pass: plainPassword,
-        },
+        auth: { user: queue.username, pass: plainPassword },
       });
+      if (this.connections.has(queue.id)) {
+        this.connectionFingerprints.set(queue.id, this.connectionFingerprint(queue));
+      }
     }
 
-    // Poll every 60 seconds
     this.pollHandle = setInterval(() => {
-      void this.pollAll().catch(() => this.logger.error('IMAP poll failed'));
+      void this.pollNow().catch((err: unknown) =>
+        this.logger.error(`IMAP poll error (${this.errorKind(err)})`),
+      );
     }, 60_000);
 
-    this.logger.log(`IMAP inbound polling started for ${queues.length} queue(s)`);
+    this.logger.log(
+      `IMAP inbound polling supervisor started (${queues.length} queue(s) connected at boot; ` +
+        `reconnects + newly enabled queues handled each cycle)`,
+    );
+  }
+
+  /**
+   * Rebuild the self-loop suppression set from the CURRENT enabled queues (+ MAIL_FROM).
+   * Called at init and on every supervisor cycle so an emailAddress change — which does not
+   * change a connection fingerprint — is reflected without an API restart. Replaces the set
+   * atomically (no await between clear and refill) and keeps the old set on a DB error
+   * rather than blanking loop suppression.
+   */
+  private async refreshOwnAddresses(): Promise<void> {
+    const configuredFrom = this.normalizeConfiguredMailbox(this.config.TELECOM_HD_MAIL_FROM ?? '');
+    let rows: Array<{ emailAddress: string }>;
+    try {
+      rows = await this.prisma.emailQueue.findMany({
+        where: { isEnabled: true },
+        select: { emailAddress: true },
+      });
+    } catch (err) {
+      this.logger.error(`ownAddresses refresh failed (keeping prior set; ${this.errorKind(err)})`);
+      return;
+    }
+    const next = new Set<string>();
+    if (configuredFrom) next.add(configuredFrom);
+    for (const r of rows) {
+      const address = normalizeEmail(r.emailAddress);
+      if (address) next.add(address);
+    }
+    this.ownAddresses.clear();
+    for (const address of next) this.ownAddresses.add(address);
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.stopping = true;
     if (this.pollHandle) clearInterval(this.pollHandle);
+    if (this.drainHandle) clearInterval(this.drainHandle);
+    if (this.pruneHandle) clearInterval(this.pruneHandle);
+    if (this.ownAddressHandle) clearInterval(this.ownAddressHandle);
+    // Let a cycle already in progress release its IMAP mailbox lock before logging out
+    // connections. New ticks cannot start after `stopping = true`.
+    await this.pollAllInFlight?.catch((err: unknown) =>
+      this.logger.warn(`Inbound poll shutdown wait failed (${this.errorKind(err)})`),
+    );
+    await this.drainInFlight?.catch((err: unknown) =>
+      this.logger.warn(`Inbound drain shutdown wait failed (${this.errorKind(err)})`),
+    );
+    // Release any queued parse waiters so pending drains reject rather than hang on shutdown.
     const shutdownError = new ServiceUnavailableException('Inbound parser is shutting down');
     for (const waiter of this.parserWaiters.splice(0)) waiter.reject(shutdownError);
     for (const [queueId, client] of this.connections) {
@@ -197,14 +433,15 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     this.connections.clear();
   }
 
-  // ─────────────────── private ───────────────────
+  // ─────────────────── connection + bootstrap ───────────────────
 
   private async connectQueue(
     queueId: number,
     opts: { host: string; port: number; secure: boolean; auth: { user: string; pass: string } },
   ): Promise<void> {
+    if (this.stopping) return;
+    await this.stampQueue(queueId, { lastConnectionAttemptAt: new Date() });
     try {
-      // Lazy import to avoid hard dep when IMAP is disabled
       const { ImapFlow: ImapFlowCtor } = await import('imapflow');
       const client = new ImapFlowCtor({
         host: opts.host,
@@ -215,380 +452,1612 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       });
       await client.connect();
       this.connections.set(queueId, client);
-      this.logger.log(`IMAP connected to queue ${queueId}`);
-    } catch {
-      this.logger.error(`Failed to connect IMAP queue ${queueId}`);
+      await this.stampQueue(queueId, { lastConnectedAt: new Date() });
+      this.logger.log(`IMAP connected to queue ${queueId} (${opts.host}:${opts.port})`);
+      // Capture the baseline SYNCHRONOUSLY at activation (not on the first 60s poll) so
+      // mail arriving between connect and the first poll is not skipped (P0-2).
+      await this.bootstrapQueue(queueId, client);
+    } catch (err) {
+      // Driver errors may embed a connection URI or authentication detail. Queue health
+      // carries a safe state; logs retain only the error class and queue id.
+      this.logger.error(`Failed to connect IMAP queue ${queueId} (${this.errorKind(err)})`);
+      await this.stampQueue(queueId, {
+        lastConnectionErrorAt: new Date(),
+        lastDisconnectedAt: new Date(),
+        lastError: 'IMAP connection failed; verify queue configuration and server availability',
+      });
     }
   }
 
-  /** Poll all connected IMAP clients for unseen messages. */
-  private async pollAll(): Promise<void> {
-    if (this.pollInProgress) {
-      this.logger.warn('IMAP poll skipped because the previous poll is still running');
-      return;
+  /**
+   * Capture the exact server-side boundary for an operator reconcile.  This runs before
+   * the endpoint returns success; it never delegates a FROM_NOW decision to the next
+   * sixty-second poll.  A matching live connection is safe to reuse, otherwise a short
+   * connection is made from the CAS snapshot's credentials so a stale pre-update socket
+   * can never establish a new mailbox baseline.
+   */
+  async captureReconcileBaseline(
+    snapshot: ReconcileMailboxSnapshot,
+    mode: 'FROM_NOW' | 'BACKFILL',
+    backfillLimit: number,
+  ): Promise<ReconcileMailboxBaseline> {
+    const expectedFingerprint = this.connectionFingerprint(snapshot);
+    let client = this.connections.get(snapshot.id);
+    let temporary = false;
+    if (
+      !client ||
+      (client as { usable?: boolean }).usable === false ||
+      this.connectionFingerprints.get(snapshot.id) !== expectedFingerprint
+    ) {
+      let pass: string;
+      try {
+        pass = decryptField(snapshot.passwordEnc, this.config.TELECOM_HD_FIELD_ENCRYPTION_KEY);
+      } catch (err) {
+        this.logger.error(
+          `IMAP reconcile credential decrypt failed for queue ${snapshot.id} (${this.errorKind(err)})`,
+        );
+        // The durable queue error/health endpoint is operator-visible.  Do not persist
+        // driver text here: it can contain a hostname, username, or authentication detail.
+        throw new ServiceUnavailableException('IMAP credentials could not be decrypted');
+      }
+      try {
+        const { ImapFlow: ImapFlowCtor } = await import('imapflow');
+        client = new ImapFlowCtor({
+          host: snapshot.host,
+          port: snapshot.port,
+          secure: snapshot.useTls,
+          auth: { user: snapshot.username, pass },
+          logger: false,
+        });
+        await client.connect();
+        temporary = true;
+      } catch (err) {
+        this.logger.error(
+          `IMAP reconcile connection failed for queue ${snapshot.id} (${this.errorKind(err)})`,
+        );
+        throw new ServiceUnavailableException('Unable to connect to IMAP mailbox');
+      }
     }
 
-    this.pollInProgress = true;
+    const active = client;
+    if (!active) throw new ServiceUnavailableException('IMAP client was not created');
+    let lock: Awaited<ReturnType<ImapFlow['getMailboxLock']>> | undefined;
     try {
-      for (const [queueId, client] of this.connections) {
-        try {
-          await this.pollQueue(queueId, client);
-        } catch {
-          this.logger.error(`IMAP poll failed for queue ${queueId}`);
+      lock = await active.getMailboxLock('INBOX');
+      const { uidValidity, uidNext } = this.readMailboxState(active);
+      // UIDNEXT is the only permitted FROM_NOW boundary.  EXISTS is a message count and
+      // fetch('*') races with arrivals; neither is an equivalent replacement.
+      if (
+        uidValidity === undefined ||
+        uidNext === undefined ||
+        !Number.isSafeInteger(uidNext) ||
+        uidNext < 1
+      ) {
+        throw new ServiceUnavailableException(
+          'IMAP server did not provide a valid UIDVALIDITY/UIDNEXT snapshot',
+        );
+      }
+      const boundary = uidNext - 1;
+      if (mode === 'FROM_NOW') {
+        return { uidValidity, boundary, cursor: boundary, selectedUids: [] };
+      }
+      if (!Number.isSafeInteger(backfillLimit) || backfillLimit < 1) {
+        throw new BadRequestException('BACKFILL requires a positive bounded UID count');
+      }
+
+      // SEARCH under the SAME mailbox lock gives actual existing UIDs.  They can be sparse
+      // after EXPUNGE, so `boundary - N` is not a valid backfill boundary.  Filtering at the
+      // captured UIDNEXT boundary excludes mail delivered after the snapshot; it will be
+      // fetched normally once the durable cursor is committed.
+      const found = boundary === 0 ? [] : await active.search({ uid: `1:${boundary}` }, { uid: true });
+      if (found === false) throw new ServiceUnavailableException('IMAP SEARCH did not return a UID set');
+      const selectedUids = found
+        .filter(
+          (uid): uid is number =>
+            typeof uid === 'number' && Number.isSafeInteger(uid) && uid > 0 && uid <= boundary,
+        )
+        .sort((a, b) => a - b)
+        .slice(-backfillLimit);
+      const oldestSelected = selectedUids[0];
+      const cursor = oldestSelected === undefined ? boundary : oldestSelected - 1;
+      return { uidValidity, boundary, cursor, selectedUids };
+    } finally {
+      try {
+        lock?.release();
+      } finally {
+        if (temporary) {
+          try {
+            await active.logout();
+          } catch {
+            // The baseline is already captured; a failed LOGOUT must not change it.
+          }
         }
       }
-    } finally {
-      this.pollInProgress = false;
     }
+  }
+
+  /**
+   * Record the starting cursor for a never-bootstrapped queue (uidValidity IS NULL).
+   * FROM_NOW records the current high-water UID and imports nothing; BACKFILL rewinds
+   * the cursor by up to TELECOM_HD_IMAP_BACKFILL_LIMIT so the most-recent existing
+   * messages are ingested. Never fails open to `1:*`.
+   */
+  private async bootstrapQueue(queueId: number, client: ImapFlow): Promise<void> {
+    const queue = await this.prisma.emailQueue.findUnique({ where: { id: queueId } });
+    if (!queue || queue.type !== 'IMAP' || !queue.isEnabled || queue.uidValidity !== null) return; // already bootstrapped
+    if (queue.syncState === 'NEEDS_RECONCILIATION') {
+      // Halted (e.g. upgraded from a legacy cursor) — never auto-FROM_NOW over it; an
+      // operator must reconcile explicitly (choose FROM_NOW or a bounded BACKFILL).
+      this.logger.warn(
+        `IMAP queue ${queueId}: NEEDS_RECONCILIATION — bootstrap skipped (operator action required)`,
+      );
+      return;
+    }
+    // Explicit P0-B reconcile owns BOOTSTRAPPING and commits its UIDNEXT baseline
+    // synchronously.  The background supervisor may bootstrap only a brand-new healthy
+    // queue; it must never complete a failed/in-progress operator request behind their back.
+    if (queue.syncState !== 'OK' || queue.reconcileCause !== null) return;
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      const { uidValidity, uidNext } = this.readMailboxState(client);
+      if (
+        uidValidity === undefined ||
+        uidNext === undefined ||
+        !Number.isSafeInteger(uidNext) ||
+        uidNext < 1
+      ) {
+        this.logger.warn(
+          `IMAP queue ${queueId}: server did not advertise a valid UIDVALIDITY/UIDNEXT — bootstrap deferred`,
+        );
+        return;
+      }
+      const boundary = uidNext - 1;
+      // A per-queue reconcile intent (bootstrapPolicy) overrides the global policy for
+      // THIS bootstrap so the mode an operator chose at reconcile time is honoured.
+      const policy = queue.bootstrapPolicy ?? this.config.TELECOM_HD_IMAP_BOOTSTRAP_POLICY;
+      const backfill =
+        policy === 'BACKFILL'
+          ? (queue.bootstrapBackfillLimit ?? this.config.TELECOM_HD_IMAP_BACKFILL_LIMIT)
+          : 0;
+      let baseline = boundary;
+      let selectedUids: number[] = [];
+      if (policy === 'BACKFILL') {
+        if (!Number.isSafeInteger(backfill) || backfill < 1) {
+          this.logger.warn(`IMAP queue ${queueId}: BACKFILL requires a positive bounded UID count`);
+          return;
+        }
+        // UID values are sparse after EXPUNGE. Select the last N *existing* UIDs
+        // under the same lock rather than using `UIDNEXT - N`, which can skip mail.
+        const found = boundary === 0 ? [] : await client.search({ uid: `1:${boundary}` }, { uid: true });
+        if (found === false) {
+          this.logger.warn(`IMAP queue ${queueId}: bootstrap SEARCH did not return a UID set`);
+          return;
+        }
+        selectedUids = [
+          ...new Set(
+            found.filter(
+              (uid): uid is number =>
+                typeof uid === 'number' && Number.isSafeInteger(uid) && uid > 0 && uid <= boundary,
+            ),
+          ),
+        ]
+          .sort((a, b) => a - b)
+          .slice(-backfill);
+        baseline = selectedUids[0] === undefined ? boundary : selectedUids[0] - 1;
+      }
+      // CAS on uidValidity IS NULL so two pods bootstrapping the same fresh queue can't
+      // write different baselines — the first wins, the loser's updateMany matches 0 rows.
+      // Also gate on `cursorGeneration` (read in the same snapshot): if an operator
+      // reconciled between our read and this write (bumping the generation and possibly
+      // choosing a different policy), our stale baseline/policy matches 0 rows and their
+      // newer intent stands. The per-queue override is consumed here (cleared).
+      const cas = await this.prisma.emailQueue.updateMany({
+        // Only a never-bootstrapped, non-halted queue is a valid bootstrap target: gate on
+        // uidValidity IS NULL + the read generation + syncState ∈ {OK, BOOTSTRAPPING}. A
+        // queue halted (NEEDS_RECONCILIATION) between our read and this write is excluded, so
+        // bootstrap flips syncState → OK only from the transient/never-bootstrapped states.
+        where: {
+          id: queueId,
+          type: 'IMAP',
+          isEnabled: true,
+          uidValidity: null,
+          cursorGeneration: queue.cursorGeneration,
+          mailboxEpoch: queue.mailboxEpoch,
+          configGeneration: queue.configGeneration,
+          syncState: 'OK',
+          reconcileCause: null,
+        },
+        data: {
+          lastSeenUid: BigInt(baseline),
+          uidValidity,
+          syncState: 'OK',
+          lastError: null,
+          bootstrapPolicy: null,
+          bootstrapBackfillLimit: null,
+        },
+      });
+      if (cas.count === 0) {
+        this.logger.log(`IMAP queue ${queueId}: bootstrap already done by another worker`);
+        return;
+      }
+      this.logger.log(
+        `IMAP queue ${queueId}: bootstrap ${policy} at uid=${baseline} ` +
+          `(boundary=${boundary}, selected=${selectedUids.join(',') || 'none'}, uidValidity=${uidValidity})`,
+      );
+    } finally {
+      lock.release();
+    }
+  }
+
+  // ─────────────────── accept phase (IMAP poll) ───────────────────
+
+  /**
+   * Run one full accept+drain cycle across all connected queues immediately. Exposed
+   * for operator "poll now" actions and live-IMAP (GreenMail/Dovecot) verification;
+   * the 60s interval calls the same path.
+   */
+  async pollNow(): Promise<void> {
+    if (!this.inboundDeliveryEnabled) return;
+    await this.pollAll();
+  }
+
+  private pollAll(): Promise<void> {
+    if (this.stopping) return Promise.resolve();
+    if (this.pollAllInFlight) return this.pollAllInFlight;
+
+    const cycle = this.runPollAll().finally(() => {
+      if (this.pollAllInFlight === cycle) this.pollAllInFlight = null;
+    });
+    this.pollAllInFlight = cycle;
+    return cycle;
+  }
+
+  private async runPollAll(): Promise<void> {
+    if (!this.inboundDeliveryEnabled) return;
+    await this.reconcileConnections();
+    for (const [queueId, client] of this.connections) {
+      try {
+        await this.pollQueue(queueId, client);
+      } catch (err) {
+        this.logger.error(`IMAP poll failed for queue ${queueId} (${this.errorKind(err)})`);
+      }
+      // Drop an unusable (dropped) connection so reconcileConnections reconnects it.
+      if ((client as { usable?: boolean }).usable === false) {
+        this.connections.delete(queueId);
+        this.connectionFingerprints.delete(queueId);
+        await this.stampQueue(queueId, { lastDisconnectedAt: new Date() });
+        this.logger.warn(`IMAP queue ${queueId}: connection dropped — will reconnect next cycle`);
+      }
+    }
+    await this.drainDeliveries();
+  }
+
+  /**
+   * Supervisor: keep live connections in sync with the enabled IMAP queues without an
+   * API restart — connect any enabled queue that has no live connection (first run,
+   * reconnect after a drop, or a newly enabled/created queue), and log out + drop
+   * connections for queues that were disabled or deleted.
+   */
+  private async reconcileConnections(): Promise<void> {
+    // Rebuild loop-suppression addresses each cycle so a queue's emailAddress change (which
+    // does not alter its connection fingerprint) is reflected without an API restart.
+    await this.refreshOwnAddresses();
+    if (!this.inboundDeliveryEnabled || !this.config.TELECOM_HD_IMAP_ENABLED || this.stopping) return;
+    let enabled: Array<{
+      id: number;
+      emailAddress: string;
+      host: string;
+      port: number;
+      useTls: boolean;
+      username: string;
+      passwordEnc: string;
+    }>;
+    try {
+      enabled = await this.prisma.emailQueue.findMany({
+        where: { isEnabled: true, type: 'IMAP' },
+        select: {
+          id: true,
+          emailAddress: true,
+          host: true,
+          port: true,
+          useTls: true,
+          username: true,
+          passwordEnc: true,
+        },
+      });
+    } catch (err) {
+      this.logger.error(`IMAP reconcile query failed (${this.errorKind(err)})`);
+      return;
+    }
+    const enabledIds = new Set(enabled.map((q) => q.id));
+
+    // Disconnect queues no longer enabled.
+    for (const [queueId, client] of this.connections) {
+      if (!enabledIds.has(queueId)) {
+        try {
+          await client.logout();
+        } catch {
+          /* ignore */
+        }
+        this.connections.delete(queueId);
+        this.connectionFingerprints.delete(queueId);
+        await this.stampQueue(queueId, { lastDisconnectedAt: new Date() });
+        this.logger.log(`IMAP queue ${queueId}: disabled/removed — disconnected`);
+      }
+    }
+
+    // Connect enabled queues with no live connection, and RECONNECT ones whose
+    // host/credentials changed (a stale connection would keep polling the old server).
+    const encKey = this.config.TELECOM_HD_FIELD_ENCRYPTION_KEY;
+    for (const q of enabled) {
+      const fingerprint = this.connectionFingerprint(q);
+      if (this.connections.has(q.id)) {
+        if (this.connectionFingerprints.get(q.id) === fingerprint) continue; // unchanged
+        const stale = this.connections.get(q.id);
+        try {
+          await stale?.logout();
+        } catch {
+          /* ignore */
+        }
+        this.connections.delete(q.id);
+        this.connectionFingerprints.delete(q.id);
+        await this.stampQueue(q.id, { lastDisconnectedAt: new Date() });
+        this.logger.log(`IMAP queue ${q.id}: connection settings changed — reconnecting`);
+      }
+      let plainPassword: string;
+      try {
+        plainPassword = decryptField(q.passwordEnc, encKey);
+      } catch (err) {
+        this.logger.error(`Failed to decrypt IMAP password for queue ${q.id} (${this.errorKind(err)})`);
+        continue;
+      }
+      await this.connectQueue(q.id, {
+        host: q.host,
+        port: q.port,
+        secure: q.useTls,
+        auth: { user: q.username, pass: plainPassword },
+      });
+      // Only fingerprint a connection that actually established (connectQueue swallows
+      // connect errors) so a failed connect is retried next cycle. (Self-loop addresses are
+      // rebuilt for ALL enabled queues at the top of this cycle by refreshOwnAddresses.)
+      if (this.connections.has(q.id)) {
+        this.connectionFingerprints.set(q.id, fingerprint);
+      }
+    }
+  }
+
+  /** Stable fingerprint of a queue's connection settings (drives reconnect-on-change). */
+  private connectionFingerprint(q: {
+    host: string;
+    port: number;
+    useTls: boolean;
+    username: string;
+    passwordEnc: string;
+  }): string {
+    return createHash('sha256')
+      .update(`${q.host}\u0000${q.port}\u0000${q.useTls}\u0000${q.username}\u0000${q.passwordEnc}`)
+      .digest('hex');
   }
 
   private async pollQueue(queueId: number, client: ImapFlow): Promise<void> {
-    if (this.pollingQueues.has(queueId)) {
-      this.logger.warn(`IMAP poll skipped for queue ${queueId} because it is already running`);
+    if (!this.inboundDeliveryEnabled || this.stopping || this.pollingQueues.has(queueId)) return;
+    this.pollingQueues.add(queueId);
+    await this.stampQueue(queueId, { lastPollStartedAt: new Date() });
+    try {
+      await this.pollQueueOnce(queueId, client);
+    } finally {
+      this.pollingQueues.delete(queueId);
+      await this.stampQueue(queueId, { lastPollCompletedAt: new Date() });
+    }
+  }
+
+  private async pollQueueOnce(queueId: number, client: ImapFlow): Promise<void> {
+    const queue = await this.prisma.emailQueue.findUnique({ where: { id: queueId } });
+    if (!queue || !queue.isEnabled || queue.type !== 'IMAP') return;
+
+    if (queue.syncState !== 'OK') {
+      if (!this.haltLogged.has(queueId)) {
+        this.logger.error(
+          `IMAP queue ${queueId} is ${queue.syncState}: ${queue.lastError ?? queue.reconcileCause ?? 'reconcile required'} — ` +
+            `operator action is required before polling resumes.`,
+        );
+        this.haltLogged.add(queueId);
+      }
       return;
     }
-    this.pollingQueues.add(queueId);
-    try {
-      const queue = await this.prisma.emailQueue.findUnique({ where: { id: queueId } });
-      if (!queue) return;
+    this.haltLogged.delete(queueId);
 
+    if (queue.uidValidity === null) {
+      // Connect-time bootstrap did not complete (e.g. server had no UIDVALIDITY then).
+      await this.bootstrapQueue(queueId, client);
+      return;
+    }
+
+    // Concurrency is safe WITHOUT a poll lock: each UID is accepted at most once via the
+    // unique transport-key claim, and the cursor advances only by monotonic CAS. (A
+    // pool-based `pg_advisory_lock` was removed — lock/unlock could land on different
+    // pooled sessions and leak the lock forever.)
+    {
       const lock = await client.getMailboxLock('INBOX');
       try {
-        const uidValidity = client.mailbox ? client.mailbox.uidValidity.toString() : '';
-        if (!uidValidity) {
-          throw new Error('IMAP mailbox did not expose UIDVALIDITY');
+        const { uidValidity } = this.readMailboxState(client);
+        if (uidValidity === undefined) {
+          this.logger.warn(`IMAP queue ${queueId}: server did not advertise UIDVALIDITY — skipping poll`);
+          return;
         }
-        let state = await this.getQueueState(queueId, uidValidity);
-
-        // Retry durable gaps before processing new UIDs. A failed message is either
-        // successfully ingested, moved to the managed error folder, or remains in
-        // this list for the next poll. Later mail is never blocked by one poison UID.
-        const pendingUids = state.failures
-          .filter((failure) => failure.status === 'pending')
-          .map((failure) => failure.uid)
-          .sort((a, b) => a - b);
-        for (const uid of pendingUids) {
-          let found = false;
-          for await (const msg of client.fetch(
-            uid,
-            { uid: true, envelope: true, source: this.imapSourceQuery() },
-            { uid: true },
-          )) {
-            found = true;
-            state = await this.finalizeImapMessage(
-              queueId,
-              client,
-              msg,
-              queue.departmentId ?? undefined,
-              state,
-            );
-          }
-          if (!found) {
-            const previousAttempts = state.failures.find((failure) => failure.uid === uid)?.attempts ?? 0;
-            const terminal = previousAttempts + 1 >= MAX_PROCESSING_ATTEMPTS;
-            state = this.recordFailure(state, uid, terminal ? 'missing' : 'pending');
-            await this.setQueueState(queueId, state);
-            this.logger.error(
-              terminal
-                ? `IMAP queue ${queueId} recorded a missing poison UID as terminal`
-                : `IMAP queue ${queueId} still has an unresolved missing poison UID`,
-            );
-          }
+        if (uidValidity !== queue.uidValidity) {
+          // Fail-closed: the server reset its UID space. Do NOT auto-advance (that could
+          // skip mail in the new space) — halt and require an explicit operator decision.
+          // Gate on the snapshot's cursorGeneration + uidValidity so a STALE poll (whose
+          // snapshot predates an operator reconcile that already moved the queue to a new
+          // generation) can't clobber the freshly-reconciled OK state with a halt.
+          const msg = `UIDVALIDITY changed ${queue.uidValidity} → ${uidValidity}`;
+          const halted = await this.haltImapSnapshot(queue, 'UIDVALIDITY_CHANGED', msg);
+          if (halted)
+            this.logger.error(`IMAP queue ${queueId}: ${msg} — queue halted (NEEDS_RECONCILIATION)`);
+          else
+            this.logger.warn(`IMAP queue ${queueId}: UIDVALIDITY halt skipped because its snapshot is stale`);
+          return;
         }
 
-        // The third fetch argument is essential: without `{ uid: true }`, the
-        // range is interpreted as volatile sequence numbers rather than UIDs.
-        const range = `${state.watermark + 1}:*`;
-        for await (const msg of client.fetch(
-          range,
-          { uid: true, envelope: true, source: this.imapSourceQuery() },
-          { uid: true },
-        )) {
-          if (msg.uid <= state.watermark) continue;
-          state = await this.finalizeImapMessage(
-            queueId,
-            client,
-            msg,
-            queue.departmentId ?? undefined,
-            state,
-          );
+        // Cursor is a BigInt column (IMAP UIDs are unsigned 32-bit). UID values are well
+        // within 2^53, so we compute in Number and store back as BigInt.
+        const lastUid = Number(queue.lastSeenUid);
+        // Discover new UIDs first (uid-only); sort the resulting set before accepting it.
+        const uids: number[] = [];
+        const seenUids = new Set<number>();
+        for await (const m of client.fetch(`${lastUid + 1}:*`, { uid: true }, { uid: true })) {
+          // Compare to the FIXED batch-start cursor, never a moving processed maximum.
+          // A server may emit high UIDs before lower ones; accepting the high row must not
+          // silently authorise the cursor to jump over a later failure at the lower UID.
+          if (typeof m.uid === 'number' && m.uid > lastUid && !seenUids.has(m.uid)) {
+            seenUids.add(m.uid);
+            uids.push(m.uid);
+          }
         }
+        // IMAP may return the discovery stream out of order. Fetch/accept in UID order so
+        // the cursor remains a contiguous acknowledgement frontier and older messages are
+        // never ticketed after newer ones from the same mailbox batch.
+        uids.sort((a, b) => a - b);
+
+        let processedMax = lastUid;
+        // UIDs are processed in ascending order, so the first failure is the earliest
+        // non-durable message and defines the contiguous cursor frontier.
+        let lowestFailureUid: number | null = null;
+        let acceptedCount = 0;
+        for (const uid of uids) {
+          try {
+            const msg = await client.fetchOne(
+              String(uid),
+              {
+                source: { maxLength: this.config.TELECOM_HD_INBOUND_MAX_SIZE_MB * 1024 * 1024 + 1 },
+                envelope: true,
+              },
+              { uid: true },
+            );
+            if (!msg || !msg.source) {
+              // Vanished (EXPUNGE) between discovery and fetch — nothing to accept.
+              processedMax = Math.max(processedMax, uid);
+              continue;
+            }
+            const accepted = await this.acceptImapMessage(queue, uidValidity, uid, msg.source);
+            if (accepted === 'accepted') acceptedCount += 1;
+            processedMax = Math.max(processedMax, uid); // only after durable acceptance
+          } catch (err) {
+            // Fetch or DB failure → FAIL-CLOSED: stop without advancing past this UID.
+            this.logger.error(`IMAP queue ${queueId}: accept failed at uid=${uid} (${this.errorKind(err)})`);
+            lowestFailureUid = lowestFailureUid === null ? uid : Math.min(lowestFailureUid, uid);
+            break;
+          }
+        }
+
+        // Safe frontier: because the batch is UID-sorted, a failed UID cannot have an
+        // unattempted lower neighbour. The cursor remains immediately before it.
+        const cursor =
+          lowestFailureUid === null ? processedMax : Math.min(processedMax, lowestFailureUid - 1);
+
+        if (cursor > lastUid) {
+          // Monotonic, generation-guarded CAS: advance only if nothing reconciled the
+          // queue underneath us (same cursorGeneration + uidValidity, still OK+enabled).
+          // A stale poller that finishes after a reconcile writes 0 rows — it can't push
+          // a cursor from the old UID space into the new one.
+          const cas = await this.prisma.emailQueue.updateMany({
+            where: {
+              id: queueId,
+              type: 'IMAP',
+              lastSeenUid: queue.lastSeenUid,
+              cursorGeneration: queue.cursorGeneration,
+              mailboxEpoch: queue.mailboxEpoch,
+              configGeneration: queue.configGeneration,
+              uidValidity: queue.uidValidity,
+              syncState: 'OK',
+              isEnabled: true,
+            },
+            data: { lastSeenUid: BigInt(cursor) },
+          });
+          if (cas.count === 0) {
+            this.logger.warn(`IMAP queue ${queueId}: cursor CAS skipped (queue reconciled mid-poll)`);
+          }
+        }
+        // Operator liveness: stamp the poll time (and accept time when this cycle accepted
+        // anything). Advisory only — a separate write, never part of the cursor CAS.
+        await this.stampQueue(queueId, {
+          lastPollAt: new Date(),
+          ...(acceptedCount > 0 ? { lastAcceptedAt: new Date() } : {}),
+        });
       } finally {
         lock.release();
       }
-    } finally {
-      this.pollingQueues.delete(queueId);
+    }
+
+    await this.drainDeliveries();
+  }
+
+  /**
+   * Raw-MIME retention in bounded batches. QUARANTINED rows are never selected: replay
+   * needs their original bytes. Large raw-storage files are deleted only after their terminal
+   * delivery is marked pruned; a failed delete leaves the key for the next bounded cleanup.
+   */
+  private async pruneRawMime(): Promise<void> {
+    const days = this.config.TELECOM_HD_INBOUND_RAW_RETENTION_DAYS;
+    if (days && days > 0) {
+      const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000);
+      const candidates = await this.prisma.inboundDelivery.findMany({
+        where: {
+          state: { in: ['PROCESSED', 'SKIPPED'] },
+          rawPrunedAt: null,
+          createdAt: { lt: cutoff },
+        },
+        orderBy: { id: 'asc' },
+        take: 100,
+        select: { id: true },
+      });
+      if (candidates.length > 0) {
+        const res = await this.prisma.inboundDelivery.updateMany({
+          where: { id: { in: candidates.map((candidate) => candidate.id) }, rawPrunedAt: null },
+          data: { rawMime: null, rawPrunedAt: new Date() },
+        });
+        this.logger.log(
+          `Inbound retention: pruned inline raw MIME from ${res.count} terminal delivery(ies) older than ${days}d`,
+        );
+      }
+    }
+    // A retention policy can later be disabled, but files already marked pruned still need
+    // bounded cleanup; do not strand them merely because no new rows are eligible today.
+    await this.cleanupPrunedRawStorage();
+    // The staging-marker reaper is independent of retention: a process can crash between
+    // atomic file rename and ledger INSERT even when raw retention is intentionally disabled.
+    await this.cleanupUncommittedRawStorage();
+  }
+
+  /** Retry at most 100 orphan-prone terminal file removals per retention cycle. */
+  private async cleanupPrunedRawStorage(): Promise<void> {
+    if (!this.rawStorage) return;
+    const rows = await this.prisma.inboundDelivery.findMany({
+      where: { rawPrunedAt: { not: null }, rawStorageKey: { not: null } },
+      orderBy: { id: 'asc' },
+      take: 100,
+      select: { id: true, rawStorageKey: true },
+    });
+    for (const row of rows) {
+      if (!row.rawStorageKey) continue;
+      try {
+        await this.rawStorage.remove(row.rawStorageKey);
+        await this.prisma.inboundDelivery.updateMany({
+          where: { id: row.id, rawStorageKey: row.rawStorageKey },
+          data: { rawStorageKey: null },
+        });
+      } catch (err) {
+        this.logger.warn(
+          `Inbound raw storage cleanup failed for delivery ${row.id} (${this.errorKind(err)})`,
+        );
+      }
     }
   }
 
-  private imapSourceQuery(): { maxLength: number } {
-    return { maxLength: this.config.TELECOM_HD_INBOUND_MAX_SIZE_MB * 1024 * 1024 + 1 };
-  }
-
-  private async finalizeImapMessage(
-    queueId: number,
-    client: ImapFlow,
-    msg: FetchMessageObject,
-    departmentId: number | undefined,
-    state: ImapQueueState,
-  ): Promise<ImapQueueState> {
-    let nextState = state;
+  /**
+   * Clean at most 100 stale pre-commit markers per retention pass. A marker is created before
+   * the raw file and removed after the ledger row is inserted. We only remove a marker/file
+   * after a database lookup proves no delivery points at it; a surviving referenced marker is
+   * simply committed, making crash recovery idempotent and safe for quarantined evidence.
+   */
+  private async cleanupUncommittedRawStorage(): Promise<void> {
+    if (!this.rawStorage) return;
+    const olderThan = new Date(Date.now() - 15 * 60_000);
+    let candidates: string[];
     try {
-      const transportMessageId = `<imap-${queueId}-${state.uidValidity}-${msg.uid}@helpdesk.invalid>`;
-      await this.processMessage(msg, departmentId, transportMessageId);
-      nextState = {
-        ...state,
-        watermark: Math.max(state.watermark, msg.uid),
-        failures: state.failures.filter((failure) => failure.uid !== msg.uid),
-      };
-    } catch {
-      const previousAttempts = state.failures.find((failure) => failure.uid === msg.uid)?.attempts ?? 0;
-      let quarantined = false;
-      if (previousAttempts + 1 >= MAX_PROCESSING_ATTEMPTS) {
+      candidates = await this.rawStorage.listPending(100, olderThan);
+    } catch (err) {
+      this.logger.warn(`Inbound raw storage marker scan failed (${this.errorKind(err)})`);
+      return;
+    }
+    if (candidates.length === 0) return;
+
+    try {
+      const [references, stages] = await Promise.all([
+        this.prisma.inboundDelivery.findMany({
+          where: { rawStorageKey: { in: candidates } },
+          select: { rawStorageKey: true },
+        }),
+        this.prisma.inboundRawMimeStaging.findMany({
+          where: { storageKey: { in: candidates } },
+          select: { storageKey: true, leaseExpiresAt: true },
+        }),
+      ]);
+      const referenced = new Set(
+        references.map((row) => row.rawStorageKey).filter((key): key is string => key !== null),
+      );
+      const staged = new Map(stages.map((stage) => [stage.storageKey, stage.leaseExpiresAt]));
+      const expiredStages = candidates.filter(
+        (key) =>
+          !referenced.has(key) && (staged.get(key)?.getTime() ?? Number.POSITIVE_INFINITY) < Date.now(),
+      );
+      // A stage selected for deletion is locked with SKIP LOCKED. If acceptance is currently
+      // holding it while inserting its ledger row, this reaper deliberately skips that key;
+      // it must never delete a file under an in-flight transaction.
+      const reapedStages = await this.claimExpiredRawStages(expiredStages, new Date());
+      for (const key of candidates) {
         try {
-          await this.ensureErrorMailbox(client);
-          quarantined = (await client.messageMove(msg.uid, IMAP_ERROR_MAILBOX, { uid: true })) !== false;
-        } catch {
-          quarantined = false;
+          if (referenced.has(key)) {
+            await this.rawStorage.commit(key);
+          } else if (staged.has(key) && !reapedStages.has(key)) {
+            // Still leased, or locked by an in-flight acceptance transaction.
+            continue;
+          } else {
+            await this.rawStorage.remove(key);
+          }
+        } catch (err) {
+          this.logger.warn(`Inbound raw storage marker cleanup failed for ${key} (${this.errorKind(err)})`);
         }
       }
+    } catch (err) {
+      // A failed DB proof must never delete a file: leave the marker for the next bounded pass.
+      this.logger.warn(
+        `Inbound raw storage marker cleanup deferred (DB unavailable; ${this.errorKind(err)})`,
+      );
+    }
+  }
 
-      nextState = this.recordFailure(state, msg.uid, quarantined ? 'quarantined' : 'pending');
-      nextState.watermark = Math.max(nextState.watermark, msg.uid);
+  /**
+   * Claim only expired stage rows that are not currently locked by acceptance. The delete holds
+   * the selected row lock until this transaction commits; a concurrent accept either wins first
+   * and commits its delivery pointer, or observes count=0 and fails before accepting bytes.
+   */
+  private async claimExpiredRawStages(keys: string[], now: Date): Promise<Set<string>> {
+    if (keys.length === 0) return new Set();
+    return this.prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<Array<{ storageKey: string }>>(Prisma.sql`
+        SELECT "storageKey"
+        FROM "InboundRawMimeStaging"
+        WHERE "storageKey" IN (${Prisma.join(keys)})
+          AND "leaseExpiresAt" < ${now}
+        FOR UPDATE SKIP LOCKED
+      `);
+      const claimed = rows
+        .map((row) => row.storageKey)
+        .filter((key): key is string => typeof key === 'string');
+      if (claimed.length === 0) return new Set<string>();
+      const removed = await tx.inboundRawMimeStaging.deleteMany({
+        where: { storageKey: { in: claimed }, leaseExpiresAt: { lt: now } },
+      });
+      if (removed.count !== claimed.length) {
+        throw new ServiceUnavailableException('Inbound raw MIME stage changed during cleanup');
+      }
+      return new Set(claimed);
+    });
+  }
+
+  /** Best-effort advisory write of a queue's liveness timestamps. Never throws (a failed
+   *  liveness stamp must not break a poll) and touches only the given columns. */
+  private async stampQueue(
+    queueId: number,
+    data: {
+      lastConnectionAttemptAt?: Date;
+      lastConnectedAt?: Date;
+      lastDisconnectedAt?: Date;
+      lastConnectionErrorAt?: Date;
+      lastPollStartedAt?: Date;
+      lastPollAt?: Date;
+      lastPollCompletedAt?: Date;
+      lastAcceptedAt?: Date;
+      lastError?: string;
+    },
+  ): Promise<void> {
+    try {
+      await this.prisma.emailQueue.updateMany({ where: { id: queueId }, data });
+    } catch (err) {
+      this.logger.warn(`IMAP queue ${queueId}: liveness stamp failed (${this.errorKind(err)})`);
+    }
+  }
+
+  /**
+   * Durably record one IMAP message in the ledger under its unique transport key.
+   * Idempotent: a duplicate key (re-poll / concurrent poller) is a no-op. The message
+   * is NOT parsed here — a malformed MIME is still ACCEPTED (never lost) and is
+   * quarantined later by the drain if it cannot be processed.
+   */
+  private async acceptImapMessage(
+    snapshot: ImapAcceptSnapshot,
+    uidValidity: bigint,
+    uid: number,
+    source: Buffer,
+  ): Promise<'accepted' | 'duplicate'> {
+    if (!this.inboundDeliveryEnabled) {
+      throw new ServiceUnavailableException('Inbound delivery is temporarily disabled');
+    }
+    if (
+      snapshot.type !== 'IMAP' ||
+      !snapshot.isEnabled ||
+      snapshot.syncState !== 'OK' ||
+      snapshot.uidValidity === null ||
+      snapshot.uidValidity !== uidValidity
+    ) {
+      throw new StaleImapAcceptSnapshotError(snapshot.id);
+    }
+
+    const transportKey = `imap:${snapshot.id}:${snapshot.mailboxEpoch}:${uidValidity}:${uid}`;
+    const contentHash = createHash('sha256').update(source).digest('hex');
+    // The IMAP fetch caps the body at MAX_SIZE+1 bytes; a source at/over the ceiling was
+    // TRUNCATED — its retained raw MIME is incomplete, so flag it (the drain quarantines a
+    // truncated delivery without partially ticketing it; replay must re-fetch the original).
+    const truncated = source.length > this.config.TELECOM_HD_INBOUND_MAX_SIZE_MB * 1024 * 1024;
+    // Stage large MIME before the acceptance transaction. A failed/stale transaction removes
+    // the fresh opaque file; a successful row leaves its marker for the bounded reaper if
+    // marker cleanup is interrupted.
+    const raw = await this.persistRawMime(source);
+    const cleanupStagedRaw = async (): Promise<void> => this.discardRawStage(raw.rawStorageKey);
+    let outcome: 'accepted' | 'duplicate' | 'collision';
+    try {
+      outcome = await this.prisma.$transaction(async (tx) => {
+        // This row lock is the acceptance fence.  If identity/reconcile won first, the
+        // conditional SELECT finds no row and no ledger delivery is inserted.  If acceptance
+        // obtains the lock first, it is durably accepted before the new boundary — which is
+        // safe; the concurrent identity/reconcile update waits and subsequently bumps epoch.
+        const current = await tx.$queryRaw<
+          Array<{
+            id: number;
+            emailAddress: string;
+            departmentId: number | null;
+            sendAutoresponder: boolean;
+            configGeneration: number;
+          }>
+        >(Prisma.sql`
+        SELECT "id", "emailAddress", "departmentId", "sendAutoresponder", "configGeneration"
+        FROM "EmailQueue"
+        WHERE "id" = ${snapshot.id}
+          AND "isEnabled" = true
+          AND "type" = 'IMAP'
+          AND "syncState" = 'OK'
+          AND "mailboxEpoch" = ${snapshot.mailboxEpoch}
+          AND "cursorGeneration" = ${snapshot.cursorGeneration}
+          AND "configGeneration" = ${snapshot.configGeneration}
+          AND "uidValidity" = ${snapshot.uidValidity}
+        FOR UPDATE
+        `);
+        const lockedQueue = current[0];
+        if (
+          !lockedQueue ||
+          lockedQueue.emailAddress !== snapshot.emailAddress ||
+          lockedQueue.departmentId !== snapshot.departmentId ||
+          lockedQueue.sendAutoresponder !== snapshot.sendAutoresponder ||
+          lockedQueue.configGeneration !== snapshot.configGeneration
+        ) {
+          throw new StaleImapAcceptSnapshotError(snapshot.id);
+        }
+        // Freeze every enabled recipient queue (including its priority and customer-mail
+        // policy) in the same transaction as the ledger row.  A later drain must not make
+        // a CC-copy's owner depend on which poller happened to claim first or on a subsequent
+        // operator edit to the queue form.
+        const routingSnapshot = await this.captureRoutingSnapshot(tx, lockedQueue);
+        await this.consumeRawStageForAcceptance(tx, raw.rawStorageKey);
+
+        // `createMany(skipDuplicates)` maps to INSERT .. ON CONFLICT DO NOTHING.  It avoids
+        // poisoning a PostgreSQL transaction with P2002 before we can inspect the conflicting
+        // row.  At accept time messageId is NULL, so the only expected unique conflict is the
+        // canonical transport key; a missing/different prior row is treated fail-closed below.
+        const created = await tx.inboundDelivery.createMany({
+          data: {
+            transport: 'IMAP',
+            queueId: snapshot.id,
+            // Values come from the row locked by the acceptance fence, never a
+            // pre-fetch snapshot which a concurrent queue edit could have made stale.
+            departmentId: lockedQueue.departmentId,
+            sendAutoresponder: lockedQueue.sendAutoresponder,
+            routedQueueId: lockedQueue.id,
+            routedDepartmentId: lockedQueue.departmentId,
+            routingSnapshot: routingSnapshot as unknown as Prisma.InputJsonValue,
+            // IMAP does not always expose the original SMTP envelope recipient in MIME.  The
+            // configured queue address is the trusted receiving-mailbox fallback used by the
+            // deterministic routing policy (not a header-derived guess).
+            envelopeTo: lockedQueue.emailAddress,
+            transportKey,
+            mailboxEpoch: snapshot.mailboxEpoch,
+            uidValidity,
+            uid: BigInt(uid),
+            contentHash,
+            rawMime: raw.rawMime,
+            rawStorageKey: raw.rawStorageKey,
+            sizeBytes: source.length,
+            truncated,
+            state: 'ACCEPTED',
+          },
+          skipDuplicates: true,
+        });
+        if (created.count === 1) return 'accepted';
+
+        const prior = await tx.inboundDelivery.findUnique({
+          where: { transportKey },
+          select: { queueId: true, mailboxEpoch: true, uidValidity: true, uid: true, contentHash: true },
+        });
+        const isExactRetry =
+          prior?.queueId === snapshot.id &&
+          prior.mailboxEpoch === snapshot.mailboxEpoch &&
+          prior.uidValidity === uidValidity &&
+          prior.uid === BigInt(uid) &&
+          prior.contentHash === contentHash;
+        if (isExactRetry) return 'duplicate';
+
+        // A different body for the same epoch+UID means a corrupt server/transport identity;
+        // never consume it as a duplicate.  Halt the exact snapshot and write durable audit in
+        // the same transaction.  If the conditional halt loses its CAS, a newer epoch already
+        // owns the queue and this stale poller must simply fail closed.
+        const msg =
+          `IMAP transport collision for ${transportKey}: existing delivery identity/content differs; ` +
+          `queue halted for explicit reconcile`;
+        const halted = await tx.emailQueue.updateMany({
+          where: {
+            id: snapshot.id,
+            type: 'IMAP',
+            isEnabled: true,
+            syncState: 'OK',
+            mailboxEpoch: snapshot.mailboxEpoch,
+            cursorGeneration: snapshot.cursorGeneration,
+            configGeneration: snapshot.configGeneration,
+            uidValidity: snapshot.uidValidity,
+          },
+          data: {
+            syncState: 'NEEDS_RECONCILIATION',
+            reconcileCause: 'TRANSPORT_COLLISION',
+            reconcileRequestedAt: null,
+            lastError: msg,
+          },
+        });
+        if (halted.count !== 1) throw new StaleImapAcceptSnapshotError(snapshot.id);
+        await tx.inboundAuditLog.create({
+          data: {
+            action: 'mail.transport_collision',
+            queueId: snapshot.id,
+            reason: 'IMAP transport identity reused with different content',
+            metadata: {
+              transportKey,
+              mailboxEpoch: snapshot.mailboxEpoch,
+              uidValidity: uidValidity.toString(),
+              uid,
+              attemptedContentHash: contentHash,
+              prior: prior
+                ? {
+                    queueId: prior.queueId,
+                    mailboxEpoch: prior.mailboxEpoch,
+                    uidValidity: prior.uidValidity?.toString() ?? null,
+                    uid: prior.uid?.toString() ?? null,
+                    contentHash: prior.contentHash,
+                  }
+                : null,
+            } as Prisma.InputJsonValue,
+          },
+        });
+        // Return normally so the halt and audit COMMIT. Throwing inside the Prisma
+        // transaction would roll those safety records back and leave the queue polling.
+        return 'collision';
+      });
+    } catch (err) {
+      await cleanupStagedRaw();
+      throw err;
+    }
+
+    if (outcome === 'accepted') {
+      if (raw.rawStorageKey && this.rawStorage) {
+        await this.rawStorage.commit(raw.rawStorageKey).catch((err: unknown) => {
+          this.logger.warn(`Inbound raw MIME marker commit deferred (${this.errorKind(err)})`);
+        });
+      }
+      return outcome;
+    }
+
+    // We created a fresh staged file for a delivery which was already present or was a
+    // transport collision; it must not be retained as an unrelated raw-MIME object.
+    await cleanupStagedRaw();
+    if (outcome === 'collision') throw new ImapTransportCollisionError(snapshot.id, transportKey);
+    return outcome;
+  }
+
+  /**
+   * Read the enabled queues after the receiving queue has been locked by the acceptance
+   * fence. The returned JSON is deliberately small, deterministic and self-contained: it is
+   * the only queue configuration a later ledger drain is allowed to use for recipient routing.
+   */
+  private async captureRoutingSnapshot(
+    tx: Prisma.TransactionClient,
+    receivingQueue: {
+      id: number;
+      emailAddress: string;
+      departmentId: number | null;
+      sendAutoresponder: boolean;
+    },
+  ): Promise<RoutingSnapshotEntry[]> {
+    const queues = await tx.emailQueue.findMany({
+      where: { isEnabled: true },
+      select: {
+        id: true,
+        emailAddress: true,
+        departmentId: true,
+        routingPriority: true,
+        sendAutoresponder: true,
+      },
+    });
+    const snapshot = queues
+      .filter((queue) => normalizeEmail(queue.emailAddress) !== '')
+      .map((queue) => ({
+        id: queue.id,
+        emailAddress: queue.emailAddress,
+        departmentId: queue.departmentId,
+        routingPriority: queue.routingPriority,
+        sendAutoresponder: queue.sendAutoresponder,
+      }))
+      .sort((a, b) => a.routingPriority - b.routingPriority || a.id - b.id);
+
+    // The receiving row is SELECT ... FOR UPDATE and enabled, therefore it must be present in
+    // the same transaction's enabled-queue view. Treat an impossible/inconsistent view as a
+    // stale acceptance fence rather than silently writing a partial route snapshot.
+    const receiving = snapshot.find((queue) => queue.id === receivingQueue.id);
+    if (
+      !receiving ||
+      receiving.emailAddress !== receivingQueue.emailAddress ||
+      receiving.departmentId !== receivingQueue.departmentId ||
+      receiving.sendAutoresponder !== receivingQueue.sendAutoresponder
+    ) {
+      throw new StaleImapAcceptSnapshotError(receivingQueue.id);
+    }
+    return snapshot;
+  }
+
+  /** Set a typed UIDVALIDITY halt plus its durable audit atomically. */
+  private async haltImapSnapshot(
+    snapshot: ImapAcceptSnapshot,
+    cause: 'UIDVALIDITY_CHANGED',
+    message: string,
+  ): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const halt = await tx.emailQueue.updateMany({
+        where: {
+          id: snapshot.id,
+          type: 'IMAP',
+          isEnabled: true,
+          syncState: 'OK',
+          mailboxEpoch: snapshot.mailboxEpoch,
+          cursorGeneration: snapshot.cursorGeneration,
+          configGeneration: snapshot.configGeneration,
+          uidValidity: snapshot.uidValidity,
+        },
+        data: {
+          syncState: 'NEEDS_RECONCILIATION',
+          reconcileCause: cause,
+          reconcileRequestedAt: null,
+          lastError: message,
+        },
+      });
+      if (halt.count !== 1) return false;
+      await tx.inboundAuditLog.create({
+        data: {
+          action: 'mail.reconcile_failed',
+          queueId: snapshot.id,
+          reason: message,
+          metadata: {
+            cause,
+            mailboxEpoch: snapshot.mailboxEpoch,
+            cursorGeneration: snapshot.cursorGeneration,
+            uidValidity: snapshot.uidValidity?.toString() ?? null,
+          } as Prisma.InputJsonValue,
+        },
+      });
+      return true;
+    });
+  }
+
+  // ─────────────────── PIPE ingress ───────────────────
+
+  /**
+   * Public entry for the MTA/PIPE webhook. Records the message in the ledger (idempotent
+   * by a trusted caller-supplied delivery id) and processes it inline so the
+   * caller sees the ticket immediately; a transient failure leaves a RETRY the drain
+   * picks up. Signature kept `(source, departmentId)` for the webhook controller.
+   */
+  async ingestRawMessage(
+    source: Buffer | string,
+    departmentId: number | undefined,
+    externalId?: string,
+    queueId?: number,
+  ): Promise<void> {
+    if (!this.inboundDeliveryEnabled) {
+      throw new ServiceUnavailableException('Inbound delivery is temporarily disabled');
+    }
+    const buf = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
+    if (buf.length > this.config.TELECOM_HD_INBOUND_MAX_SIZE_MB * 1024 * 1024) {
+      throw new PayloadTooLargeException('Inbound message exceeds the configured size limit');
+    }
+
+    // PIPE has no safe default queue: accepting a request against an unknown/disabled/IMAP
+    // queue would turn routing into a silent fallback. Snapshot the active PIPE queue's
+    // department at acceptance so later configuration edits cannot reroute this delivery.
+    if (queueId == null) throw new BadRequestException('x-inbound-queue-id is required for PIPE ingress');
+    const normalizedExternalId = normalizePipeDeliveryId(externalId);
+    const q = await this.prisma.emailQueue.findUnique({
+      where: { id: queueId },
+      select: {
+        id: true,
+        emailAddress: true,
+        departmentId: true,
+        sendAutoresponder: true,
+        type: true,
+        isEnabled: true,
+      },
+    });
+    if (!q) throw new BadRequestException(`Unknown inbound queue id ${queueId}`);
+    if (!q.isEnabled) throw new BadRequestException(`Inbound PIPE queue ${queueId} is disabled`);
+    if (q.type !== 'PIPE') {
+      throw new BadRequestException(`Inbound queue ${queueId} must have type PIPE (got ${q.type})`);
+    }
+    const boundQueueId = q.id;
+    // The webhook never trusts a caller-provided department. An internal caller may only
+    // supply the same snapshot; otherwise fail closed rather than misroute a ticket.
+    if (departmentId !== undefined && departmentId !== q.departmentId) {
+      throw new BadRequestException('PIPE department must match the bound queue');
+    }
+    const contentHash = createHash('sha256').update(buf).digest('hex');
+    // Index a fixed-width SHA-256 of the normalized MTA id rather than an arbitrary
+    // header value. Keep the original normalized id for diagnostics/audit.
+    const deliveryIdHash = createHash('sha256').update(normalizedExternalId).digest('hex');
+    const transportKey = `pipe:${boundQueueId}:id-sha256:${deliveryIdHash}`;
+
+    const raw = await this.persistRawMime(buf);
+    const cleanupStagedRaw = async (): Promise<void> => this.discardRawStage(raw.rawStorageKey);
+    let accepted: { id: number; departmentId: number | null };
+    try {
+      accepted = await this.prisma.$transaction(async (tx) => {
+        // Re-check and lock the queue in the same transaction as the ledger insert. A
+        // concurrent disable or IMAP/PIPE type switch must not admit a late PIPE delivery.
+        const locked = await tx.$queryRaw<
+          Array<{
+            id: number;
+            emailAddress: string;
+            departmentId: number | null;
+            sendAutoresponder: boolean;
+          }>
+        >(
+          Prisma.sql`
+            SELECT "id", "emailAddress", "departmentId", "sendAutoresponder"
+            FROM "EmailQueue"
+            WHERE "id" = ${boundQueueId}
+              AND "type" = 'PIPE'
+              AND "isEnabled" = true
+            FOR UPDATE
+          `,
+        );
+        const queue = locked[0];
+        if (!queue) {
+          throw new ConflictException(
+            'Inbound PIPE queue changed while delivery was accepted; retry after reload',
+          );
+        }
+        if (departmentId !== undefined && departmentId !== queue.departmentId) {
+          throw new ConflictException('Inbound PIPE queue department changed while delivery was accepted');
+        }
+        // PIPE uses the exact same immutable recipient/priorities snapshot as IMAP. Without
+        // this, two MTA copies bearing the same Message-ID could assign ownership to whichever
+        // PIPE drain happened to create the logical claim first.
+        const routingSnapshot = await this.captureRoutingSnapshot(tx, queue);
+        await this.consumeRawStageForAcceptance(tx, raw.rawStorageKey);
+        const created = await tx.inboundDelivery.create({
+          data: {
+            transport: 'PIPE',
+            queueId: queue.id,
+            departmentId: queue.departmentId,
+            sendAutoresponder: queue.sendAutoresponder,
+            routedQueueId: queue.id,
+            routedDepartmentId: queue.departmentId,
+            routingSnapshot: routingSnapshot as unknown as Prisma.InputJsonValue,
+            transportKey,
+            externalId: normalizedExternalId,
+            contentHash,
+            // The MTA-selected queue is the trusted envelope fallback; do not route from a
+            // caller-controlled MIME To header.
+            envelopeTo: queue.emailAddress,
+            rawMime: raw.rawMime,
+            rawStorageKey: raw.rawStorageKey,
+            sizeBytes: buf.length,
+            state: 'ACCEPTED',
+          },
+          select: { id: true },
+        });
+        return { id: created.id, departmentId: queue.departmentId };
+      });
+    } catch (err) {
+      await cleanupStagedRaw();
+      if (this.isUniqueViolation(err)) {
+        // A reused delivery id already exists. If the content matches, this is an
+        // idempotent re-delivery — no-op. If it DIFFERS, the caller reused an
+        // `x-inbound-delivery-id` for a DIFFERENT message: reject 409 so the second
+        // message is not silently lost (rather than dropping it).
+        const prior = await this.prisma.inboundDelivery.findUnique({
+          where: { transportKey },
+          select: { id: true, contentHash: true },
+        });
+        if (!prior) {
+          // A P2002 with no matching transport row means the database rejected a different
+          // unique constraint or a concurrent delete occurred. Never treat that as a retry.
+          await this.recordInboundCollision({
+            queueId: boundQueueId,
+            contentHash,
+            reason: 'PIPE delivery-id collision could not be verified against a prior transport row',
+          });
+          throw new ConflictException('Inbound delivery collision could not be verified safely');
+        }
+        if (prior.contentHash !== contentHash) {
+          await this.recordInboundCollision({
+            queueId: boundQueueId,
+            deliveryId: prior.id,
+            contentHash,
+            priorContentHash: prior.contentHash,
+            reason: 'PIPE delivery id was reused with different message content',
+          });
+          throw new ConflictException(
+            `Inbound delivery id already used for a different message (contentHash mismatch)`,
+          );
+        }
+        this.logger.log(`PIPE: duplicate delivery (${transportKey}) — already accepted`);
+        return; // idempotent re-delivery
+      }
+      throw err;
+    }
+    if (raw.rawStorageKey && this.rawStorage) {
+      await this.rawStorage.commit(raw.rawStorageKey).catch((err: unknown) => {
+        this.logger.warn(`PIPE raw MIME marker commit deferred (${this.errorKind(err)})`);
+      });
+    }
+    await this.processDelivery(accepted.id, accepted.departmentId ?? undefined);
+  }
+
+  // ─────────────────── drain (process ledger) ───────────────────
+
+  /**
+   * Process due deliveries in id order: fresh `ACCEPTED`/`RETRY` work, plus any
+   * `PROCESSING` whose lease has expired (a worker crashed mid-processing) — so a
+   * delivery can never be stranded in `PROCESSING` forever.
+   */
+  drainDeliveries(): Promise<void> {
+    if (!this.inboundDeliveryEnabled) return Promise.resolve();
+    if (this.stopping) return this.drainInFlight ?? Promise.resolve();
+    if (this.drainInFlight) return this.drainInFlight;
+
+    const cycle = this.runDrainDeliveries().finally(() => {
+      if (this.drainInFlight === cycle) this.drainInFlight = null;
+    });
+    this.drainInFlight = cycle;
+    return cycle;
+  }
+
+  private async runDrainDeliveries(): Promise<void> {
+    if (!this.inboundDeliveryEnabled) return;
+    const now = new Date();
+    let due: Array<{ id: number; departmentId: number | null }>;
+    try {
+      due = await this.prisma.inboundDelivery.findMany({
+        where: {
+          OR: [
+            {
+              state: { in: ['ACCEPTED', 'RETRY'] },
+              OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }],
+            },
+            // Reclaim expired leases (stale PROCESSING from a crashed worker).
+            { state: 'PROCESSING', leaseExpiresAt: { lt: now } },
+          ],
+        },
+        orderBy: { id: 'asc' },
+        take: 50,
+        select: { id: true, departmentId: true },
+      });
+    } catch (err) {
+      this.logger.error(`Inbound drain query failed (${this.errorKind(err)})`);
+      return;
+    }
+    for (const d of due) {
+      // Route by the department snapshotted at acceptance, not the queue's current one.
+      await this.processDelivery(d.id, d.departmentId ?? undefined);
+    }
+  }
+
+  /**
+   * Process a single ledger delivery. Claims it with a LEASE (CAS: ACCEPTED/RETRY, or a
+   * PROCESSING whose lease has expired → PROCESSING + our lease), runs the routing
+   * pipeline, then transitions to PROCESSED/SKIPPED — but every terminal/retry write is
+   * itself lease-gated (`leaseOwner = us`), so if our lease expired and another worker
+   * took over mid-processing we drop our result instead of clobbering theirs. Any error
+   * → RETRY (backoff) or, once attempts are exhausted, QUARANTINED — raw MIME is always
+   * retained, so a message is never lost, discarded, or stranded in PROCESSING.
+   */
+  private async processDelivery(deliveryId: number, departmentId: number | undefined): Promise<void> {
+    if (!this.inboundDeliveryEnabled) return;
+    // In-process guard: never handle the same delivery twice concurrently in this process
+    // (closes the "slow flow, lease expired, drain reclaims it" duplicate window).
+    if (this.inFlight.has(deliveryId)) return;
+    this.inFlight.add(deliveryId);
+    try {
+      await this.processDeliveryClaimed(deliveryId, departmentId);
+    } finally {
+      this.inFlight.delete(deliveryId);
+    }
+  }
+
+  private async processDeliveryClaimed(deliveryId: number, departmentId: number | undefined): Promise<void> {
+    const now = new Date();
+    const leaseUntil = new Date(now.getTime() + InboundMailService.LEASE_MS);
+    // A FRESH per-claim token (not the process id) so the settle fence distinguishes THIS
+    // claim from a later reclaim: if our lease expired and another claim took over, our
+    // terminal write matches 0 rows instead of clobbering theirs.
+    const leaseToken = randomUUID();
+    const claim = await this.prisma.inboundDelivery.updateMany({
+      where: {
+        id: deliveryId,
+        OR: [
+          { state: 'ACCEPTED' },
+          // A RETRY is only claimable once its backoff has elapsed. Enforce the schedule
+          // in the CLAIM CAS itself (not only in the drain's pre-select) so any caller —
+          // an inline ingest, a future direct call, or a racing worker — can never claim a
+          // not-yet-due RETRY and burn an attempt early.
+          { state: 'RETRY', OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
+          { state: 'PROCESSING', leaseExpiresAt: { lt: now } }, // reclaim expired lease
+        ],
+      },
+      // Increment `attempts` in the CLAIM itself, NOT only in the lease-fenced settle: a
+      // delivery whose processing consistently outlives the lease would otherwise have every
+      // settle rejected (wrong lease owner) and its attempt-count never advance → retried
+      // forever, never quarantined. Counting per claim guarantees the budget is exhausted.
+      data: {
+        state: 'PROCESSING',
+        leaseOwner: leaseToken,
+        leaseExpiresAt: leaseUntil,
+        attempts: { increment: 1 },
+      },
+    });
+    if (claim.count === 0) return; // another worker holds a live lease, or already terminal
+
+    const delivery = await this.prisma.inboundDelivery.findUnique({ where: { id: deliveryId } });
+    if (!delivery) return;
+
+    // All terminal/retry writes are CAS-gated on OUR lease token so a claim that reclaimed
+    // an expired lease can't be overwritten by the original stalled flow. A 0-row settle
+    // means our lease was stolen (processing outlived it and another worker reclaimed) —
+    // surface it instead of silently discarding the result; the winner will settle it.
+    const settle = async (data: Record<string, unknown>) => {
+      const res = await this.prisma.inboundDelivery.updateMany({
+        where: { id: deliveryId, leaseOwner: leaseToken, state: 'PROCESSING' },
+        data,
+      });
+      if (res.count === 0) {
+        this.logger.warn(
+          `Inbound delivery ${deliveryId}: settle no-op — lease lost mid-processing ` +
+            `(reclaimed by another worker); result dropped, the current owner will settle it.`,
+        );
+      }
+      return res;
+    };
+
+    // A truncated (oversized) IMAP fetch has incomplete raw bytes — never partially ticket it.
+    // Quarantine before touching external storage; a faithful replay must re-fetch the original.
+    if (delivery.truncated) {
+      await settle({
+        state: 'QUARANTINED',
+        lastError:
+          'oversized: the fetched raw MIME is truncated at the size ceiling — re-fetch the original message to replay',
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
       this.logger.error(
-        quarantined
-          ? `IMAP queue ${queueId} quarantined a poison message in ${IMAP_ERROR_MAILBOX}`
-          : previousAttempts + 1 >= MAX_PROCESSING_ATTEMPTS
-            ? `IMAP queue ${queueId} retained a poison UID because quarantine failed`
-            : `IMAP queue ${queueId} retained a failed UID for retry`,
+        `Inbound delivery ${deliveryId}: QUARANTINED — oversized/truncated IMAP fetch (${delivery.sizeBytes} bytes)`,
+      );
+      return;
+    }
+
+    // `attempts` was already incremented by the claim above. If it now exceeds the budget,
+    // earlier claims kept losing their terminal write (processing outlived the lease) — do a
+    // FAST quarantine now (a millisecond write, comfortably inside the fresh lease) instead
+    // of running the slow processing again and losing another terminal write.
+    if (delivery.attempts > this.maxAttempts) {
+      await settle({
+        state: 'QUARANTINED',
+        lastError: `exhausted ${this.maxAttempts} attempts (processing repeatedly exceeded the lease)`,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
+      this.logger.error(
+        `Inbound delivery ${deliveryId}: QUARANTINED — ${delivery.attempts} claims exhausted the attempt budget`,
+      );
+      return;
+    }
+
+    let rawMime: Buffer | null = delivery.rawMime ? Buffer.from(delivery.rawMime) : null;
+    try {
+      if (!rawMime && delivery.rawStorageKey) {
+        if (!this.rawStorage) throw new ServiceUnavailableException('Inbound raw MIME storage unavailable');
+        rawMime = await this.rawStorage.read(delivery.rawStorageKey);
+      }
+    } catch (err) {
+      // External storage can be temporarily unavailable. Never leave the row PROCESSING:
+      // retry with a lease-fenced backoff, then quarantine at the same attempt budget as the
+      // parser path. Durable error text must not expose filesystem/provider internals.
+      const exhausted = delivery.attempts >= this.maxAttempts;
+      await settle(
+        exhausted
+          ? {
+              state: 'QUARANTINED',
+              lastError: 'Inbound raw MIME storage remained unavailable after retry budget',
+              leaseOwner: null,
+              leaseExpiresAt: null,
+            }
+          : {
+              state: 'RETRY',
+              nextAttemptAt: new Date(Date.now() + 60_000 * 2 ** (delivery.attempts - 1)),
+              lastError: 'Inbound raw MIME storage temporarily unavailable',
+              leaseOwner: null,
+              leaseExpiresAt: null,
+            },
+      );
+      this.logger.warn(`Inbound delivery ${deliveryId}: raw storage read failed (${this.errorKind(err)})`);
+      return;
+    }
+    if (!rawMime) {
+      await settle({
+        state: 'QUARANTINED',
+        lastError: 'missing rawMime',
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
+      this.logger.error(`Inbound delivery ${deliveryId}: missing rawMime — quarantined`);
+      return;
+    }
+
+    // For an IMAP delivery, also dedup against the LEGACY transport Message-ID form
+    // (`<imap-<queueId>-<uidValidity>-<uid>@helpdesk.invalid>`) that the pre-ledger poller
+    // stamped on header-less mail — otherwise a RESUME_MIGRATED re-fetch of already-ticketed
+    // header-less mail would miss dedup (it now hashes to a different synthetic id) and
+    // duplicate the ticket.
+    const legacyDedupIds: string[] = [];
+    if (
+      delivery.transport === 'IMAP' &&
+      delivery.queueId != null &&
+      delivery.uidValidity != null &&
+      delivery.uid != null
+    ) {
+      legacyDedupIds.push(
+        `<imap-${delivery.queueId}-${delivery.uidValidity}-${delivery.uid}@helpdesk.invalid>`,
       );
     }
 
-    // Persist after every finalized or durably-recorded UID. A process crash can
-    // therefore replay at most the current UID; atomic Message-ID ingestion makes
-    // that replay idempotent.
-    await this.setQueueState(queueId, nextState);
-    return nextState;
-  }
-
-  private async ensureErrorMailbox(client: ImapFlow): Promise<void> {
-    const mailboxes = await client.list();
-    if (!mailboxes.some((mailbox) => mailbox.path === IMAP_ERROR_MAILBOX)) {
-      await client.mailboxCreate(IMAP_ERROR_MAILBOX);
-    }
-  }
-
-  private recordFailure(
-    state: ImapQueueState,
-    uid: number,
-    status: ImapFailureState['status'],
-  ): ImapQueueState {
-    const existing = state.failures.find((failure) => failure.uid === uid);
-    const currentPending = state.failures.filter((failure) => failure.status === 'pending');
-    if (status === 'pending' && !existing && currentPending.length >= MAX_PENDING_FAILURES) {
-      // Do not advance/checkpoint this UID when the durable retry set is full.
-      // The next poll will fetch it again from the current watermark, while the
-      // bounded Setting JSON cannot be grown indefinitely by a hostile mailbox.
-      throw new ServiceUnavailableException('IMAP poison-message retry capacity is exhausted');
-    }
-    const failure: ImapFailureState = {
-      uid,
-      status,
-      attempts: (existing?.attempts ?? 0) + 1,
-      lastFailedAt: new Date().toISOString(),
-    };
-    const failures = [...state.failures.filter((item) => item.uid !== uid), failure].sort(
-      (a, b) => a.uid - b.uid,
-    );
-    const pending = failures.filter((item) => item.status === 'pending');
-    const terminal = failures
-      .filter((item) => item.status === 'quarantined' || item.status === 'missing')
-      .slice(-MAX_DEAD_LETTER_RECORDS);
-    return {
-      ...state,
-      failures: [...pending, ...terminal].sort((a, b) => a.uid - b.uid),
-    };
-  }
-
-  /** Setting section/key under which per-queue IMAP state is stored. */
-  private static readonly UID_SETTING_SECTION = 'imap';
-  private uidSettingKey(queueId: number): string {
-    return `state:${queueId}`;
-  }
-
-  private legacyUidSettingKey(queueId: number): string {
-    return `lastSeenUid:${queueId}`;
-  }
-
-  /** Read UIDVALIDITY, watermark and poison-message state for a queue. */
-  private async getQueueState(queueId: number, uidValidity: string): Promise<ImapQueueState> {
-    const row = await this.prisma.setting.findUnique({
-      where: {
-        section_key: {
-          section: InboundMailService.UID_SETTING_SECTION,
-          key: this.uidSettingKey(queueId),
+    // Heartbeat: keep extending OUR lease while a healthy-but-slow message is processed
+    // (a large parse + attachment upload can approach the lease window). CAS-gated on our
+    // token so it no-ops the instant we lose the lease; unref'd so it never holds the event
+    // loop open; always cleared in `finally`. This closes the window where a long-but-live
+    // flow's lease expired and another worker reclaimed and reprocessed it.
+    const heartbeat = setInterval(() => {
+      void this.prisma.inboundDelivery
+        .updateMany({
+          where: { id: deliveryId, leaseOwner: leaseToken, state: 'PROCESSING' },
+          data: { leaseExpiresAt: new Date(Date.now() + InboundMailService.LEASE_MS) },
+        })
+        .catch(() => {
+          /* transient; the next tick retries, and settle is CAS-fenced regardless */
+        });
+    }, InboundMailService.LEASE_MS / 2);
+    heartbeat.unref?.();
+    // Header-less mail is deliberately idempotent ONLY by transport identity. Do not seed an
+    // id from `contentHash`: two distinct IMAP UIDs carrying identical bytes are independent
+    // deliveries and must create two tickets. `transportKey` contains the full IMAP identity
+    // (including mailbox epoch after P0-A) and the trusted PIPE delivery identity after P1-G.
+    const syntheticSeed = delivery.transportKey;
+    try {
+      const outcome = await this.processRawMessage(rawMime, departmentId, {
+        deliveryId,
+        legacyDedupIds,
+        syntheticSeed,
+        deliveryContext: {
+          queueId: delivery.queueId ?? undefined,
+          transportKey: delivery.transportKey,
+          envelopeTo: delivery.envelopeTo ?? undefined,
+          routedQueueId: delivery.routedQueueId ?? undefined,
+          routedDepartmentId: delivery.routedDepartmentId ?? undefined,
+          sendAutoresponder: delivery.sendAutoresponder,
+          routingSnapshot: this.normalizeRoutingSnapshot(delivery.routingSnapshot),
         },
-      },
-    });
-    const value = row?.value as Partial<ImapQueueState> | undefined;
-    if (
-      value &&
-      value.uidValidity === uidValidity &&
-      typeof value.watermark === 'number' &&
-      Number.isSafeInteger(value.watermark) &&
-      value.watermark >= 0
-    ) {
-      const failures = Array.isArray(value.failures) ? value.failures.filter(this.isValidFailureState) : [];
-      return { uidValidity, watermark: value.watermark, failures };
+      });
+      await settle({
+        state: outcome.state,
+        ticketId: outcome.ticketId ?? null,
+        postId: outcome.postId ?? null,
+        processedAt: new Date(),
+        lastError: null,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
+    } catch (err) {
+      const attempts = delivery.attempts; // already incremented by the claim CAS
+      const safeError = this.safeProcessingError(err);
+      // A malformed / oversized message fails deterministically — quarantine it at once
+      // (raw MIME retained) instead of burning every retry on an error that cannot pass.
+      if (this.isPermanentProcessingError(err) || attempts >= this.maxAttempts) {
+        await settle({
+          state: 'QUARANTINED',
+          attempts,
+          lastError: safeError,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+        });
+        this.logger.error(
+          `Inbound delivery ${deliveryId}: QUARANTINED after ${attempts} attempt(s) ` +
+            `(raw MIME retained for replay; ${this.errorKind(err)})`,
+        );
+      } else {
+        const backoffMs = 60_000 * 2 ** (attempts - 1);
+        await settle({
+          state: 'RETRY',
+          attempts,
+          nextAttemptAt: new Date(Date.now() + backoffMs),
+          lastError: safeError,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+        });
+        this.logger.warn(
+          `Inbound delivery ${deliveryId}: retry ${attempts}/${this.maxAttempts} in ${backoffMs}ms ` +
+            `(${this.errorKind(err)})`,
+        );
+      }
+    } finally {
+      clearInterval(heartbeat);
     }
-
-    // A UID is meaningful only inside one UIDVALIDITY generation. Reusing the
-    // old numeric watermark after a server-side mailbox rebuild can silently
-    // skip new mail or re-ingest old mail. Fail closed and require an operator to
-    // inspect/reset this one Setting row rather than guessing across generations.
-    if (value?.uidValidity && value.uidValidity !== uidValidity) {
-      this.logger.error(`IMAP UIDVALIDITY changed for queue ${queueId}; polling is paused`);
-      throw new ServiceUnavailableException('IMAP UIDVALIDITY changed; manual queue-state reset required');
-    }
-
-    // One-time compatibility with the old numeric watermark. Associate it with
-    // the currently-open mailbox's UIDVALIDITY, then persist the richer state.
-    const legacy = await this.prisma.setting.findUnique({
-      where: {
-        section_key: {
-          section: InboundMailService.UID_SETTING_SECTION,
-          key: this.legacyUidSettingKey(queueId),
-        },
-      },
-    });
-    const legacyWatermark = legacy?.value;
-    const watermark =
-      typeof legacyWatermark === 'number' && Number.isSafeInteger(legacyWatermark) && legacyWatermark >= 0
-        ? legacyWatermark
-        : 0;
-    const initial: ImapQueueState = { uidValidity, watermark, failures: [] };
-    await this.setQueueState(queueId, initial);
-    return initial;
-  }
-
-  private readonly isValidFailureState = (value: unknown): value is ImapFailureState => {
-    if (!value || typeof value !== 'object') return false;
-    const item = value as Partial<ImapFailureState>;
-    return (
-      typeof item.uid === 'number' &&
-      Number.isSafeInteger(item.uid) &&
-      item.uid > 0 &&
-      (item.status === 'pending' || item.status === 'quarantined' || item.status === 'missing') &&
-      typeof item.attempts === 'number' &&
-      Number.isSafeInteger(item.attempts) &&
-      item.attempts > 0 &&
-      typeof item.lastFailedAt === 'string'
-    );
-  };
-
-  private async setQueueState(queueId: number, state: ImapQueueState): Promise<void> {
-    const value: Prisma.InputJsonObject = {
-      uidValidity: state.uidValidity,
-      watermark: state.watermark,
-      failures: state.failures.map((failure) => ({ ...failure })),
-    };
-    await this.prisma.setting.upsert({
-      where: {
-        section_key: {
-          section: InboundMailService.UID_SETTING_SECTION,
-          key: this.uidSettingKey(queueId),
-        },
-      },
-      create: {
-        section: InboundMailService.UID_SETTING_SECTION,
-        key: this.uidSettingKey(queueId),
-        value,
-      },
-      update: { value },
-    });
   }
 
   /**
-   * Process one inbound IMAP message.
-   * Threading priority:
-   *   1. In-Reply-To / References header → look up TicketPost.messageId
-   *   2. Subject mask TT-XXXXXX
-   *   3. Apply parser rules (PRE_PARSE) — may discard or override routing
-   *   4. Fall back to creating a new ticket
+   * Persist small raw MIME inline for low-latency ledger reads. Large MIME uses a durable
+   * staging row before the filesystem write; acceptance consumes that row under the same
+   * transaction as its ledger insert, fencing the marker reaper across multiple API pods.
    */
-  /**
-   * A5(ii): true when an inbound message looks machine-generated or self-sent, so
-   * we must not auto-reply to it. Checks RFC 3834 Auto-Submitted, Precedence:bulk/
-   * list/junk, any X-Loop, and a From that matches our own MAIL_FROM / a configured
-   * queue address (self-loop).
-   */
-  private isLoopMessage(parsed: { headers?: Map<string, unknown> }, fromEmail: string): boolean {
-    const headers = parsed.headers;
-    // A header can arrive as a string, an array (repeated header lines), or a
-    // structured object (mailparser parses params). Flatten all to a lowercased
-    // string so a multi-valued `Precedence: list` + `Precedence: bulk` (array) or
-    // a parameterised value can't slip past the checks below.
-    const get = (k: string): string => {
-      if (!headers || typeof headers.get !== 'function') return '';
-      const raw = headers.get(k);
-      if (raw == null) return '';
-      const flat = Array.isArray(raw)
-        ? raw.map((v) => (typeof v === 'object' && v ? JSON.stringify(v) : String(v))).join(' ')
-        : typeof raw === 'object'
-          ? JSON.stringify(raw)
-          : String(raw);
-      return flat.toLowerCase();
-    };
-    // True if any whitespace/comma-separated token of the header equals one of `tokens`.
-    const hasToken = (headerVal: string, tokens: string[]): boolean => {
-      const parts = headerVal.split(/[\s,;]+/).filter(Boolean);
-      return parts.some((p) => tokens.includes(p));
-    };
-
-    const autoSubmitted = get('auto-submitted');
-    // Anything other than an explicit "no" (incl. multi/parameterised) is a loop.
-    if (autoSubmitted && !hasToken(autoSubmitted, ['no'])) return true;
-
-    const precedence = get('precedence');
-    if (hasToken(precedence, ['bulk', 'list', 'junk', 'auto_reply'])) return true;
-
-    if (get('x-loop') || get('x-autoreply') || get('x-autorespond')) return true;
-
-    // Self-from: never react to mail we ourselves sent.
-    const normalizedFrom = normalizeEmail(fromEmail);
-    const configuredFrom = this.normalizeConfiguredMailbox(this.config.TELECOM_HD_MAIL_FROM ?? '');
-    if (normalizedFrom && (normalizedFrom === configuredFrom || this.ownAddresses.has(normalizedFrom))) {
-      return true;
+  private async persistRawMime(
+    source: Buffer,
+  ): Promise<{ rawMime: Uint8Array<ArrayBuffer> | null; rawStorageKey: string | null }> {
+    if (source.length <= MAX_INLINE_RAW_MIME_BYTES) {
+      // Prisma's Bytes input intentionally requires an ArrayBuffer-backed view.
+      // Node Buffers can instead carry the broader ArrayBufferLike type.
+      const rawMime = new Uint8Array(new ArrayBuffer(source.byteLength));
+      rawMime.set(source);
+      return { rawMime, rawStorageKey: null };
     }
-
-    return false;
+    if (!this.rawStorage) {
+      throw new ServiceUnavailableException('Inbound raw MIME storage is unavailable for a large message');
+    }
+    const rawStorageKey = this.rawStorage.allocateKey();
+    try {
+      await this.prisma.inboundRawMimeStaging.create({
+        data: {
+          storageKey: rawStorageKey,
+          leaseExpiresAt: new Date(Date.now() + InboundMailService.RAW_STAGING_LEASE_MS),
+        },
+      });
+      await this.rawStorage.write(source, rawStorageKey);
+      return { rawMime: null, rawStorageKey };
+    } catch (err) {
+      await this.discardRawStage(rawStorageKey);
+      throw err;
+    }
   }
 
-  private async processMessage(
-    msg: FetchMessageObject,
-    departmentId: number | undefined,
-    transportMessageId?: string,
+  /**
+   * Delete one filesystem stage after an acceptance error/duplicate. DB deletion is best-effort:
+   * a surviving row is safe, expires, and can later be reclaimed by the locked reaper.
+   */
+  private async discardRawStage(rawStorageKey: string | null): Promise<void> {
+    if (!rawStorageKey) return;
+    if (this.rawStorage) {
+      await this.rawStorage.remove(rawStorageKey).catch((err: unknown) => {
+        this.logger.warn(`Inbound raw MIME staged-file cleanup deferred (${this.errorKind(err)})`);
+      });
+    }
+    await this.prisma.inboundRawMimeStaging
+      .deleteMany({ where: { storageKey: rawStorageKey } })
+      .catch((err) => {
+        this.logger.warn(`Inbound raw MIME stage cleanup deferred (${this.errorKind(err)})`);
+      });
+  }
+
+  /** Consume the durable stage while holding the acceptance transaction open. */
+  private async consumeRawStageForAcceptance(
+    tx: Prisma.TransactionClient,
+    rawStorageKey: string | null,
   ): Promise<void> {
-    const source = msg.source;
-    if (!source) throw new BadRequestException('IMAP message source is unavailable');
-    await this.ingestRawMessage(source, departmentId, transportMessageId);
+    if (!rawStorageKey) return;
+    const consumed = await tx.inboundRawMimeStaging.deleteMany({ where: { storageKey: rawStorageKey } });
+    if (consumed.count !== 1) {
+      throw new ServiceUnavailableException('Inbound raw MIME staging lease expired before acceptance');
+    }
   }
 
   /**
-   * Parse a raw RFC822 message and route it (thread / new ticket). Shared by the
-   * IMAP poller and the inbound webhook (A1) so both transports behave identically.
+   * Transport collisions are rejected to the MTA, but must also be durable/visible to an
+   * operator: a repeated delivery id with different bytes could otherwise look like an ordinary
+   * HTTP failure in mail logs. Audit write failure does not turn the collision into success.
    */
-  async ingestRawMessage(
-    source: Buffer | string | Readable,
+  private async recordInboundCollision(input: {
+    queueId: number;
+    deliveryId?: number;
+    contentHash: string;
+    priorContentHash?: string;
+    reason: string;
+  }): Promise<void> {
+    try {
+      await this.prisma.inboundAuditLog.create({
+        data: {
+          actorEmail: 'system',
+          action: 'mail.transport_collision',
+          queueId: input.queueId,
+          deliveryId: input.deliveryId ?? null,
+          reason: input.reason,
+          metadata: {
+            transport: 'PIPE',
+            incomingContentHash: input.contentHash,
+            priorContentHash: input.priorContentHash ?? null,
+          },
+        },
+      });
+    } catch (err) {
+      this.logger.error(
+        `INBOUND ALERT transport collision queue=${input.queueId}: audit write failed (${this.errorKind(err)})`,
+      );
+    }
+    this.logger.error(`INBOUND ALERT transport collision queue=${input.queueId}: ${input.reason}`);
+  }
+
+  // ─────────────────── routing pipeline ───────────────────
+
+  /**
+   * Parse a raw RFC822 message and route it (thread / new ticket). Returns the terminal
+   * outcome for the ledger. Throws on transient/DB errors so the caller retries (never
+   * swallowed). Shared by the IMAP drain and the PIPE ingress.
+   */
+  private async processRawMessage(
+    source: Buffer | string,
     departmentId: number | undefined,
-    transportMessageId?: string,
-  ): Promise<void> {
-    const maxBytes = this.config.TELECOM_HD_INBOUND_MAX_SIZE_MB * 1024 * 1024;
-    const boundedSource = this.boundedInboundSource(source, maxBytes);
+    opts: {
+      deliveryId?: number;
+      legacyDedupIds?: string[];
+      /** Stable transport identity used only for the ticket-post retry key of headerless mail. */
+      syntheticSeed?: string;
+      /** Immutable transport/route snapshot read from the ledger row that owns this attempt. */
+      deliveryContext?: DeliveryRoutingContext;
+    } = {},
+  ): Promise<ProcessOutcome> {
+    const { deliveryId, legacyDedupIds = [], syntheticSeed, deliveryContext } = opts;
+    // Reject oversized raw before parsing (an IMAP fetch capped at the size limit + 1 byte
+    // arrives here truncated; the PIPE path already rejects at ingress).
+    const sourceBytes = typeof source === 'string' ? Buffer.byteLength(source) : source.length;
+    if (sourceBytes > this.config.TELECOM_HD_INBOUND_MAX_SIZE_MB * 1024 * 1024) {
+      throw new PayloadTooLargeException('Inbound message exceeds the configured size limit');
+    }
+
+    // Parse under a bounded concurrency permit, then reject parser-amplified fields before
+    // they reach routing, storage, or the regex parser rules.
     const parsed = await this.withParserSlot(async () => {
       const { simpleParser } = await import('mailparser');
-      return simpleParser(boundedSource);
+      return simpleParser(source);
     });
+    const realMessageId = this.resolveRealMessageId(parsed);
     this.validateParsedMail(parsed);
 
     const subject = (parsed.subject ?? '(no subject)').trim() || '(no subject)';
@@ -598,80 +2067,155 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('Inbound message has no valid From address');
     }
     const fromName = (from?.name ?? fromEmail).trim() || fromEmail;
+    const toField = parsed.to;
+    const toAddress =
+      normalizeEmail(
+        (!Array.isArray(toField) ? toField?.value?.[0]?.address : toField?.[0]?.value?.[0]?.address) ?? '',
+      ) || undefined;
+    // The envelope recipient is a trusted transport snapshot (needed for BCC routing). Never
+    // overwrite it with the visible To header when processing an already-accepted delivery.
+    const persistedEnvelopeTo = deliveryContext?.envelopeTo ?? toAddress;
+    const rawBuf = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
+    const semanticHash = this.computeSemanticHash(parsed);
+    let route: InboundRoute = { departmentId, fallback: false };
+    let winnerClaim: LogicalClaimWinner | undefined;
 
-    // A5(ii): drop machine-generated / looping mail before it can create a ticket
-    // or reply (which would trigger our autoresponder and ping-pong).
-    if (this.isLoopMessage(parsed, fromEmail)) {
-      this.logger.log('IMAP: skipped auto/loop message');
-      return;
-    }
-
-    // A3 dedup: if we've already ingested a post bearing this exact Message-ID,
-    // this is a re-delivery (re-poll, or the same mail arriving via IMAP + webhook)
-    // — skip it so no duplicate ticket/reply is created. Empty IDs are never matched.
-    const incomingMessageId =
-      this.normalizeMessageId(parsed.messageId) ?? this.normalizeMessageId(transportMessageId);
-    if (incomingMessageId) {
-      const existing = await this.prisma.ticketPost.findFirst({
-        where: { messageId: incomingMessageId },
-        select: { id: true },
-      });
-      if (existing) {
-        this.logger.log('IMAP: duplicate message skipped');
-        return;
+    // Every ledger delivery records the observed real Message-ID (if present), semantic hash,
+    // and deterministic business route BEFORE loop/rule/ticket decisions. That makes CC copies,
+    // parser skips, and quarantined semantic conflicts forensic-visible rather than invisible
+    // side effects of a unique field on InboundDelivery.
+    if (deliveryId != null) {
+      const proposedRoute = await this.resolveInboundRoute(parsed, deliveryContext, departmentId);
+      if (realMessageId) {
+        const claim = await this.claimRealMessage({
+          deliveryId,
+          messageId: realMessageId,
+          semanticHash,
+          route: proposedRoute,
+          deliveryContext,
+          envelopeFrom: fromEmail,
+          envelopeTo: persistedEnvelopeTo,
+          subject,
+        });
+        if (claim.kind === 'DUPLICATE') {
+          this.logger.log(`Inbound: logical duplicate ${realMessageId} from ${fromEmail} — skipped`);
+          return { state: 'SKIPPED' };
+        }
+        if (claim.kind === 'CONFLICT') {
+          this.logger.error(
+            `Inbound: Message-ID semantic conflict ${realMessageId} delivery=${deliveryId} ` +
+              `(existing=${claim.existingSemanticHash ?? 'legacy/unknown'})`,
+          );
+          throw new SemanticMessageIdConflictError(
+            'Message-ID was already claimed by different or unreconstructable logical content',
+          );
+        }
+        route = claim.winner.route;
+        winnerClaim = claim.winner;
+      } else {
+        route = await this.recordHeaderlessDelivery({
+          deliveryId,
+          semanticHash,
+          route: proposedRoute,
+          deliveryContext,
+          envelopeFrom: fromEmail,
+          envelopeTo: persistedEnvelopeTo,
+          subject,
+        });
       }
     }
 
-    // Strip the quoted reply history so a threaded reply stores only the new text
-    // (Kayako keeps the whole quoted chain on every message). HTML is left as-is —
-    // the plain-text body is what we persist when there is no HTML part.
+    // True Message-IDs key the inbound ticket-post idempotency backstop. Headerless mail gets a
+    // per-transport synthetic key: identical bytes on different IMAP UIDs intentionally do
+    // NOT collide, while a retry of the same ledger row still cannot create another post.
+    const seed: string | Buffer = syntheticSeed ?? rawBuf;
+    const effectiveMessageId =
+      realMessageId ?? `<inbound-${createHash('sha256').update(seed).digest('hex')}@23telecom.local>`;
+
+    const finalize = async (outcome: ProcessOutcome): Promise<ProcessOutcome> => {
+      if (winnerClaim && deliveryId != null && (outcome.ticketId != null || outcome.postId != null)) {
+        const updated = await this.prisma.inboundMessageClaim.updateMany({
+          where: {
+            messageIdHash: winnerClaim.messageIdHash,
+            winnerDeliveryId: deliveryId,
+          },
+          data: {
+            ticketId: outcome.ticketId ?? null,
+            postId: outcome.postId ?? null,
+          },
+        });
+        if (updated.count !== 1) {
+          throw new ServiceUnavailableException(
+            `Logical Message-ID claim ${winnerClaim.messageIdHash} changed before finalization`,
+          );
+        }
+      }
+      return outcome;
+    };
+
+    // A5(ii): drop machine-generated / looping mail before it can create a ticket/reply. The
+    // delivery/claim was intentionally recorded above, so a loop is auditable and idempotent.
+    if (this.isLoopMessage(parsed, fromEmail)) {
+      this.logger.log('Inbound: skipped auto/loop message');
+      return finalize({ state: 'SKIPPED' });
+    }
+
+    // Secondary fast dedup: only an inbound post bearing this idempotency key proves this
+    // message was ingested before (e.g. a retry after post creation, or — via
+    // `legacyDedupIds` — the pre-ledger poller already ticketed this IMAP UID). Do not query
+    // TicketPost.messageId here: it is a threading namespace and an attacker can reuse a
+    // staff outbound Message-ID. Returns the existing ids for observability.
+    const dedupIds = [effectiveMessageId, ...legacyDedupIds];
+    const existing = await this.prisma.ticketPost.findFirst({
+      where: { inboundMessageId: { in: dedupIds } },
+      select: { id: true, ticketId: true },
+    });
+    if (existing) {
+      this.logger.log(`Inbound: duplicate message ${effectiveMessageId} from ${fromEmail} — skipped`);
+      return finalize({ state: 'SKIPPED', ticketId: existing.ticketId, postId: existing.id });
+    }
+
     const textBody = stripQuotedReply(parsed.text ?? '');
     const htmlBody = parsed.html || undefined;
 
-    // Persist email attachments if AttachmentsService is available
-    let emailAttachmentIds: number[] = [];
-    if (this.attachmentsService && parsed.attachments?.length) {
-      const uploaded = await this.attachmentsService.uploadFiles(
-        parsed.attachments
-          .filter((a) => a.content instanceof Buffer)
-          .map((a) => ({
-            originalname: a.filename ?? 'attachment',
-            mimetype: a.contentType ?? 'application/octet-stream',
-            size: (a.content as Buffer).length,
-            buffer: a.content as Buffer,
-          })),
-        { source: 'inbound' },
-      );
-      emailAttachmentIds = uploaded.map((a) => a.id);
-    }
+    // #9: stage attachments LAZILY — only upload when we are actually about to reply or
+    // create a ticket. Loop/duplicate/parser-ignore messages return before this runs, so
+    // they never leave orphan attachment files. Memoised so it uploads at most once.
+    let stagedAttachmentIds: number[] | null = null;
+    const attachmentIds = async (): Promise<number[]> => {
+      if (stagedAttachmentIds) return stagedAttachmentIds;
+      stagedAttachmentIds = [];
+      if (this.attachmentsService && parsed.attachments?.length) {
+        const uploaded = await this.attachmentsService.uploadFiles(
+          parsed.attachments
+            .filter((a) => a.content instanceof Buffer)
+            .map((a) => ({
+              originalname: a.filename ?? 'attachment',
+              mimetype: a.contentType ?? 'application/octet-stream',
+              size: (a.content as Buffer).length,
+              buffer: a.content as Buffer,
+            })),
+          { source: 'inbound' },
+        );
+        stagedAttachmentIds = uploaded.map((a) => a.id);
+      }
+      return stagedAttachmentIds;
+    };
 
-    // RFC threading identifiers (incomingMessageId already resolved above for dedup).
+    // RFC threading identifiers. Filter empties so a blank id can never match the ''
+    // default on legacy posts.
     const inReplyTo = this.normalizeMessageId(parsed.inReplyTo);
-    const references = parsed.references ?? undefined;
-
-    // Build list of message IDs from In-Reply-To and References to try.
-    // Filter empties so a blank id can never match the '' default on legacy posts.
     const referencedIds: string[] = [];
     if (inReplyTo) referencedIds.push(inReplyTo);
-    if (references) {
-      if (Array.isArray(references)) {
-        referencedIds.push(
-          ...references
-            .map((id) => this.normalizeMessageId(id))
-            .filter((id): id is string => id !== undefined),
-        );
-      } else {
-        referencedIds.push(
-          ...String(references)
-            .split(/\s+/)
-            .map((id) => this.normalizeMessageId(id))
-            .filter((id): id is string => id !== undefined),
-        );
-      }
+    for (const ref of this.referenceValues(parsed.references)) {
+      const normalized = this.normalizeMessageId(ref);
+      if (normalized) referencedIds.push(normalized);
     }
     const cleanReferencedIds = [...new Set(referencedIds)].slice(0, MAX_REFERENCES);
 
-    // 1. Try RFC threading by In-Reply-To / References
+    // 1. Thread by In-Reply-To / References. Possession of a real Message-ID is strong, but
+    // still require the sender to be a ticket participant (requester / linked user account /
+    // recipient) so a leaked Message-ID cannot be used to append to another customer's ticket.
     if (cleanReferencedIds.length > 0) {
       const linkedPost = await this.prisma.ticketPost.findFirst({
         where: { messageId: { in: cleanReferencedIds } },
@@ -684,9 +2228,8 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           },
         },
       });
-
       if (linkedPost && this.senderCanReply(linkedPost.ticket as ThreadableTicket, fromEmail)) {
-        await this.ticketsService.reply(linkedPost.ticketId, {
+        const post = await this.ticketsService.reply(linkedPost.ticketId, {
           contents: htmlBody ?? textBody,
           isHtml: !!htmlBody,
           isNote: false,
@@ -694,22 +2237,24 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           isThirdParty: false,
           creationMode: 'EMAIL',
           ipAddress: '0.0.0.0',
-          attachmentIds: emailAttachmentIds,
-          incomingMessageId,
+          attachmentIds: await attachmentIds(),
+          incomingMessageId: effectiveMessageId,
         });
-        this.logger.log(`IMAP: RFC-threaded reply to ticketId ${linkedPost.ticketId}`);
-        return;
+        this.logger.log(`Inbound: RFC-threaded reply to ${linkedPost.ticket.mask} from ${fromEmail}`);
+        return finalize({ state: 'PROCESSED', ticketId: linkedPost.ticketId, postId: post.id });
       }
       if (linkedPost) {
-        this.logger.warn('IMAP: RFC-thread sender was not authorized for the ticket');
+        this.logger.warn('Inbound: RFC-thread sender not authorized for the ticket — creating new');
       }
     }
 
-    // 2. Thread by mask in subject
+    // 2. Thread by subject mask — a mask is guessable, so require the sender to be a ticket
+    // participant (requester / linked user account / recipient). Not found or unauthorized →
+    // new ticket; a DB error propagates so the delivery is retried, never silently duplicated.
     const maskMatch = MASK_RE.exec(subject);
     if (maskMatch) {
       const mask = maskMatch[0].toUpperCase();
-      const ticket = await this.prisma.ticket.findUnique({
+      const maskTicket = await this.prisma.ticket.findUnique({
         where: { mask },
         select: {
           id: true,
@@ -718,12 +2263,8 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           recipients: { select: { email: true } },
         },
       });
-      if (!ticket) {
-        this.logger.warn('IMAP: subject mask did not resolve; creating a new ticket');
-      }
-
-      if (ticket && this.senderCanReply(ticket, fromEmail)) {
-        await this.ticketsService.reply(ticket.id, {
+      if (maskTicket && this.senderCanReply(maskTicket, fromEmail)) {
+        const post = await this.ticketsService.reply(maskTicket.id, {
           contents: htmlBody ?? textBody,
           isHtml: !!htmlBody,
           isNote: false,
@@ -731,38 +2272,30 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           isThirdParty: false,
           creationMode: 'EMAIL',
           ipAddress: '0.0.0.0',
-          attachmentIds: emailAttachmentIds,
-          incomingMessageId,
+          attachmentIds: await attachmentIds(),
+          incomingMessageId: effectiveMessageId,
         });
-        this.logger.log(`IMAP: subject-mask reply threaded to ticketId ${ticket.id}`);
-        return;
+        this.logger.log(`Inbound: threaded reply to ${mask} from ${fromEmail}`);
+        return finalize({ state: 'PROCESSED', ticketId: maskTicket.id, postId: post.id });
       }
-      if (ticket) {
-        this.logger.warn('IMAP: subject-mask sender was not authorized for the ticket');
-      }
+      this.logger.warn(
+        maskTicket
+          ? `Inbound: mask ${mask} sender not authorized — creating new ticket`
+          : `Inbound: mask ${mask} did not resolve — creating new ticket`,
+      );
     }
 
-    // 3. Apply PRE_PARSE parser rules (before creating a new ticket)
-    const toField = parsed.to;
-    const toAddress = !Array.isArray(toField)
-      ? toField?.value?.[0]?.address
-      : toField?.[0]?.value?.[0]?.address;
-    const parsedEmail: ParsedEmail = {
-      subject,
-      fromEmail,
-      fromName,
-      toEmail: toAddress,
-      body: textBody,
-    };
-    const ruleResult = await this.applyParserRules(parsedEmail, departmentId);
-
+    // 3. PRE_PARSE parser rules (before creating a new ticket)
+    const parsedEmail: ParsedEmail = { subject, fromEmail, fromName, toEmail: toAddress, body: textBody };
+    const routedDepartmentId = route.departmentId ?? departmentId;
+    const ruleResult = await this.applyParserRules(parsedEmail, routedDepartmentId);
     if (ruleResult.skip) {
-      this.logger.log('IMAP: message discarded by parser rule');
-      return;
+      this.logger.log(`Inbound: message from ${fromEmail} discarded by parser rule — "${subject}"`);
+      return finalize({ state: 'SKIPPED' });
     }
 
-    // 4. Create new ticket
-    const deptId = ruleResult.departmentId ?? departmentId ?? (await this.defaultDeptId());
+    // 4. Create a new ticket. Message-ID written atomically with the first post.
+    const deptId = ruleResult.departmentId ?? routedDepartmentId ?? (await this.defaultDeptId());
     const newTicket = await this.ticketsService.createTicket({
       subject,
       contents: htmlBody ?? textBody,
@@ -774,20 +2307,488 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       ipAddress: '0.0.0.0',
       tags: ruleResult.tags,
       customFields: {},
-      attachmentIds: emailAttachmentIds,
+      attachmentIds: await attachmentIds(),
+      incomingMessageId: effectiveMessageId,
+      // The deterministic owner selected from the immutable acceptance snapshot controls
+      // both ticket attribution and the customer-autoresponder policy. A historical/unknown
+      // row deliberately leaves this undefined; TicketsService then fails closed rather than
+      // consulting a currently unrelated queue by department.
+      ...(route.queueId != null ? { inboundQueueId: route.queueId } : {}),
+      ...(route.sendAutoresponder !== undefined ? { inboundSendAutoresponder: route.sendAutoresponder } : {}),
       ...(ruleResult.priorityId !== undefined ? { priorityId: ruleResult.priorityId } : {}),
       ...(ruleResult.ownerStaffId !== undefined ? { ownerStaffId: ruleResult.ownerStaffId } : {}),
-      incomingMessageId,
     });
-
-    // NOTE: the autoresponder is sent by TicketsService.createTicket() (it fires for
-    // every requesterEmail on creation). Sending it again here produced a duplicate
-    // autoresponder for every inbound email — removed intentionally.
-
-    this.logger.log(`IMAP: created ticketId ${newTicket.id}`);
+    const firstPost = await this.prisma.ticketPost.findFirst({
+      where: { ticketId: newTicket.id },
+      orderBy: { id: 'asc' },
+      select: { id: true },
+    });
+    this.logger.log(`Inbound: new ticket ${newTicket.mask} from ${fromEmail} — "${subject}"`);
+    return finalize({ state: 'PROCESSED', ticketId: newTicket.id, postId: firstPost?.id });
   }
 
-  /** At most two MIME trees are materialized at once; excess work is bounded. */
+  // ─────────────────── logical Message-ID claim + deterministic route ───────────────────
+
+  /**
+   * Select the business owner. Ledger-backed deliveries route only against their immutable
+   * acceptance-time queue snapshot, so equal RFC Message-ID copies resolve to the same
+   * `(routingPriority, id)` winner regardless of drain order. Direct (non-ledger) callers
+   * retain a current enabled-queue lookup for backwards compatibility.
+   */
+  private async resolveInboundRoute(
+    parsed: ParsedMail,
+    context: DeliveryRoutingContext | undefined,
+    fallbackDepartmentId: number | undefined,
+  ): Promise<InboundRoute> {
+    const recipients = new Set<string>();
+    for (const field of [parsed.to, parsed.cc]) {
+      for (const entry of this.addressEntries(field)) {
+        const email = normalizeEmail(entry.address ?? '');
+        if (email) recipients.add(email);
+      }
+    }
+    const envelopeRecipient = normalizeEmail(context?.envelopeTo ?? '');
+    if (envelopeRecipient) recipients.add(envelopeRecipient);
+
+    // No queue may be re-read while draining a ledger row.  The acceptance snapshot carries
+    // every enabled address/policy needed to make the documented deterministic choice even
+    // when two CC copies are claimed in the opposite order by separate workers.
+    // `queueId` can be nulled by an intentional queue deletion (the ledger retains the raw
+    // delivery for replay), whereas `transportKey` is immutable. Use the latter to recognize
+    // a ledger row so deletion can never make a queued delivery fall back to live routing.
+    if (context?.transportKey !== undefined) {
+      const matched = (context.routingSnapshot ?? [])
+        .filter((queue) => recipients.has(normalizeEmail(queue.emailAddress)))
+        .sort((a, b) => a.routingPriority - b.routingPriority || a.id - b.id);
+      const winner = matched[0];
+      if (winner) {
+        return {
+          queueId: winner.id,
+          departmentId: winner.departmentId ?? fallbackDepartmentId,
+          sendAutoresponder: winner.sendAutoresponder,
+          fallback: false,
+        };
+      }
+
+      // Old ledger rows predate `routingSnapshot`. Their accepting queue/department is the
+      // only immutable information available, so retain that conservative legacy fallback;
+      // never query today's queue configuration and accidentally reroute historical mail.
+      return {
+        queueId: context.routedQueueId ?? context.queueId,
+        departmentId: context.routedDepartmentId ?? fallbackDepartmentId,
+        ...(context.sendAutoresponder !== undefined && context.sendAutoresponder !== null
+          ? { sendAutoresponder: context.sendAutoresponder }
+          : {}),
+        fallback: true,
+        fallbackReason: 'RECEIVING_QUEUE',
+      };
+    }
+
+    const queues = await this.prisma.emailQueue.findMany({
+      where: { isEnabled: true },
+      select: {
+        id: true,
+        emailAddress: true,
+        departmentId: true,
+        routingPriority: true,
+        sendAutoresponder: true,
+      },
+    });
+    const matched = queues
+      .filter((queue) => recipients.has(normalizeEmail(queue.emailAddress)))
+      .sort((a, b) => a.routingPriority - b.routingPriority || a.id - b.id);
+    const winner = matched[0];
+    if (winner) {
+      return {
+        queueId: winner.id,
+        departmentId: winner.departmentId ?? fallbackDepartmentId,
+        sendAutoresponder: winner.sendAutoresponder,
+        fallback: false,
+      };
+    }
+
+    return {
+      departmentId: fallbackDepartmentId ?? (await this.defaultDeptId()),
+      fallback: true,
+      fallbackReason: 'DEFAULT_DEPARTMENT',
+    };
+  }
+
+  /** Validate the JSON persisted at acceptance before it participates in routing. */
+  private normalizeRoutingSnapshot(value: Prisma.JsonValue | null | undefined): RoutingSnapshotEntry[] {
+    if (!Array.isArray(value)) return [];
+    const ids = new Set<number>();
+    const result: RoutingSnapshotEntry[] = [];
+    for (const valueEntry of value) {
+      if (!valueEntry || typeof valueEntry !== 'object' || Array.isArray(valueEntry)) continue;
+      const entry = valueEntry as Record<string, unknown>;
+      const id = entry['id'];
+      const emailAddress = entry['emailAddress'];
+      const departmentId = entry['departmentId'];
+      const routingPriority = entry['routingPriority'];
+      const sendAutoresponder = entry['sendAutoresponder'];
+      if (
+        !Number.isSafeInteger(id) ||
+        (id as number) <= 0 ||
+        ids.has(id as number) ||
+        typeof emailAddress !== 'string' ||
+        normalizeEmail(emailAddress) === '' ||
+        !(departmentId === null || (Number.isSafeInteger(departmentId) && (departmentId as number) > 0)) ||
+        !Number.isSafeInteger(routingPriority) ||
+        (routingPriority as number) < 0 ||
+        typeof sendAutoresponder !== 'boolean'
+      ) {
+        continue;
+      }
+      ids.add(id as number);
+      result.push({
+        id: id as number,
+        emailAddress,
+        departmentId: departmentId as number | null,
+        routingPriority: routingPriority as number,
+        sendAutoresponder,
+      });
+    }
+    return result.sort((a, b) => a.routingPriority - b.routingPriority || a.id - b.id);
+  }
+
+  /**
+   * Create/read the durable logical claim inside one database transaction. A unique hash
+   * collision is resolved by reading the winning claim in the same transaction; only the
+   * winner is allowed into ticket routing. A semantic mismatch is durably audited and returned
+   * to the caller as a permanent quarantine outcome.
+   */
+  private async claimRealMessage(args: {
+    deliveryId: number;
+    messageId: string;
+    semanticHash: string;
+    route: InboundRoute;
+    deliveryContext?: DeliveryRoutingContext;
+    envelopeFrom: string;
+    envelopeTo?: string;
+    subject: string;
+  }): Promise<LogicalClaimResult> {
+    const messageIdHash = createHash('sha256').update(args.messageId).digest('hex');
+    return this.prisma.$transaction<LogicalClaimResult>(async (tx: Prisma.TransactionClient) => {
+      // Do NOT catch P2002 then read in this transaction: PostgreSQL marks a transaction
+      // aborted after a unique violation. `createMany(skipDuplicates)` emits INSERT .. ON
+      // CONFLICT DO NOTHING instead, so the subsequent read is valid for both the winner and
+      // a concurrent loser (and any other DB failure still propagates/retries).
+      await tx.inboundMessageClaim.createMany({
+        data: {
+          messageIdHash,
+          normalizedMessageId: args.messageId,
+          semanticHash: args.semanticHash,
+          semanticHashVersion: 1,
+          winnerDeliveryId: args.deliveryId,
+          routedQueueId: args.route.queueId ?? null,
+          departmentId: args.route.departmentId ?? null,
+          sendAutoresponder: args.route.sendAutoresponder ?? null,
+        },
+        skipDuplicates: true,
+      });
+      const claim = await tx.inboundMessageClaim.findUnique({ where: { messageIdHash } });
+      if (!claim) {
+        // `skipDuplicates` can also be triggered by winnerDeliveryId's unique constraint.
+        // If the expected hash is absent, do not assume duplicate semantics; retry/fail closed.
+        throw new ServiceUnavailableException(
+          `Logical Message-ID claim ${messageIdHash} was not readable after atomic insert`,
+        );
+      }
+
+      const persistedRoute: InboundRoute = {
+        queueId: claim.routedQueueId ?? undefined,
+        departmentId: claim.departmentId ?? undefined,
+        ...(claim.sendAutoresponder !== null && claim.sendAutoresponder !== undefined
+          ? { sendAutoresponder: claim.sendAutoresponder }
+          : {}),
+        fallback: false,
+      };
+      await this.recordDeliveryIdentity(tx, {
+        deliveryId: args.deliveryId,
+        observedMessageId: args.messageId,
+        messageIdHash,
+        semanticHash: args.semanticHash,
+        route: persistedRoute,
+        envelopeFrom: args.envelopeFrom,
+        envelopeTo: args.envelopeTo,
+        subject: args.subject,
+      });
+
+      if (claim.winnerDeliveryId === args.deliveryId) {
+        // A retry of the original winner after ticket creation but before settle must retain
+        // ownership. A malformed changed raw payload on that same delivery is still unsafe.
+        if (claim.semanticHashVersion !== 1 || claim.semanticHash !== args.semanticHash) {
+          await this.writeSemanticConflictAudit(tx, args, messageIdHash, claim.semanticHash);
+          return { kind: 'CONFLICT', route: persistedRoute, existingSemanticHash: claim.semanticHash };
+        }
+        if (args.route.fallback) await this.writeRouteFallbackAudit(tx, args.deliveryId, args.route);
+        return { kind: 'WINNER', winner: { messageIdHash, route: persistedRoute } };
+      }
+
+      // A historical claim with no semantic content is intentionally fail-closed. Treating raw
+      // bytes as a semantic hash would falsely conflict valid CC copies; treating it as equal
+      // would silently discard a genuinely different message that reused a Message-ID.
+      if (
+        claim.semanticHashVersion !== 1 ||
+        !claim.semanticHash ||
+        claim.semanticHash !== args.semanticHash
+      ) {
+        await this.writeSemanticConflictAudit(tx, args, messageIdHash, claim.semanticHash);
+        return { kind: 'CONFLICT', route: persistedRoute, existingSemanticHash: claim.semanticHash };
+      }
+
+      return { kind: 'DUPLICATE', route: persistedRoute };
+    });
+  }
+
+  /** Persist an identity/route for headerless mail without creating a logical claim. */
+  private async recordHeaderlessDelivery(args: {
+    deliveryId: number;
+    semanticHash: string;
+    route: InboundRoute;
+    deliveryContext?: DeliveryRoutingContext;
+    envelopeFrom: string;
+    envelopeTo?: string;
+    subject: string;
+  }): Promise<InboundRoute> {
+    return this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await this.recordDeliveryIdentity(tx, {
+        deliveryId: args.deliveryId,
+        observedMessageId: null,
+        messageIdHash: null,
+        semanticHash: args.semanticHash,
+        route: args.route,
+        envelopeFrom: args.envelopeFrom,
+        envelopeTo: args.envelopeTo,
+        subject: args.subject,
+      });
+      if (args.route.fallback) await this.writeRouteFallbackAudit(tx, args.deliveryId, args.route);
+      return args.route;
+    });
+  }
+
+  private async recordDeliveryIdentity(
+    tx: Prisma.TransactionClient,
+    args: {
+      deliveryId: number;
+      observedMessageId: string | null;
+      messageIdHash: string | null;
+      semanticHash: string;
+      route: InboundRoute;
+      envelopeFrom: string;
+      envelopeTo?: string;
+      subject: string;
+    },
+  ): Promise<void> {
+    await tx.inboundDelivery.update({
+      where: { id: args.deliveryId },
+      data: {
+        observedMessageId: args.observedMessageId,
+        messageIdHash: args.messageIdHash,
+        semanticHash: args.semanticHash,
+        routedQueueId: args.route.queueId ?? null,
+        routedDepartmentId: args.route.departmentId ?? null,
+        envelopeFrom: args.envelopeFrom,
+        envelopeTo: args.envelopeTo ?? null,
+        subject: args.subject.slice(0, MAX_SUBJECT_CHARS),
+      },
+    });
+  }
+
+  private async writeRouteFallbackAudit(
+    tx: Prisma.TransactionClient,
+    deliveryId: number,
+    route: InboundRoute,
+  ): Promise<void> {
+    await tx.inboundAuditLog.create({
+      data: {
+        action: 'mail.route_fallback',
+        queueId: route.queueId ?? null,
+        deliveryId,
+        reason: route.fallbackReason ?? 'unknown',
+        metadata: {
+          routedQueueId: route.queueId ?? null,
+          routedDepartmentId: route.departmentId ?? null,
+        } as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  private async writeSemanticConflictAudit(
+    tx: Prisma.TransactionClient,
+    args: {
+      deliveryId: number;
+      messageId: string;
+      semanticHash: string;
+      route: InboundRoute;
+      deliveryContext?: DeliveryRoutingContext;
+    },
+    messageIdHash: string,
+    existingSemanticHash: string | null,
+  ): Promise<void> {
+    await tx.inboundAuditLog.create({
+      data: {
+        action: 'mail.message_id_conflict',
+        queueId: args.route.queueId ?? args.deliveryContext?.queueId ?? null,
+        deliveryId: args.deliveryId,
+        reason: 'Message-ID reused with different or unreconstructable logical content',
+        metadata: {
+          messageId: args.messageId,
+          messageIdHash,
+          incomingSemanticHash: args.semanticHash,
+          existingSemanticHash,
+        } as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  /** SHA-256 over logical RFC content only; never raw MIME / per-hop trace headers. */
+  private computeSemanticHash(parsed: ParsedMail): string {
+    const normalizeText = (value: string | undefined): string =>
+      (value ?? '')
+        .normalize('NFC')
+        .replace(/\r\n?/g, '\n')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    const addressField = (field: AddressObject | AddressObject[] | undefined) =>
+      this.addressEntries(field)
+        .map((entry) => ({
+          address: normalizeEmail(entry.address ?? ''),
+          name: normalizeText(entry.name).toLowerCase(),
+        }))
+        .filter((entry) => entry.address)
+        .sort((a, b) => `${a.address}\u0000${a.name}`.localeCompare(`${b.address}\u0000${b.name}`));
+    const attachmentSummary = (parsed.attachments ?? [])
+      .map((attachment) => {
+        const content = attachment.content instanceof Buffer ? attachment.content : Buffer.alloc(0);
+        const reportedSize = (attachment as { size?: unknown }).size;
+        return {
+          filename: normalizeText(attachment.filename),
+          mimeType: normalizeText(attachment.contentType).toLowerCase(),
+          size:
+            typeof reportedSize === 'number' && Number.isSafeInteger(reportedSize)
+              ? reportedSize
+              : content.length,
+          hash: createHash('sha256').update(content).digest('hex'),
+        };
+      })
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    const canonical = JSON.stringify({
+      version: 1,
+      from: addressField(parsed.from),
+      to: addressField(parsed.to),
+      cc: addressField(parsed.cc),
+      replyTo: addressField(parsed.replyTo),
+      subject: normalizeText(parsed.subject),
+      text: normalizeText(parsed.text),
+      html: normalizeText(typeof parsed.html === 'string' ? parsed.html : undefined),
+      attachments: attachmentSummary,
+    });
+    return createHash('sha256').update(canonical).digest('hex');
+  }
+
+  // ─────────────────── helpers: mailbox / locks ───────────────────
+
+  /** Read UIDVALIDITY / UIDNEXT / EXISTS from the currently-selected mailbox. */
+  private readMailboxState(client: ImapFlow): {
+    uidValidity?: bigint;
+    uidNext?: number;
+    exists?: number;
+  } {
+    const mailbox = (client as { mailbox?: unknown }).mailbox;
+    if (!mailbox || typeof mailbox !== 'object') return {};
+    const mb = mailbox as { uidValidity?: unknown; uidNext?: unknown; exists?: unknown };
+    let uidValidity: bigint | undefined;
+    if (typeof mb.uidValidity === 'bigint') uidValidity = mb.uidValidity;
+    else if (typeof mb.uidValidity === 'number' && Number.isFinite(mb.uidValidity))
+      uidValidity = BigInt(mb.uidValidity);
+    const uidNext = typeof mb.uidNext === 'number' && Number.isFinite(mb.uidNext) ? mb.uidNext : undefined;
+    const exists = typeof mb.exists === 'number' && Number.isFinite(mb.exists) ? mb.exists : undefined;
+    return { uidValidity, uidNext, exists };
+  }
+
+  /**
+   * Highest currently-existing UID: `uidNext-1` when advertised, else the max UID from a
+   * `*` fetch, else 0 for an empty mailbox. `null` only when it truly can't be resolved.
+   */
+  private async resolveHighWaterUid(
+    client: ImapFlow,
+    uidNext: number | undefined,
+    exists: number | undefined,
+  ): Promise<number | null> {
+    if (uidNext !== undefined) return Math.max(uidNext - 1, 0);
+    if (exists === 0) return 0;
+    try {
+      let hi = 0;
+      for await (const m of client.fetch('*', { uid: true }, { uid: true })) {
+        if (typeof m.uid === 'number' && m.uid > hi) hi = m.uid;
+      }
+      return hi;
+    } catch {
+      return null;
+    }
+  }
+
+  /** True for a Prisma unique-constraint violation (P2002). */
+  private isUniqueViolation(err: unknown): boolean {
+    return !!err && typeof err === 'object' && (err as { code?: string }).code === 'P2002';
+  }
+
+  // ─────────────────── loop/bounce guard (A5) ───────────────────
+
+  /**
+   * A5(ii): true when an inbound message looks machine-generated or self-sent, so we
+   * must not auto-reply to it. Checks RFC 3834 Auto-Submitted, Precedence:bulk/list/junk,
+   * any X-Loop, and a From that matches our own MAIL_FROM (self-loop).
+   */
+  private isLoopMessage(parsed: { headers?: Map<string, unknown> }, fromEmail: string): boolean {
+    const headers = parsed.headers;
+    const get = (k: string): string => {
+      if (!headers || typeof headers.get !== 'function') return '';
+      const raw = headers.get(k);
+      if (raw == null) return '';
+      const flat = Array.isArray(raw)
+        ? raw.map((v) => (typeof v === 'object' && v ? JSON.stringify(v) : String(v))).join(' ')
+        : typeof raw === 'object'
+          ? JSON.stringify(raw)
+          : String(raw);
+      return flat.toLowerCase();
+    };
+    const hasToken = (headerVal: string, tokens: string[]): boolean => {
+      const parts = headerVal.split(/[\s,;]+/).filter(Boolean);
+      return parts.some((p) => tokens.includes(p));
+    };
+
+    const autoSubmitted = get('auto-submitted');
+    if (autoSubmitted && !hasToken(autoSubmitted, ['no'])) return true;
+
+    const precedence = get('precedence');
+    if (hasToken(precedence, ['bulk', 'list', 'junk', 'auto_reply'])) return true;
+
+    if (get('x-loop') || get('x-autoreply') || get('x-autorespond')) return true;
+
+    // Self-from: never react to mail we ourselves sent. MAIL_FROM is usually a display
+    // form like `Name <addr>` — compare the bare address, not the whole string. Also match
+    // any configured queue address (seeded into ownAddresses at init).
+    const ownAddr = this.extractAddress(this.config.TELECOM_HD_MAIL_FROM ?? '');
+    if (ownAddr && fromEmail.toLowerCase() === ownAddr) return true;
+    const normalizedFrom = normalizeEmail(fromEmail);
+    if (normalizedFrom && this.ownAddresses.has(normalizedFrom)) return true;
+
+    return false;
+  }
+
+  /** Extract the bare lowercased email address from a `Name <addr>` / `addr` string. */
+  private extractAddress(value: string): string {
+    const angle = /<([^>]+)>/.exec(value);
+    return (angle?.[1] ?? value).trim().toLowerCase();
+  }
+
+  // ─────────────────── security helpers (parse bounds / authorization) ───────────────────
+
+  /** Run `work` while holding one of MAX_CONCURRENT_PARSERS parse permits. */
   private async withParserSlot<T>(work: () => Promise<T>): Promise<T> {
     await this.acquireParserSlot();
     try {
@@ -805,8 +2806,8 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     if (this.parserWaiters.length >= MAX_QUEUED_PARSERS) {
       throw new ServiceUnavailableException('Inbound parser is at capacity');
     }
-    // The active counter represents permits. releaseParserSlot() transfers the
-    // permit directly to the oldest waiter without decrementing it first.
+    // The active counter represents permits. releaseParserSlot() transfers the permit
+    // directly to the oldest waiter without decrementing it first.
     await new Promise<void>((resolve, reject) => this.parserWaiters.push({ resolve, reject }));
   }
 
@@ -842,7 +2843,12 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       this.assertFieldLength(entry.name, MAX_NAME_CHARS, 'Address display name');
     }
 
-    this.assertValidMessageId(parsed.messageId, 'Message-ID');
+    // Message-ID has deliberately stricter handling than the reply/reference headers:
+    // mailparser may synthesize angle brackets around a malformed raw value, and an empty
+    // raw header is represented as `undefined`. resolveRealMessageId() checks the original
+    // header line, so a *present* invalid Message-ID quarantines rather than falling through
+    // to headerless transport deduplication.
+    this.resolveRealMessageId(parsed);
     this.assertValidMessageId(parsed.inReplyTo, 'In-Reply-To');
     const references = this.referenceValues(parsed.references);
     if (references.length > MAX_REFERENCES) {
@@ -895,13 +2901,62 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Return a normalized real Message-ID, or undefined only when the header is absent.
+   *
+   * `mailparser` normalizes an unbracketed `Message-ID: broken` to `<broken>`, and omits an
+   * empty `Message-ID:` from `headers` entirely. Looking solely at `parsed.messageId` would
+   * therefore silently classify attacker/broken-sender input as either a valid ID or a
+   * headerless message. The raw header line is the authoritative presence check.
+   */
+  private resolveRealMessageId(parsed: ParsedMail): string | undefined {
+    const messageIdLines = parsed.headerLines.filter((line) => line.key.toLowerCase() === 'message-id');
+    if (messageIdLines.length === 0) {
+      if (parsed.messageId === undefined || parsed.messageId === null || parsed.messageId === '')
+        return undefined;
+      const normalized = this.normalizeMessageId(parsed.messageId);
+      if (!normalized) throw new BadRequestException('Message-ID is invalid or too long');
+      return normalized;
+    }
+    if (messageIdLines.length !== 1) {
+      throw new BadRequestException('Inbound message contains multiple Message-ID headers');
+    }
+
+    const rawLine = messageIdLines[0]!.line;
+    const separator = rawLine.indexOf(':');
+    if (separator < 0) throw new BadRequestException('Message-ID is invalid or too long');
+    // Unfold legal RFC header folding, then validate the actual header value. Whitespace inside
+    // the ID itself remains invalid in normalizeMessageId().
+    const rawValue = rawLine
+      .slice(separator + 1)
+      .replace(/\r?\n[\t ]+/g, '')
+      .trim();
+    const normalized = this.normalizeMessageId(rawValue);
+    if (!normalized) throw new BadRequestException('Message-ID is invalid or too long');
+    return normalized;
+  }
+
+  /**
+   * Normalize a real RFC Message-ID for its bounded SHA-256 claim key. Invalid/oversized
+   * headers are rejected by validateParsedMail and therefore quarantined; they are never
+   * silently downgraded into headerless mail.
+   */
   private normalizeMessageId(value: unknown): string | undefined {
     if (typeof value !== 'string') return undefined;
     const normalized = value.trim();
-    if (!normalized || normalized.length > MAX_MESSAGE_ID_CHARS) return undefined;
-    for (const char of normalized) {
+    if (
+      !normalized ||
+      normalized.length > MAX_MESSAGE_ID_CHARS ||
+      !normalized.startsWith('<') ||
+      !normalized.endsWith('>') ||
+      normalized.length < 3
+    ) {
+      return undefined;
+    }
+    const body = normalized.slice(1, -1);
+    for (const char of body) {
       const code = char.charCodeAt(0);
-      if (code <= 0x20 || code === 0x7f) return undefined;
+      if (code <= 0x20 || code === 0x7f || char === '<' || char === '>') return undefined;
     }
     return normalized;
   }
@@ -938,6 +2993,8 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     return normalizeEmail(start >= 0 && end > start ? value.slice(start + 1, end) : value);
   }
 
+  /** A sender may reply to a ticket only if they are the requester, the linked user
+   *  account, or a listed recipient — a guessed mask / leaked Message-ID is not enough. */
   private senderCanReply(ticket: ThreadableTicket, fromEmail: string): boolean {
     const sender = normalizeEmail(fromEmail);
     if (!sender) return false;
@@ -949,32 +3006,34 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     return authorized.some((email) => Boolean(email) && normalizeEmail(email ?? '') === sender);
   }
 
-  /** Cap buffers immediately and streams while mailparser consumes them. */
-  private boundedInboundSource(
-    source: Buffer | string | Readable,
-    maxBytes: number,
-  ): Buffer | string | Readable {
-    if (!source || typeof source === 'string' || Buffer.isBuffer(source)) {
-      const bytes = Buffer.isBuffer(source) ? source.length : Buffer.byteLength(source);
-      if (bytes > maxBytes) {
-        throw new PayloadTooLargeException('Inbound message exceeds the configured size limit');
-      }
-      return source;
-    }
-
-    const bounded = async function* () {
-      let bytes = 0;
-      for await (const chunk of source) {
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
-        bytes += buffer.length;
-        if (bytes > maxBytes) {
-          throw new PayloadTooLargeException('Inbound message exceeds the configured size limit');
-        }
-        yield buffer;
-      }
-    };
-    return Readable.from(bounded());
+  /** Deterministic input failures (malformed / oversized MIME) — retrying cannot help, so
+   *  quarantine at once (raw MIME retained). */
+  private isPermanentProcessingError(err: unknown): boolean {
+    return err instanceof BadRequestException || err instanceof PayloadTooLargeException;
   }
+
+  /**
+   * `lastError` is shown in the operator UI and must never persist raw parser, database,
+   * mailbox, filesystem, or provider details. Keep the durable message actionable but
+   * deliberately coarse; the structured state/audit trail identifies the recovery action.
+   */
+  private safeProcessingError(err: unknown): string {
+    if (err instanceof SemanticMessageIdConflictError) {
+      return 'Message-ID conflicts with a different logical message; operator review required';
+    }
+    if (err instanceof PayloadTooLargeException) {
+      return 'Inbound message exceeds the configured size limit';
+    }
+    if (err instanceof BadRequestException) {
+      return 'Inbound message was rejected by validation';
+    }
+    if (err instanceof ServiceUnavailableException) {
+      return 'Inbound dependency is temporarily unavailable';
+    }
+    return 'Inbound processing failed; retry scheduled';
+  }
+
+  // ─────────────────── parser rules (unchanged) ───────────────────
 
   /**
    * Apply enabled PRE_PARSE parser rules to a parsed inbound email.
@@ -990,9 +3049,12 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         where: { isEnabled: true, ruleType: 'PRE_PARSE' },
         orderBy: { sortOrder: 'asc' },
       });
-    } catch {
-      // Table may not exist yet (migration pending) — skip rules gracefully
-      return result;
+    } catch (err) {
+      // Table not migrated yet → skip rules gracefully. But a REAL DB error must NOT be
+      // swallowed (that would silently route mail to the default department); rethrow so
+      // the delivery goes to RETRY instead.
+      if (/does not exist/i.test(String(err))) return result;
+      throw err;
     }
 
     for (const rule of rules) {
@@ -1009,7 +3071,6 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       const matches = this.evaluateCriteria(parsed, criteria, rule.matchType);
       if (!matches) continue;
 
-      // Apply actions
       for (const action of actions) {
         switch (action.type) {
           case 'ignore':
@@ -1046,9 +3107,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     matchType: string,
   ): boolean {
     if (criteria.length === 0) return true;
-
     const results = criteria.map((c) => this.matchCriterion(parsed, c));
-
     return matchType === 'ANY' ? results.some(Boolean) : results.every(Boolean);
   }
 
@@ -1068,6 +3127,9 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       case 'ends_with':
         return fieldVal.toLowerCase().endsWith(target.toLowerCase());
       case 'regex': {
+        // JavaScript RegExp has no execution timeout, so a catastrophic-backtracking pattern
+        // in a DB parser rule + an attacker-controlled inbound body would block the event
+        // loop (full-API DoS). Only run patterns from a safe, linear-time subset.
         if (!this.isSafeRuleRegex(target)) return false;
         try {
           return new RegExp(target, 'i').test(fieldVal);
@@ -1081,10 +3143,10 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * JavaScript RegExp has no execution timeout. Accept a deliberately small,
-   * linear-time subset for database parser rules: literals/classes/anchors with
-   * at most one simple quantifier. Groups, alternation, lookarounds, backrefs and
-   * counted/nested quantifiers are rejected instead of risking event-loop ReDoS.
+   * Accept only a small, linear-time regex subset for DB parser rules: bounded length, no
+   * groups/alternation/`{}` quantifiers, at most one simple quantifier, no backreferences or
+   * Unicode-property escapes, and an unbounded `*`/`+` only when start-anchored. Prevents
+   * ReDoS from a privileged-but-easily-mistaken rule pattern. (Preserved from main.)
    */
   private isSafeRuleRegex(pattern: string): boolean {
     if (!pattern || pattern.length > MAX_RULE_PATTERN_CHARS) return false;
@@ -1098,8 +3160,6 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     for (let i = 0; i < pattern.length; i += 1) {
       const char = pattern[i]!;
       if (escaped) {
-        // Numeric/named backreferences and Unicode property escapes are outside
-        // the safe subset. Ordinary escaped literals and \d/\s/\w are fine.
         if (/\d/.test(char) || char === 'k' || char === 'p' || char === 'P') return false;
         escaped = false;
         if (inClass) classHasCharacter = true;
@@ -1141,8 +3201,6 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       canQuantify = true;
     }
 
-    // An unanchored `.*suffix` still permits quadratic rescanning at every start
-    // position even without groups. Require a start anchor for * / + patterns.
     return !escaped && !inClass && (!hasUnboundedQuantifier || pattern.startsWith('^'));
   }
 
@@ -1161,6 +3219,11 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       default:
         return '';
     }
+  }
+
+  /** Keep IMAP/auth exceptions out of logs; their messages may contain connection secrets. */
+  private errorKind(err: unknown): string {
+    return err instanceof Error && err.name ? err.name.slice(0, 80) : 'UnknownError';
   }
 
   private async defaultDeptId(): Promise<number> {

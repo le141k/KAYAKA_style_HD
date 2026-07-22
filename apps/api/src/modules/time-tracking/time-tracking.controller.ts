@@ -30,14 +30,14 @@ export class TimeTrackingController {
     @Body(new ZodValidationPipe(LogTimeSchema)) dto: LogTimeDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.timeTracking.create(ticketId, staff.staffId, dto);
+    return this.timeTracking.create(ticketId, staff.staffId, dto, staff);
   }
 
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
   @Get('tickets/:id/time')
   @ApiOperation({ summary: 'List time entries for a ticket with the total minutes' })
-  listTime(@Param('id', ParseIntPipe) ticketId: number) {
-    return this.timeTracking.list(ticketId);
+  listTime(@Param('id', ParseIntPipe) ticketId: number, @CurrentStaff() staff: AuthStaff) {
+    return this.timeTracking.list(ticketId, staff);
   }
 
   @RequirePermissions(PERMISSIONS.TICKET_EDIT)
@@ -46,6 +46,6 @@ export class TimeTrackingController {
   @ApiOperation({ summary: 'Delete a time entry (owner, or admin/STAFF_MANAGE)' })
   deleteTime(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
     const canManageOthers = staff.isAdmin || staff.permissions.includes(PERMISSIONS.STAFF_MANAGE);
-    return this.timeTracking.remove(id, staff.staffId, canManageOthers);
+    return this.timeTracking.remove(id, staff.staffId, canManageOthers, staff);
   }
 }

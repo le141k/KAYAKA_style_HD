@@ -47,6 +47,15 @@ All routes are under the `/api` global prefix.
 > `POST /api/tickets/public` (create) and `POST /api/attachments/upload/public` remain gated by
 > `ClientPortalGuard` (fail-closed **404 in production** until S4 abuse controls land; override
 > with `TELECOM_HD_CLIENT_PORTAL_ENABLED=true`, not before S4). Dev/test are unaffected.
+>
+> **Staff department scope (ACL-01).** Permission is necessary but not sufficient for every
+> staff ticket route below, ticket recipients, ticket-linked attachment download, time entries and
+> follow-ups. Administrators and staff with no `DepartmentStaff` assignments are unrestricted;
+> otherwise the API applies the department predicate in SQL and returns the same 404 for a missing
+> or inaccessible ticket. A bulk request is all-or-nothing, links/merges require both ticket sides,
+> and assigning or moving a ticket validates the assignee and target department.
+> The same SQL predicate applies to `/api/reports/dashboard` and every ticket-derived report run,
+> including `ticketPosts` and `ticketAuditLogs` through their parent ticket.
 
 ## Client auth (verified customer sessions — S2)
 
@@ -207,27 +216,46 @@ pre-disable links or sessions; the customer must request a new link.
 
 ## Inbound mail
 
-| Method | Path              | Auth                         | Body             | Returns              |
-| ------ | ----------------- | ---------------------------- | ---------------- | -------------------- |
-| POST   | /api/inbound/pipe | 🔑 `x-inbound-secret` header | `{ raw: string}` | `{ accepted: true }` |
+| Method | Path              | Auth                         | Body                                              | Returns                                                                                    |
+| ------ | ----------------- | ---------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| POST   | /api/inbound/pipe | 🔑 `x-inbound-secret` header | raw `message/rfc822`/octet-stream or JSON `{raw}` | `{ accepted: true }` (or retryable `503` while the global inbound-delivery gate is closed) |
 
 > Note: `@Public()` (bypasses JWT) but enforces `x-inbound-secret` against
-> `TELECOM_HD_INBOUND_WEBHOOK_SECRET` (constant-time). `raw` is the full RFC822
-> message; it feeds the same parse→thread→dedup→ticket pipeline as the IMAP poller
-> (`InboundMailService.ingestRawMessage`). For MTA/PIPE delivery (Postfix/Exim pipe
-> transport). Loop-guarded (Auto-Submitted / Precedence / X-Loop / self-from) and
-> deduplicated by `Message-ID`. Returns `202 Accepted`.
+> `TELECOM_HD_INBOUND_WEBHOOK_SECRET` (constant-time). The secret is validated **twice**:
+> in a **pre-body-parser Express middleware** (`apps/api/src/app.factory.ts`) that rejects an
+> unauthenticated caller with **403 before the large raw body is buffered** (closing the
+> buffer-then-reject amplification window up to `TELECOM_HD_INBOUND_MAX_SIZE_MB`), and again in
+> the controller (defence in depth). With a valid secret but
+> `TELECOM_HD_INBOUND_DELIVERY_ENABLED=false`, that same pre-parser middleware returns a
+> retryable **503**: it creates no ledger row and reads no raw MIME. The body may be raw `message/rfc822` /
+> `application/octet-stream` bytes **or** JSON `{ raw }`. It feeds the same
+> parse→thread→dedup→ticket pipeline as the IMAP poller (`InboundMailService.ingestRawMessage`).
+> For MTA/PIPE delivery (Postfix/Exim pipe transport). Loop-guarded (Auto-Submitted / Precedence /
+> X-Loop / self-from). Both `x-inbound-delivery-id` and `x-inbound-queue-id` are **required**.
+> Delivery id is 1–256 safe UTF-8 bytes and is SHA-256 hashed for the transport key. Queue must
+> exist, be enabled and have type `PIPE`; its department and email address are snapshotted rather
+> than trusting caller routing. Same id+same content is idempotent; same id+different content is
+> **409** plus a durable transport-collision audit. Oversize body is **413**. Returns `202 Accepted`.
 
 ---
 
 ## Reports
 
-| Method | Path                   | Auth                | Body                                   | Returns                                       |
-| ------ | ---------------------- | ------------------- | -------------------------------------- | --------------------------------------------- |
-| GET    | /api/reports/dashboard | 🔒 `ticket.view`    | —                                      | `{total, resolved, byStatus[], byPriority[]}` |
-| GET    | /api/reports           | 🔒 `ticket.view`    | —                                      | `Report[]`                                    |
-| GET    | /api/reports/{id}/run  | 🔒 `ticket.view`    | —                                      | aggregated rows for stored report             |
-| POST   | /api/reports           | 🔒 `admin.settings` | `{title, kind, definition}` (KQL-lite) | Created report                                |
+| Method | Path                   | Auth               | Body                                   | Returns                                                         |
+| ------ | ---------------------- | ------------------ | -------------------------------------- | --------------------------------------------------------------- |
+| GET    | /api/reports/dashboard | 🔒 `ticket.view`   | —                                      | Department-scoped `{total, resolved, byStatus[], byPriority[]}` |
+| GET    | /api/reports           | 🔒 `report.run`    | —                                      | `Report[]`                                                      |
+| GET    | /api/reports/{id}/run  | 🔒 `report.run`    | —                                      | Department-scoped aggregated rows for stored report             |
+| POST   | /api/reports           | 🔒 `report.manage` | `{title, kind, definition}` (KQL-lite) | Created report                                                  |
+
+Scheduled reports record the authenticated creator as `ownerStaffId`. The worker resolves that
+owner's **current** enabled/RBAC/department state before every run; a missing, disabled or
+`report.run`-revoked owner is fail-closed and the schedule is disabled without sending mail.
+Managers can view/change only their own schedules; administrators can manage all schedules. The
+ownership migration disables legacy schedules because their historical owner is unknowable; recreate
+them explicitly after deployment. During rollout, pause old report workers, apply the migration,
+deploy this API/worker version, then resume workers—an old worker must not create or execute an
+ownerless schedule after the migration.
 
 ## Troubleshooter
 
@@ -302,7 +330,7 @@ SLA plans, schedules, holidays, and escalation rules. All routes require `admin.
 | DELETE | /api/admin/workflows/{id} | 🔒 `admin.workflow` | —                                                    | 204 No Content                      |
 
 > `criteria` is a JSON array of `{ field, op: 'eq'|'neq'|'contains'|'gt'|'lt', value }`.
-> `actions` is a JSON array of `{ type: 'change_department'|'change_owner'|'change_status'|'change_priority'|'change_type'|'add_tag'|'add_note', ...params }`.
+> `actions` is a JSON array of `{ type: 'change_department'|'change_owner'|'change_status'|'change_priority'|'change_type'|'add_tag'|'add_note'|'send_email', ...params }`. New `send_email` actions require a bounded non-empty body. Matching actions are snapshotted with the ticket mutation and later materialized through the durable workflow-email outbox; an EventEmitter listener never sends a second copy.
 
 ### Macros
 
@@ -344,9 +372,40 @@ SLA plans, schedules, holidays, and escalation rules. All routes require `admin.
 
 ## Admin / Email Templates
 
-| Method | Path                            | Auth            | Body                                           | Returns                                    |
-| ------ | ------------------------------- | --------------- | ---------------------------------------------- | ------------------------------------------ |
-| GET    | /api/admin/email-templates      | 🔒 `admin.mail` | —                                              | `EmailTemplate[]` (ordered by key, locale) |
-| POST   | /api/admin/email-templates      | 🔒 `admin.mail` | `{key, locale?, subject, htmlBody, textBody?}` | Created template                           |
-| PATCH  | /api/admin/email-templates/{id} | 🔒 `admin.mail` | Partial template fields (key/locale immutable) | Updated template                           |
-| DELETE | /api/admin/email-templates/{id} | 🔒 `admin.mail` | —                                              | 204 No Content                             |
+| Method | Path                            | Auth                | Body                                           | Returns                                    |
+| ------ | ------------------------------- | ------------------- | ---------------------------------------------- | ------------------------------------------ |
+| GET    | /api/admin/email-templates      | 🔒 `mail.configure` | —                                              | `EmailTemplate[]` (ordered by key, locale) |
+| POST   | /api/admin/email-templates      | 🔒 `mail.configure` | `{key, locale?, subject, htmlBody, textBody?}` | Created template                           |
+| PATCH  | /api/admin/email-templates/{id} | 🔒 `mail.configure` | Partial template fields (key/locale immutable) | Updated template                           |
+| DELETE | /api/admin/email-templates/{id} | 🔒 `mail.configure` | —                                              | 204 No Content                             |
+
+---
+
+## Admin / Email Queues + inbound ledger
+
+| Method              | Path                                                           | Auth                | Body                                                                 | Returns                                                                                                                                                                                                                                                                                |
+| ------------------- | -------------------------------------------------------------- | ------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET                 | /api/admin/email-queues                                        | 🔒 `mail.view`      | —                                                                    | Safe queue diagnostics: cursor/epoch/generation, reconcile cause/allowed modes, routing priority and liveness; never credentials.                                                                                                                                                      |
+| GET                 | /api/admin/email-queues/{id}                                   | 🔒 `mail.view`      | —                                                                    | One safe queue diagnostic.                                                                                                                                                                                                                                                             |
+| POST / PUT / DELETE | /api/admin/email-queues[/{id}]                                 | 🔒 `mail.configure` | Queue fields                                                         | Create/update/delete. IMAP identity changes atomically advance mailbox epoch, halt for reconciliation and invalidate old cursor snapshots; password-only change does not.                                                                                                              |
+| POST                | /api/admin/email-queues/{id}/reconcile                         | 🔒 `mail.reconcile` | `{mode, expectedCursorGeneration, reason, confirm?, backfillLimit?}` | Server returns `allowedModes`; standard reconcile rejects a healthy queue, enforces cause/mode, generation/epoch/state CAS, exact IMAP baseline and transactional requested+completed/failed audit. `FROM_NOW` requires confirmation/reason; BACKFILL requires bounded positive limit. |
+| GET                 | /api/admin/email-queues/inbound/health                         | 🔒 `mail.view`      | —                                                                    | Per-queue liveness plus ledger backlog/stalled work/quarantine count+bytes, raw-storage reserve and actionable alerts (global disable, halt, stale poll, collision, etc.).                                                                                                             |
+| GET                 | /api/admin/email-queues/inbound/quarantine                     | 🔒 `mail.view`      | `?page&limit&queueId&reason&messageId&from&to`                       | `{items,total,page,limit}` metadata only; no raw MIME or storage key. Each row reports server replay capability.                                                                                                                                                                       |
+| GET                 | /api/admin/email-queues/inbound/quarantine/{deliveryId}        | 🔒 `mail.view`      | —                                                                    | Metadata, replay capability/block reason and delivery audit history; no raw MIME/storage key.                                                                                                                                                                                          |
+| POST                | /api/admin/email-queues/inbound/quarantine/{deliveryId}/replay | 🔒 `mail.replay`    | `{reason, expectedUpdatedAt}`                                        | Transactional CAS replay + durable audit. Stale/repeated action → 409; truncated MIME → 400/replay blocked.                                                                                                                                                                            |
+| GET                 | /api/admin/workflow-email-events/health                        | 🔒 `mail.view`      | —                                                                    | Ticket-scoped workflow customer-email backlog, lease/quarantine state and actionable alerts.                                                                                                                                                                                           |
+| GET                 | /api/admin/workflow-email-events                               | 🔒 `mail.view`      | `?page&limit&state&ticketId`                                         | Ticket-scoped metadata list only; no recipient or message body.                                                                                                                                                                                                                        |
+| GET                 | /api/admin/workflow-email-events/{eventId}                     | 🔒 `mail.view`      | —                                                                    | Ticket-scoped validated immutable action snapshot, status and replay block reason. Unauthorized callers receive the same 404 as an absent event.                                                                                                                                       |
+| POST                | /api/admin/workflow-email-events/{eventId}/replay              | 🔒 `mail.replay`    | `{reason, expectedUpdatedAt}`                                        | Requeues only safe quarantined events under a ticket-scope/version CAS and writes `TicketAuditLog`. Invalid snapshots or changed requester identity remain blocked.                                                                                                                    |
+
+### Admin / Durable outbound email
+
+`GET /api/tickets/{id}` and `GET /api/tickets/by-mask/{mask}` expose a staff-only
+`post.outboundEmail` projection (`state`, attempts, retry/sent timestamps and
+sanitized error) for a public staff reply. Ticket detail also exposes the same
+safe status-only projection for postless automated customer and internal-staff
+commands. Both intentionally exclude body, recipient lists and BCC.
+
+| Method | Path                                  | Auth                | Body | Returns                                                                                                                                                               |
+| ------ | ------------------------------------- | ------------------- | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | /api/admin/outbound-emails/{id}/retry | 🔒 `mail.configure` | —    | Requeues only `FAILED`, `AMBIGUOUS` or `RETRY` durable mail using its original Message-ID, recipient and attachment snapshots. `SENT` is never retried by this route. |

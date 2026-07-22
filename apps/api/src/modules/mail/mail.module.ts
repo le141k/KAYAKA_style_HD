@@ -4,22 +4,29 @@ import { MailService } from './mail.service';
 import { MailProcessor } from './mail.processor';
 import { InboundMailService } from './inbound.service';
 import { EmailQueueService } from './email-queue.service';
+import { InboundAuditService } from './inbound-audit.service';
+import { InboundRawStorageService } from './inbound-raw-storage.service';
+import { MailAccessPolicy } from './mail-access-policy.service';
 import { EmailQueueController } from './email-queue.controller';
 import { ParserRulesController } from './parser-rules.controller';
 import { InboundController } from './inbound.controller';
+import { OutboundEmailController } from './outbound-email.controller';
 import { TicketsModule } from '../tickets/tickets.module';
 import { AttachmentsModule } from '../attachments/attachments.module';
 import { loadConfig, APP_CONFIG } from '../../config/configuration';
 
 @Module({
   imports: [forwardRef(() => TicketsModule), BullModule.registerQueue({ name: 'mail' }), AttachmentsModule],
-  controllers: [EmailQueueController, ParserRulesController, InboundController],
+  controllers: [EmailQueueController, ParserRulesController, InboundController, OutboundEmailController],
   providers: [
     { provide: APP_CONFIG, useValue: loadConfig() },
     MailService,
     MailProcessor,
     InboundMailService,
     EmailQueueService,
+    InboundAuditService,
+    InboundRawStorageService,
+    MailAccessPolicy,
   ],
   exports: [MailService],
 })

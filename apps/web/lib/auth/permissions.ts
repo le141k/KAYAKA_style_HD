@@ -26,7 +26,10 @@ export const PERMISSIONS = {
   ADMIN_SETTINGS: 'admin.settings',
   ADMIN_SLA: 'admin.sla',
   ADMIN_WORKFLOW: 'admin.workflow',
-  ADMIN_MAIL: 'admin.mail',
+  MAIL_VIEW: 'mail.view',
+  MAIL_REPLAY: 'mail.replay',
+  MAIL_RECONCILE: 'mail.reconcile',
+  MAIL_CONFIGURE: 'mail.configure',
   ADMIN_DEPARTMENTS: 'admin.departments',
   ADMIN_CUSTOMFIELDS: 'admin.customfields',
   ADMIN_ALARIS: 'admin.alaris',
@@ -46,6 +49,7 @@ export const ADMIN_TAB_PERMISSIONS: Record<string, PermissionKey> = {
   '/admin/workflows': PERMISSIONS.ADMIN_WORKFLOW,
   '/admin/staff': PERMISSIONS.STAFF_MANAGE,
   '/admin/custom-fields': PERMISSIONS.ADMIN_CUSTOMFIELDS,
+  '/admin/mail': PERMISSIONS.MAIL_VIEW,
   '/admin/alaris': PERMISSIONS.ADMIN_ALARIS,
 };
 

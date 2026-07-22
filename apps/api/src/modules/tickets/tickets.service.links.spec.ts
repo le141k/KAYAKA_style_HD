@@ -39,6 +39,7 @@ describe('TicketsService — ticket links', () => {
       { emit: vi.fn() } as unknown as EventEmitter2,
       {} as unknown as MailService,
       {} as unknown as AdminService,
+      {} as never,
     );
   });
 

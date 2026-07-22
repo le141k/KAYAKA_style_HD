@@ -2,7 +2,15 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
-import type { Ticket, Reply, PaginatedResponse, DashboardStats, User, Department } from '@/lib/types';
+import type {
+  Ticket,
+  Reply,
+  PaginatedResponse,
+  DashboardStats,
+  User,
+  Department,
+  AutomatedOutboundEmail,
+} from '@/lib/types';
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
@@ -40,6 +48,14 @@ interface ApiPost {
   createdAt: string;
   staff?: ApiStaffRel | null;
   attachments?: ApiAttachment[];
+  outboundEmail?: {
+    id: string;
+    state: 'QUEUED' | 'PROCESSING' | 'SENT' | 'RETRY' | 'FAILED' | 'AMBIGUOUS';
+    attempts: number;
+    nextAttemptAt?: string | null;
+    lastError?: string | null;
+    sentAt?: string | null;
+  } | null;
 }
 interface ApiNote {
   id: number;
@@ -81,6 +97,17 @@ interface ApiTicket {
   posts?: ApiPost[];
   notes?: ApiNote[];
   tags?: { name: string }[];
+  outboundEmails?: Array<{
+    id: string;
+    kind: 'AUTORESPONDER' | 'AUTO_CLOSE' | 'WORKFLOW' | 'INTERNAL_NOTIFICATION';
+    state: AutomatedOutboundEmail['state'];
+    attempts: number;
+    nextAttemptAt?: string | null;
+    lastError?: string | null;
+    acceptedAt?: string | null;
+    sentAt?: string | null;
+    createdAt: string;
+  }>;
 }
 
 function staffName(s?: ApiStaffRel | null): string | undefined {
@@ -121,6 +148,18 @@ function mapPostToReply(p: ApiPost): Reply {
       mime_type: a.mimeType,
       url: `${API_URL}/attachments/${a.id}/download`,
     })),
+    ...(p.outboundEmail
+      ? {
+          delivery: {
+            id: p.outboundEmail.id,
+            state: p.outboundEmail.state,
+            attempts: p.outboundEmail.attempts,
+            next_attempt_at: p.outboundEmail.nextAttemptAt,
+            last_error: p.outboundEmail.lastError,
+            sent_at: p.outboundEmail.sentAt,
+          },
+        }
+      : {}),
   };
 }
 
@@ -188,6 +227,17 @@ function mapTicket(t: ApiTicket): Ticket {
     updated_at: t.updatedAt,
     reply_count: t.totalReplies ?? 0,
     tags: t.tags?.map((tag) => tag.name),
+    automated_outbound_emails: t.outboundEmails?.map((email) => ({
+      id: email.id,
+      kind: email.kind,
+      state: email.state,
+      attempts: email.attempts,
+      next_attempt_at: email.nextAttemptAt,
+      last_error: email.lastError,
+      accepted_at: email.acceptedAt,
+      sent_at: email.sentAt,
+      created_at: email.createdAt,
+    })),
     // posts[0] is rendered separately as the original message (ticket.body); skip it
     // here so it isn't duplicated in the conversation thread.
     replies: [...(t.posts?.slice(1).map(mapPostToReply) ?? []), ...(t.notes?.map(mapNoteToReply) ?? [])].sort(
@@ -407,6 +457,20 @@ export function useReply(ticketId: number) {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ticketKeys.replies(ticketId) });
       void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });
+    },
+  });
+}
+
+/** Explicit operator action for a terminal outbound delivery. The server owns
+ * authorization and ticket department scope; the client only keeps its views fresh. */
+export function useRetryOutboundEmail(ticketId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (outboundEmailId: string) =>
+      api.post(`/admin/outbound-emails/${encodeURIComponent(outboundEmailId)}/retry`, {}),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ticketKeys.detail(ticketId) });
+      void qc.invalidateQueries({ queryKey: ticketKeys.replies(ticketId) });
     },
   });
 }

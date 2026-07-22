@@ -154,12 +154,23 @@ Key invariants beyond CRUD:
 
 Consumed by: `TicketsController`, `AlarisService`, `InboundMailService`.
 
-Constructor: `(prisma: PrismaService, usersService: UsersService, slaService: SlaService, eventEmitter: EventEmitter2)`
+`TicketAccessPolicy` is injected by all staff-facing ticket/recipient/attachment/time/follow-up
+paths. A controller passes its authenticated `TicketAccessActor`; trusted inbound/client/system
+calls omit it. With an actor, all list/detail/mutation predicates are department scoped (empty
+`DepartmentStaff` = unrestricted), cross-ticket operations validate both sides, and an unavailable
+policy fails closed instead of falling back to an unscoped lookup.
+
+Constructor: `(prisma: PrismaService, usersService: UsersService, slaService: SlaService, eventEmitter: EventEmitter2, …, ticketAccess?: TicketAccessPolicy)`
 
 ```ts
-createTicket(dto: InternalCreateTicketInput, creatorStaffId?: number): Promise<Ticket>
+createTicket(dto: InternalCreateTicketInput, creatorStaffId?: number, actor?: TicketAccessActor): Promise<Ticket>
 // Resolves/creates requester User by email, generates mask (TT-XXXXXX),
 // creates first TicketPost, resolves default status/priority, writes CREATE audit log.
+// LIFE-03: the CC/BCC `TicketRecipient` rows AND the CREATE `TicketAuditLog` row are now
+// written INSIDE the same $transaction as the ticket + first post + attachment links — a
+// crash after commit can no longer leave a ticket with no recipients / no audit row, and
+// the P2002 (duplicate inboundMessageId) retry path returns the existing ticket so it never
+// re-creates them.
 // Trusted inbound callers may set incomingMessageId (not part of the HTTP schema).
 // A duplicate non-empty ID returns the existing ticket without audit/mail/events.
 // SLA wiring (implemented): calls slaService.resolvePlanForTicket(orgId) to set slaPlanId,
@@ -167,23 +178,23 @@ createTicket(dto: InternalCreateTicketInput, creatorStaffId?: number): Promise<T
 // Fires eventEmitter.emit('ticket.created', { ticketId }) on completion.
 // Invariant: every ticket has ≥1 post and a unique mask.
 
-listTickets(query: ListTicketsQueryDto): Promise<{ data: Ticket[]; total: number }>
+listTickets(query: ListTicketsQueryDto, actor?: TicketAccessActor): Promise<{ data: Ticket[]; total: number }>
 // Filters: statusId, priorityId, departmentId, typeId, userId, ownerStaffId,
 // unassigned, search (subject/mask/email/name). Excludes merged-away tickets.
 
-getTicket(id: number): Promise<TicketDetail>
+getTicket(id: number, actor?: TicketAccessActor): Promise<TicketDetail>
 // Includes: posts (with attachments), notes, watchers, tags, auditLogs (last 50).
 
-getTicketByMask(mask: string): Promise<TicketDetail>
+getTicketByMask(mask: string, actor?: TicketAccessActor): Promise<TicketDetail>
 // Same as getTicket but looks up by human-readable mask, e.g. "TT-000042".
 
-reply(ticketId: number, dto: InternalReplyTicketInput, staffId?: number): Promise<TicketPost | TicketNote>
+reply(ticketId: number, dto: InternalReplyTicketInput, staffId?: number, actor?: TicketAccessActor): Promise<TicketPost | TicketNote>
 // Atomically appends the post, adopts attachments, updates counters/status and writes audit.
 // Sets firstResponseAt on first staff reply. Trusted inbound callers may set
 // incomingMessageId; a duplicate returns the exact existing post with no side effects.
 // If dto.isNote is true, delegates to addNote() and forwards attachmentIds.
 
-addNote(ticketId: number, contents: string, staffId?: number, attachmentIds?: number[]): Promise<TicketNote>
+addNote(ticketId: number, contents: string, staffId?: number, attachmentIds?: number[], actor?: TicketAccessActor): Promise<TicketNote>
 // Internal-only note; note creation, attachment adoption, ticket flags and audit
 // commit in one transaction.
 
@@ -239,11 +250,11 @@ checkBreaches(): Promise<BreachEntry[]>
 // Finds open, unmerged tickets past dueAt (no firstResponseAt) or resolutionDueAt.
 
 runPeriodicCheck(): Promise<void>
-// Calls checkBreaches(), marks breaching tickets isEscalated=true (escalationLevel++).
-// Then calls executeEscalationRules() which fetches EscalationRule rows for the ticket's
-// slaPlanId where thresholdSeconds ≤ minutesOverdue and isEnabled=true, then executes each
-// action: notify (sends 'sla_breach_internal' mail template), change_priority, assign,
-// add_note, mark_escalated.
+// Calls checkBreaches(), then claims one SlaEscalationEvent under a SERIALIZABLE
+// transaction before updating escalation state and re-reading enabled rules. `notify`
+// creates a durable INTERNAL_NOTIFICATION command (not direct SMTP); stale/disabled
+// rules and out-of-scope recipients fail closed. Other actions are priority/assign/note/
+// mark_escalated and roll back together if the event cannot be materialized.
 
 resolvePlanForTicket(organizationId: number | null | undefined): Promise<number | null>
 // Returns the SLA plan ID to assign to a new ticket.
@@ -331,29 +342,210 @@ sendTemplateStrict(to: string | string[], templateKey: string, locale: string, v
 
 ## InboundMailService (`apps/api/src/modules/mail/inbound.service.ts`)
 
-Implements `OnModuleInit` / `OnModuleDestroy`; `ingestRawMessage` is also shared by the
-secret-authenticated MTA/PIPE controller.
+> **Superseded implementation notes.** The detailed bullets immediately below describe the
+> pre-epoch/pre-claim implementation retained for migration history. They are not the current
+> contract; use **Current inbound contract** below when changing or operating the service.
 
-- On init: queries `EmailQueue` for enabled IMAP queues, connects via `imapflow`, starts a
-  60-second `setInterval` poll.
-- A process-local poll lock prevents overlapping interval/direct polls. State is checkpointed
-  after every UID as `{uidValidity, watermark, failures}` in `Setting`. A failed message remains a
-  durable retry gap and is moved to `Helpdesk-Processing-Errors` after three failed processing
-  attempts; a failed move stays pending, while later UIDs continue. A UID that has disappeared
-  from INBOX is retained as a bounded terminal `missing` record after three lookup attempts.
-  A UIDVALIDITY change pauses that queue instead of reusing an unsafe watermark; operations must
-  inspect the mailbox and reset `imap/state:<queueId>` deliberately.
-- MIME source bytes, parsed subject/body/addresses/references/filenames and parser concurrency are
-  bounded. Database regex rules accept only a small non-backtracking subset; unsafe expressions
-  fail closed.
-- Per message: threads replies by RFC references first, then by an owned `TT-XXXXXX` subject
-  mask, and creates a new ticket otherwise. Threading requires normalized sender membership in
-  the ticket requester, linked `UserEmail`, or `TicketRecipient` set; possession of a Message-ID
-  or mask alone is never authorization. The receiving MTA must enforce its normal anti-spoofing
-  policy because the application sees the RFC `From` identity supplied by that trusted ingress.
-- The parsed/synthetic Message-ID is passed only through internal TicketsService inputs; a partial
-  unique DB index makes concurrent IMAP/webhook redelivery an idempotent no-op.
-- TODO: replace `setInterval` with IMAP IDLE push.
+Durable, idempotent, fail-closed inbound pipeline backed by the **`InboundDelivery` ledger**.
+Both transports (IMAP poll, `POST /api/inbound/pipe`) record every message in the ledger under a
+UNIQUE `transportKey` before it is processed.
+
+- **Cutover master gate:** `TELECOM_HD_INBOUND_DELIVERY_ENABLED` defaults to `false`. While it is
+  false, the API does not start the IMAP supervisor or ledger drain, `pollNow()` is a no-op, and
+  PIPE returns retryable 503 before its body parser. Existing `ACCEPTED`/`RETRY` ledger rows and
+  all operator health/reconcile/quarantine/replay endpoints remain available; an attended
+  configuration-only restart with the gate true is required before any ticket can be created.
+
+- **Public:** `ingestRawMessage(source, departmentId?, externalId?, queueId?)` — PIPE ingress:
+  records a ledger delivery (idempotent by `externalId` or content hash) and processes it inline.
+  An optional `queueId` (from the `x-inbound-queue-id` header) binds the delivery to an
+  `EmailQueue` — the queue's department routes the message and the delivery records the queue
+  (unknown id → 400); the `transportKey` is scoped by the bound queue (`pipe:<queueId|->:…`).
+  `pollNow()` — run one accept+drain cycle now (ops / live-IMAP verification).
+- **Accept phase (IMAP, per queue):** discovers new UIDs uid-only, then `fetchOne`s each
+  (source capped at `TELECOM_HD_INBOUND_MAX_SIZE_MB`) and accepts it in a short DB transaction
+  whose row lock rechecks `isEnabled`, type, `syncState`, `mailboxEpoch`, `cursorGeneration`, and
+  UIDVALIDITY. The transport key is `imap:<queueId>:<mailboxEpoch>:<uidValidity>:<uid>`; a stale
+  poller cannot insert after a reconcile/identity cutover. It `create`s an
+  `InboundDelivery` (state `ACCEPTED`, raw MIME stored) — `client.fetch(range, query, { uid: true })`
+  with `{ uid: true }` as the **third** arg (real UID range). The `EmailQueue.lastSeenUid` cursor
+  advances via a fixed-snapshot CAS ONLY after durable acceptance; the safe frontier never crosses
+  the lowest failed UID, even when a higher UID was accepted first (**fail-closed** — no silent
+  loss). A duplicate transport key is a no-op only when its full epoch/UID/content identity matches;
+  any mismatch halts the queue with a durable collision audit.
+- **Bootstrap barrier:** the starting cursor is captured **synchronously at connect** (not the
+  first 60 s poll) via `TELECOM_HD_IMAP_BOOTSTRAP_POLICY` `FROM_NOW` (high-water, imports nothing)
+  or `BACKFILL` (rewinds by `TELECOM_HD_IMAP_BACKFILL_LIMIT`). Never fails open to `1:*`.
+- **UIDVALIDITY:** on a server UID-space reset the queue flips to
+  `EmailQueue.syncState = NEEDS_RECONCILIATION` and polling **halts** (fail-closed) until an
+  operator re-bootstraps (clear `uidValidity`).
+- **Explicit reconcile:** the API requires `expectedCursorGeneration` and returns
+  server-computed `allowedModes` from its typed `reconcileCause`. FROM_NOW/BACKFILL moves the
+  queue to `BOOTSTRAPPING`, captures UIDVALIDITY plus exact `UIDNEXT - 1` under the mailbox lock,
+  and writes the baseline in a second epoch/generation CAS before returning success. BACKFILL
+  enumerates actual existing UIDs under that same lock; it never uses `boundary - N`.
+- **Drain phase (only while the master gate is enabled):** a `setInterval` (30 s, plus one
+  **startup drain** for crash recovery) processes
+  `ACCEPTED`/`RETRY` deliveries in id order; claims each with a **lease** (CAS: `ACCEPTED`, a
+  `RETRY` whose `nextAttemptAt` is due, or a `PROCESSING` whose `leaseExpiresAt` passed →
+  `PROCESSING` + a fresh per-claim `leaseOwner` token/`leaseExpiresAt`). The **claim CAS increments
+  `attempts`** (not the settle) — so a delivery whose processing repeatedly outlives its lease still
+  exhausts its budget — and it enforces the `RETRY` `nextAttemptAt` schedule **in the CAS itself**, so
+  no caller (inline ingest, racing worker) can claim a not-yet-due RETRY and burn an attempt early.
+  A **lease heartbeat** (`setInterval`, CAS-gated on our token, unref'd) extends the lease while a
+  healthy-but-slow message (large parse + attachment upload) is processed, then is cleared in
+  `finally`. Every terminal/retry write goes through a lease-gated `settle()` (`leaseOwner = us AND
+state = PROCESSING`): a **0-row settle** means the lease was lost mid-processing (another worker
+  reclaimed) — the result is dropped and logged, never clobbering the winner. A delivery is thus
+  **never stranded in `PROCESSING`**. Success → `PROCESSED` (+`ticketId`/`postId`); transient error →
+  `RETRY` (exponential backoff `60s·2^(n-1)`); a **truncated** (oversized) IMAP fetch or other
+  permanent input error → **fast `QUARANTINED`** at once (a truncated fetch is never partially
+  ticketed — replay must re-fetch the original); attempts ≥ `TELECOM_HD_INBOUND_MAX_ATTEMPTS` (5) →
+  `QUARANTINED`. Raw MIME is **always retained** — a quarantine never discards a message.
+- **Security (preserved from the hardened baseline):** MIME source bytes, parsed
+  subject/body/addresses/references/filenames and parser concurrency are bounded; a threaded reply
+  (RFC `References` or `TT-XXXXXX` mask) requires the normalized sender to be a ticket participant
+  (requester, linked `UserEmail`, or `TicketRecipient`) — possessing a Message-ID or guessing a mask
+  is never authorization. Loop/bounce guard (A5) suppresses mail from our own configured mailboxes.
+- **Upgrade/cutover:** the ledger migration halts every already-enabled IMAP queue
+  (`syncState = NEEDS_RECONCILIATION`) so a deploy can't FROM_NOW-bootstrap over an in-flight legacy
+  cursor and skip mail. `bootstrapQueue` refuses to run on a halted queue — an operator reconciles
+  explicitly via `POST /api/admin/email-queues/:id/reconcile`, which reads the legacy `Setting`
+  state (`imap/state:<id>` primary, `imap/lastSeenUid:<id>` fallback) and carries UIDVALIDITY +
+  watermark forward before clearing the halt.
+- **Routing / idempotency (P1-E logical claim):** each transport copy remains a separate
+  `InboundDelivery` and stores its non-unique `observedMessageId`, `messageIdHash`, `semanticHash`
+  and immutable route snapshot. A real RFC Message-ID is normalized, SHA-256 hashed and claimed in
+  one transaction through `InboundMessageClaim(messageIdHash PK, winnerDeliveryId UNIQUE)`. The
+  semantic hash contains normalized From/To/Cc/Reply-To, subject, text/HTML and attachment metadata
+  - content hashes; it deliberately excludes per-hop `Received`, `Return-Path` and `Delivered-To`.
+    Same real ID + same semantic content → loser `SKIPPED`; same ID + differing (or legacy unknown)
+    semantic content → loser `QUARANTINED` with a durable `mail.message_id_conflict` audit.
+    `TicketPost.inboundMessageId` is the independent inbound retry backstop; non-unique
+    `TicketPost.messageId` remains available only for RFC threading, so a spoofed staff outbound
+    ID cannot suppress an inbound delivery. Headerless mail has **no logical
+    content claim**: it receives an internal post key from its exact transport key, so two different
+    IMAP UIDs with identical bytes become two tickets, while a retry of one transport remains
+    idempotent. A headerless re-fetch after UIDVALIDITY reset may visibly duplicate — this is the
+    intentional safe trade-off over silent loss. During the forward-only expand/contract rollout,
+    legacy `InboundDelivery.messageId @unique` remains as compatibility state; it is not written by
+    new runtime and cannot be removed before real-PostgreSQL backfill/cutover verification. Deploy
+    must quiesce all old inbound workers first: old headerless content-derived keys and new
+    transport-derived keys are deliberately never mixed in a rolling worker fleet.
+- **Deterministic owner:** before any ticket work, enabled queues matching normalized To/Cc or a
+  trusted envelope recipient are sorted by `routingPriority` (ascending), then queue `id`. The chosen
+  queue/department is persisted once on the logical claim and every copy reuses it, independent of
+  poller arrival order. No match falls back explicitly to the receiving queue/default department and
+  records `mail.route_fallback` audit metadata.
+- **Liveness + retention (advisory):** the supervisor stamps `EmailQueue.lastConnectedAt` on a
+  successful connect, the poller `lastPollAt` each cycle, and the accept path `lastAcceptedAt` on a
+  durable record (best-effort `stampQueue`, never breaks a poll; surfaced by health). A **raw-MIME
+  retention prune** (`pruneRawMime`, `setInterval` hourly + once at startup, unref'd) nulls the
+  inline `rawMime` (setting `rawPrunedAt`) of terminal `PROCESSED`/`SKIPPED` deliveries older than
+  `TELECOM_HD_INBOUND_RAW_RETENTION_DAYS` (default 30; 0 disables), keeping metadata + `contentHash`;
+  `QUARANTINED` rows are never pruned (raw MIME is needed to replay).
+- TODO: IMAP IDLE push.
+
+### Current inbound contract
+
+- IMAP acceptance is a transaction fenced by enabled IMAP queue, `mailboxEpoch`,
+  `cursorGeneration`, `syncState=OK` and `uidValidity`. Transport key is
+  `imap:<queue>:<epoch>:<uidValidity>:<uid>`; stale pollers cannot insert after an identity or
+  reconcile boundary. Cursor safe frontier uses the same fixed snapshot.
+- Reconcile is server-side cause/mode gated and returns `allowedModes`. `FROM_NOW` and BACKFILL
+  obtain UIDNEXT/UIDVALIDITY under mailbox lock and persist their baseline before HTTP success.
+- PIPE requires secret, enabled PIPE queue id and normalized delivery id. The factory middleware
+  validates secret before a bounded raw parser; transport key stores SHA-256(delivery id), and the
+  trusted queue address is snapshotted as `envelopeTo`.
+- `InboundDelivery` records each transport copy. Real Message-ID logical identity is an atomic
+  `InboundMessageClaim`; `observedMessageId`/semantic hash stay on every copy. Headerless IMAP
+  messages use transport identity, never content hash alone.
+- Poll and drain are single-flight. Liveness distinguishes connection attempt/connect/disconnect,
+  poll started/completed and accepted. Large raw MIME is stored privately under uploads using a
+  pending marker + fsync/rename + bounded DB-proven orphan reaper; user-visible storage errors are
+  sanitized.
+
+---
+
+## EmailQueueService (`apps/api/src/modules/mail/email-queue.service.ts`)
+
+> **Superseded implementation notes.** The following legacy pseudo-signatures predate mandatory
+> reconcile audit transactions and split mail permissions. The current contract is below.
+
+Consumed by: `EmailQueueController`. Owns queue CRUD (password `passwordEnc` never returned) plus
+the inbound operator actions. Injects `MailAccessPolicy` and `InboundAuditService` (`@Optional()`).
+`MailAccessPolicy` makes only global administrators unrestricted. A non-admin gets an explicit
+`DepartmentStaff` allow-list (an empty list is deny-all, matching ticket ACL behavior):
+queue predicates require an allowed non-null `EmailQueue.departmentId`; delivery predicates require
+an allowed non-null acceptance-time `InboundDelivery.departmentId` and, when bound to a queue, an
+allowed current queue department too. ID mutations repeat their scoped SQL predicate at write time
+to prevent a read-then-write scope race.
+
+```ts
+list() / get(id) / create(dto) / delete(id)
+
+update(id, dto): Promise<SafeQueue>
+// Mailbox-identity guard: changing host/port/username/useTls or crossing the IMAP boundary
+// uses an optimistic CAS to bump mailboxEpoch + cursorGeneration, clear the cursor, and halt
+// with MAILBOX_IDENTITY_CHANGED — including before first bootstrap. Password-only change: exempt.
+
+reconcile(id, dto, actor?): Promise<{ reconciled, mode, queue, detail }>
+// Refuses a non-IMAP queue (400). RESUME_MIGRATED reads the legacy Setting cursor
+// (imap/state:<id> primary — UIDVALIDITY+watermark rewound past still-pending UIDs; or the bare
+// imap/lastSeenUid:<id> fallback, refused when it has no UIDVALIDITY) → OK. FROM_NOW/BACKFILL
+// require a server-allowed typed cause + expectedCursorGeneration, synchronously capture an
+// exact IMAP baseline under lock, and return success only after the second CAS writes it. Every
+// accepted request has mail.reconcile_requested plus exactly one completed/failed audit row in
+// the same state-transition transactions.
+
+health(now?): Promise<{ queues[], ledger, alerts[], checkedAt }>
+// Per-IMAP-queue sync state + liveness (lastConnectedAt/lastPollAt/lastAcceptedAt) and the ledger
+// backlog/staleness (backlog, byState, stalledProcessing, oldestPendingAt, lastProcessedAt).
+// Computes alerts[]: queue_halted (critical), quarantine, stalled_processing, aged_backlog (>15m).
+
+listQuarantined() / replayQuarantined(deliveryId, actor?)
+// replayQuarantined resets a QUARANTINED delivery → ACCEPTED (attempts 0, lease cleared) so the
+// drain reprocesses it (404 if not quarantined) and audits it (action mail.quarantine_replay).
+```
+
+**Scheduled health-alert emitter.** `onModuleInit` starts a `setInterval` (5 min, unref'd) that runs
+`health()` and logs each alert (`this.logger.error` for `critical`, `warn` otherwise) — so a halted
+queue / quarantine backlog / stalled processing surfaces to a log-based monitor without an operator
+polling the endpoint. Cleared in `onModuleDestroy`.
+
+### Current queue/operator contract
+
+- Queue update atomically advances mailbox epoch for IMAP identity/transport transitions; it does
+  not rely on an in-memory epoch. Password-only changes do not invalidate the mailbox snapshot.
+- Reconcile requires expected generation and a server-allowed mode. Request, terminal completion or
+  failure audit entries are written with their conditional state transitions; a CAS loser is 409 and
+  produces no false audit.
+- `listQuarantined(query)` returns server pagination/filter metadata only. Detail returns audit and
+  `replayAllowed`/block reason, never raw bytes or `rawStorageKey`. Replay requires reason + row
+  version and writes state/audit in one transaction.
+- `health()` includes quarantine bytes, raw-storage reserve and collision alerts as well as queue
+  liveness. All mail operator routes use `mail.view`, `mail.replay`, `mail.reconcile` or
+  `mail.configure`; backend guard is authoritative.
+
+## InboundAuditService (`apps/api/src/modules/mail/inbound-audit.service.ts`)
+
+`InboundAuditService` remains suitable for non-critical observability. It is **not** the authority
+for reconcile/replay: correctness-critical operator state transitions insert `InboundAuditLog`
+directly through the same Prisma transaction, so an audit failure rolls back that action.
+
+Consumed by: `EmailQueueService`. Append-only writer for `InboundAuditLog` — the durable audit trail
+for inbound operator actions, kept separate from `RbacAuditLog` so mail-ops history is queryable per
+queue/delivery.
+
+```ts
+log(entry): Promise<void>
+// Non-critical observability helper. May log a failed insert, but MUST NOT be used for a
+// correctness-critical reconcile/replay transition. Those paths call tx.inboundAuditLog.create
+// in their owning transaction. Actions also include mail.transport_collision and
+// mail.message_id_conflict.
+
+list({ page, limit }): Promise<[rows, total]>   // newest first (id desc)
+```
 
 ---
 
@@ -394,12 +586,19 @@ workflows against the mutated ticket.
 @OnEvent('ticket.status_changed') → evaluate(ticketId, 'ticket.status_changed')
 ```
 
-`evaluate()` loads all enabled `Workflow` rows (ordered by `sortOrder`), runs `matchesCriteria()`
-against the ticket, and calls `applyActions()` for each matching workflow.
+`evaluate()` loads all enabled `Workflow` rows (ordered by `sortOrder`), runs the shared ordered
+rule-chain projection against the ticket, and calls `applyActions()` for each matching workflow.
+Scalar mutations made by an earlier matching rule are visible to later criteria. `send_email` is
+never sent by this listener: `TicketsService` stores an immutable `WorkflowEmailEvent` snapshot in
+the source ticket transaction, and `WorkflowEmailEventService` materializes idempotent durable
+outbox rows with a lease/retry/quarantine state machine. Workflow assignment writes its ticket
+update, audit and internal-notification command atomically.
 
 **Criteria operators:** `eq | neq | contains | gt | lt` on any scalar ticket field.
 
-**Action types:** `change_department | change_owner | change_status | change_priority | change_type | add_tag | add_note`
+**Action types:** `change_department | change_owner | change_status | change_priority | change_type | add_tag | add_note | send_email`.
+New `send_email` bodies are validated; malformed legacy data is preserved as operator-visible
+quarantine evidence rather than rolling back a customer mutation or sending partial rule output.
 
 ---
 
@@ -444,12 +643,19 @@ deleteTemplate(id): Promise<void>
 ```ts
 list(): Promise<Report[]>
 create(dto: { title, kind, definition }): Promise<Report>
-run(id: number): Promise<AggregatedRows>   // executes stored report definition
-execute(def: Definition): Promise<AggregatedRows>  // ad-hoc execution
-dashboard(): Promise<{ total, resolved, byStatus, byPriority }>
+run(id: number, actor: TicketAccessActor): Promise<AggregatedRows>
+execute(def: Definition, actor: TicketAccessActor): Promise<AggregatedRows>
+dashboard(actor: TicketAccessActor): Promise<{ total, resolved, byStatus, byPriority }>
 ```
 
 Definition schema supports: `source: 'tickets'`, `groupBy?: statusId|priorityId|departmentId|typeId|ownerStaffId|creationMode`, `filters`, `metric: 'count'`.
+
+`ReportCompiler.compile()` requires a `TicketAccessActor` and derives its `TicketWhereInput` scope
+from `TicketAccessPolicy`; it applies it directly for `tickets`, and through the parent `ticket`
+relation for `ticketPosts` / `ticketAuditLogs`. There is no unscoped compiler execution path.
+`ReportSchedule.ownerStaffId` is mandatory for new schedules;
+the worker re-loads that owner, checks enabled + `report.run`, derives its current department scope,
+and disables unsafe legacy/revoked schedules before any recipient email is sent.
 
 ---
 
@@ -485,13 +691,16 @@ update(id: number, dto: Partial<NewsDto>): Promise<NewsItem>
 `BullModule.forRoot()` is registered in `AppModule` with the Redis connection from `REDIS_URL`.
 Each feature module that needs a queue calls `BullModule.registerQueue({ name })`.
 
-| Queue      | Job                       | Producer                 | Consumer             | Purpose                                                                                                             |
-| ---------- | ------------------------- | ------------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `sla`      | `scan` (repeatable, 60 s) | `SlaModule` on init      | `SlaProcessor`       | Periodic SLA breach scan → `SlaService.runPeriodicCheck()`                                                          |
-| `workflow` | `auto-close` (repeatable) | `WorkflowModule` on init | `AutoCloseProcessor` | Close idle pending tickets after `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); sends `autoresponder` mail template |
-| `mail`     | per-message send job      | `MailService`            | `MailProcessor`      | Async outbound mail delivery via nodemailer                                                                         |
+| Queue      | Job                       | Producer                 | Consumer             | Purpose                                                                                                                         |
+| ---------- | ------------------------- | ------------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `sla`      | `scan` (repeatable, 60 s) | `SlaModule` on init      | `SlaProcessor`       | Periodic SLA breach scan → `SlaService.runPeriodicCheck()`                                                                      |
+| `workflow` | `auto-close` (repeatable) | `WorkflowModule` on init | `AutoCloseProcessor` | Close idle pending tickets after `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); queues one durable `ticket_auto_closed` command |
+| `mail`     | per-message send job      | `MailService`            | `MailProcessor`      | Durable outbox wake-up; PostgreSQL scan/recovery remains authoritative for SMTP delivery                                        |
 
-`InboundMailService` still uses `setInterval` (60 s) for IMAP polling; IMAP IDLE is a future TODO.
+Inbound mail is NOT on a BullMQ queue — it runs on in-process `setInterval` timers:
+`InboundMailService` polls IMAP (60 s) and drains the ledger (30 s, + a startup drain for crash
+recovery) and prunes raw MIME (hourly, + at startup); `EmailQueueService` emits inbound health
+alerts (5 min). IMAP IDLE push is a future TODO.
 
 ---
 

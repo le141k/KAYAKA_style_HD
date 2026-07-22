@@ -29,7 +29,10 @@ run "api: typecheck"       npm run -s typecheck       --workspace=apps/api
 run "api: unit tests"      npm run -s test            --workspace=apps/api
 run "api: build"           npm run -s build           --workspace=apps/api
 run "api: lint"            npm run -s lint            --workspace=apps/api
-run "deps: production audit" npm audit --omit=dev --audit-level=high
+# `sharp` is an optional Next image-optimizer dependency. This app does not use
+# `next/image`, and production images deliberately omit optional packages; audit
+# the dependency graph that is actually shipped.
+run "deps: production audit" npm audit --omit=dev --omit=optional --audit-level=high
 
 # ── Frontend gates ──
 run "web: typecheck"       npm run -s typecheck       --workspace=apps/web

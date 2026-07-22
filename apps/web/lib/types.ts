@@ -61,6 +61,34 @@ export interface Reply {
   is_internal: boolean;
   created_at: string;
   attachments?: Attachment[];
+  /** Server-owned SMTP outcome for a public staff reply; absent for notes/inbound posts. */
+  delivery?: {
+    /** Opaque durable outbox id; only used for the permission-gated retry action. */
+    id: string;
+    state: 'QUEUED' | 'PROCESSING' | 'SENT' | 'RETRY' | 'FAILED' | 'AMBIGUOUS';
+    attempts: number;
+    next_attempt_at?: string | null;
+    last_error?: string | null;
+    sent_at?: string | null;
+  };
+}
+
+/**
+ * Delivery state for an automated email which deliberately has no ticket post
+ * (for example an inbound receipt or a staff assignment alert). The API omits
+ * recipient, subject, body and SMTP identifiers from this view.
+ */
+export interface AutomatedOutboundEmail {
+  /** Opaque durable outbox id; only used for the permission-gated retry action. */
+  id: string;
+  kind: 'AUTORESPONDER' | 'AUTO_CLOSE' | 'WORKFLOW' | 'INTERNAL_NOTIFICATION';
+  state: 'QUEUED' | 'PROCESSING' | 'SENT' | 'RETRY' | 'FAILED' | 'AMBIGUOUS';
+  attempts: number;
+  next_attempt_at?: string | null;
+  last_error?: string | null;
+  accepted_at?: string | null;
+  sent_at?: string | null;
+  created_at: string;
 }
 
 export interface Ticket {
@@ -84,6 +112,8 @@ export interface Ticket {
   reply_count: number;
   tags?: string[];
   replies?: Reply[];
+  /** Safe staff-only status handles for postless automated customer emails. */
+  automated_outbound_emails?: AutomatedOutboundEmail[];
 }
 
 export interface KBCategory {

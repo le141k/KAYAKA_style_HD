@@ -69,7 +69,24 @@ Required invariants:
   `TELECOM_HD_TURNSTILE_HOSTNAME` refer to the same production host.
 - `NEXT_PUBLIC_API_URL` is empty for the recommended same-origin `/api` path.
 - JWT secrets are strong and distinct; DB/Redis passwords are URL-safe; the field-encryption key is
-  64 hexadecimal characters.
+  present and exactly 64 hexadecimal characters. It is mandatory in production and must be unchanged
+  from the currently running API. The helper compares non-printed fingerprints and performs a
+  read-only ciphertext validation before quiesce. **Routine field-key rotation is unsupported**;
+  do not edit this key in a normal deploy. Legacy plaintext queue credentials are converted only after
+  the verified forward-only migration boundary, with compare-and-swap updates and aggregate-only logs.
+- `TELECOM_HD_UPLOAD_DIR` is exactly `/app/uploads`. This is the sole durable Compose volume mount for
+  attachments and inbound raw MIME; another path is rejected by preflight and API production startup.
+- Keep the shared delivery gate explicitly safe until the inbound canary gate:
+  `TELECOM_HD_INBOUND_DELIVERY_ENABLED=false` and `TELECOM_HD_IMAP_ENABLED=false`.
+  `scripts/deploy-prod.sh` rejects a release env with either enabled, so a stale production
+  file cannot consume an IMAP mailbox, accept PIPE mail, or drain an existing ledger before
+  the live canary proof. Every code or migration deployment must therefore start with both
+  false. After the live canary is green, use the separate configuration-only API restart in
+  [the inbound cutover runbook](INBOUND_PRODUCTION_CUTOVER.md) to enable the shared gate and,
+  only for an IMAP canary, polling; turn both false again before the next normal deployment.
+  `TELECOM_HD_IMAP_BOOTSTRAP_POLICY=FROM_NOW`, `TELECOM_HD_IMAP_BACKFILL_LIMIT=0`,
+  `TELECOM_HD_INBOUND_MAX_ATTEMPTS=5`, and `TELECOM_HD_INBOUND_RAW_RETENTION_DAYS=30`. Queue connection
+  settings are stored in the database; `BACKFILL` requires a deliberate non-zero bounded limit.
 - SMTP uses a real authenticated relay. Port 587 uses mandatory STARTTLS
   (`TELECOM_HD_SMTP_SECURE=false`); port 465 uses implicit TLS (`true`).
 - `TELECOM_HD_BOOTSTRAP_ADMIN_EMAIL/PASSWORD` are absent from `.env.prod`; first-install creation is
@@ -118,16 +135,21 @@ For an existing release the helper performs, in order:
 1. configuration, resource, architecture, clean-tree and exact fetched-`origin/main` checks;
 2. exact inventory and health validation of the dedicated Compose project;
 3. pinned image pulls and immutable builds while the old release remains online; the web tag includes
-   the digest of its `NEXT_PUBLIC_*` build inputs;
-4. ingress closure, global BullMQ pause, a ten-minute maximum active-job drain, then API/web stop;
-5. schema-compatible template, ownership and worker-idle pre-migration audits;
-6. one exact, quiesced DB/uploads pair in a unique deployment directory plus real restores into
+   the digest of its `NEXT_PUBLIC_*` build inputs. The production dependency audit runs inside the
+   resulting pinned API image, not through a host Node/npm installation;
+4. before quiesce, it verifies field-key continuity/read-only ciphertext compatibility and proves the
+   live PostgreSQL role can `CREATE EXTENSION pgcrypto` inside a rolled-back transaction (needed by the
+   inbound-message-claim migration);
+5. ingress closure, global BullMQ pause, a ten-minute maximum active-job drain, then API/web stop;
+6. schema-compatible template, ownership and worker-idle pre-migration audits, then one exact,
+   quiesced DB/uploads pair in a unique deployment directory plus real restores into
    disposable targets and exact file-count/byte reconciliation;
 7. live Redis RDB→AOF conversion when needed, a preserved immutable rollback-volume copy, target
    volume copy, then a read-only-source clone into a disposable Redis volume/container with strict
    truncated-AOF rejection and an exact bounded BullMQ aggregate comparison before cutover;
-8. internal base Compose startup, Prisma migrations and API/web health waits; first install prompts
-   once for an administrator through `scripts/bootstrap-admin.sh`;
+8. the verified forward-only boundary: Prisma migrations, then legacy queue-password conversion with CAS,
+   then internal base Compose startup and API/web health waits; first install prompts once for an
+   administrator through `scripts/bootstrap-admin.sh`;
 9. strict ownership, production-readiness, attachment-storage and scanner audits, followed by queue
    resume only after every gate is green.
 
@@ -164,6 +186,30 @@ docker compose --profile scanner -f docker-compose.prod.yml \
   --env-file .env.prod logs --tail=150 api web postgres redis clamav
 ss -lntup
 ```
+
+### Inbound-mail migration/canary gate
+
+The deploy helper's generic quiesce is necessary but does not prove an IMAP mailbox boundary.
+Before enabling production queues after an inbound-ledger migration:
+
+1. Keep all inbound workers/queues quiesced while the matching PostgreSQL + `uploads` (including
+   `inbound-raw`) + Redis recovery triplet is backed up and restore-rehearsed.
+2. Apply migrations forward only. Do not start an old API binary against an epoch/claim/reconcile
+   schema, and do not invent a down migration.
+3. Run the real PostgreSQL migration/upgrade rehearsal and the GreenMail/Dovecot/PIPE matrix from
+   [INBOUND_PRODUCTION_CUTOVER.md](INBOUND_PRODUCTION_CUTOVER.md). A missing/red gate blocks
+   queue enablement and production cutover.
+4. Configure exactly one non-customer-impacting canary mailbox/PIPE queue. Verify `/admin/mail`
+   health: connection/poll/accepted stamps, epoch/generation, no unexplained alert, and raw-storage
+   reserve. Deliver a controlled message, retry it, and inspect its ledger/audit outcome.
+5. Only then enable the remaining queues one at a time. Stop immediately on a halted queue,
+   transport/semantic collision, stale poll, quarantine growth, storage-reserve alert or unexpected
+   ticket/post count. Preserve ledger/raw evidence; do not delete rows as a recovery shortcut.
+
+For the current inbound acceptance and automated-customer-email migration, the exact PostgreSQL,
+GreenMail/Dovecot, PIPE, configuration-only IMAP restart and recovery procedure is
+[INBOUND_PRODUCTION_CUTOVER.md](INBOUND_PRODUCTION_CUTOVER.md). It is a mandatory gate, not
+an optional troubleshooting guide.
 
 ## 5. HTTPS edge gate
 

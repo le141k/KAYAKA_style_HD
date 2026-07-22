@@ -3,6 +3,8 @@ import { BadRequestException } from '@nestjs/common';
 import { ReportsService } from './reports.service';
 import { ReportCompiler } from './report-compiler';
 import type { PrismaService } from '../../prisma/prisma.service';
+import type { AuthStaff } from '../../auth/auth.decorators';
+import type { TicketAccessPolicy } from '../tickets/ticket-access-policy.service';
 
 // ─── Mock factories ───────────────────────────────────────────────────────────
 
@@ -30,8 +32,11 @@ function makePrismaMock() {
     reportSchedule: {
       create: vi.fn().mockResolvedValue({ id: 1 }),
       findMany: vi.fn().mockResolvedValue([]),
+      findFirst: vi.fn().mockResolvedValue(null),
       update: vi.fn().mockResolvedValue({}),
+      updateMany: vi.fn().mockResolvedValue({ count: 0 }),
       delete: vi.fn().mockResolvedValue({}),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
   } as unknown as PrismaService;
 }
@@ -42,17 +47,43 @@ function makeCompilerMock() {
   } as unknown as ReportCompiler;
 }
 
+function makeTicketAccessMock() {
+  return {
+    ticketWhere: vi.fn().mockResolvedValue({ departmentId: { in: [1] } }),
+    resolveScope: vi.fn().mockResolvedValue({ unrestricted: false, departmentIds: [1] }),
+    ticketWhereForScope: vi.fn().mockReturnValue({ departmentId: { in: [1] } }),
+  } as unknown as TicketAccessPolicy;
+}
+
+const REPORT_RUNNER: AuthStaff = {
+  staffId: 7,
+  email: 'agent-a@example.test',
+  isAdmin: false,
+  permissions: ['report.run'],
+};
+
+const REPORT_MANAGER: AuthStaff = {
+  ...REPORT_RUNNER,
+  permissions: ['report.run', 'report.manage'],
+};
+
 // ─── Suite ────────────────────────────────────────────────────────────────────
 
 describe('ReportsService', () => {
   let service: ReportsService;
   let prisma: ReturnType<typeof makePrismaMock>;
   let compiler: ReturnType<typeof makeCompilerMock>;
+  let ticketAccess: ReturnType<typeof makeTicketAccessMock>;
 
   beforeEach(() => {
     prisma = makePrismaMock();
     compiler = makeCompilerMock();
-    service = new ReportsService(prisma as unknown as PrismaService, compiler as unknown as ReportCompiler);
+    ticketAccess = makeTicketAccessMock();
+    service = new ReportsService(
+      prisma as unknown as PrismaService,
+      compiler as unknown as ReportCompiler,
+      ticketAccess,
+    );
   });
 
   // ─── list ────────────────────────────────────────────────────────────────────
@@ -104,6 +135,22 @@ describe('ReportsService', () => {
     });
   });
 
+  describe('configuration generations', () => {
+    it('increments the report generation on every semantic report update', async () => {
+      (prisma.report.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 8, title: 'Renamed' });
+
+      await service.update(8, { title: 'Renamed' });
+
+      expect(prisma.report.update).toHaveBeenCalledWith({
+        where: { id: 8 },
+        data: {
+          title: 'Renamed',
+          configGeneration: { increment: 1 },
+        },
+      });
+    });
+  });
+
   // ─── run ─────────────────────────────────────────────────────────────────────
 
   describe('run', () => {
@@ -121,9 +168,12 @@ describe('ReportsService', () => {
         },
       });
 
-      const result = await service.run(1);
+      const result = await service.run(1, REPORT_RUNNER);
       expect(result).toEqual(mockRows);
-      expect(compiler.compile).toHaveBeenCalledTimes(1);
+      expect(compiler.compile).toHaveBeenCalledWith(
+        expect.objectContaining({ source: 'tickets' }),
+        REPORT_RUNNER,
+      );
     });
 
     it('creates a ReportRun record', async () => {
@@ -139,7 +189,7 @@ describe('ReportsService', () => {
         },
       });
 
-      await service.run(2, 'manual', 7);
+      await service.run(2, REPORT_RUNNER);
 
       expect(prisma.reportRun.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -160,9 +210,59 @@ describe('ReportsService', () => {
         definition: { source: 'DROP TABLE tickets' },
       });
 
-      await expect(service.run(99)).rejects.toThrow(BadRequestException);
+      await expect(service.run(99, REPORT_RUNNER)).rejects.toThrow(BadRequestException);
       // Compiler should NOT have been called
       expect(compiler.compile).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listRuns', () => {
+    it('scopes run history to the requesting non-admin staff member', async () => {
+      await service.listRuns(4, REPORT_RUNNER);
+
+      expect(prisma.reportRun.findMany).toHaveBeenCalledWith({
+        where: { reportId: 4, staffId: REPORT_RUNNER.staffId },
+        include: {
+          outboundEmail: {
+            select: {
+              id: true,
+              kind: true,
+              state: true,
+              attempts: true,
+              nextAttemptAt: true,
+              lastError: true,
+              acceptedAt: true,
+              sentAt: true,
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      });
+    });
+
+    it('allows a global administrator to inspect operational run history', async () => {
+      await service.listRuns(4, { ...REPORT_RUNNER, isAdmin: true });
+
+      expect(prisma.reportRun.findMany).toHaveBeenCalledWith({
+        where: { reportId: 4 },
+        include: {
+          outboundEmail: {
+            select: {
+              id: true,
+              kind: true,
+              state: true,
+              attempts: true,
+              nextAttemptAt: true,
+              lastError: true,
+              acceptedAt: true,
+              sentAt: true,
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      });
     });
   });
 
@@ -179,7 +279,7 @@ describe('ReportsService', () => {
         .mockResolvedValueOnce(5); // slaBreached
       (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([{ avg_minutes: 30 }]);
 
-      const result = await service.dashboard();
+      const result = await service.dashboard(REPORT_RUNNER);
 
       expect(result).toHaveProperty('total');
       expect(result).toHaveProperty('resolved');
@@ -194,7 +294,7 @@ describe('ReportsService', () => {
       (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
       (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 
-      await service.dashboard();
+      await service.dashboard(REPORT_RUNNER);
 
       const groupByCalls = (prisma.ticket.groupBy as ReturnType<typeof vi.fn>).mock.calls;
       const groupByFields = groupByCalls.map((call: unknown[]) => (call[0] as { by: string[] }).by[0]);
@@ -202,12 +302,52 @@ describe('ReportsService', () => {
       expect(groupByFields).toContain('priorityId');
     });
 
+    it('keeps every aggregate query inside the caller department predicate', async () => {
+      await service.dashboard(REPORT_RUNNER);
+
+      for (const call of (prisma.ticket.groupBy as ReturnType<typeof vi.fn>).mock.calls) {
+        expect(call[0].where).toEqual({
+          AND: [{ mergedIntoId: null }, { departmentId: { in: [1] } }],
+        });
+      }
+      expect((prisma.ticket.count as ReturnType<typeof vi.fn>).mock.calls[0]![0].where).toEqual({
+        AND: [{ mergedIntoId: null }, { departmentId: { in: [1] } }],
+      });
+      const rawAverageCall = (prisma.$queryRaw as ReturnType<typeof vi.fn>).mock.calls[0]!;
+      const rawDepartmentClause = rawAverageCall[1] as { strings: string[]; values: unknown[] };
+      expect(rawDepartmentClause.strings.join('')).toContain('"departmentId" IN');
+      expect(rawDepartmentClause.values).toContain(1);
+      expect(ticketAccess.resolveScope).toHaveBeenCalledWith(REPORT_RUNNER);
+    });
+
+    it('fails closed for an unassigned non-admin instead of emitting invalid or unscoped raw SQL', async () => {
+      (ticketAccess.resolveScope as ReturnType<typeof vi.fn>).mockResolvedValue({
+        unrestricted: false,
+        departmentIds: [],
+      });
+      (ticketAccess.ticketWhereForScope as ReturnType<typeof vi.fn>).mockReturnValue({
+        departmentId: { in: [] },
+      });
+
+      await service.dashboard(REPORT_RUNNER);
+
+      for (const call of (prisma.ticket.groupBy as ReturnType<typeof vi.fn>).mock.calls) {
+        expect(call[0].where).toEqual({
+          AND: [{ mergedIntoId: null }, { departmentId: { in: [] } }],
+        });
+      }
+      const rawAverageCall = (prisma.$queryRaw as ReturnType<typeof vi.fn>).mock.calls[0]!;
+      const rawDepartmentClause = rawAverageCall[1] as { strings: string[]; values: unknown[] };
+      expect(rawDepartmentClause.strings.join('')).toContain('AND FALSE');
+      expect(rawDepartmentClause.values).toEqual([]);
+    });
+
     it('returns 0 avgFirstResponseMinutes when no responded tickets', async () => {
       (prisma.ticket.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
       (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([{ avg_minutes: null }]);
 
-      const result = await service.dashboard();
+      const result = await service.dashboard(REPORT_RUNNER);
       expect(result.avgFirstResponseMinutes).toBe(0);
     });
   });
@@ -219,10 +359,10 @@ describe('ReportsService', () => {
       const runs = [{ id: 1, reportId: 5, rowCount: 10 }];
       (prisma.reportRun.findMany as ReturnType<typeof vi.fn>).mockResolvedValue(runs);
 
-      const result = await service.listRuns(5);
+      const result = await service.listRuns(5, REPORT_RUNNER);
       expect(result).toEqual(runs);
       expect(prisma.reportRun.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { reportId: 5 } }),
+        expect.objectContaining({ where: { reportId: 5, staffId: REPORT_RUNNER.staffId } }),
       );
     });
   });
@@ -235,16 +375,96 @@ describe('ReportsService', () => {
       }));
 
       const before = Date.now();
-      const res = (await service.createSchedule(7, {
-        cron: '*/5 * * * *',
-        recipients: [],
-        isEnabled: true,
-        format: 'json',
-      })) as { nextRunAt: Date };
+      const res = (await service.createSchedule(
+        7,
+        {
+          cron: '*/5 * * * *',
+          recipients: [],
+          isEnabled: true,
+          format: 'json',
+        },
+        REPORT_MANAGER,
+      )) as { nextRunAt: Date; ownerStaffId: number };
 
       expect(res.nextRunAt).toBeInstanceOf(Date);
       // Next */5 fire is in the future (never NULL → the `nextRunAt <= now` scan works).
       expect(res.nextRunAt.getTime()).toBeGreaterThan(before);
+      expect(res.ownerStaffId).toBe(REPORT_MANAGER.staffId);
+    });
+
+    it('refuses an owner who can manage definitions but cannot run their scheduled report', async () => {
+      await expect(
+        service.createSchedule(
+          7,
+          { cron: '*/5 * * * *', recipients: [], isEnabled: true, format: 'json' },
+          { ...REPORT_MANAGER, permissions: ['report.manage'] },
+        ),
+      ).rejects.toThrow('report.run');
+      expect(prisma.reportSchedule.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('schedule ownership', () => {
+    it("hides another manager's schedule and refuses to mutate it", async () => {
+      await expect(service.updateSchedule(44, { isEnabled: false }, REPORT_MANAGER)).rejects.toThrow(
+        'Report schedule not found',
+      );
+      expect(prisma.reportSchedule.update).not.toHaveBeenCalled();
+      expect(prisma.reportSchedule.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 44, ownerStaffId: REPORT_MANAGER.staffId } }),
+      );
+    });
+
+    it('scopes non-admin schedule lists to the owner', async () => {
+      await service.listSchedules(7, REPORT_MANAGER);
+      expect(prisma.reportSchedule.findMany).toHaveBeenCalledWith({
+        where: { reportId: 7, ownerStaffId: REPORT_MANAGER.staffId },
+      });
+    });
+
+    it('updates an owned schedule through an owner-qualified mutation', async () => {
+      (prisma.reportSchedule.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.reportSchedule.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 44,
+        isEnabled: false,
+      });
+
+      await expect(service.updateSchedule(44, { isEnabled: false }, REPORT_MANAGER)).resolves.toEqual({
+        id: 44,
+        isEnabled: false,
+      });
+      expect(prisma.reportSchedule.updateMany).toHaveBeenCalledWith({
+        where: { id: 44, ownerStaffId: REPORT_MANAGER.staffId },
+        data: { isEnabled: false, configGeneration: { increment: 1 } },
+      });
+      expect(prisma.reportSchedule.update).not.toHaveBeenCalled();
+    });
+
+    it('increments the schedule generation for an administrator configuration edit', async () => {
+      (prisma.reportSchedule.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 44 });
+
+      await service.updateSchedule(
+        44,
+        { recipients: ['new-recipient@example.test'] },
+        { ...REPORT_MANAGER, isAdmin: true },
+      );
+
+      expect(prisma.reportSchedule.update).toHaveBeenCalledWith({
+        where: { id: 44 },
+        data: {
+          recipients: ['new-recipient@example.test'],
+          configGeneration: { increment: 1 },
+        },
+      });
+    });
+
+    it('uses an owner-qualified DELETE predicate instead of a check-then-unscoped delete', async () => {
+      (prisma.reportSchedule.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 44 });
+      await expect(service.removeSchedule(44, REPORT_MANAGER)).rejects.toThrow('Report schedule not found');
+      expect(prisma.reportSchedule.delete).not.toHaveBeenCalled();
+      expect(prisma.reportSchedule.deleteMany).toHaveBeenCalledWith({
+        where: { id: 44, ownerStaffId: REPORT_MANAGER.staffId },
+      });
     });
   });
 });

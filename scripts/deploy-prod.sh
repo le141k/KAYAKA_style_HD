@@ -132,6 +132,109 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   CHECKSUM_CMD=(shasum -a 256)
 fi
+
+field_key_fingerprint() {
+  # Hash through stdin so a secret never appears in an argv, log line or shell
+  # trace. The digest is compared only in-memory and is never printed.
+  printf '%s' "$1" | "${CHECKSUM_CMD[@]}" | awk '{print $1}'
+}
+
+assert_existing_field_key_continuity() {
+  local new_key old_key_line old_key_lines old_key_count old_key old_fingerprint new_fingerprint
+  new_key="$(env_value TELECOM_HD_FIELD_ENCRYPTION_KEY)"
+  old_key_lines="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$API_ID" \
+    | sed -n '/^TELECOM_HD_FIELD_ENCRYPTION_KEY=/p')"
+  old_key_count="$(printf '%s\n' "$old_key_lines" | sed '/^$/d' | wc -l | tr -d ' ')"
+
+  if (( old_key_count == 0 )); then
+    # A release from before field encryption has no key to rotate. The separate
+    # read-only verifier below still proves any pre-existing v1 values are
+    # decryptable with the proposed key before the release is quiesced.
+    echo '[deploy-prod] Existing API has no field-encryption key; allowing one-time plaintext upgrade only.'
+    return
+  fi
+  if (( old_key_count != 1 )); then
+    echo '[deploy-prod] ERROR: existing API has an ambiguous field-encryption key environment' >&2
+    exit 1
+  fi
+
+  old_key_line="$old_key_lines"
+  old_key="${old_key_line#TELECOM_HD_FIELD_ENCRYPTION_KEY=}"
+  if [[ ! "$old_key" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo '[deploy-prod] ERROR: existing API field-encryption key is absent or malformed; do not rotate it during deploy' >&2
+    exit 1
+  fi
+
+  old_fingerprint="$(field_key_fingerprint "$old_key")"
+  new_fingerprint="$(field_key_fingerprint "$new_key")"
+  if [[ "$old_fingerprint" != "$new_fingerprint" ]]; then
+    echo '[deploy-prod] ERROR: TELECOM_HD_FIELD_ENCRYPTION_KEY rotation is not supported by the normal deploy path' >&2
+    exit 1
+  fi
+  echo '[deploy-prod] Field-encryption key continuity matches the running API (fingerprint not printed).'
+}
+
+assert_pgcrypto_migration_capability() {
+  local pgcrypto_ready
+  # The inbound-claim migration calls CREATE EXTENSION pgcrypto. Run the exact
+  # capability/privilege check in a transaction while the old release is still
+  # healthy; ROLLBACK leaves a previously absent extension absent.
+  pgcrypto_ready="$(
+    "${COMPOSE[@]}" exec -T postgres \
+      psql -v ON_ERROR_STOP=1 \
+        -U "$(env_value TELECOM_HD_DB_USER)" \
+        -d "$(env_value TELECOM_HD_DB_NAME)" \
+        -qAt <<'SQL'
+BEGIN;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+SELECT extname FROM pg_extension WHERE extname = 'pgcrypto';
+ROLLBACK;
+SQL
+  )"
+  if [[ "$pgcrypto_ready" != pgcrypto ]]; then
+    echo '[deploy-prod] ERROR: PostgreSQL pgcrypto capability check did not return pgcrypto' >&2
+    exit 1
+  fi
+  echo '[deploy-prod] PostgreSQL pgcrypto capability and CREATE EXTENSION privilege verified pre-boundary.'
+}
+
+assert_required_automated_email_templates() {
+  local templates_ready
+  # Durable customer acknowledgements/auto-close notices and staff assignment,
+  # watcher-reply and SLA alerts snapshot a template inside their source
+  # transaction. A missing/empty production template must therefore stop the
+  # release instead of committing a ticket mutation with a silently missing
+  # notification. Do not print template bodies: return one aggregate sentinel.
+  templates_ready="$(
+    "${COMPOSE[@]}" exec -T postgres \
+      psql -v ON_ERROR_STOP=1 \
+        -U "$(env_value TELECOM_HD_DB_USER)" \
+        -d "$(env_value TELECOM_HD_DB_NAME)" \
+        -qAt <<'SQL'
+SELECT CASE WHEN COUNT(*) = 5 THEN 'ready' ELSE 'missing_or_empty' END
+FROM "EmailTemplate"
+WHERE ("key", "locale") IN (
+  ('autoresponder', 'en'),
+  ('ticket_auto_closed', 'en'),
+  ('notify_staff_assigned', 'en'),
+  ('notify_staff_user_replied', 'en'),
+  ('sla_breach_internal', 'en')
+)
+  -- Keep this definition aligned with the MailService required-template guard:
+  -- PostgreSQL BTRIM removes spaces only, while the runtime rejects every
+  -- whitespace-only rendering (including tabs and newlines).
+  AND NULLIF(regexp_replace("subject", '[[:space:]]+', '', 'g'), '') IS NOT NULL
+  AND NULLIF(regexp_replace("htmlBody", '[[:space:]]+', '', 'g'), '') IS NOT NULL
+  AND NULLIF(regexp_replace("textBody", '[[:space:]]+', '', 'g'), '') IS NOT NULL;
+SQL
+  )"
+  if [[ "$templates_ready" != ready ]]; then
+    echo '[deploy-prod] ERROR: required durable customer/staff notification templates are missing or empty after migration' >&2
+    exit 1
+  fi
+  echo '[deploy-prod] Required durable customer/staff notification templates are present and non-empty.'
+}
+
 PUBLIC_CONFIG_CHECKSUM="$({
   for key in TELECOM_HD_RELEASE DOMAIN TELECOM_HD_PUBLIC_URL NEXT_PUBLIC_API_URL \
     NEXT_PUBLIC_TURNSTILE_SITE_KEY TELECOM_HD_CLIENT_PORTAL_ENABLED \
@@ -209,6 +312,19 @@ echo '[deploy-prod] 3/12 pulling pinned runtime images while the old release rem
 
 echo '[deploy-prod] 4/12 building immutable API/web images while the old release remains online'
 "${COMPOSE[@]}" build --pull api web
+
+echo '[deploy-prod] validating the production dependency audit inside the pinned API image'
+docker run --rm -e npm_config_cache=/tmp/npm-cache -w /app \
+  "telecom-hd-api:${RELEASE_ID}" \
+  npm audit --package-lock-only --omit=dev --omit=optional --audit-level=high
+
+if [[ "$EXISTING_RELEASE" == true ]]; then
+  echo '[deploy-prod] proving field-key continuity, read-only credential compatibility, and pgcrypto before quiesce'
+  assert_existing_field_key_continuity
+  "${COMPOSE[@]}" run --rm --no-deps -T api \
+    node dist/seed/reencrypt-email-queue-passwords.js --verify-only
+  assert_pgcrypto_migration_capability
+fi
 
 QUIESCED=false
 ROLL_FORWARD=false
@@ -340,7 +456,12 @@ if [[ "$EXISTING_RELEASE" == true ]]; then
     exit 1
   }
 
-  echo '[deploy-prod] 6/12 running schema-compatible pre-migration and worker-idle audits'
+  echo '[deploy-prod] 6/12 running pre-migration audits'
+  # Credential conversion is intentionally NOT performed before this release
+  # crosses the forward-only schema boundary: an old binary cannot decrypt a
+  # newly converted queue password, so a pre-boundary rollback would be unsafe.
+  # The read-only verifier ran while it was still online; conversion happens only
+  # after the verified migration boundary below.
   "${COMPOSE[@]}" run --rm --no-deps -T api node dist/seed/audit-pre-migration.js
   "${COMPOSE[@]}" run --rm --no-deps -T api \
     node dist/seed/audit-user-email-ownership.js --pre-migration
@@ -586,11 +707,45 @@ else
   echo '[deploy-prod] 5-8/12 first deployment: no live writers, backups or Redis state to migrate.'
 fi
 
-echo '[deploy-prod] 9/12 removing only inventoried legacy edges and starting internal services'
+echo '[deploy-prod] 9/12 crossing the verified forward-only boundary and starting internal services'
 ROLL_FORWARD=true
 for id in "$CADDY_ID" "$PROXY_ID"; do
   [[ -n "$id" ]] && docker rm "$id" >/dev/null
 done
+if [[ "$EXISTING_RELEASE" == true ]]; then
+  # The existing Postgres container is intentionally still available here. A
+  # first install has no prior rows and lets Compose start dependencies before
+  # its normal API migration command runs.
+  echo '[deploy-prod] Applying Prisma migrations before the queue-password conversion.'
+  "${COMPOSE[@]}" run --rm --no-deps -T api npx prisma migrate deploy
+  # Do this before a new API can receive a PIPE ingress request. The migration
+  # intentionally preserves operator-customized templates on conflict, so an
+  # empty legacy row must fail the release boundary rather than make a live
+  # inbound ticket transaction roll back after the worker has started.
+  assert_required_automated_email_templates
+  echo '[deploy-prod] Converting legacy queue credentials after the forward-only boundary.'
+  "${COMPOSE[@]}" run --rm --no-deps -T api \
+    node dist/seed/reencrypt-email-queue-passwords.js
+else
+  # A first install has no running Postgres service, but its API command would
+  # otherwise migrate and begin accepting internal ingress in one step. Bring
+  # up only private dependencies, apply/check the schema through a one-shot
+  # container, and start the API only once required customer templates exist.
+  echo '[deploy-prod] Starting private dependencies for first-install migration gate.'
+  "${COMPOSE[@]}" up -d --no-build postgres redis clamav
+  POSTGRES_ID="$(service_ids postgres)"
+  REDIS_ID="$(service_ids redis)"
+  CLAMAV_ID="$(service_ids clamav)"
+  require_single_id postgres "$POSTGRES_ID"
+  require_single_id redis "$REDIS_ID"
+  require_single_id clamav "$CLAMAV_ID"
+  wait_healthy "$POSTGRES_ID" postgres 120
+  wait_healthy "$REDIS_ID" redis 120
+  wait_healthy "$CLAMAV_ID" clamav 180
+  echo '[deploy-prod] Applying Prisma migrations before starting the first API worker.'
+  "${COMPOSE[@]}" run --rm --no-deps -T api npx prisma migrate deploy
+  assert_required_automated_email_templates
+fi
 "${COMPOSE[@]}" up -d --no-build
 
 echo '[deploy-prod] 10/12 waiting for internal API and web health checks'
@@ -625,6 +780,9 @@ if [[ "$EXISTING_RELEASE" == false ]]; then
   echo '[deploy-prod] First deployment: creating the initial administrator via one-shot prompt'
   ENV_FILE="$ENV_FILE" scripts/bootstrap-admin.sh
 fi
+## Redundant post-start proof: the release boundary above is the authoritative
+## ingress fence; this confirms the live database still has the same invariant.
+assert_required_automated_email_templates
 "${COMPOSE[@]}" exec -T api node dist/seed/audit-user-email-ownership.js
 "${COMPOSE[@]}" exec -T api node dist/seed/audit-production-readiness.js
 "${COMPOSE[@]}" exec -T api node dist/seed/audit-attachment-storage.js

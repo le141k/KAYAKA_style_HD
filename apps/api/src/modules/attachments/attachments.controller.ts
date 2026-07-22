@@ -22,7 +22,8 @@ import { mkdirSync, promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import type { Request } from 'express';
 import { APP_CONFIG, AppConfig } from '../../config/configuration';
-import { Public, RequirePermissions } from '../../auth/auth.decorators';
+import { CurrentStaff, Public, RequirePermissions } from '../../auth/auth.decorators';
+import type { AuthStaff } from '../../auth/auth.decorators';
 import { ClientAuthenticated, CurrentClient } from '../client-auth/client-auth.decorators';
 import type { ClientPrincipal } from '../client-auth/client-auth.service';
 import type { Attachment } from '@prisma/client';
@@ -32,6 +33,7 @@ import { StorageService } from './storage.service';
 import { PublicWrite } from '../../security/public-write.guard';
 import { PublicUploadChallengeGuard } from '../../security/public-upload-challenge.guard';
 import { ClientUploadAdmissionGuard } from '../../security/client-upload-admission.guard';
+import { TicketAccessPolicy } from '../tickets/ticket-access-policy.service';
 
 // Anon upload throttle — mirrors the public submit limit so an unauthenticated
 // caller cannot flood storage. Env-overridable (e2e/dev raise it for determinism).
@@ -90,6 +92,7 @@ export class AttachmentsController {
     private readonly attachmentsService: AttachmentsService,
     private readonly storageService: StorageService,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
+    private readonly ticketAccess: TicketAccessPolicy,
   ) {}
 
   /** Staff-authenticated upload: up to 10 files, requires TICKET_REPLY permission. */
@@ -201,7 +204,12 @@ export class AttachmentsController {
    */
   @Get(':id/download')
   @RequirePermissions(PERMISSIONS.TICKET_VIEW)
-  async download(@Param('id', ParseIntPipe) id: number, @Res() res: Response): Promise<void> {
+  async download(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentStaff() staff: AuthStaff,
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.ticketAccess.assertCanAccessAttachment(staff, id);
     const attachment = await this.attachmentsService.getAttachmentOrThrow(id);
     this.streamAttachment(res, attachment);
   }

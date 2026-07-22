@@ -46,7 +46,12 @@ describe('AttachmentsController — public upload', () => {
     service = { uploadFiles: vi.fn().mockResolvedValue([makeAttachment(1), makeAttachment(2)]) };
     const storage = {} as unknown as StorageService;
     const config = { TELECOM_HD_UPLOAD_MAX_SIZE_MB: 25 } as unknown as AppConfig;
-    controller = new AttachmentsController(service as unknown as AttachmentsService, storage, config);
+    controller = new AttachmentsController(
+      service as unknown as AttachmentsService,
+      storage,
+      config,
+      {} as never,
+    );
   });
 
   it('SEC-5: the public upload route is throttled (anon storage-abuse guard)', () => {

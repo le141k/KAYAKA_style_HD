@@ -12,7 +12,7 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { SlaService } from './sla.service';
-import { RequirePermissions } from '../../auth/auth.decorators';
+import { RequireGlobalAdmin, RequirePermissions } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
@@ -38,6 +38,7 @@ import {
 
 @ApiTags('admin/sla')
 @Controller('admin/sla/schedules')
+@RequireGlobalAdmin()
 export class SlaScheduleController {
   constructor(private readonly slaService: SlaService) {}
 
@@ -122,6 +123,7 @@ export class SlaScheduleController {
 
 @ApiTags('admin/sla')
 @Controller('admin/sla/plans')
+@RequireGlobalAdmin()
 export class SlaPlansController {
   constructor(private readonly slaService: SlaService) {}
 

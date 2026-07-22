@@ -24,6 +24,9 @@
     "@nestjs/common": "11.1.28",
     "@nestjs/core": "11.1.28"
   },
+  "overrides": {
+    "rxjs": "7.8.2"
+  },
   "devDependencies": {
     "@types/multer": "2.2.0",
     "@types/node": "^22.10.2",

@@ -19,6 +19,7 @@ const ADMIN_TABS: { label: string; href: string }[] = [
   { label: 'Правила и макросы', href: '/admin/workflows' },
   { label: 'Сотрудники и группы', href: '/admin/staff' },
   { label: 'Пользовательские поля', href: '/admin/custom-fields' },
+  { label: 'Почтовые очереди', href: '/admin/mail' },
   { label: 'Интеграция Alaris', href: '/admin/alaris' },
 ];
 

@@ -14,22 +14,31 @@
 - schema: `EmailParserRule{id,title,ruleType(PRE/POST_PARSE),matchType(ALL/ANY),stopProcessing,isEnabled,sortOrder,criteria Json,actions Json}`.
 - parser-rule.types.ts: ParserCriterion{field:subject|sender|sendername|recipient|body, op:contains|not_contains|eq|starts_with|ends_with|regex, value} ; ParserAction{type:ignore|route_dept|set_priority|assign_staff|add_tag, value}.
 - inbound.service: applyParserRules(parsed,deptId)→{skip,departmentId,priorityId?,ownerStaffId?,tags[]} evaluated before threading; skip→discard (no ticket); else pass overrides to createTicket. evaluateCriteria(ALL/ANY)+extractField.
-- admin CRUD parser-rules.controller (ADMIN_MAIL): GET/POST/PATCH/DELETE /admin/parser-rules + /reorder.
+- admin CRUD parser-rules.controller (`mail.configure`): GET/POST/PATCH/DELETE /admin/parser-rules + /reorder.
 - migration: swparserrules + swparserrulecriteria(ruleop 1eq/3contains/4not_contains/5starts/6ends/7regex) + swparserruleactions(setdepartment→route_dept etc).
 
 ## C [P0] IMAP password encryption (prod queues fail auth today; inbound.service.ts:57 TODO passes ciphertext)
 
 - common/field-encrypt.util.ts: AES-256-GCM, format `v1:<ivHex>:<tagHex>:<ctHex>`; legacy (no v1:) returns as-is (rolling migration).
-- config: `TELECOM_HD_FIELD_ENCRYPTION_KEY` (64 hex, optional+warn). .env.example with gen cmd.
+- config: `TELECOM_HD_FIELD_ENCRYPTION_KEY` (64 hex, required in production; dev/test may omit).
+  The deploy helper converts legacy plaintext `EmailQueue.passwordEnc` values while workers are paused,
+  validates existing `v1:` ciphertext with that key, and fails closed on a malformed value.
 - email-queue.service: encryptField on create/update password→passwordEnc.
 - inbound.service:57: `pass: decryptField(queue.passwordEnc, key)`.
-- scripts/encrypt-queues.ts one-off (idempotent via v1: check).
+- `seed/reencrypt-email-queue-passwords.ts` is the idempotent deployment gate (CAS updates plus a final
+  aggregate-only verification); it is run by `scripts/deploy-prod.sh` before new API startup.
 
-## D [P1] Staff notifications (no notify-on-assign; prod swnotificationrules has assignment rule)
+## D [P1] Staff notifications
 
-- notification.service.ts: notifyOnAssign(ticketId,staffId) emails assignee (template notify_staff_assigned); notifyWatchersOnUserReply(ticketId) emails enabled watchers (notify_staff_user_replied).
-- TicketsService.assign → notifyOnAssign; reply USER path → notifyWatchersOnUserReply.
-- seed 2 templates. workflow.executor: add `notify_staff` action (P2). NotificationRule model = P2 stub (TICKET_ASSIGNED/REPLIED/STATUS_CHANGED/CREATED).
+- Assignment, customer-reply watcher alerts and SLA alerts are immutable
+  `INTERNAL_NOTIFICATION` outbox commands, never direct `sendTemplate()` calls.
+- `TicketsService.assign` creates its assignment audit and command in one transaction;
+  a customer reply uses its `TicketPost` id as the watcher-command source. Workflow
+  assignment uses the same transactional helper. SLA uses a unique
+  `SlaEscalationEvent` under a serializable fence.
+- Five mandatory production templates (`autoresponder`, `ticket_auto_closed`,
+  `notify_staff_assigned`, `notify_staff_user_replied`, `sla_breach_internal`) are
+  seeded by migration and verified non-empty by `scripts/deploy-prod.sh`.
 
 ## Tests
 

@@ -3,6 +3,7 @@ import { assertProductionSecrets, type AppConfig } from './configuration';
 
 const STRONG_A = 'a'.repeat(16) + 'b'.repeat(16) + '17';
 const STRONG_B = 'c'.repeat(16) + 'd'.repeat(16) + '42';
+const FIELD_ENCRYPTION_KEY = 'e'.repeat(64);
 
 function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
   return {
@@ -41,7 +42,7 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
     TELECOM_HD_CLAMAV_PORT: 3310,
     TELECOM_HD_CLAMAV_TIMEOUT_MS: 15000,
     TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
-    TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined,
+    TELECOM_HD_FIELD_ENCRYPTION_KEY: FIELD_ENCRYPTION_KEY,
     ...over,
   } as AppConfig;
 }
@@ -89,6 +90,26 @@ describe('assertProductionSecrets', () => {
     expect(() => assertProductionSecrets(makeConfig({ TELECOM_HD_FIELD_ENCRYPTION_KEY: 'not-hex' }))).toThrow(
       /64 hex/i,
     );
+  });
+
+  it('rejects a missing field-encryption key in production', () => {
+    expect(() => assertProductionSecrets(makeConfig({ TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined }))).toThrow(
+      /FIELD_ENCRYPTION_KEY.*required/i,
+    );
+  });
+
+  it('requires the durable production upload mount path exactly', () => {
+    expect(() => assertProductionSecrets(makeConfig({ TELECOM_HD_UPLOAD_DIR: '/tmp/uploads' }))).toThrow(
+      /TELECOM_HD_UPLOAD_DIR.*\/app\/uploads/i,
+    );
+  });
+
+  it('rejects a zero global backfill when BACKFILL is selected', () => {
+    expect(() =>
+      assertProductionSecrets(
+        makeConfig({ TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'BACKFILL', TELECOM_HD_IMAP_BACKFILL_LIMIT: 0 }),
+      ),
+    ).toThrow(/IMAP_BACKFILL_LIMIT.*at least 1/i);
   });
 
   // S5-7: public URL + SMTP host must be real in production.

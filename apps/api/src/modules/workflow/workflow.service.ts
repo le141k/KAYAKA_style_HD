@@ -3,13 +3,14 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
 import { WORKFLOW_CHANGED_EVENT } from './workflow.executor';
 import type { Workflow, Macro, MacroCategory } from '@prisma/client';
-import type {
-  CreateWorkflowDto,
-  UpdateWorkflowDto,
-  CreateMacroCategoryDto,
-  UpdateMacroCategoryDto,
-  CreateMacroDto,
-  UpdateMacroDto,
+import {
+  WorkflowActionsSchema,
+  type CreateWorkflowDto,
+  type UpdateWorkflowDto,
+  type CreateMacroCategoryDto,
+  type UpdateMacroCategoryDto,
+  type CreateMacroDto,
+  type UpdateMacroDto,
 } from './dto';
 
 @Injectable()
@@ -39,11 +40,15 @@ export class WorkflowService {
   }
 
   async createWorkflow(dto: CreateWorkflowDto): Promise<Workflow> {
+    // Controllers already parse the DTO, but services are also invoked by tests
+    // and future internal callers. Keep the customer-email safety boundary here
+    // so a bypass cannot persist an invalid send_email action.
+    const actions = WorkflowActionsSchema.parse(dto.actions ?? []);
     const created = await this.prisma.workflow.create({
       data: {
         title: dto.title,
         criteria: dto.criteria as object,
-        actions: dto.actions as object,
+        actions: actions as object,
         isEnabled: dto.isEnabled,
         sortOrder: dto.sortOrder,
       },
@@ -54,12 +59,13 @@ export class WorkflowService {
 
   async updateWorkflow(id: number, dto: UpdateWorkflowDto): Promise<Workflow> {
     await this.getWorkflow(id);
+    const actions = dto.actions !== undefined ? WorkflowActionsSchema.parse(dto.actions) : undefined;
     const updated = await this.prisma.workflow.update({
       where: { id },
       data: {
         ...(dto.title !== undefined && { title: dto.title }),
         ...(dto.criteria !== undefined && { criteria: dto.criteria as object }),
-        ...(dto.actions !== undefined && { actions: dto.actions as object }),
+        ...(actions !== undefined && { actions: actions as object }),
         ...(dto.isEnabled !== undefined && { isEnabled: dto.isEnabled }),
         ...(dto.sortOrder !== undefined && { sortOrder: dto.sortOrder }),
       },

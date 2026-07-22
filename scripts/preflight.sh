@@ -142,6 +142,7 @@ REQUIRED_KEYS=(
   TELECOM_HD_FIELD_ENCRYPTION_KEY
   TELECOM_HD_SMTP_HOST TELECOM_HD_SMTP_PORT TELECOM_HD_SMTP_SECURE
   TELECOM_HD_SMTP_USER TELECOM_HD_SMTP_PASSWORD TELECOM_HD_MAIL_FROM
+  TELECOM_HD_UPLOAD_DIR
   TELECOM_HD_CLIENT_PORTAL_ENABLED TELECOM_HD_CLIENT_UPLOAD_ENABLED
   TELECOM_HD_PUBLIC_TICKET_CREATE_ENABLED TELECOM_HD_PUBLIC_UPLOAD_ENABLED
   TELECOM_HD_UPLOAD_MAX_SIZE_MB TELECOM_HD_UPLOAD_TOTAL_MAX_SIZE_MB
@@ -149,6 +150,8 @@ REQUIRED_KEYS=(
   TELECOM_HD_ORPHAN_ATTACHMENT_TTL_HOURS TELECOM_HD_ORPHAN_ATTACHMENT_MAX_COUNT
   TELECOM_HD_ORPHAN_ATTACHMENT_MAX_SIZE_MB TELECOM_HD_UPLOAD_MIN_FREE_DISK_MB
   TELECOM_HD_ATTACHMENT_CLEANUP_MAX_ITEMS TELECOM_HD_ATTACHMENT_CLEANUP_MAX_RUN_SECONDS
+  TELECOM_HD_INBOUND_DELIVERY_ENABLED TELECOM_HD_IMAP_ENABLED TELECOM_HD_IMAP_BOOTSTRAP_POLICY TELECOM_HD_IMAP_BACKFILL_LIMIT
+  TELECOM_HD_INBOUND_MAX_ATTEMPTS TELECOM_HD_INBOUND_RAW_RETENTION_DAYS
   TELECOM_HD_CLAMAV_ENABLED TELECOM_HD_CLAMAV_HOST
   TELECOM_HD_CLAMAV_PORT TELECOM_HD_CLAMAV_TIMEOUT_MS COMPOSE_PROFILES
 )
@@ -308,6 +311,13 @@ check_int TELECOM_HD_UPLOAD_MIN_FREE_DISK_MB 256 10240
 check_int TELECOM_HD_ATTACHMENT_CLEANUP_MAX_ITEMS 1 5000
 check_int TELECOM_HD_ATTACHMENT_CLEANUP_MAX_RUN_SECONDS 10 300
 
+UPLOAD_DIR="$(get_val TELECOM_HD_UPLOAD_DIR)"
+if [[ "$UPLOAD_DIR" == /app/uploads ]]; then
+  ok 'TELECOM_HD_UPLOAD_DIR — exactly the durable Compose mount /app/uploads'
+else
+  fail 'TELECOM_HD_UPLOAD_DIR — must be exactly /app/uploads in production'
+fi
+
 PER_FILE="$(get_val TELECOM_HD_UPLOAD_MAX_SIZE_MB)"
 TOTAL_UPLOAD="$(get_val TELECOM_HD_UPLOAD_TOTAL_MAX_SIZE_MB)"
 REQUEST_UPLOAD="$(get_val TELECOM_HD_UPLOAD_REQUEST_MAX_SIZE_MB)"
@@ -365,7 +375,51 @@ else
   ok 'Client/public challenge surface — all switches are fail-closed'
 fi
 
-printf '\n%s\n' '--- 5. Private malware scanner profile ---'
+printf '\n%s\n' '--- 5. Inbound-mail global safety gates ---'
+check_bool TELECOM_HD_INBOUND_DELIVERY_ENABLED
+check_bool TELECOM_HD_IMAP_ENABLED
+
+# A release starts API workers immediately after the forward-only migration boundary.
+# The shared gate closes BOTH IMAP and PIPE before their body/ledger work, so a stale
+# production env cannot consume live mail before the mandatory canary matrix.
+INBOUND_DELIVERY_ENABLED="$(get_val TELECOM_HD_INBOUND_DELIVERY_ENABLED)"
+if is_true "$INBOUND_DELIVERY_ENABLED"; then
+  fail 'TELECOM_HD_INBOUND_DELIVERY_ENABLED — must be false during deploy; enable only for the documented attended inbound canary'
+else
+  ok 'TELECOM_HD_INBOUND_DELIVERY_ENABLED — fail-closed for deployment; IMAP + PIPE remain operator-gated'
+fi
+
+# IMAP remains independently closed for PIPE-only canaries. The reviewed post-deploy
+# procedure is the only place that may enable polling, one reconciled queue at a time.
+IMAP_ENABLED="$(get_val TELECOM_HD_IMAP_ENABLED)"
+if is_true "$IMAP_ENABLED"; then
+  fail 'TELECOM_HD_IMAP_ENABLED — must be false during deploy; enable only after the documented IMAP canary gate'
+else
+  ok 'TELECOM_HD_IMAP_ENABLED — fail-closed for deployment; IMAP canary remains operator-gated'
+fi
+
+IMAP_BOOTSTRAP_POLICY="$(get_val TELECOM_HD_IMAP_BOOTSTRAP_POLICY)"
+case "$IMAP_BOOTSTRAP_POLICY" in
+  FROM_NOW|BACKFILL) ok 'TELECOM_HD_IMAP_BOOTSTRAP_POLICY — explicit safe mode' ;;
+  *) fail 'TELECOM_HD_IMAP_BOOTSTRAP_POLICY — must be FROM_NOW or BACKFILL' ;;
+esac
+
+check_int TELECOM_HD_IMAP_BACKFILL_LIMIT 0 10000
+check_int TELECOM_HD_INBOUND_MAX_ATTEMPTS 1 20
+check_int TELECOM_HD_INBOUND_RAW_RETENTION_DAYS 0 3650
+
+IMAP_BACKFILL_LIMIT="$(get_val TELECOM_HD_IMAP_BACKFILL_LIMIT)"
+if [[ "$IMAP_BOOTSTRAP_POLICY" == BACKFILL ]]; then
+  if [[ "$IMAP_BACKFILL_LIMIT" =~ ^[0-9]+$ ]] && (( 10#$IMAP_BACKFILL_LIMIT >= 1 )); then
+    ok 'IMAP BACKFILL — bounded, non-zero historical import is explicit'
+  else
+    fail 'IMAP BACKFILL — TELECOM_HD_IMAP_BACKFILL_LIMIT must be at least 1'
+  fi
+elif [[ "$IMAP_BOOTSTRAP_POLICY" == FROM_NOW && "$IMAP_BACKFILL_LIMIT" =~ ^[0-9]+$ ]]; then
+  ok 'IMAP FROM_NOW — global historical import is disabled'
+fi
+
+printf '\n%s\n' '--- 6. Private malware scanner profile ---'
 CLAMAV_ENABLED="$(get_val TELECOM_HD_CLAMAV_ENABLED)"
 CLAMAV_HOST="$(get_val TELECOM_HD_CLAMAV_HOST)"
 COMPOSE_PROFILES_VALUE="$(get_val COMPOSE_PROFILES)"

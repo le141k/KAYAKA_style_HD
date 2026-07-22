@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Lock, Send, Loader2, Paperclip } from 'lucide-react';
+import { ArrowLeft, Lock, Send, Loader2, Paperclip, RotateCcw } from 'lucide-react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -10,6 +10,7 @@ import { motion } from 'framer-motion';
 import {
   useTicket,
   useReply,
+  useRetryOutboundEmail,
   useUpdateTicket,
   useStaffOptions,
   useTicketTags,
@@ -21,7 +22,7 @@ import {
   usePriorityOptions,
   useTypeOptions,
 } from '@/lib/hooks/use-tickets';
-import type { Ticket, Attachment } from '@/lib/types';
+import type { Ticket, Attachment, AutomatedOutboundEmail } from '@/lib/types';
 import { StatusBadge } from '@/components/premium/StatusBadge';
 import { PriorityChip } from '@/components/premium/PriorityChip';
 import { SlaPill } from '@/components/premium/SlaPill';
@@ -45,6 +46,16 @@ import { WatchersPanel } from '@/components/tickets/WatchersPanel';
 import { RecipientsPanel } from '@/components/tickets/RecipientsPanel';
 import { toast } from '@/components/ui/use-toast';
 import { useI18n } from '@/lib/i18n';
+import { useAuth } from '@/lib/auth/auth-context';
+import { PERMISSIONS } from '@/lib/auth/permissions';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 
 // ── Separate RHF schemas for reply and note so they never share a single ref ──
 const replySchema = z.object({
@@ -58,12 +69,39 @@ type NoteForm = z.infer<typeof noteSchema>;
 
 const MAX_BODY_CHARS = 10_000;
 
+const DELIVERY_LABELS = {
+  QUEUED: 'В очереди',
+  PROCESSING: 'Отправляется',
+  SENT: 'Принято SMTP',
+  RETRY: 'Повторная попытка',
+  FAILED: 'Не доставлено',
+  AMBIGUOUS: 'Требует проверки',
+} as const;
+
+const DELIVERY_COLORS = {
+  QUEUED: 'bg-muted text-muted-foreground',
+  PROCESSING: 'bg-blue-500/10 text-blue-700 dark:text-blue-300',
+  SENT: 'bg-status-resolved/10 text-status-resolved',
+  RETRY: 'bg-status-pending/10 text-status-pending',
+  FAILED: 'bg-destructive/10 text-destructive',
+  AMBIGUOUS: 'bg-status-pending/10 text-status-pending',
+} as const;
+
+const AUTOMATED_EMAIL_LABELS: Record<AutomatedOutboundEmail['kind'], string> = {
+  AUTORESPONDER: 'Автоответ о приёме заявки',
+  AUTO_CLOSE: 'Автоматическое уведомление о закрытии',
+  WORKFLOW: 'Автоматическое уведомление workflow',
+  INTERNAL_NOTIFICATION: 'Внутреннее уведомление сотруднику',
+};
+
 export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const { t } = useI18n();
   const ta = t.ticketActions;
+  const { can } = useAuth();
 
   const { data: ticket, isLoading: ticketLoading, isError: ticketError, refetch } = useTicket(ticketId);
   const replyMutation = useReply(ticketId);
+  const retryOutbound = useRetryOutboundEmail(ticketId);
   const updateTicket = useUpdateTicket(ticketId);
   const { data: staffOptions = [] } = useStaffOptions();
   const { data: departmentOptions = [] } = useDepartmentOptions();
@@ -75,6 +113,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const applyMacro = useApplyMacro(ticketId);
   const tags = useTicketTags(ticketId);
   const [newTag, setNewTag] = useState('');
+  const [ambiguousRetryId, setAmbiguousRetryId] = useState<string | null>(null);
 
   const [replyTab, setReplyTab] = useState<'reply' | 'note'>('reply');
   // Separate attachment state per tab so they don't bleed across
@@ -83,6 +122,39 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const [assigneeId, setAssigneeId] = useState<string>('');
   const [departmentId, setDepartmentId] = useState<string>('');
   const [typeId, setTypeId] = useState<string>('');
+
+  // A post is committed before SMTP accepts it, so refresh an open ticket while
+  // its durable outbox command is still changing state. This avoids leaving an
+  // operator looking at a stale "queued" badge after the worker settles it.
+  const postOutboundDeliveries =
+    ticket?.replies?.flatMap((reply) => (reply.delivery ? [reply.delivery] : [])) ?? [];
+  const automatedOutboundDeliveries = ticket?.automated_outbound_emails ?? [];
+  const allOutboundDeliveries = [...postOutboundDeliveries, ...automatedOutboundDeliveries];
+  const fastOutboundRefresh = allOutboundDeliveries.some(
+    (delivery) => delivery.state === 'QUEUED' || delivery.state === 'PROCESSING',
+  );
+  const retryOutboundRefresh = allOutboundDeliveries.some((delivery) => delivery.state === 'RETRY');
+  useEffect(() => {
+    const intervalMs = fastOutboundRefresh ? 5_000 : retryOutboundRefresh ? 30_000 : null;
+    if (!intervalMs) return;
+    const timer = window.setInterval(() => void refetch(), intervalMs);
+    return () => window.clearInterval(timer);
+  }, [fastOutboundRefresh, refetch, retryOutboundRefresh]);
+
+  const submitOutboundRetry = async (outboundEmailId: string) => {
+    try {
+      await retryOutbound.mutateAsync(outboundEmailId);
+      setAmbiguousRetryId(null);
+      await refetch();
+      toast({ title: 'Письмо возвращено в очередь отправки' });
+    } catch {
+      toast({
+        title: 'Не удалось повторить отправку',
+        description: 'Проверьте права доступа и текущее состояние доставки.',
+        variant: 'destructive',
+      });
+    }
+  };
 
   // Snapshot previous assignee/dept for error rollback
   const prevAssigneeRef = useRef<string>('');
@@ -245,7 +317,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
       replyForm.reset();
       setReplyAttachmentIds([]);
       if (typeof window !== 'undefined') localStorage.removeItem(replyDraftKey);
-      toast({ title: 'Ответ отправлен' });
+      toast({ title: 'Ответ поставлен в очередь', description: 'Статус SMTP появится в переписке.' });
     } catch {
       toast({ title: 'Ошибка', description: 'Не удалось отправить ответ', variant: 'destructive' });
     }
@@ -289,6 +361,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   }
 
   const allReplies = ticket.replies ?? [];
+  const automatedOutboundEmails = ticket.automated_outbound_emails ?? [];
 
   // Build status/priority options for the combobox (need value:string, label:string)
   const statusComboOptions = statusOptions.map((s) => ({ value: s.value, label: s.label }));
@@ -335,6 +408,65 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
               <p className="text-sm leading-relaxed whitespace-pre-line">{ticket.body}</p>
             </motion.div>
 
+            {automatedOutboundEmails.length > 0 && (
+              <section
+                className="rounded-xl border border-border bg-card p-5"
+                aria-label="Автоматические письма"
+              >
+                <div className="mb-3">
+                  <h2 className="text-sm font-semibold">Автоматические письма</h2>
+                  <p className="text-xs text-muted-foreground">
+                    Только статус доставки — содержание и адреса получателей здесь не показываются.
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  {automatedOutboundEmails.map((email) => (
+                    <div
+                      key={email.id}
+                      className="flex flex-wrap items-center gap-2 rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm"
+                    >
+                      <span className="font-medium">{AUTOMATED_EMAIL_LABELS[email.kind]}</span>
+                      <span
+                        title={email.last_error ?? undefined}
+                        className={cn(
+                          'inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold',
+                          DELIVERY_COLORS[email.state],
+                        )}
+                      >
+                        {DELIVERY_LABELS[email.state]}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        создано <RelativeTime date={email.created_at} />
+                      </span>
+                      {email.attempts > 0 && (
+                        <span className="text-xs text-muted-foreground">попыток: {email.attempts}</span>
+                      )}
+                      {can(PERMISSIONS.MAIL_CONFIGURE) &&
+                        (email.state === 'FAILED' || email.state === 'AMBIGUOUS') && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="ml-auto"
+                            disabled={retryOutbound.isPending}
+                            onClick={() => {
+                              if (email.state === 'AMBIGUOUS') {
+                                setAmbiguousRetryId(email.id);
+                              } else {
+                                void submitOutboundRetry(email.id);
+                              }
+                            }}
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" />
+                            Повторить
+                          </Button>
+                        )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
             {/* Replies */}
             {allReplies.map((reply, i) => (
               <motion.div
@@ -363,6 +495,38 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                           Внутренняя
                         </span>
                       )}
+                      {reply.delivery && (
+                        <>
+                          <span
+                            title={reply.delivery.last_error ?? undefined}
+                            className={cn(
+                              'inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold',
+                              DELIVERY_COLORS[reply.delivery.state],
+                            )}
+                          >
+                            {DELIVERY_LABELS[reply.delivery.state]}
+                          </span>
+                          {can(PERMISSIONS.MAIL_CONFIGURE) &&
+                            (reply.delivery.state === 'FAILED' || reply.delivery.state === 'AMBIGUOUS') && (
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                disabled={retryOutbound.isPending}
+                                onClick={() => {
+                                  if (reply.delivery?.state === 'AMBIGUOUS') {
+                                    setAmbiguousRetryId(reply.delivery.id);
+                                  } else {
+                                    void submitOutboundRetry(reply.delivery!.id);
+                                  }
+                                }}
+                              >
+                                <RotateCcw className="h-3.5 w-3.5" />
+                                Повторить
+                              </Button>
+                            )}
+                        </>
+                      )}
                     </div>
                     <RelativeTime className="text-xs text-muted-foreground" date={reply.created_at} />
                   </div>
@@ -386,6 +550,41 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
               </motion.div>
             ))}
           </div>
+
+          <Dialog
+            open={ambiguousRetryId !== null}
+            onOpenChange={(open) => {
+              if (!open && !retryOutbound.isPending) setAmbiguousRetryId(null);
+            }}
+          >
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Подтвердить повторную отправку</DialogTitle>
+                <DialogDescription>
+                  SMTP-сервер мог уже принять это письмо, хотя окончательный результат неизвестен. Повторная
+                  отправка может создать дубликат у получателя.
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={retryOutbound.isPending}
+                  onClick={() => setAmbiguousRetryId(null)}
+                >
+                  Отмена
+                </Button>
+                <Button
+                  type="button"
+                  disabled={retryOutbound.isPending || !ambiguousRetryId}
+                  onClick={() => ambiguousRetryId && void submitOutboundRetry(ambiguousRetryId)}
+                >
+                  <RotateCcw className="h-4 w-4" />
+                  Да, отправить повторно
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
 
           {/* Reply composer */}
           <div className="border-t border-border bg-card p-4">

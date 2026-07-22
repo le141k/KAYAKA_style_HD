@@ -82,6 +82,7 @@ beforeAll(async () => {
   process.env['TELECOM_HD_JWT_ACCESS_SECRET'] = 'int-test-access-secret-32chars!!';
   process.env['TELECOM_HD_JWT_REFRESH_SECRET'] = 'int-test-refresh-secret-32chars!!';
   process.env['TELECOM_HD_INBOUND_WEBHOOK_SECRET'] = INBOUND_SECRET;
+  process.env['TELECOM_HD_INBOUND_DELIVERY_ENABLED'] = 'true';
 
   execSync('npx prisma migrate deploy', {
     env: { ...process.env, DATABASE_URL: databaseUrl },

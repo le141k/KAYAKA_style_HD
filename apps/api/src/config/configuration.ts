@@ -33,12 +33,15 @@ const schema = z.object({
   // MTA/PIPE delivery script. Same entropy requirement as the Alaris secret.
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_INBOUND_WEBHOOK_SECRET: z.string().min(32).default('inbound-dev-secret-change-me-0000'),
-  TELECOM_HD_UPLOAD_DIR: z.string().default('/app/uploads'),
+  TELECOM_HD_UPLOAD_DIR: z.string().min(1).default('/app/uploads'),
   TELECOM_HD_UPLOAD_MAX_SIZE_MB: z.coerce.number().int().min(1).max(25).default(25),
   TELECOM_HD_UPLOAD_TOTAL_MAX_SIZE_MB: z.coerce.number().int().min(1).max(50).default(50),
   // Multipart envelope included. Keep this slightly above the aggregate file-byte
   // limit and at/below the reverse-proxy request-body limit (55 MiB in production).
   TELECOM_HD_UPLOAD_REQUEST_MAX_SIZE_MB: z.coerce.number().int().min(1).max(55).default(51),
+  // Max accepted inbound message size (MB): the PIPE webhook body cap AND the IMAP
+  // fetch ceiling. Must be >= the largest real email+attachments; align with the
+  // reverse proxy / MTA limit. Reused by the ledger accept path (byte-safe PIPE).
   TELECOM_HD_INBOUND_MAX_SIZE_MB: z.coerce.number().int().min(1).max(35).default(35),
   TELECOM_HD_ORPHAN_ATTACHMENT_TTL_HOURS: z.coerce.number().int().min(1).max(168).default(24),
   // Absolute, cross-channel cap for unclaimed rows. Public/client/staff/inbound
@@ -83,7 +86,47 @@ const schema = z.object({
   TELECOM_HD_CLAMAV_HOST: z.string().default('clamav'),
   TELECOM_HD_CLAMAV_PORT: z.coerce.number().int().min(1).max(65535).default(3310),
   TELECOM_HD_CLAMAV_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(15000),
-  // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
+  // Global IMAP poller switch. When false (default) the poller never connects; the
+  // inbound webhook (POST /api/inbound/pipe) and the ledger drain still run. Turn on
+  // ONLY once at least one IMAP EmailQueue is configured and reconciled.
+  TELECOM_HD_IMAP_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
+  // Master inbound-delivery gate. Unlike TELECOM_HD_IMAP_ENABLED this closes BOTH
+  // delivery transports: background IMAP connection/poll/accept is stopped, PIPE is
+  // rejected before its body parser, and already-accepted ledger rows are left untouched
+  // for a later, explicitly enabled drain. An operator may still take an explicit IMAP
+  // reconcile baseline while closed; that read-only mailbox step never accepts or routes
+  // a message and prepares a canary safely. Keep the gate false for every code/migration
+  // deploy; turn it on only for an attended inbound canary after the cutover runbook gates.
+  TELECOM_HD_INBOUND_DELIVERY_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
+  // IMAP first-connect baseline policy. FROM_NOW (default) records the current
+  // high-water UID and imports nothing; BACKFILL additionally ingests up to
+  // TELECOM_HD_IMAP_BACKFILL_LIMIT most-recent existing messages. Chosen explicitly
+  // so a fresh connect can never silently import the whole historical mailbox.
+  TELECOM_HD_IMAP_BOOTSTRAP_POLICY: z.enum(['FROM_NOW', 'BACKFILL']).default('FROM_NOW'),
+  // A global backfill is deliberately bounded. Per-queue BACKFILL remains an
+  // explicit reconcile action, but a typo in the environment must never turn a
+  // first production connect into an unbounded historical import.
+  TELECOM_HD_IMAP_BACKFILL_LIMIT: z.coerce.number().int().min(0).max(10_000).default(0),
+  // Max processing attempts before an inbound delivery is QUARANTINED (raw MIME is
+  // always retained for replay — a quarantine never discards a message).
+  TELECOM_HD_INBOUND_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
+  // Raw-MIME retention (days). A terminal PROCESSED/SKIPPED delivery older than this has its
+  // inline raw MIME pruned (metadata + contentHash kept) to bound the ledger's on-disk growth.
+  // QUARANTINED deliveries are NEVER pruned (raw MIME is needed to replay). 0 disables pruning.
+  TELECOM_HD_INBOUND_RAW_RETENTION_DAYS: z.coerce.number().int().min(0).max(3650).default(30),
+  // 256-bit AES key for field-level encryption (IMAP passwords, etc.). It remains
+  // optional in dev/test so local fixtures can run without secret material, but
+  // production startup requires it below.
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_FIELD_ENCRYPTION_KEY: z.string().optional(),
   // Fail-closed gate for the anonymous client portal (GOAL_PUBLIC_SECURITY S2-1).
@@ -133,9 +176,26 @@ export function assertProductionSecrets(cfg: AppConfig): void {
   if (cfg.TELECOM_HD_JWT_ACCESS_SECRET === cfg.TELECOM_HD_JWT_REFRESH_SECRET) {
     problems.push('  - TELECOM_HD_JWT_REFRESH_SECRET: must differ from the access secret');
   }
-  // Field-encryption key, if provided, must be a real 64-hex (256-bit) key.
-  if (cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY && !/^[0-9a-f]{64}$/i.test(cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY)) {
-    problems.push('  - TELECOM_HD_FIELD_ENCRYPTION_KEY: must be 64 hex chars (256-bit) when set');
+  // Email-queue credentials must never silently fall back to plaintext in
+  // production. The deployment migration converts legacy plaintext rows before
+  // the new runtime starts, and this gate keeps every subsequent write encrypted.
+  if (!cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY || !/^[0-9a-f]{64}$/i.test(cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY)) {
+    problems.push(
+      '  - TELECOM_HD_FIELD_ENCRYPTION_KEY: is required and must be 64 hex chars (256-bit) in production',
+    );
+  }
+
+  // The production Compose volume is mounted only here. Allowing an arbitrary
+  // path would silently split attachments/raw MIME between an ephemeral
+  // container filesystem and the durable upload volume.
+  if (cfg.TELECOM_HD_UPLOAD_DIR !== '/app/uploads') {
+    problems.push('  - TELECOM_HD_UPLOAD_DIR: must be exactly /app/uploads in production');
+  }
+
+  if (cfg.TELECOM_HD_IMAP_BOOTSTRAP_POLICY === 'BACKFILL' && cfg.TELECOM_HD_IMAP_BACKFILL_LIMIT < 1) {
+    problems.push(
+      '  - TELECOM_HD_IMAP_BACKFILL_LIMIT: must be at least 1 when TELECOM_HD_IMAP_BOOTSTRAP_POLICY=BACKFILL',
+    );
   }
 
   // S5-7: the public origin and mail host must be REAL in production — the dev localhost defaults

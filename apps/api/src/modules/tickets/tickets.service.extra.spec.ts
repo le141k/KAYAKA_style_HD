@@ -103,6 +103,12 @@ function makePrismaMock() {
     ticketAuditLog: {
       create: vi.fn(),
     },
+    workflow: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    workflowEmailEvent: {
+      upsert: vi.fn(),
+    },
     ticketWatcher: {
       upsert: vi.fn(),
       deleteMany: vi.fn(),
@@ -121,6 +127,9 @@ function makePrismaMock() {
     ticketRecipient: {
       findMany: vi.fn().mockResolvedValue([]),
       createMany: vi.fn().mockResolvedValue({}),
+    },
+    outboundEmail: {
+      create: vi.fn().mockResolvedValue({ id: 'outbox-test' }),
     },
     $transaction: vi.fn((arg: unknown) =>
       typeof arg === 'function'
@@ -163,6 +172,11 @@ describe('TicketsService (extra coverage)', () => {
         .fn()
         .mockImplementation((_s: unknown, rows: unknown) => Promise.resolve(rows)),
     } as unknown as AdminService;
+    const notificationMock = {
+      queueWatcherNotificationsForUserReply: vi.fn().mockResolvedValue([]),
+      queueAssignmentNotification: vi.fn().mockResolvedValue(undefined),
+      wakeCommittedNotifications: vi.fn(),
+    };
     service = new TicketsService(
       prisma as unknown as PrismaService,
       users,
@@ -170,6 +184,7 @@ describe('TicketsService (extra coverage)', () => {
       eventEmitterMock,
       mailMock,
       adminMock,
+      notificationMock as never,
     );
   });
 
@@ -337,6 +352,31 @@ describe('TicketsService (extra coverage)', () => {
       expect(userClause.select!['passwordHash']).toBeUndefined();
       expect(userClause.select!['fullName']).toBe(true);
     });
+
+    it('projects delivery truth for staff without recipients or BCC', async () => {
+      const ticket = {
+        ...makeTicket(),
+        posts: [],
+        notes: [],
+        watchers: [],
+        tags: [],
+        attachments: [],
+        auditLogs: [],
+      };
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+
+      await service.getTicket(1);
+
+      const arg = (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        include: { posts: { include: { outboundEmail: { select: Record<string, unknown> } } } };
+      };
+      const delivery = arg.include.posts.include.outboundEmail.select;
+      expect(delivery['state']).toBe(true);
+      expect(delivery['lastError']).toBe(true);
+      expect(delivery['recipients']).toBeUndefined();
+      expect(delivery['bcc']).toBeUndefined();
+      expect(delivery['htmlBody']).toBeUndefined();
+    });
   });
 
   // ─── getTicketByMask ──────────────────────────────────────────────────────────
@@ -367,7 +407,7 @@ describe('TicketsService (extra coverage)', () => {
   // ─── reply ───────────────────────────────────────────────────────────────────
 
   describe('reply', () => {
-    it('creates a staff post reply and updates ticket metadata', async () => {
+    it('creates a staff post reply and updates ticket metadata without claiming SMTP delivery', async () => {
       const ticket = makeTicket({ firstResponseAt: null });
       const post = { id: 10, ticketId: 1, contents: 'Reply here' };
 
@@ -392,7 +432,9 @@ describe('TicketsService (extra coverage)', () => {
 
       expect(result).toBe(post);
       expect(prisma.ticket.update).toHaveBeenCalledWith(
-        expect.objectContaining({ data: expect.objectContaining({ firstResponseAt: expect.any(Date) }) }),
+        expect.objectContaining({
+          data: expect.objectContaining({ totalReplies: { increment: 1 } }),
+        }),
       );
     });
 
@@ -956,6 +998,14 @@ describe('TicketsService (extra coverage)', () => {
 
   describe('bulkAction', () => {
     const fm = () => prisma.ticket.findMany as ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      // bulkAction now uses the returned update row as the immutable snapshot
+      // for its in-transaction notification/workflow planners, and its audit id
+      // as the durable source key. Real Prisma always returns both values.
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(makeTicket());
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
+    });
 
     it('applies a status change atomically to every existing id', async () => {
       fm().mockResolvedValue([

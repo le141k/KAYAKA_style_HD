@@ -1,4 +1,13 @@
-import { BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  Optional,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
@@ -7,7 +16,12 @@ import { MailService } from '../mail/mail.service';
 import { AdminService } from '../admin/admin.service';
 import { AttachmentsService } from '../attachments/attachments.service';
 import { NotificationService } from './notification.service';
+import { enqueueWorkflowEmailEvent } from '../workflow/workflow-email-event.service';
 import { formatTicketMask } from './ticket-mask.util';
+import { normalizeEmail } from '../../common/email.util';
+import type { AuthStaff } from '../../auth/auth.decorators';
+import { PERMISSIONS } from '../../auth/permissions';
+import { TicketAccessPolicy, type TicketAccessActor } from './ticket-access-policy.service';
 import type {
   CreateTicketDto,
   ReplyTicketDto,
@@ -36,6 +50,21 @@ export interface TicketDetail extends Ticket {
   notes: TicketNote[];
   watchers: Array<{ staffId: number }>;
   tags: Array<{ name: string }>;
+  // Automated commands have no TicketPost, but staff need a safe status/retry
+  // handle rather than an invisible fire-and-forget email. This intentionally
+  // includes staff-facing INTERNAL_NOTIFICATION rows while omitting recipients,
+  // bodies and SMTP identifiers from the ticket projection.
+  outboundEmails?: Array<{
+    id: string;
+    kind: 'AUTORESPONDER' | 'AUTO_CLOSE' | 'WORKFLOW' | 'INTERNAL_NOTIFICATION';
+    state: string;
+    attempts: number;
+    nextAttemptAt: Date | null;
+    lastError: string | null;
+    acceptedAt: Date | null;
+    sentAt: Date | null;
+    createdAt: Date;
+  }>;
 }
 
 /**
@@ -78,6 +107,10 @@ export type InternalCreateTicketInput = CreateTicketDto & {
   creationMode?: CreationMode;
   ipAddress?: string;
   incomingMessageId?: string;
+  /** Immutable receiving-queue snapshot from the inbound ledger; never HTTP input. */
+  inboundQueueId?: number;
+  /** NULL/undefined legacy delivery is deliberately fail-closed for EMAIL auto replies. */
+  inboundSendAutoresponder?: boolean;
 };
 
 /** Trusted service-to-service reply input; not accepted by ReplyTicketSchema. */
@@ -86,6 +119,19 @@ export type InternalReplyTicketInput = ReplyTicketDto & {
   ipAddress?: string;
   incomingMessageId?: string;
 };
+
+interface StaffReplyOutboxDraft {
+  messageId: string;
+  emailQueueId: number | null;
+  fromAddress: string;
+  replyToAddress: string | null;
+  subject: string;
+  htmlBody: string;
+  textBody: string;
+  inReplyTo: string | null;
+  references: string[];
+  recipients: Array<{ email: string; role: 'TO' | 'CC' | 'BCC' }>;
+}
 
 /**
  * A client-safe post. Internal/PII fields (staff `email`, `ipAddress`, `staffId`,
@@ -121,6 +167,12 @@ const PUBLIC_USER_SELECT = {
   emails: { select: { email: true, isPrimary: true } },
 } as const;
 
+// These values deliberately stay below the RFC 5322 physical-line limit after
+// the transport adds the header name.  Historic TicketPost rows predate the
+// inbound validator, so never trust their Message-ID values as SMTP headers.
+const MAX_OUTBOUND_THREADING_MESSAGE_ID_CHARS = 512;
+const MAX_OUTBOUND_REFERENCES_CHARS = 900;
+
 @Injectable()
 export class TicketsService {
   private readonly logger = new Logger(TicketsService.name);
@@ -132,8 +184,12 @@ export class TicketsService {
     private readonly eventEmitter: EventEmitter2,
     private readonly mailService: MailService,
     private readonly adminService: AdminService,
+    // Required: a customer reply/assignment must fail its transaction if the
+    // durable internal-notification planner is not wired.  Silently omitting it
+    // would recreate the exact crash/loss window the outbox closes.
+    private readonly notificationService: NotificationService,
     @Optional() private readonly attachmentsService?: AttachmentsService,
-    @Optional() private readonly notificationService?: NotificationService,
+    @Optional() private readonly ticketAccess?: TicketAccessPolicy,
   ) {}
 
   // ─────────────────────────── Create ───────────────────────────
@@ -169,15 +225,36 @@ export class TicketsService {
     // trusted callers (controllers, alaris/inbound services) set them here.
     dto: InternalCreateTicketInput,
     creatorStaffId?: number,
+    actor?: TicketAccessActor,
   ): Promise<Ticket> {
+    if (actor) {
+      const ticketAccess = this.requireTicketAccess(actor);
+      await ticketAccess.assertCanAccessDepartment(actor, dto.departmentId);
+      if (dto.ownerStaffId != null) {
+        await ticketAccess.assertAssigneeCanHandleDepartments(dto.ownerStaffId, [dto.departmentId]);
+      }
+    }
     const incomingMessageId = this.normalizeIncomingMessageId(dto.incomingMessageId);
     if (incomingMessageId) {
       const existing = await this.findTicketByInboundMessageId(incomingMessageId);
-      if (existing) return existing;
+      if (existing) {
+        // A staff-facing call must not use an idempotency key as an alternate
+        // ticket lookup. HTTP DTOs cannot set this field, but enforcing the
+        // invariant here protects future internal callers too.
+        if (actor) await this.requireTicketAccess(actor).assertCanAccessTicket(actor, existing.id);
+        return existing;
+      }
     }
 
     const creationMode: CreationMode = dto.creationMode ?? 'STAFF';
     const ipAddress = dto.ipAddress ?? '0.0.0.0';
+    // EMAIL can only auto-reply when the accepting delivery snapshotted an
+    // explicit queue opt-in. Historical/unknown ledger rows fail closed rather
+    // than consulting a live queue that may now belong to another department.
+    const shouldQueueAutoresponder =
+      Boolean(dto.requesterEmail) &&
+      creationMode !== 'ALARIS' &&
+      (creationMode !== 'EMAIL' || dto.inboundSendAutoresponder === true);
     // Validate custom fields against TICKET scope definitions, then encrypt any
     // fields flagged isEncrypted before they are persisted to the JSONB column.
     let customFields = dto.customFields as Record<string, unknown> | undefined;
@@ -229,8 +306,16 @@ export class TicketsService {
     // auto-increment id, so we create first (temp mask) then update within a
     // single $transaction to avoid a window where a TT-PENDING mask is visible.
     let updated: Ticket;
+    let autoresponderOutboundEmailId: string | undefined;
     try {
-      const [, transactionTicket] = await this.prisma.$transaction(async (tx) => {
+      const committed = await this.prisma.$transaction(async (tx) => {
+        if (actor) {
+          await this.requireTicketAccess(actor).assertCanAccessDepartmentInTransaction(
+            actor,
+            dto.departmentId,
+            tx,
+          );
+        }
         const created = await tx.ticket.create({
           data: {
             mask: 'TT-PENDING', // temporary; replaced within this same transaction
@@ -263,6 +348,7 @@ export class TicketsService {
                 isHtml: dto.isHtml,
                 creationMode,
                 messageId: incomingMessageId,
+                inboundMessageId: incomingMessageId,
                 ipAddress,
               },
             },
@@ -279,10 +365,10 @@ export class TicketsService {
           },
           include: { posts: { select: { id: true } } },
         });
+        const firstPost = created.posts[0];
+        if (!firstPost) throw new BadRequestException('Initial ticket post was not created');
 
         if (dto.attachmentIds?.length && this.attachmentsService) {
-          const firstPost = created.posts[0];
-          if (!firstPost) throw new BadRequestException('Initial ticket post was not created');
           await this.attachmentsService.linkToPost(
             dto.attachmentIds,
             firstPost.id,
@@ -300,11 +386,59 @@ export class TicketsService {
           },
         });
 
-        return [created, updatedTicket] as const;
+        // LIFE-03: persist CC/BCC recipients AND the CREATE audit inside the SAME
+        // transaction as the ticket + first post + attachment links. Writing them
+        // after commit left a crash window in which a ticket could exist with no
+        // recipients / no audit row — and the P2002 retry path returns the existing
+        // ticket, so a follow-up delivery would never re-create them. Atomic now.
+        const allRecipients = [
+          ...(dto.ccEmails ?? []).map((email) => ({ email, role: 'CC' as const })),
+          ...(dto.bccEmails ?? []).map((email) => ({ email, role: 'BCC' as const })),
+        ];
+        if (allRecipients.length > 0) {
+          await tx.ticketRecipient.createMany({
+            data: allRecipients.map((r) => ({ ticketId: created.id, email: r.email, role: r.role })),
+            skipDuplicates: true,
+          });
+        }
+        await this.writeAudit(
+          created.id,
+          'CREATE',
+          creatorStaffId,
+          creatorActor,
+          { newValue: updatedTicket.mask },
+          tx,
+        );
+
+        let outboxId: string | undefined;
+        if (shouldQueueAutoresponder) {
+          const requesterName = dto.requesterName || dto.requesterEmail;
+          const outbox = await this.mailService.createAutomatedTicketEmail(tx, {
+            ticketId: created.id,
+            emailQueueId: dto.inboundQueueId ?? null,
+            kind: 'AUTORESPONDER',
+            templateKey: 'autoresponder',
+            locale: 'en',
+            to: dto.requesterEmail,
+            vars: {
+              mask: updatedTicket.mask,
+              subject: dto.subject,
+              contents: dto.contents,
+              name: requesterName,
+              requesterName,
+            },
+          });
+          outboxId = outbox.id;
+        }
+
+        await enqueueWorkflowEmailEvent(tx, updatedTicket, 'ticket.created', `ticket-post:${firstPost.id}`);
+
+        return { ticket: updatedTicket, autoresponderOutboundEmailId: outboxId };
       });
-      updated = transactionTicket;
+      updated = committed.ticket;
+      autoresponderOutboundEmailId = committed.autoresponderOutboundEmailId;
     } catch (err) {
-      // Concurrent delivery: the partial unique index is the final arbiter. The
+      // Concurrent delivery: the inbound-only unique index is the final arbiter. The
       // losing transaction is fully rolled back; return the winning ticket and
       // skip recipients, audit, events and autoresponder.
       if (incomingMessageId && this.isUniqueConstraintViolation(err)) {
@@ -314,58 +448,26 @@ export class TicketsService {
       throw err;
     }
 
-    const ticket = updated;
     const mask = updated.mask;
 
-    // Persist CC/BCC recipients
-    const allRecipients = [
-      ...(dto.ccEmails ?? []).map((email) => ({ email, role: 'CC' as const })),
-      ...(dto.bccEmails ?? []).map((email) => ({ email, role: 'BCC' as const })),
-    ];
-    if (allRecipients.length > 0) {
-      await this.prisma.ticketRecipient.createMany({
-        data: allRecipients.map((r) => ({ ticketId: ticket.id, email: r.email, role: r.role })),
-        skipDuplicates: true,
-      });
-    }
-
-    // Write audit log
-    await this.writeAudit(ticket.id, 'CREATE', creatorStaffId, creatorActor, {
-      newValue: mask,
-    });
-
+    // Recipients + CREATE audit are now written INSIDE the create transaction above
+    // (LIFE-03), so a crash after commit can never leave them missing.
     this.logger.log(`Ticket ${mask} created`);
 
     // Emit domain event
     this.emitDomainEvent('ticket.created', updated.id);
 
-    // Send autoresponder email to requester (non-blocking).
-    // Skip for system-generated tickets (e.g. Alaris) — their requesterEmail is a
-    // non-deliverable internal address and should not receive an autoresponder.
-    const isSystemTicket = creationMode === 'ALARIS';
-    // Per-queue autoresponder (Kayako): for inbound EMAIL tickets, only send the
-    // autoresponder when the receiving queue opts in (noc@/rates@ are OFF). Web/
-    // staff/API tickets keep the previous always-send behaviour.
-    let suppressAutoresponder = false;
-    if (creationMode === 'EMAIL') {
-      const queue = await this.prisma.emailQueue.findFirst({
-        where: { departmentId: dto.departmentId },
-        select: { sendAutoresponder: true },
-      });
-      suppressAutoresponder = !queue?.sendAutoresponder;
-    }
-    if (dto.requesterEmail && !isSystemTicket && !suppressAutoresponder) {
-      const requesterName = dto.requesterName || dto.requesterEmail;
+    if (autoresponderOutboundEmailId) {
+      // Redis is only a wake-up accelerator. The customer-facing command already
+      // committed with the ticket; periodic DB recovery delivers it after a crash.
       this.mailService
-        .sendTemplate(dto.requesterEmail, 'autoresponder', 'en', {
-          mask,
-          subject: dto.subject,
-          contents: dto.contents,
-          // Templates reference {{name}}; keep requesterName too for forward-compat.
-          name: requesterName,
-          requesterName,
-        })
-        .catch((err: unknown) => this.logger.error(`Autoresponder email failed for ${mask}: ${String(err)}`));
+        .enqueueOutbound(autoresponderOutboundEmailId)
+        .catch((err: unknown) =>
+          this.logger.error(
+            `Autoresponder outbox wake-up failed for ${mask} ` +
+              `(${err instanceof Error && err.name ? err.name.slice(0, 80) : 'UnknownError'})`,
+          ),
+        );
     }
 
     return updated;
@@ -555,7 +657,7 @@ export class TicketsService {
         }
       : {};
 
-    const post = await this.prisma.$transaction(async (tx) => {
+    const committed = await this.prisma.$transaction(async (tx) => {
       const createdPost = await tx.ticketPost.create({
         data: {
           ticketId,
@@ -581,7 +683,7 @@ export class TicketsService {
           tx,
         );
       }
-      await tx.ticket.update({
+      const updatedTicket = await tx.ticket.update({
         where: { id: ticketId },
         data: {
           totalReplies: { increment: 1 },
@@ -591,10 +693,31 @@ export class TicketsService {
           ...reopenData,
         },
       });
-      return createdPost;
+      await enqueueWorkflowEmailEvent(tx, updatedTicket, 'ticket.replied', `ticket-post:${createdPost.id}`);
+      // Portal replies are customer replies too. Persist watcher commands in this
+      // same source transaction as the post, attachment claim and ticket update;
+      // a crash must not leave staff without the durable notification that an
+      // inbound/API customer reply receives.
+      const watcherNotificationIds = await this.notificationService.queueWatcherNotificationsForUserReply(
+        tx,
+        updatedTicket,
+        createdPost.id,
+      );
+      // The user-reply audit is part of the same business event as its post,
+      // workflow trigger and watcher commands. Keeping it in this transaction
+      // prevents a committed portal reply from losing its audit trail if the
+      // process fails before the former post-commit write.
+      await this.writeAudit(ticketId, 'REPLY', undefined, 'USER', {}, tx);
+      return { post: createdPost, watcherNotificationIds };
     });
 
-    await this.writeAudit(ticketId, 'REPLY', undefined, 'USER', {});
+    const post = committed.post;
+
+    // Redis only accelerates delivery; the notification commands are already
+    // committed and MailService's recovery scan remains the durable backstop.
+    if (committed.watcherNotificationIds.length > 0) {
+      this.notificationService.wakeCommittedNotifications(committed.watcherNotificationIds);
+    }
     this.emitDomainEvent('ticket.replied', ticketId);
 
     return post;
@@ -602,37 +725,43 @@ export class TicketsService {
 
   // ─────────────────────────── List ───────────────────────────
 
-  async listTickets(query: ListTicketsQueryDto): Promise<{ data: Ticket[]; total: number }> {
+  async listTickets(
+    query: ListTicketsQueryDto,
+    actor?: TicketAccessActor,
+  ): Promise<{ data: Ticket[]; total: number }> {
     const { page, limit, sortBy, sortDir, unassigned, search, sla_breached, ...filters } = query;
 
-    const where: Record<string, unknown> = {};
+    // Keep the caller's filters and department policy as separate AND terms.
+    // Assigning `departmentId` directly onto an existing scope object would let a
+    // query parameter replace `{ in: allowedDepartments }` with an arbitrary id.
+    const requestedWhere: Record<string, unknown> = {};
 
-    if (filters.statusId !== undefined) where['statusId'] = filters.statusId;
-    if (filters.priorityId !== undefined) where['priorityId'] = filters.priorityId;
-    if (filters.departmentId !== undefined) where['departmentId'] = filters.departmentId;
-    if (filters.typeId !== undefined) where['typeId'] = filters.typeId;
-    if (filters.userId !== undefined) where['userId'] = filters.userId;
-    if (filters.isResolved !== undefined) where['isResolved'] = filters.isResolved;
+    if (filters.statusId !== undefined) requestedWhere['statusId'] = filters.statusId;
+    if (filters.priorityId !== undefined) requestedWhere['priorityId'] = filters.priorityId;
+    if (filters.departmentId !== undefined) requestedWhere['departmentId'] = filters.departmentId;
+    if (filters.typeId !== undefined) requestedWhere['typeId'] = filters.typeId;
+    if (filters.userId !== undefined) requestedWhere['userId'] = filters.userId;
+    if (filters.isResolved !== undefined) requestedWhere['isResolved'] = filters.isResolved;
 
-    if (filters.ownerStaffId !== undefined) where['ownerStaffId'] = filters.ownerStaffId;
-    if (unassigned) where['ownerStaffId'] = null;
+    if (filters.ownerStaffId !== undefined) requestedWhere['ownerStaffId'] = filters.ownerStaffId;
+    if (unassigned) requestedWhere['ownerStaffId'] = null;
 
     // SLA breach is computed server-side: unresolved tickets whose dueAt is in the
     // past. (Previously filtered client-side, which broke counts across pages.)
     if (sla_breached) {
-      where['isResolved'] = false;
-      where['dueAt'] = { lt: new Date() };
+      requestedWhere['isResolved'] = false;
+      requestedWhere['dueAt'] = { lt: new Date() };
     }
 
     if (filters.createdAfter || filters.createdBefore) {
-      where['createdAt'] = {
+      requestedWhere['createdAt'] = {
         ...(filters.createdAfter ? { gte: filters.createdAfter } : {}),
         ...(filters.createdBefore ? { lte: filters.createdBefore } : {}),
       };
     }
 
     if (search) {
-      where['OR'] = [
+      requestedWhere['OR'] = [
         { subject: { contains: search, mode: 'insensitive' } },
         { mask: { contains: search } },
         { requesterEmail: { contains: search, mode: 'insensitive' } },
@@ -641,7 +770,16 @@ export class TicketsService {
     }
 
     // Exclude merged-away tickets from the main list
-    where['mergedIntoId'] = null;
+    requestedWhere['mergedIntoId'] = null;
+
+    const where: Prisma.TicketWhereInput = actor
+      ? {
+          AND: [
+            await this.requireTicketAccess(actor).ticketWhere(actor),
+            requestedWhere as Prisma.TicketWhereInput,
+          ],
+        }
+      : (requestedWhere as Prisma.TicketWhereInput);
 
     const [data, total] = await Promise.all([
       this.prisma.ticket.findMany({
@@ -670,9 +808,8 @@ export class TicketsService {
 
   // ─────────────────────────── Get ───────────────────────────
 
-  async getTicket(id: number): Promise<TicketDetail> {
-    const ticket = await this.prisma.ticket.findUnique({
-      where: { id },
+  async getTicket(id: number, actor?: TicketAccessActor): Promise<TicketDetail> {
+    const query = {
       include: {
         status: true,
         priority: true,
@@ -685,6 +822,20 @@ export class TicketsService {
           include: {
             attachments: true,
             staff: { select: { firstName: true, lastName: true, email: true } },
+            // Safe staff-only delivery projection: recipients (especially BCC),
+            // raw bodies and relay response details remain out of the ticket API.
+            outboundEmail: {
+              select: {
+                id: true,
+                kind: true,
+                state: true,
+                attempts: true,
+                nextAttemptAt: true,
+                lastError: true,
+                acceptedAt: true,
+                sentAt: true,
+              },
+            },
           },
         },
         notes: {
@@ -699,8 +850,32 @@ export class TicketsService {
         tags: { select: { name: true } },
         auditLogs: { orderBy: { createdAt: 'desc' }, take: 50 },
         recipients: { orderBy: { addedAt: 'asc' } },
+        outboundEmails: {
+          // Only postless automated commands belong in this staff-safe projection.
+          // A corrupt legacy STAFF_REPLY row with postId=NULL must not violate the
+          // API/UI discriminator contract below.
+          where: { postId: null, kind: { not: 'STAFF_REPLY' } },
+          orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            kind: true,
+            state: true,
+            attempts: true,
+            nextAttemptAt: true,
+            lastError: true,
+            acceptedAt: true,
+            sentAt: true,
+            createdAt: true,
+          },
+        },
       },
-    });
+    } as const;
+    const ticket = actor
+      ? await this.prisma.ticket.findFirst({
+          ...query,
+          where: { AND: [{ id }, await this.requireTicketAccess(actor).ticketWhere(actor)] },
+        })
+      : await this.prisma.ticket.findUnique({ ...query, where: { id } });
 
     if (!ticket) throw new NotFoundException(`Ticket ${id} not found`);
     ticket.customFields = (await this.adminService.decryptCustomFields(
@@ -710,9 +885,8 @@ export class TicketsService {
     return ticket as unknown as TicketDetail;
   }
 
-  async getTicketByMask(mask: string): Promise<TicketDetail> {
-    const ticket = await this.prisma.ticket.findUnique({
-      where: { mask },
+  async getTicketByMask(mask: string, actor?: TicketAccessActor): Promise<TicketDetail> {
+    const query = {
       include: {
         status: true,
         priority: true,
@@ -725,6 +899,18 @@ export class TicketsService {
           include: {
             attachments: true,
             staff: { select: { firstName: true, lastName: true, email: true } },
+            outboundEmail: {
+              select: {
+                id: true,
+                kind: true,
+                state: true,
+                attempts: true,
+                nextAttemptAt: true,
+                lastError: true,
+                acceptedAt: true,
+                sentAt: true,
+              },
+            },
           },
         },
         notes: { orderBy: { createdAt: 'asc' } },
@@ -732,8 +918,29 @@ export class TicketsService {
         watchers: { select: { staffId: true } },
         tags: { select: { name: true } },
         auditLogs: { orderBy: { createdAt: 'desc' }, take: 50 },
+        outboundEmails: {
+          where: { postId: null, kind: { not: 'STAFF_REPLY' } },
+          orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            kind: true,
+            state: true,
+            attempts: true,
+            nextAttemptAt: true,
+            lastError: true,
+            acceptedAt: true,
+            sentAt: true,
+            createdAt: true,
+          },
+        },
       },
-    });
+    } as const;
+    const ticket = actor
+      ? await this.prisma.ticket.findFirst({
+          ...query,
+          where: { AND: [{ mask }, await this.requireTicketAccess(actor).ticketWhere(actor)] },
+        })
+      : await this.prisma.ticket.findUnique({ ...query, where: { mask } });
 
     if (!ticket) throw new NotFoundException(`Ticket ${mask} not found`);
     ticket.customFields = (await this.adminService.decryptCustomFields(
@@ -751,24 +958,39 @@ export class TicketsService {
     // controller forces STAFF + real ip; inbound mail passes EMAIL explicitly.
     dto: InternalReplyTicketInput,
     staffId?: number,
+    actor?: TicketAccessActor,
   ): Promise<TicketPost | TicketNote> {
     const incomingMessageId = this.normalizeIncomingMessageId(dto.incomingMessageId);
     if (dto.isNote) {
       if (incomingMessageId) {
         throw new BadRequestException('Inbound Message-ID cannot be assigned to an internal note');
       }
-      return this.addNote(ticketId, dto.contents, staffId, dto.attachmentIds);
+      return actor
+        ? this.addNote(ticketId, dto.contents, staffId, dto.attachmentIds, actor)
+        : this.addNote(ticketId, dto.contents, staffId, dto.attachmentIds);
     }
 
-    // Fast-path ordinary redelivery before doing any ticket/author work. The DB
-    // unique index remains the concurrency-safe arbiter below.
+    // Fast-path ordinary redelivery before doing any ticket/author work. The
+    // inbound-only unique index remains the concurrency-safe arbiter below; do
+    // not let a spoofed staff outbound threading Message-ID suppress this mail.
+    // Staff-facing calls authorize their requested ticket before looking at a
+    // duplicate key. This prevents a future caller from turning a known
+    // Message-ID into an alternate read path for another department.
+    const actorTicket = actor ? await this.findAccessibleOrThrow(ticketId, actor) : undefined;
+
+    // Fast-path ordinary redelivery before doing any ticket/author work. The
+    // inbound-only unique index remains the concurrency-safe arbiter below; do
+    // not let a spoofed staff outbound threading Message-ID suppress this mail.
     if (incomingMessageId) {
       const existing = await this.findPostByInboundMessageId(incomingMessageId);
-      if (existing) return existing;
+      if (existing) {
+        if (actor && existing.ticketId !== ticketId)
+          throw new NotFoundException(`Ticket ${ticketId} not found`);
+        return existing;
+      }
     }
 
-    const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
-    if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
+    const ticket = actorTicket ?? (await this.findAccessibleOrThrow(ticketId));
 
     if (dto.attachmentIds?.length && !this.attachmentsService) {
       throw new BadRequestException('Attachment service is unavailable');
@@ -778,7 +1000,6 @@ export class TicketsService {
     const replyIp = dto.ipAddress ?? '0.0.0.0';
     const now = new Date();
     const isStaffReply = !!staffId;
-    const firstResponse = isStaffReply && ticket.firstResponseAt === null;
 
     // Capture the author's display name/email on the post so the thread shows
     // who replied (previously left blank → rendered as "—").
@@ -797,6 +1018,25 @@ export class TicketsService {
 
     const hasNewAttachments = Boolean(dto.attachmentIds?.length);
 
+    // A public staff reply without a recipient is neither a delivery nor an
+    // internal note. Refuse it rather than creating a timeline entry the UI could
+    // mistake for queued/sent email; the operator can add a note until requester
+    // identity is repaired.
+    if (isStaffReply && !incomingMessageId && !ticket.requesterEmail.trim()) {
+      throw new BadRequestException(
+        'Ticket has no requester email; add an internal note or repair the requester first',
+      );
+    }
+
+    // Staff public replies use a database-backed SMTP command. Build all immutable
+    // snapshots before opening the transaction; the transaction below persists the
+    // post, counters, audit, recipients and attachment snapshots as one unit. An
+    // inbound trusted Message-ID is never repurposed as an outbound command.
+    const outboundDraft =
+      isStaffReply && ticket.requesterEmail && !incomingMessageId
+        ? await this.prepareStaffReplyOutboxDraft(ticket, dto, staffId!, authorName, authorEmail)
+        : undefined;
+
     // Reopen the ticket when a USER (customer) replies to a resolved/closed
     // ticket so it re-surfaces to staff. Staff replies must NOT reopen.
     const reopenData =
@@ -811,8 +1051,11 @@ export class TicketsService {
         : {};
 
     let post: TicketPost;
+    let outboundEmailId: string | undefined;
+    let watcherNotificationIds: string[] = [];
     try {
-      post = await this.prisma.$transaction(async (tx) => {
+      const committed = await this.prisma.$transaction(async (tx) => {
+        await this.fenceTicketMutation(tx, ticketId, actor, now);
         const createdPost = await tx.ticketPost.create({
           data: {
             ticketId,
@@ -823,10 +1066,13 @@ export class TicketsService {
             subject: ticket.subject,
             contents: dto.contents,
             isHtml: dto.isHtml,
-            isEmailed: dto.isEmailed,
+            // A staff post becomes emailed only after the SMTP worker commits
+            // SENT. The HTTP DTO may not manufacture delivery truth.
+            isEmailed: isStaffReply ? false : dto.isEmailed,
             isThirdParty: dto.isThirdParty,
             creationMode: replyCreationMode,
-            messageId: incomingMessageId,
+            messageId: incomingMessageId ?? outboundDraft?.messageId,
+            inboundMessageId: incomingMessageId,
             ipAddress: replyIp,
           },
         });
@@ -841,14 +1087,47 @@ export class TicketsService {
           );
         }
 
-        await tx.ticket.update({
+        let attachmentSnapshots: Array<{
+          sourceAttachmentId: number;
+          fileName: string;
+          mimeType: string;
+          size: number;
+          sha1: string;
+          storageKey: string;
+        }> = [];
+        if (outboundDraft && hasNewAttachments) {
+          const attachmentIds = [...new Set(dto.attachmentIds!)];
+          const attachments = await tx.attachment.findMany({
+            where: { id: { in: attachmentIds }, postId: createdPost.id, ticketId },
+            select: {
+              id: true,
+              fileName: true,
+              mimeType: true,
+              size: true,
+              sha1: true,
+              storageKey: true,
+            },
+          });
+          if (attachments.length !== attachmentIds.length) {
+            throw new BadRequestException('One or more outbound attachments cannot be snapshotted');
+          }
+          this.assertOutboundAttachmentBounds(attachments);
+          attachmentSnapshots = attachments.map((attachment) => ({
+            sourceAttachmentId: attachment.id,
+            fileName: attachment.fileName,
+            mimeType: attachment.mimeType,
+            size: attachment.size,
+            sha1: attachment.sha1,
+            storageKey: attachment.storageKey,
+          }));
+        }
+
+        const updatedTicket = await tx.ticket.update({
           where: { id: ticketId },
           data: {
             totalReplies: { increment: 1 },
             lastReplyAt: now,
             lastActivityAt: now,
-            // Mark first staff response time if not yet set
-            ...(firstResponse && { firstResponseAt: now }),
             // Set hasAttachments if new attachments were linked
             ...(hasNewAttachments && { hasAttachments: true }),
             ...reopenData,
@@ -856,86 +1135,82 @@ export class TicketsService {
         });
 
         await this.writeAudit(ticketId, 'REPLY', staffId, isStaffReply ? 'STAFF' : 'USER', {}, tx);
-        return createdPost;
+        await enqueueWorkflowEmailEvent(tx, updatedTicket, 'ticket.replied', `ticket-post:${createdPost.id}`);
+
+        const outbox = outboundDraft
+          ? await tx.outboundEmail.create({
+              data: {
+                ticketId,
+                postId: createdPost.id,
+                emailQueueId: outboundDraft.emailQueueId,
+                kind: 'STAFF_REPLY',
+                state: 'QUEUED',
+                messageId: outboundDraft.messageId,
+                fromAddress: outboundDraft.fromAddress,
+                replyToAddress: outboundDraft.replyToAddress,
+                subject: outboundDraft.subject,
+                htmlBody: outboundDraft.htmlBody,
+                textBody: outboundDraft.textBody,
+                inReplyTo: outboundDraft.inReplyTo,
+                references: outboundDraft.references,
+                recipients: { create: outboundDraft.recipients },
+                ...(attachmentSnapshots.length ? { attachments: { create: attachmentSnapshots } } : {}),
+              },
+              select: { id: true },
+            })
+          : undefined;
+        // A customer reply and each watcher notification share this transaction.
+        // The TicketPost id is the durable business-event key, so a retry cannot
+        // produce a second alert and a crash cannot commit the post without its
+        // notification commands.
+        const notificationIds = !isStaffReply
+          ? await this.notificationService.queueWatcherNotificationsForUserReply(
+              tx,
+              updatedTicket,
+              createdPost.id,
+            )
+          : [];
+        return { post: createdPost, outboundEmailId: outbox?.id, watcherNotificationIds: notificationIds };
       });
+      post = committed.post;
+      outboundEmailId = committed.outboundEmailId;
+      watcherNotificationIds = committed.watcherNotificationIds;
     } catch (err) {
       if (incomingMessageId && this.isUniqueConstraintViolation(err)) {
         const existing = await this.findPostByInboundMessageId(incomingMessageId);
-        if (existing) return existing;
+        if (existing) {
+          if (actor && existing.ticketId !== ticketId)
+            throw new NotFoundException(`Ticket ${ticketId} not found`);
+          return existing;
+        }
       }
       throw err;
     }
 
-    // Send outbound email to requester when a staff member replies (non-blocking)
-    if (isStaffReply && ticket.requesterEmail) {
-      const requesterName = ticket.requesterName || ticket.requesterEmail;
-      // Load CC/BCC recipients for this ticket
-      const recipients = await this.prisma.ticketRecipient.findMany({ where: { ticketId } });
-      const ccEmails = [
-        ...(dto.ccEmails ?? []),
-        ...recipients.filter((r) => r.role === 'CC').map((r) => r.email),
-      ];
-      const bccEmails = [
-        ...(dto.bccEmails ?? []),
-        ...recipients.filter((r) => r.role === 'BCC').map((r) => r.email),
-      ];
-
-      // RFC threading: reply In-Reply-To the most recent prior post that carries a
-      // Message-ID (the customer's inbound mail), so their MUA threads our reply.
-      const priorMsg = await this.prisma.ticketPost.findFirst({
-        where: { ticketId, id: { not: post.id }, messageId: { not: null }, NOT: { messageId: '' } },
-        orderBy: { createdAt: 'desc' },
-        select: { messageId: true },
-      });
-
-      // Append the staff + queue signature (Kayako EmailQueue.signature is never
-      // appended otherwise). Queue is resolved by the ticket's department.
-      const [staff, queue] = await Promise.all([
-        staffId
-          ? this.prisma.staff.findUnique({ where: { id: staffId }, select: { signature: true } })
-          : null,
-        this.prisma.emailQueue.findFirst({
-          where: { departmentId: ticket.departmentId },
-          select: { signature: true },
-        }),
-      ]);
-      const sig = [staff?.signature, queue?.signature]
-        .map((s) => s?.trim())
-        .filter(Boolean)
-        .join('\n\n');
-      const contents = sig ? `${dto.contents}\n\n--\n${sig}` : dto.contents;
-
-      this.mailService
-        .sendTemplate(
-          ticket.requesterEmail,
-          'ticket_user_reply',
-          'en',
-          {
-            mask: ticket.mask,
-            subject: ticket.subject,
-            contents,
-            // Templates reference {{name}}; keep requesterName too for forward-compat.
-            name: requesterName,
-            requesterName,
-          },
-          {
-            cc: ccEmails.length > 0 ? ccEmails : undefined,
-            bcc: bccEmails.length > 0 ? bccEmails : undefined,
-            ...(priorMsg?.messageId ? { inReplyTo: priorMsg.messageId, references: priorMsg.messageId } : {}),
-          },
-        )
-        .catch((err: unknown) =>
-          this.logger.error(`Reply email failed for ticket ${ticket.mask}: ${String(err)}`),
-        );
+    if (outboundEmailId) {
+      // Redis is only a wake-up accelerator. An enqueue failure leaves the durable
+      // row in QUEUED for MailService's startup/periodic DB recovery scan.
+      const enqueue = (
+        this.mailService as unknown as {
+          enqueueOutbound?: (id: string) => Promise<void>;
+        }
+      ).enqueueOutbound;
+      if (enqueue) {
+        enqueue
+          .call(this.mailService, outboundEmailId)
+          .catch((err: unknown) =>
+            this.logger.error(
+              `Outbox wake-up failed for ticket ${ticket.mask} ` +
+                `(${err instanceof Error && err.name ? err.name.slice(0, 80) : 'UnknownError'})`,
+            ),
+          );
+      }
     }
 
-    // Notify watchers when a user (customer) replies
-    if (!isStaffReply && this.notificationService) {
-      this.notificationService
-        .notifyWatchersOnUserReply(ticketId)
-        .catch((err: unknown) =>
-          this.logger.error(`Watcher notification failed for ticket ${ticket.mask}: ${String(err)}`),
-        );
+    if (watcherNotificationIds.length > 0) {
+      // Redis only accelerates delivery; the commands are already committed and
+      // MailService's durable recovery scan will pick them up after an outage.
+      this.notificationService.wakeCommittedNotifications(watcherNotificationIds);
     }
 
     // Emit domain event
@@ -951,14 +1226,16 @@ export class TicketsService {
     contents: string,
     staffId?: number,
     attachmentIds?: number[],
+    actor?: TicketAccessActor,
   ): Promise<TicketNote> {
-    await this.findOrThrow(ticketId);
+    await this.findAccessibleOrThrow(ticketId, actor);
     if (attachmentIds?.length && !this.attachmentsService) {
       throw new BadRequestException('Attachment service is unavailable');
     }
     const hasNoteAttachments = Boolean(attachmentIds?.length);
 
     return this.prisma.$transaction(async (tx) => {
+      await this.fenceTicketMutation(tx, ticketId, actor, new Date());
       const note = await tx.ticketNote.create({
         data: { ticketId, staffId, contents },
       });
@@ -987,24 +1264,39 @@ export class TicketsService {
 
   /**
    * Apply one action (status change or (re)assignment) to many tickets at once.
-   * Reuses the per-ticket changeStatus/assign paths so audit logs, SLA side
-   * effects and events fire exactly as for a single update. Returns the count
-   * of tickets updated; ids that fail (e.g. already gone) are skipped.
+   * Keeps the same business guarantees as the single-ticket paths: each
+   * mutation's audit is the source for its durable side effect, while all
+   * external wake-ups/domain events happen only after the batch commits.
+   * Returns the count of tickets updated; ids that fail (e.g. already gone)
+   * are skipped.
    */
   async bulkAction(
     dto: BulkTicketActionDto,
     staffId: number,
+    actor?: TicketAccessActor,
   ): Promise<{ updated: number; failed: number[] }> {
     // Pre-validate: ids that don't exist (or were merged away) are reported in
-    // `failed[]` and never touched. Bulk ops apply a direct field update + audit
-    // atomically (no per-ticket notification/event spam — that's by design for a
-    // batch); the resolved-status side effect is preserved inline.
+    // `failed[]` and never touched. The batch remains all-or-nothing, including
+    // durable notification/workflow commands; a failed member must not leave a
+    // committed ticket mutation with its command silently missing.
+    const uniqueIds = [...new Set(dto.ids)];
+    const policyWhere = actor ? await this.requireTicketAccess(actor).ticketWhere(actor) : undefined;
     const existing = await this.prisma.ticket.findMany({
-      where: { id: { in: dto.ids }, mergedIntoId: null },
-      select: { id: true, isResolved: true, slaPlanId: true },
+      where: policyWhere
+        ? {
+            AND: [{ id: { in: uniqueIds }, mergedIntoId: null }, policyWhere],
+          }
+        : { id: { in: uniqueIds }, mergedIntoId: null },
+      select: { id: true, departmentId: true, isResolved: true, slaPlanId: true },
     });
     const existingIds = new Set(existing.map((t) => t.id));
-    const failed = dto.ids.filter((id) => !existingIds.has(id));
+    const failed = uniqueIds.filter((id) => !existingIds.has(id));
+    // Staff HTTP bulk requests are deliberately all-or-nothing.  Otherwise a
+    // single hidden department id would let an agent mutate the visible subset
+    // and use `failed[]` as a cross-department existence oracle.
+    if (actor && failed.length > 0) {
+      throw new NotFoundException('One or more tickets not found');
+    }
     if (existing.length === 0) return { updated: 0, failed };
 
     let status: { markAsResolved: boolean } | null = null;
@@ -1017,12 +1309,22 @@ export class TicketsService {
     }
     // E3: validate the bulk assignee once before the transaction (clean 404 vs FK 500).
     if (dto.action === 'assignee' && dto.ownerStaffId != null) {
-      await this.assertAssignableStaff(dto.ownerStaffId);
+      if (actor) {
+        await this.requireTicketAccess(actor).assertAssigneeCanHandleDepartments(dto.ownerStaffId, [
+          ...new Set(existing.map((ticket) => ticket.departmentId)),
+        ]);
+      } else {
+        await this.assertAssignableStaff(dto.ownerStaffId);
+      }
     }
 
     const now = new Date();
-    await this.prisma.$transaction(async (tx) => {
+    const committed = await this.prisma.$transaction(async (tx) => {
+      const notificationIds: string[] = [];
+      const statusChangedTicketIds: number[] = [];
+
       for (const t of existing) {
+        await this.fenceTicketMutation(tx, t.id, actor, now);
         const data: Record<string, unknown> = { lastActivityAt: now };
         let action: string;
         let newValue: string | null;
@@ -1049,59 +1351,117 @@ export class TicketsService {
           newValue = ownerStaffId?.toString() ?? null;
         }
 
-        await tx.ticket.update({ where: { id: t.id }, data });
-        await tx.ticketAuditLog.create({
-          data: {
-            ticketId: t.id,
-            staffId,
-            actorType: 'STAFF',
-            action,
+        const updatedTicket = await tx.ticket.update({ where: { id: t.id }, data });
+        const audit = await this.writeAudit(
+          t.id,
+          action,
+          staffId,
+          'STAFF',
+          {
             field: action === 'STATUS' ? 'statusId' : 'ownerStaffId',
             newValue,
           },
-        });
+          tx,
+        );
+
+        if (dto.action === 'assignee' && dto.ownerStaffId != null) {
+          const notificationId = await this.notificationService.queueAssignmentNotification(
+            tx,
+            updatedTicket,
+            dto.ownerStaffId,
+            `audit:${audit.id}`,
+          );
+          if (notificationId) notificationIds.push(notificationId);
+        }
+
+        if (dto.action === 'status') {
+          await enqueueWorkflowEmailEvent(
+            tx,
+            updatedTicket,
+            'ticket.status_changed',
+            `ticket-audit:${audit.id}`,
+          );
+          statusChangedTicketIds.push(updatedTicket.id);
+        }
       }
+
+      return { notificationIds, statusChangedTicketIds };
     });
+
+    // Both helpers below are wake-up accelerators/listener dispatch, never the
+    // source of truth.  The durable rows above must commit first, otherwise a
+    // failed batch could notify an assignee or execute a workflow for a ticket
+    // whose mutation was rolled back.
+    if (committed.notificationIds.length > 0) {
+      this.notificationService.wakeCommittedNotifications(committed.notificationIds);
+    }
+    for (const ticketId of committed.statusChangedTicketIds) {
+      this.emitDomainEvent('ticket.status_changed', ticketId);
+    }
 
     return { updated: existing.length, failed };
   }
 
-  async assign(ticketId: number, dto: AssignTicketDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
+  async assign(
+    ticketId: number,
+    dto: AssignTicketDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
 
     // E3: validate the assignee exists (and is enabled) up front — a bad id would
     // otherwise surface as an opaque FK 500 from the update below.
     if (dto.ownerStaffId != null) {
-      await this.assertAssignableStaff(dto.ownerStaffId);
+      if (actor) {
+        await this.requireTicketAccess(actor).assertAssigneeCanHandleDepartments(dto.ownerStaffId, [
+          ticket.departmentId,
+        ]);
+      } else {
+        await this.assertAssignableStaff(dto.ownerStaffId);
+      }
     }
 
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { ownerStaffId: dto.ownerStaffId, lastActivityAt: new Date() },
-    });
-
-    await this.writeAudit(ticketId, 'ASSIGN', staffId, 'STAFF', {
+    const now = new Date();
+    const audit = {
       field: 'ownerStaffId',
       oldValue: ticket.ownerStaffId?.toString() ?? null,
       newValue: dto.ownerStaffId?.toString() ?? null,
+    };
+    const committed = await this.prisma.$transaction(async (tx) => {
+      if (actor) await this.fenceTicketMutation(tx, ticketId, actor, now);
+      const result = await tx.ticket.update({
+        where: { id: ticketId },
+        data: { ownerStaffId: dto.ownerStaffId, lastActivityAt: now },
+      });
+      const auditLog = await this.writeAudit(ticketId, 'ASSIGN', staffId, 'STAFF', audit, tx);
+      const notificationId = dto.ownerStaffId
+        ? await this.notificationService.queueAssignmentNotification(
+            tx,
+            result,
+            dto.ownerStaffId,
+            `audit:${auditLog.id}`,
+          )
+        : undefined;
+      return { ticket: result, notificationId };
     });
 
-    // Notify the newly assigned staff member (non-blocking)
-    if (dto.ownerStaffId && this.notificationService) {
-      this.notificationService
-        .notifyOnAssign(ticketId, dto.ownerStaffId)
-        .catch((err: unknown) =>
-          this.logger.error(`Assignment notification failed for ticket ${ticketId}: ${String(err)}`),
-        );
+    if (committed.notificationId) {
+      this.notificationService.wakeCommittedNotifications([committed.notificationId]);
     }
 
-    return updated;
+    return committed.ticket;
   }
 
   // ─────────────────────────── Status / Priority / Type ───────────────────────────
 
-  async changeStatus(ticketId: number, dto: ChangeStatusDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
+  async changeStatus(
+    ticketId: number,
+    dto: ChangeStatusDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
     const status = await this.prisma.ticketStatus.findUnique({ where: { id: dto.statusId } });
     if (!status) throw new NotFoundException(`Status ${dto.statusId} not found`);
 
@@ -1133,21 +1493,27 @@ export class TicketsService {
       };
     }
 
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: {
-        statusId: dto.statusId,
-        isResolved: becomesResolved,
-        resolvedAt: becomesResolved ? now : null,
-        lastActivityAt: now,
-        ...slaUpdate,
-      },
-    });
-
-    await this.writeAudit(ticketId, 'STATUS_CHANGE', staffId, 'STAFF', {
+    const data = {
+      statusId: dto.statusId,
+      isResolved: becomesResolved,
+      resolvedAt: becomesResolved ? now : null,
+      lastActivityAt: now,
+      ...slaUpdate,
+    };
+    const audit = {
       field: 'statusId',
       oldValue: ticket.statusId.toString(),
       newValue: dto.statusId.toString(),
+    };
+    // The status audit is the immutable business source for a workflow-email
+    // event.  Keep all three writes in one transaction so a crash cannot leave
+    // an updated ticket with no durable customer-notification trigger.
+    const updated = await this.prisma.$transaction(async (tx) => {
+      if (actor) await this.fenceTicketMutation(tx, ticketId, actor, now);
+      const result = await tx.ticket.update({ where: { id: ticketId }, data });
+      const statusAudit = await this.writeAudit(ticketId, 'STATUS_CHANGE', staffId, 'STAFF', audit, tx);
+      await enqueueWorkflowEmailEvent(tx, result, 'ticket.status_changed', `ticket-audit:${statusAudit.id}`);
+      return result;
     });
 
     // Emit domain event
@@ -1156,36 +1522,56 @@ export class TicketsService {
     return updated;
   }
 
-  async changePriority(ticketId: number, dto: ChangePriorityDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
-
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { priorityId: dto.priorityId, lastActivityAt: new Date() },
-    });
-
-    await this.writeAudit(ticketId, 'PRIORITY_CHANGE', staffId, 'STAFF', {
+  async changePriority(
+    ticketId: number,
+    dto: ChangePriorityDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
+    const now = new Date();
+    const data = { priorityId: dto.priorityId, lastActivityAt: now };
+    const audit = {
       field: 'priorityId',
       oldValue: ticket.priorityId.toString(),
       newValue: dto.priorityId.toString(),
-    });
+    };
+    const updated = actor
+      ? await this.prisma.$transaction(async (tx) => {
+          await this.fenceTicketMutation(tx, ticketId, actor, now);
+          const result = await tx.ticket.update({ where: { id: ticketId }, data });
+          await this.writeAudit(ticketId, 'PRIORITY_CHANGE', staffId, 'STAFF', audit, tx);
+          return result;
+        })
+      : await this.prisma.ticket.update({ where: { id: ticketId }, data });
+    if (!actor) await this.writeAudit(ticketId, 'PRIORITY_CHANGE', staffId, 'STAFF', audit);
 
     return updated;
   }
 
-  async changeType(ticketId: number, dto: ChangeTypeDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
-
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { typeId: dto.typeId, lastActivityAt: new Date() },
-    });
-
-    await this.writeAudit(ticketId, 'TYPE_CHANGE', staffId, 'STAFF', {
+  async changeType(
+    ticketId: number,
+    dto: ChangeTypeDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
+    const now = new Date();
+    const data = { typeId: dto.typeId, lastActivityAt: now };
+    const audit = {
       field: 'typeId',
       oldValue: ticket.typeId?.toString() ?? null,
       newValue: dto.typeId?.toString() ?? null,
-    });
+    };
+    const updated = actor
+      ? await this.prisma.$transaction(async (tx) => {
+          await this.fenceTicketMutation(tx, ticketId, actor, now);
+          const result = await tx.ticket.update({ where: { id: ticketId }, data });
+          await this.writeAudit(ticketId, 'TYPE_CHANGE', staffId, 'STAFF', audit, tx);
+          return result;
+        })
+      : await this.prisma.ticket.update({ where: { id: ticketId }, data });
+    if (!actor) await this.writeAudit(ticketId, 'TYPE_CHANGE', staffId, 'STAFF', audit);
 
     return updated;
   }
@@ -1196,9 +1582,14 @@ export class TicketsService {
    * Merge the source ticket into the target ticket.
    * All posts from source are re-parented to the target; source is marked merged.
    */
-  async merge(sourceTicketId: number, dto: MergeTicketDto, staffId: number): Promise<Ticket> {
-    const source = await this.findOrThrow(sourceTicketId);
-    const target = await this.findOrThrow(dto.targetTicketId);
+  async merge(
+    sourceTicketId: number,
+    dto: MergeTicketDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const source = await this.findAccessibleOrThrow(sourceTicketId, actor);
+    const target = await this.findAccessibleOrThrow(dto.targetTicketId, actor);
 
     if (source.id === target.id) {
       throw new BadRequestException('Cannot merge a ticket into itself');
@@ -1216,6 +1607,11 @@ export class TicketsService {
 
     await this.prisma.$transaction(async (tx) => {
       const now = new Date();
+      // Deterministic order prevents A→B and B→A merges from deadlocking while
+      // both transactions acquire their department-scope fences.
+      for (const ticketId of [sourceTicketId, target.id].sort((a, b) => a - b)) {
+        await this.fenceTicketMutation(tx, ticketId, actor, now);
+      }
 
       // Move all posts from source to target
       await tx.ticketPost.updateMany({
@@ -1232,6 +1628,13 @@ export class TicketsService {
         where: { ticketId: sourceTicketId },
         data: { ticketId: target.id },
       });
+
+      // A merge can cross departments. Before moving watcher rows onto the
+      // surviving ticket, discard stale memberships that are not entitled to
+      // its department. Otherwise a later user reply would become an email
+      // side-channel even though the watcher cannot open the target ticket.
+      await this.pruneWatchersOutsideDepartment(tx, sourceTicketId, target.departmentId);
+      await this.pruneWatchersOutsideDepartment(tx, target.id, target.departmentId);
 
       // Re-parent watchers. The watcher PK is (ticketId, staffId), so a watcher
       // already present on the target would collide — move only the non-colliding
@@ -1285,8 +1688,13 @@ export class TicketsService {
    * Creates a new ticket with the given subject and moves the selected posts to it.
    * Writes SPLIT audit entries on both tickets.
    */
-  async split(sourceTicketId: number, dto: SplitTicketDto, staffId: number): Promise<Ticket> {
-    const source = await this.findOrThrow(sourceTicketId);
+  async split(
+    sourceTicketId: number,
+    dto: SplitTicketDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const source = await this.findAccessibleOrThrow(sourceTicketId, actor);
 
     if (!dto.postIds.length) {
       throw new BadRequestException('postIds must not be empty');
@@ -1306,6 +1714,16 @@ export class TicketsService {
     const priorityId = source.priorityId;
     const departmentId = dto.departmentId ?? source.departmentId;
 
+    if (actor) {
+      const ticketAccess = this.requireTicketAccess(actor);
+      // The actor must be authorized for both the source and the target
+      // department: a split is otherwise a cross-department exfiltration path.
+      await ticketAccess.assertCanAccessDepartment(actor, departmentId);
+      if (source.ownerStaffId != null) {
+        await ticketAccess.assertAssigneeCanHandleDepartments(source.ownerStaffId, [departmentId]);
+      }
+    }
+
     const now = new Date();
 
     // Compute SLA due dates for the new ticket
@@ -1324,6 +1742,10 @@ export class TicketsService {
     // concurrent split/merge can't let us yank posts that no longer belong to the
     // source (TOCTOU between the verify above and the move).
     const { newTicket, newMask } = await this.prisma.$transaction(async (tx) => {
+      if (actor) {
+        await this.requireTicketAccess(actor).assertCanAccessDepartmentInTransaction(actor, departmentId, tx);
+      }
+      await this.fenceTicketMutation(tx, sourceTicketId, actor, now);
       const created = await tx.ticket.create({
         data: {
           mask: 'TT-PENDING',
@@ -1346,7 +1768,7 @@ export class TicketsService {
         },
       });
       const mask = formatTicketMask(created.id);
-      await tx.ticket.update({ where: { id: created.id }, data: { mask } });
+      const newTicket = await tx.ticket.update({ where: { id: created.id }, data: { mask } });
       const moved = await tx.ticketPost.updateMany({
         where: { id: { in: dto.postIds }, ticketId: sourceTicketId },
         data: { ticketId: created.id },
@@ -1360,7 +1782,8 @@ export class TicketsService {
         where: { id: sourceTicketId },
         data: { totalReplies: { decrement: posts.length }, lastActivityAt: now },
       });
-      return { newTicket: created, newMask: mask };
+      await enqueueWorkflowEmailEvent(tx, newTicket, 'ticket.created', `ticket-split:${newTicket.id}`);
+      return { newTicket, newMask: mask };
     });
 
     // Audit on both
@@ -1381,17 +1804,44 @@ export class TicketsService {
 
   // ─────────────────────────── Watchers ───────────────────────────
 
-  async addWatcher(ticketId: number, dto: WatcherDto): Promise<void> {
-    await this.findOrThrow(ticketId);
-    await this.prisma.ticketWatcher.upsert({
-      where: { ticketId_staffId: { ticketId, staffId: dto.staffId } },
-      create: { ticketId, staffId: dto.staffId },
-      update: {},
-    });
+  async addWatcher(ticketId: number, dto: WatcherDto, actor?: TicketAccessActor): Promise<void> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
+    if (actor) {
+      // A watcher receives ticket activity; allowing a restricted staff member
+      // to add an out-of-department watcher would leak the same data via
+      // notifications even though direct detail access is blocked.
+      await this.requireTicketAccess(actor).assertAssigneeCanHandleDepartments(dto.staffId, [
+        ticket.departmentId,
+      ]);
+    }
+    const upsert = (db: PrismaService | Prisma.TransactionClient) =>
+      db.ticketWatcher.upsert({
+        where: { ticketId_staffId: { ticketId, staffId: dto.staffId } },
+        create: { ticketId, staffId: dto.staffId },
+        update: {},
+      });
+    if (actor) {
+      await this.prisma.$transaction(async (tx) => {
+        await this.fenceTicketMutation(tx, ticketId, actor, new Date());
+        await upsert(tx);
+      });
+    } else {
+      await upsert(this.prisma);
+    }
   }
 
-  async removeWatcher(ticketId: number, staffId: number): Promise<void> {
-    await this.prisma.ticketWatcher.deleteMany({ where: { ticketId, staffId } });
+  async removeWatcher(ticketId: number, staffId: number, actor?: TicketAccessActor): Promise<void> {
+    if (actor) await this.findAccessibleOrThrow(ticketId, actor);
+    const remove = (db: PrismaService | Prisma.TransactionClient) =>
+      db.ticketWatcher.deleteMany({ where: { ticketId, staffId } });
+    if (actor) {
+      await this.prisma.$transaction(async (tx) => {
+        await this.fenceTicketMutation(tx, ticketId, actor, new Date());
+        await remove(tx);
+      });
+    } else {
+      await remove(this.prisma);
+    }
   }
 
   // ─────────────────────────── Ticket links (client ↔ supplier) ─────────────
@@ -1402,14 +1852,17 @@ export class TicketsService {
    * is the backbone of the 23T broker model: a client ticket shows its supplier
    * ticket(s) and vice-versa.
    */
-  async listLinks(ticketId: number): Promise<
+  async listLinks(
+    ticketId: number,
+    actor?: TicketAccessActor,
+  ): Promise<
     Array<{
       linkId: number;
       linkType: string;
       ticket: { id: number; mask: string; subject: string; status: string | null; isResolved: boolean };
     }>
   > {
-    await this.findOrThrow(ticketId);
+    await this.findAccessibleOrThrow(ticketId, actor);
     const counterpart = {
       select: {
         id: true,
@@ -1419,8 +1872,16 @@ export class TicketsService {
         status: { select: { title: true } },
       },
     } as const;
+    const counterpartScope = actor ? await this.requireTicketAccess(actor).ticketWhere(actor) : undefined;
     const links = await this.prisma.ticketLink.findMany({
-      where: { OR: [{ sourceId: ticketId }, { targetId: ticketId }] },
+      where: counterpartScope
+        ? {
+            OR: [
+              { sourceId: ticketId, target: { is: counterpartScope } },
+              { targetId: ticketId, source: { is: counterpartScope } },
+            ],
+          }
+        : { OR: [{ sourceId: ticketId }, { targetId: ticketId }] },
       include: { source: counterpart, target: counterpart },
     });
     // Inverse label so the counterpart reads correctly from the other side.
@@ -1445,37 +1906,63 @@ export class TicketsService {
   async addLink(
     ticketId: number,
     dto: LinkTicketDto,
+    actor?: TicketAccessActor,
   ): Promise<{ linkId: number; linkType: string; targetId: number }> {
     if (dto.targetId === ticketId) {
       throw new BadRequestException('A ticket cannot be linked to itself');
     }
-    await this.findOrThrow(ticketId);
-    await this.findOrThrow(dto.targetId);
+    await this.findAccessibleOrThrow(ticketId, actor);
+    await this.findAccessibleOrThrow(dto.targetId, actor);
 
-    // Reject a duplicate in either direction (the @@unique only covers one).
-    const existing = await this.prisma.ticketLink.findFirst({
-      where: {
-        OR: [
-          { sourceId: ticketId, targetId: dto.targetId },
-          { sourceId: dto.targetId, targetId: ticketId },
-        ],
-      },
-    });
-    if (existing) throw new BadRequestException('These tickets are already linked');
-
-    const link = await this.prisma.ticketLink.create({
-      data: { sourceId: ticketId, targetId: dto.targetId, linkType: dto.linkType },
-    });
+    const create = async (db: PrismaService | Prisma.TransactionClient) => {
+      // Reject a duplicate in either direction (the @@unique only covers one).
+      const existing = await db.ticketLink.findFirst({
+        where: {
+          OR: [
+            { sourceId: ticketId, targetId: dto.targetId },
+            { sourceId: dto.targetId, targetId: ticketId },
+          ],
+        },
+      });
+      if (existing) throw new BadRequestException('These tickets are already linked');
+      return db.ticketLink.create({
+        data: { sourceId: ticketId, targetId: dto.targetId, linkType: dto.linkType },
+      });
+    };
+    const link = actor
+      ? await this.prisma.$transaction(async (tx) => {
+          // Take both fences in a stable order, so a department move cannot race
+          // the relationship insert and A↔B concurrent requests do not deadlock.
+          for (const id of [ticketId, dto.targetId].sort((a, b) => a - b)) {
+            await this.fenceTicketMutation(tx, id, actor, new Date());
+          }
+          return create(tx);
+        })
+      : await create(this.prisma);
     return { linkId: link.id, linkType: link.linkType, targetId: link.targetId };
   }
 
-  async removeLink(ticketId: number, linkId: number): Promise<void> {
-    // Scope the delete to links that actually involve this ticket (either end).
-    const link = await this.prisma.ticketLink.findUnique({ where: { id: linkId } });
-    if (!link || (link.sourceId !== ticketId && link.targetId !== ticketId)) {
-      throw new NotFoundException(`Link ${linkId} not found on ticket ${ticketId}`);
+  async removeLink(ticketId: number, linkId: number, actor?: TicketAccessActor): Promise<void> {
+    const remove = async (db: PrismaService | Prisma.TransactionClient) => {
+      // Scope the delete to links that actually involve this ticket (either end).
+      const link = await db.ticketLink.findUnique({ where: { id: linkId } });
+      if (!link || (link.sourceId !== ticketId && link.targetId !== ticketId)) {
+        throw new NotFoundException(`Link ${linkId} not found on ticket ${ticketId}`);
+      }
+      if (actor) {
+        // A link changes both sides. Fence both rows inside the same transaction
+        // so a concurrent department move cannot turn it into an A↔B mutation.
+        for (const id of [link.sourceId, link.targetId].sort((a, b) => a - b)) {
+          await this.fenceTicketMutation(db as Prisma.TransactionClient, id, actor, new Date());
+        }
+      }
+      await db.ticketLink.delete({ where: { id: linkId } });
+    };
+    if (actor) {
+      await this.prisma.$transaction(remove);
+    } else {
+      await remove(this.prisma);
     }
-    await this.prisma.ticketLink.delete({ where: { id: linkId } });
   }
 
   /**
@@ -1489,60 +1976,81 @@ export class TicketsService {
     clientTicketId: number,
     dto: SpawnSupplierDto,
     staffId: number,
+    actor?: TicketAccessActor,
   ): Promise<{ ticket: Ticket; linkId: number; clientTicketId: number }> {
-    const client = await this.findOrThrow(clientTicketId);
+    const client = await this.findAccessibleOrThrow(clientTicketId, actor);
     // Prefer a "Vendor Issue" type; fall back to leaving it unset.
     const vendorType = await this.prisma.ticketType.findFirst({
       where: { title: { in: ['Vendor Issue', 'Vendor', 'Supplier Issue'] } },
       select: { id: true },
     });
 
-    const supplier = await this.createTicket(
-      {
-        subject: dto.subject ?? `[Supplier] ${client.subject}`,
-        contents: dto.contents,
-        isHtml: false,
-        departmentId: client.departmentId,
-        ...(vendorType ? { typeId: vendorType.id } : {}),
-        requesterEmail: dto.supplierEmail,
-        requesterName: dto.supplierName ?? '',
-        creationMode: 'STAFF',
-        ipAddress: '0.0.0.0',
-        customFields: {},
-        tags: [],
-      },
-      staffId,
-    );
+    const supplierInput = {
+      subject: dto.subject ?? `[Supplier] ${client.subject}`,
+      contents: dto.contents,
+      isHtml: false,
+      departmentId: client.departmentId,
+      ...(vendorType ? { typeId: vendorType.id } : {}),
+      requesterEmail: dto.supplierEmail,
+      requesterName: dto.supplierName ?? '',
+      creationMode: 'STAFF' as const,
+      ipAddress: '0.0.0.0',
+      customFields: {},
+      tags: [],
+    };
+    const supplier = actor
+      ? await this.createTicket(supplierInput, staffId, actor)
+      : await this.createTicket(supplierInput, staffId);
 
-    const link = await this.addLink(clientTicketId, { targetId: supplier.id, linkType: 'supplier' });
+    const link = actor
+      ? await this.addLink(clientTicketId, { targetId: supplier.id, linkType: 'supplier' }, actor)
+      : await this.addLink(clientTicketId, { targetId: supplier.id, linkType: 'supplier' });
     return { ticket: supplier, linkId: link.linkId, clientTicketId };
   }
 
   // ─────────────────────────── Tags ───────────────────────────
 
-  async addTag(ticketId: number, dto: TagDto): Promise<void> {
-    await this.findOrThrow(ticketId);
-    await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: {
-        tags: {
-          connectOrCreate: {
-            where: { name: dto.name },
-            create: { name: dto.name },
+  async addTag(ticketId: number, dto: TagDto, actor?: TicketAccessActor): Promise<void> {
+    await this.findAccessibleOrThrow(ticketId, actor);
+    const add = (db: PrismaService | Prisma.TransactionClient) =>
+      db.ticket.update({
+        where: { id: ticketId },
+        data: {
+          tags: {
+            connectOrCreate: {
+              where: { name: dto.name },
+              create: { name: dto.name },
+            },
           },
         },
-      },
-    });
+      });
+    if (actor) {
+      await this.prisma.$transaction(async (tx) => {
+        await this.fenceTicketMutation(tx, ticketId, actor, new Date());
+        await add(tx);
+      });
+    } else {
+      await add(this.prisma);
+    }
   }
 
-  async removeTag(ticketId: number, tagName: string): Promise<void> {
-    await this.findOrThrow(ticketId);
+  async removeTag(ticketId: number, tagName: string, actor?: TicketAccessActor): Promise<void> {
+    await this.findAccessibleOrThrow(ticketId, actor);
     const tag = await this.prisma.ticketTag.findUnique({ where: { name: tagName } });
     if (!tag) return; // idempotent
-    await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { tags: { disconnect: { name: tagName } } },
-    });
+    const remove = (db: PrismaService | Prisma.TransactionClient) =>
+      db.ticket.update({
+        where: { id: ticketId },
+        data: { tags: { disconnect: { name: tagName } } },
+      });
+    if (actor) {
+      await this.prisma.$transaction(async (tx) => {
+        await this.fenceTicketMutation(tx, ticketId, actor, new Date());
+        await remove(tx);
+      });
+    } else {
+      await remove(this.prisma);
+    }
   }
 
   // ─────────────────────────── Apply Macro ───────────────────────────
@@ -1553,41 +2061,56 @@ export class TicketsService {
    * Each action in actions[] is executed (set_status / set_priority / assign / add_tag /
    * change_status / change_priority / change_owner / add_tag — tolerates both naming schemes).
    */
-  async applyMacro(ticketId: number, dto: ApplyMacroDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
+  async applyMacro(
+    ticketId: number,
+    dto: ApplyMacroDto,
+    staffId: number,
+    actor?: AuthStaff,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
 
     const macro = await this.prisma.macro.findUnique({ where: { id: dto.macroId } });
     if (!macro) throw new NotFoundException(`Macro ${dto.macroId} not found`);
+    this.assertMacroPermissions(macro, actor);
 
     // 1. Post the reply text if present
     if (macro.replyText && macro.replyText.trim()) {
       const staff = await this.prisma.staff.findUnique({ where: { id: staffId } });
       const now = new Date();
+      const createMacroReply = async (db: PrismaService | Prisma.TransactionClient): Promise<void> => {
+        await db.ticketPost.create({
+          data: {
+            ticketId,
+            authorType: 'STAFF',
+            staffId,
+            fullName: staff ? `${staff.firstName} ${staff.lastName}`.trim() || staff.email : undefined,
+            email: staff?.email,
+            subject: ticket.subject,
+            contents: macro.replyText,
+            isHtml: false,
+            creationMode: 'STAFF',
+            ipAddress: '0.0.0.0',
+          },
+        });
 
-      await this.prisma.ticketPost.create({
-        data: {
-          ticketId,
-          authorType: 'STAFF',
-          staffId,
-          fullName: staff ? `${staff.firstName} ${staff.lastName}`.trim() || staff.email : undefined,
-          email: staff?.email,
-          subject: ticket.subject,
-          contents: macro.replyText,
-          isHtml: false,
-          creationMode: 'STAFF',
-          ipAddress: '0.0.0.0',
-        },
-      });
-
-      await this.prisma.ticket.update({
-        where: { id: ticketId },
-        data: {
-          totalReplies: { increment: 1 },
-          lastReplyAt: now,
-          lastActivityAt: now,
-          ...(ticket.firstResponseAt === null ? { firstResponseAt: now } : {}),
-        },
-      });
+        await db.ticket.update({
+          where: { id: ticketId },
+          data: {
+            totalReplies: { increment: 1 },
+            lastReplyAt: now,
+            lastActivityAt: now,
+            ...(ticket.firstResponseAt === null ? { firstResponseAt: now } : {}),
+          },
+        });
+      };
+      if (actor) {
+        await this.prisma.$transaction(async (tx) => {
+          await this.fenceTicketMutation(tx, ticketId, actor, now);
+          await createMacroReply(tx);
+        });
+      } else {
+        await createMacroReply(this.prisma);
+      }
     }
 
     // 2. Execute actions[]
@@ -1633,17 +2156,8 @@ export class TicketsService {
               // H8-8: cap the length so a macro can't create an absurd tag.
               const tag = ((action['tag'] ?? action['value']) as string | undefined)?.slice(0, 100);
               if (typeof tag === 'string' && tag) {
-                await this.prisma.ticket.update({
-                  where: { id: ticketId },
-                  data: {
-                    tags: {
-                      connectOrCreate: {
-                        where: { name: tag },
-                        create: { name: tag },
-                      },
-                    },
-                  },
-                });
+                if (actor) await this.addTag(ticketId, { name: tag }, actor);
+                else await this.addTag(ticketId, { name: tag });
               }
               break;
             }
@@ -1652,13 +2166,11 @@ export class TicketsService {
               // H8-8: cap the note length (defensive against an oversized macro).
               const note = ((action['note'] ?? action['value']) as string | undefined)?.slice(0, 5000);
               if (typeof note === 'string' && note) {
-                await this.prisma.ticketNote.create({
-                  data: {
-                    ticketId,
-                    staffId,
-                    contents: `[Macro: ${macro.title}] ${note}`,
-                  },
-                });
+                if (actor) {
+                  await this.addNote(ticketId, `[Macro: ${macro.title}] ${note}`, staffId, undefined, actor);
+                } else {
+                  await this.addNote(ticketId, `[Macro: ${macro.title}] ${note}`, staffId);
+                }
               }
               break;
             }
@@ -1676,7 +2188,8 @@ export class TicketsService {
       if (ticketUpdate['statusId']) {
         const sid = ticketUpdate['statusId'] as number;
         if (await this.prisma.ticketStatus.findUnique({ where: { id: sid } })) {
-          await this.changeStatus(ticketId, { statusId: sid }, staffId);
+          if (actor) await this.changeStatus(ticketId, { statusId: sid }, staffId, actor);
+          else await this.changeStatus(ticketId, { statusId: sid }, staffId);
         } else {
           this.logger.warn(`Macro ${macro.id}: skipped set_status — status ${sid} not found`);
         }
@@ -1684,7 +2197,8 @@ export class TicketsService {
       if (ticketUpdate['priorityId']) {
         const pid = ticketUpdate['priorityId'] as number;
         if (await this.prisma.ticketPriority.findUnique({ where: { id: pid } })) {
-          await this.changePriority(ticketId, { priorityId: pid }, staffId);
+          if (actor) await this.changePriority(ticketId, { priorityId: pid }, staffId, actor);
+          else await this.changePriority(ticketId, { priorityId: pid }, staffId);
         } else {
           this.logger.warn(`Macro ${macro.id}: skipped set_priority — priority ${pid} not found`);
         }
@@ -1692,7 +2206,8 @@ export class TicketsService {
       if (ticketUpdate['departmentId']) {
         const did = ticketUpdate['departmentId'] as number;
         if (await this.prisma.department.findUnique({ where: { id: did } })) {
-          await this.changeDepartment(ticketId, { departmentId: did }, staffId);
+          if (actor) await this.changeDepartment(ticketId, { departmentId: did }, staffId, actor);
+          else await this.changeDepartment(ticketId, { departmentId: did }, staffId);
         } else {
           this.logger.warn(`Macro ${macro.id}: skipped change_department — department ${did} not found`);
         }
@@ -1700,9 +2215,11 @@ export class TicketsService {
       if ('ownerStaffId' in ticketUpdate) {
         const oid = ticketUpdate['ownerStaffId'] as number | null;
         if (oid == null) {
-          await this.assign(ticketId, { ownerStaffId: null }, staffId);
+          if (actor) await this.assign(ticketId, { ownerStaffId: null }, staffId, actor);
+          else await this.assign(ticketId, { ownerStaffId: null }, staffId);
         } else if (await this.prisma.staff.findUnique({ where: { id: oid } })) {
-          await this.assign(ticketId, { ownerStaffId: oid }, staffId);
+          if (actor) await this.assign(ticketId, { ownerStaffId: oid }, staffId, actor);
+          else await this.assign(ticketId, { ownerStaffId: oid }, staffId);
         } else {
           this.logger.warn(`Macro ${macro.id}: skipped assign — staff ${oid} not found`);
         }
@@ -1723,22 +2240,57 @@ export class TicketsService {
   /**
    * Change the department a ticket belongs to.
    */
-  async changeDepartment(ticketId: number, dto: ChangeDepartmentDto, staffId: number): Promise<Ticket> {
-    const ticket = await this.findOrThrow(ticketId);
+  async changeDepartment(
+    ticketId: number,
+    dto: ChangeDepartmentDto,
+    staffId: number,
+    actor?: TicketAccessActor,
+  ): Promise<Ticket> {
+    const ticket = await this.findAccessibleOrThrow(ticketId, actor);
+
+    if (actor) {
+      const ticketAccess = this.requireTicketAccess(actor);
+      await ticketAccess.assertCanAccessDepartment(actor, dto.departmentId);
+      if (ticket.ownerStaffId != null) {
+        await ticketAccess.assertAssigneeCanHandleDepartments(ticket.ownerStaffId, [dto.departmentId]);
+      }
+    }
 
     const dept = await this.prisma.department.findUnique({ where: { id: dto.departmentId } });
     if (!dept) throw new NotFoundException(`Department ${dto.departmentId} not found`);
 
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { departmentId: dto.departmentId, lastActivityAt: new Date() },
-    });
-
-    await this.writeAudit(ticketId, 'DEPARTMENT_CHANGE', staffId, 'STAFF', {
+    const now = new Date();
+    const data = { departmentId: dto.departmentId, lastActivityAt: now };
+    const audit = {
       field: 'departmentId',
       oldValue: ticket.departmentId.toString(),
       newValue: dto.departmentId.toString(),
-    });
+    };
+    const updated = actor
+      ? await this.prisma.$transaction(async (tx) => {
+          await this.requireTicketAccess(actor).assertCanAccessDepartmentInTransaction(
+            actor,
+            dto.departmentId,
+            tx,
+          );
+          await this.fenceTicketMutation(tx, ticketId, actor, now);
+          const removedWatchers = await this.pruneWatchersOutsideDepartment(tx, ticketId, dto.departmentId);
+          const result = await tx.ticket.update({ where: { id: ticketId }, data });
+          if (removedWatchers > 0) {
+            await this.writeAudit(
+              ticketId,
+              'WATCHERS_PRUNED_FOR_DEPARTMENT',
+              staffId,
+              'STAFF',
+              { field: 'watchers', newValue: String(removedWatchers) },
+              tx,
+            );
+          }
+          await this.writeAudit(ticketId, 'DEPARTMENT_CHANGE', staffId, 'STAFF', audit, tx);
+          return result;
+        })
+      : await this.prisma.ticket.update({ where: { id: ticketId }, data });
+    if (!actor) await this.writeAudit(ticketId, 'DEPARTMENT_CHANGE', staffId, 'STAFF', audit);
 
     return updated;
   }
@@ -1754,10 +2306,285 @@ export class TicketsService {
 
   // ─────────────────────────── Helpers ───────────────────────────
 
+  private async prepareStaffReplyOutboxDraft(
+    ticket: Ticket,
+    dto: InternalReplyTicketInput,
+    staffId: number,
+    _authorName?: string,
+    _authorEmail?: string,
+  ): Promise<StaffReplyOutboxDraft> {
+    const [storedRecipients, staff, queue, threadingIds] = await Promise.all([
+      this.prisma.ticketRecipient.findMany({ where: { ticketId: ticket.id } }),
+      this.prisma.staff.findUnique({ where: { id: staffId }, select: { signature: true } }),
+      this.prisma.emailQueue.findFirst({
+        where: { departmentId: ticket.departmentId, isEnabled: true },
+        orderBy: { id: 'asc' },
+        select: { id: true, emailAddress: true, signature: true },
+      }),
+      this.loadThreadingIds(ticket.id),
+    ]);
+
+    const signature = [staff?.signature, queue?.signature]
+      .map((value) => value?.trim())
+      .filter((value): value is string => Boolean(value))
+      .join('\n\n');
+    const contents = signature ? `${dto.contents}\n\n--\n${signature}` : dto.contents;
+    const requesterName = ticket.requesterName || ticket.requesterEmail;
+    const rendered = await this.renderStaffReplyTemplate({
+      mask: ticket.mask,
+      subject: ticket.subject,
+      contents,
+      name: requesterName,
+      requesterName,
+    });
+
+    return {
+      messageId: this.createOutboundMessageId(),
+      emailQueueId: queue?.id ?? null,
+      fromAddress: this.outboundFromAddress(),
+      replyToAddress: queue?.emailAddress ?? null,
+      subject: rendered.subject,
+      htmlBody: rendered.html,
+      textBody: rendered.text,
+      inReplyTo: threadingIds.at(-1) ?? null,
+      references: threadingIds,
+      recipients: this.normalizeOutboundRecipients(ticket.requesterEmail, dto, storedRecipients),
+    };
+  }
+
+  private async loadThreadingIds(ticketId: number): Promise<string[]> {
+    // The optional guard is useful for narrow unit doubles; a real Prisma client
+    // always has findMany and keeps a bounded chain for RFC threading.
+    const repository = this.prisma.ticketPost as unknown as {
+      findMany?: (args: unknown) => Promise<Array<{ messageId: string | null }> | undefined>;
+    };
+    if (!repository.findMany) return [];
+    const posts =
+      (await repository.findMany({
+        where: { ticketId, messageId: { not: null }, NOT: { messageId: '' } },
+        select: { messageId: true },
+        orderBy: { createdAt: 'asc' },
+        take: 20,
+      })) ?? [];
+    const validIds = posts
+      .map((post) => this.parseMessageId(post.messageId))
+      .filter((messageId): messageId is string => Boolean(messageId));
+
+    // Keep a chronological suffix: References is a chain, so retaining an
+    // older ID after dropping a newer one would create a misleading thread.
+    // Work backwards so the newest valid ID remains In-Reply-To whenever it
+    // fits, then reverse it back into chronological order for the DB snapshot.
+    const newestFirst: string[] = [];
+    let referenceChars = 0;
+    for (const messageId of [...validIds].reverse()) {
+      const addedChars = messageId.length + (newestFirst.length > 0 ? 1 : 0);
+      if (referenceChars + addedChars > MAX_OUTBOUND_REFERENCES_CHARS) break;
+      newestFirst.push(messageId);
+      referenceChars += addedChars;
+    }
+    return newestFirst.reverse();
+  }
+
+  private async renderStaffReplyTemplate(vars: Record<string, string>): Promise<{
+    subject: string;
+    html: string;
+    text: string;
+  }> {
+    const renderer = this.mailService as unknown as {
+      renderTemplateRequired?: (
+        key: string,
+        locale: string,
+        variables: Record<string, string>,
+      ) => Promise<{ subject: string; html: string; text: string }>;
+      renderTemplate?: (
+        key: string,
+        locale: string,
+        variables: Record<string, string>,
+      ) => Promise<{ subject: string; html: string; text: string }>;
+    };
+    if (renderer.renderTemplateRequired) {
+      return renderer.renderTemplateRequired('ticket_user_reply', 'en', vars);
+    }
+    if (renderer.renderTemplate) {
+      return renderer.renderTemplate('ticket_user_reply', 'en', vars);
+    }
+    // Test doubles and a deliberately minimal emergency construction still get a
+    // useful plain snapshot rather than serialising variables as JSON. Production
+    // MailService always provides renderTemplate.
+    return {
+      subject: `Re: [${vars['mask']}] ${vars['subject']}`,
+      html: vars['contents'] ?? '',
+      text: vars['contents'] ?? '',
+    };
+  }
+
+  private normalizeOutboundRecipients(
+    requesterEmail: string,
+    dto: InternalReplyTicketInput,
+    storedRecipients: Array<{ email: string; role: 'CC' | 'BCC' }>,
+  ): Array<{ email: string; role: 'TO' | 'CC' | 'BCC' }> {
+    const recipients = new Map<string, 'TO' | 'CC' | 'BCC'>();
+    const add = (email: string | undefined, role: 'TO' | 'CC' | 'BCC'): void => {
+      if (!email) return;
+      const normalized = normalizeEmail(email);
+      if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(normalized)) {
+        if (role === 'TO') throw new BadRequestException('Requester email is invalid for outbound delivery');
+        return; // A malformed historic CC/BCC row must not poison the main reply.
+      }
+      const existing = recipients.get(normalized);
+      // TO takes precedence over all, CC takes precedence over BCC. That makes a
+      // recipient visible only when explicitly chosen visible and never leaks BCC.
+      if (!existing || (existing === 'BCC' && role !== 'BCC')) recipients.set(normalized, role);
+    };
+    add(requesterEmail, 'TO');
+    for (const email of [
+      ...(dto.ccEmails ?? []),
+      ...storedRecipients.filter((r) => r.role === 'CC').map((r) => r.email),
+    ]) {
+      add(email, 'CC');
+    }
+    for (const email of [
+      ...(dto.bccEmails ?? []),
+      ...storedRecipients.filter((r) => r.role === 'BCC').map((r) => r.email),
+    ]) {
+      add(email, 'BCC');
+    }
+    if (![...recipients.values()].includes('TO')) {
+      throw new BadRequestException('A public staff reply requires a requester recipient');
+    }
+    return [...recipients.entries()].map(([email, role]) => ({ email, role }));
+  }
+
+  private assertOutboundAttachmentBounds(attachments: Array<{ id: number; size: number }>): void {
+    const MAX_OUTBOUND_ATTACHMENTS = 10;
+    const MAX_OUTBOUND_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+    const totalBytes = attachments.reduce((total, attachment) => total + attachment.size, 0);
+    if (attachments.length > MAX_OUTBOUND_ATTACHMENTS || totalBytes > MAX_OUTBOUND_ATTACHMENT_BYTES) {
+      throw new BadRequestException('Outbound attachment count or size limit exceeded');
+    }
+  }
+
+  private outboundFromAddress(): string {
+    const mail = this.mailService as unknown as { getDefaultFromAddress?: () => string };
+    return mail.getDefaultFromAddress?.() ?? 'support@23telecom.invalid';
+  }
+
+  private createOutboundMessageId(): string {
+    const from = this.outboundFromAddress();
+    const address = /<([^>]+)>/.exec(from)?.[1] ?? from;
+    const domain = address.split('@')[1]?.trim().toLowerCase();
+    const safeDomain = domain && /^[a-z0-9.-]+$/i.test(domain) ? domain : '23telecom.invalid';
+    return `<${randomUUID()}@${safeDomain}>`;
+  }
+
   private async findOrThrow(id: number): Promise<Ticket> {
     const t = await this.prisma.ticket.findUnique({ where: { id } });
     if (!t) throw new NotFoundException(`Ticket ${id} not found`);
     return t;
+  }
+
+  /**
+   * Trusted mail/workflow calls deliberately omit an actor and retain their
+   * system path.  Every staff HTTP controller supplies one; fail closed if its
+   * policy provider is unexpectedly absent rather than silently falling back to
+   * an unscoped lookup.
+   */
+  private requireTicketAccess(actor: TicketAccessActor): TicketAccessPolicy {
+    if (this.ticketAccess) return this.ticketAccess;
+    throw new ServiceUnavailableException(`Ticket access policy is unavailable for staff ${actor.staffId}`);
+  }
+
+  /**
+   * Keep TicketWatcher rows aligned with the ticket's current department.
+   * Global administrators may watch every department; other staff need a live
+   * DepartmentStaff membership.  Notification delivery repeats this predicate
+   * at send time as a revocation backstop, while this transactional cleanup
+   * preserves a truthful watcher list after moves and cross-department merges.
+   */
+  private async pruneWatchersOutsideDepartment(
+    db: PrismaService | Prisma.TransactionClient,
+    ticketId: number,
+    departmentId: number,
+  ): Promise<number> {
+    const removed = await db.ticketWatcher.deleteMany({
+      where: {
+        ticketId,
+        staff: {
+          is: {
+            staffGroup: { is: { isAdmin: false } },
+            departments: { none: { departmentId } },
+          },
+        },
+      },
+    });
+    return removed.count;
+  }
+
+  /**
+   * Macros are data-driven bundles of privileged ticket actions.  The route's
+   * ticket.edit permission is sufficient only for edit-class actions; it must
+   * never become an implicit grant of reply, note, or assignment authority just
+   * because a global administrator configured a convenient macro earlier.
+   * Trusted system callers deliberately omit an actor and remain explicit about
+   * that bypass; every staff HTTP call supplies the authenticated principal.
+   */
+  private assertMacroPermissions(macro: { replyText: string; actions: unknown }, actor?: AuthStaff): void {
+    if (!actor || actor.isAdmin) return;
+
+    const required = new Set<string>([PERMISSIONS.TICKET_EDIT]);
+    if (macro.replyText.trim()) required.add(PERMISSIONS.TICKET_REPLY);
+    if (Array.isArray(macro.actions)) {
+      for (const action of macro.actions) {
+        if (!action || typeof action !== 'object') continue;
+        switch ((action as { type?: unknown }).type) {
+          case 'assign':
+          case 'change_owner':
+            required.add(PERMISSIONS.TICKET_ASSIGN);
+            break;
+          case 'add_note':
+            required.add(PERMISSIONS.TICKET_NOTE);
+            break;
+          default:
+            // Status/priority/department/tag actions are ticket-edit actions,
+            // already required above. Unknown actions are ignored by execution.
+            break;
+        }
+      }
+    }
+    const held = new Set<string>(actor.permissions);
+    const missing = [...required].filter((permission) => !held.has(permission));
+    if (missing.length > 0) {
+      throw new ForbiddenException(`Applying this macro requires: ${missing.join(', ')}`);
+    }
+  }
+
+  private async findAccessibleOrThrow(id: number, actor?: TicketAccessActor): Promise<Ticket> {
+    if (!actor) return this.findOrThrow(id);
+    const ticket = await this.prisma.ticket.findFirst({
+      where: {
+        AND: [{ id }, await this.requireTicketAccess(actor).ticketWhere(actor)],
+      },
+    });
+    if (!ticket) throw new NotFoundException(`Ticket ${id} not found`);
+    return ticket;
+  }
+
+  /**
+   * Fence a staff mutation with the same SQL department predicate used for the
+   * initial read.  The conditional update takes a row lock for the rest of an
+   * interactive transaction, so a concurrent department move cannot turn a
+   * correctly-authorized read into a cross-department post/note/relationship
+   * write. Trusted system paths intentionally pass no actor and remain explicit
+   * about being unscoped.
+   */
+  private async fenceTicketMutation(
+    transaction: Prisma.TransactionClient,
+    ticketId: number,
+    actor: TicketAccessActor | undefined,
+    now: Date,
+  ): Promise<void> {
+    if (!actor) return;
+    await this.requireTicketAccess(actor).fenceTicketMutation(transaction, actor, ticketId, now);
   }
 
   /** E3: a ticket can only be assigned to an existing, enabled staff member. */
@@ -1775,38 +2602,53 @@ export class TicketsService {
   private normalizeIncomingMessageId(messageId?: string): string | undefined {
     const normalized = messageId?.trim();
     if (!normalized) return undefined;
-    // RFC 5322 caps a physical line at 998 characters; reject pathological
-    // parser input instead of persisting an unbounded idempotency key.
+    if (!this.parseMessageId(normalized, 998)) throw new BadRequestException('Invalid inbound Message-ID');
+    return normalized;
+  }
+
+  /**
+   * Validate a Message-ID before it is persisted or emitted as an SMTP header.
+   * Unlike inbound input validation, callers that read a legacy database row
+   * receive `undefined` rather than an exception: one corrupt historic post
+   * must not prevent an agent from replying to the ticket.
+   */
+  private parseMessageId(
+    value: string | null | undefined,
+    maxLength = MAX_OUTBOUND_THREADING_MESSAGE_ID_CHARS,
+  ): string | undefined {
+    const normalized = value?.trim();
+    if (
+      !normalized ||
+      normalized.length > maxLength ||
+      !normalized.startsWith('<') ||
+      !normalized.endsWith('>')
+    ) {
+      return undefined;
+    }
     const body = normalized.slice(1, -1);
-    const hasForbiddenCharacter = [...body].some((character) => {
+    if (!body) return undefined;
+    for (const character of body) {
       const codePoint = character.codePointAt(0) ?? 0;
-      return (
+      if (
         character === '<' ||
         character === '>' ||
         /\s/u.test(character) ||
         codePoint <= 0x1f ||
         codePoint === 0x7f
-      );
-    });
-    if (
-      normalized.length > 998 ||
-      !normalized.startsWith('<') ||
-      !normalized.endsWith('>') ||
-      body.length === 0 ||
-      hasForbiddenCharacter
-    ) {
-      throw new BadRequestException('Invalid inbound Message-ID');
+      ) {
+        return undefined;
+      }
     }
     return normalized;
   }
 
   private findPostByInboundMessageId(messageId: string): Promise<TicketPost | null> {
-    return this.prisma.ticketPost.findFirst({ where: { messageId } });
+    return this.prisma.ticketPost.findFirst({ where: { inboundMessageId: messageId } });
   }
 
   private async findTicketByInboundMessageId(messageId: string): Promise<Ticket | null> {
     const post = await this.prisma.ticketPost.findFirst({
-      where: { messageId },
+      where: { inboundMessageId: messageId },
       select: { ticketId: true },
     });
     if (!post) return null;
@@ -1837,9 +2679,9 @@ export class TicketsService {
     actorType: ActorType,
     opts: { field?: string; oldValue?: string | null; newValue?: string | null },
     transaction?: Prisma.TransactionClient,
-  ): Promise<void> {
+  ): Promise<{ id: number }> {
     const client = transaction ?? this.prisma;
-    await client.ticketAuditLog.create({
+    return client.ticketAuditLog.create({
       data: {
         ticketId,
         staffId: staffId ?? null,
@@ -1849,6 +2691,7 @@ export class TicketsService {
         oldValue: opts.oldValue ?? null,
         newValue: opts.newValue ?? null,
       },
+      select: { id: true },
     });
   }
 }

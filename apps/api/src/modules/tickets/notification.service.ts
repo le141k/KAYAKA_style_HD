@@ -1,96 +1,146 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
+import type { Prisma, Ticket } from '@prisma/client';
 import { MailService } from '../mail/mail.service';
-import { PrismaService } from '../../prisma/prisma.service';
+
+type TicketNotificationSnapshot = Pick<Ticket, 'id' | 'mask' | 'subject' | 'departmentId'>;
 
 /**
- * Notification service for staff-facing notifications.
- * Handles assignment notifications and watcher notifications on user replies.
+ * Transactional staff-notification planner.
+ *
+ * This class deliberately never calls `sendTemplate()`: SMTP is an asynchronous
+ * effect and must be represented by an immutable OutboundEmail command before
+ * the ticket/post/audit transaction commits.  Callers enqueue the returned ids
+ * only after commit; MailService's DB recovery scan handles a failed wake-up.
  */
 @Injectable()
 export class NotificationService {
   private readonly logger = new Logger(NotificationService.name);
 
   constructor(
-    private readonly prisma: PrismaService,
-    @Optional() private readonly mailService?: MailService,
+    // Required in real DI: a missing adapter must abort the source transaction
+    // rather than make a committed ticket look as though it notified staff.
+    private readonly mailService: MailService,
   ) {}
 
   /**
-   * Send assignment notification email to the newly assigned staff member.
-   * Template key: notify_staff_assigned
+   * Queue the assignee alert alongside its assignment audit. `sourceKey` must
+   * contain a server-created audit/event id, never a client-controlled value.
    */
-  async notifyOnAssign(ticketId: number, staffId: number): Promise<void> {
-    if (!this.mailService) return;
+  async queueAssignmentNotification(
+    tx: Prisma.TransactionClient,
+    ticket: TicketNotificationSnapshot,
+    staffId: number,
+    sourceKey: string,
+  ): Promise<string | undefined> {
+    const staff = await tx.staff.findUnique({
+      where: { id: staffId },
+      include: {
+        staffGroup: { select: { isAdmin: true } },
+        departments: { select: { departmentId: true } },
+      },
+    });
+    if (!staff?.isEnabled || !staff.email) return undefined;
 
-    try {
-      const [ticket, staff] = await Promise.all([
-        this.prisma.ticket.findUnique({ where: { id: ticketId } }),
-        this.prisma.staff.findUnique({ where: { id: staffId } }),
-      ]);
+    // A notification must not become a second stale authorization channel when
+    // an assignee loses membership during a concurrent ticket move/revocation.
+    if (
+      !staff.staffGroup.isAdmin &&
+      !staff.departments.some((membership) => membership.departmentId === ticket.departmentId)
+    ) {
+      this.logger.warn(`Skipped out-of-scope assignment notification for ticket ${ticket.id}`);
+      return undefined;
+    }
 
-      if (!ticket || !staff) return;
-      if (!staff.email) return;
-
-      const staffName = `${staff.firstName} ${staff.lastName}`.trim() || staff.email;
-
-      await this.mailService.sendTemplate(staff.email, 'notify_staff_assigned', 'en', {
+    const staffName = `${staff.firstName} ${staff.lastName}`.trim() || staff.email;
+    const command = await this.requireMailService().createInternalNotificationEmail(tx, {
+      ticketId: ticket.id,
+      templateKey: 'notify_staff_assigned',
+      locale: 'en',
+      to: staff.email,
+      vars: {
         mask: ticket.mask,
         subject: ticket.subject,
         name: staffName,
         staffName,
-      });
-
-      this.logger.debug(`Assignment notification sent for ticket ${ticket.mask}`);
-    } catch (err) {
-      this.logger.error(`Failed to send assignment notification for ticket ${ticketId}: ${String(err)}`);
-    }
+      },
+      idempotencyKey: `internal:assignment:${sourceKey}:staff:${staff.id}`,
+    });
+    return command.id;
   }
 
   /**
-   * Send reply notification to all enabled watchers of a ticket
-   * when a USER (customer) posts a reply.
-   * Template key: notify_staff_user_replied
+   * Queue one immutable alert per currently eligible watcher.  The TicketPost
+   * id is the business event fence, so a delivery retry cannot create a second
+   * email for the same watcher/user reply.
    */
-  async notifyWatchersOnUserReply(ticketId: number): Promise<void> {
-    if (!this.mailService) return;
-
-    try {
-      const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
-      if (!ticket) return;
-
-      // Load watchers with their staff details
-      const watchers = await this.prisma.ticketWatcher.findMany({
-        where: { ticketId },
-        include: {
-          staff: { select: { id: true, email: true, firstName: true, lastName: true, isEnabled: true } },
-        },
-      });
-
-      const enabledWatchers = watchers.filter((w) => w.staff.isEnabled);
-
-      await Promise.all(
-        enabledWatchers.map(async (w) => {
-          const staffName = `${w.staff.firstName} ${w.staff.lastName}`.trim() || w.staff.email;
-          try {
-            await this.mailService!.sendTemplate(w.staff.email, 'notify_staff_user_replied', 'en', {
-              mask: ticket.mask,
-              subject: ticket.subject,
-              name: staffName,
-              staffName,
-            });
-          } catch {
-            this.logger.error(`Failed to send watcher notification for ticket ${ticket.mask}`);
-          }
-        }),
-      );
-
-      if (enabledWatchers.length > 0) {
-        this.logger.debug(
-          `Watcher notifications sent to ${enabledWatchers.length} staff for ticket ${ticket.mask}`,
-        );
-      }
-    } catch (err) {
-      this.logger.error(`Failed to send watcher notifications for ticket ${ticketId}: ${String(err)}`);
+  async queueWatcherNotificationsForUserReply(
+    tx: Prisma.TransactionClient,
+    ticket: TicketNotificationSnapshot,
+    postId: number,
+  ): Promise<string[]> {
+    if (!Number.isInteger(postId) || postId <= 0) {
+      throw new Error('Watcher notification source post id is invalid');
     }
+    const watchers = await tx.ticketWatcher.findMany({
+      where: {
+        ticketId: ticket.id,
+        staff: {
+          is: {
+            isEnabled: true,
+            OR: [
+              { staffGroup: { is: { isAdmin: true } } },
+              { departments: { some: { departmentId: ticket.departmentId } } },
+            ],
+          },
+        },
+      },
+      include: {
+        staff: { select: { id: true, email: true, firstName: true, lastName: true, isEnabled: true } },
+      },
+      orderBy: { staffId: 'asc' },
+    });
+
+    const mail = this.requireMailService();
+    const commandIds: string[] = [];
+    for (const watcher of watchers) {
+      // Defensive projection guard for historic test doubles and a nullable
+      // email; the relational predicate above is the source of truth.
+      if (!watcher.staff.isEnabled || !watcher.staff.email) continue;
+      const staffName = `${watcher.staff.firstName} ${watcher.staff.lastName}`.trim() || watcher.staff.email;
+      const command = await mail.createInternalNotificationEmail(tx, {
+        ticketId: ticket.id,
+        templateKey: 'notify_staff_user_replied',
+        locale: 'en',
+        to: watcher.staff.email,
+        vars: {
+          mask: ticket.mask,
+          subject: ticket.subject,
+          name: staffName,
+          staffName,
+        },
+        idempotencyKey: `internal:watcher-reply:post:${postId}:staff:${watcher.staff.id}`,
+      });
+      commandIds.push(command.id);
+    }
+    return commandIds;
+  }
+
+  /** Best-effort low-latency wake-up after the surrounding transaction commits. */
+  wakeCommittedNotifications(ids: Iterable<string>): void {
+    const mail = this.mailService;
+    for (const id of new Set(ids)) {
+      void mail
+        .enqueueOutbound(id)
+        .catch((err: unknown) =>
+          this.logger.error(
+            `Internal notification outbox wake-up failed for ${id}: ` +
+              `${err instanceof Error && err.name ? err.name.slice(0, 80) : 'UnknownError'}`,
+          ),
+        );
+    }
+  }
+
+  private requireMailService(): MailService {
+    return this.mailService;
   }
 }

@@ -14,7 +14,7 @@ import {
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { z } from 'zod';
 import { PrismaService } from '../../prisma/prisma.service';
-import { RequirePermissions } from '../../auth/auth.decorators';
+import { RequireGlobalAdmin, RequirePermissions } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 
@@ -53,7 +53,8 @@ type ReorderDto = z.infer<typeof ReorderSchema>;
 
 @ApiTags('admin/parser-rules')
 @Controller('admin/parser-rules')
-@RequirePermissions(PERMISSIONS.ADMIN_MAIL)
+@RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
+@RequireGlobalAdmin()
 export class ParserRulesController {
   constructor(private readonly prisma: PrismaService) {}
 

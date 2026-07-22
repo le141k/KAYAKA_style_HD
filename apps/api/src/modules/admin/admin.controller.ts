@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
-import { RequirePermissions } from '../../auth/auth.decorators';
+import { RequireGlobalAdmin, RequirePermissions } from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { AdminService } from './admin.service';
 import {
@@ -79,20 +79,23 @@ export class AdminController {
   }
 
   // ── Email templates ──
-  @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
+  @RequireGlobalAdmin()
+  @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
   @Get('email-templates')
   @ApiOperation({ summary: 'List email templates' })
   listTemplates() {
     return this.admin.listTemplates();
   }
 
-  @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
+  @RequireGlobalAdmin()
+  @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
   @Post('email-templates')
   createTemplate(@Body(new ZodValidationPipe(CreateEmailTemplateSchema)) dto: CreateEmailTemplateDto) {
     return this.admin.createTemplate(dto);
   }
 
-  @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
+  @RequireGlobalAdmin()
+  @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
   @Patch('email-templates/:id')
   updateTemplate(
     @Param('id', ParseIntPipe) id: number,
@@ -101,7 +104,8 @@ export class AdminController {
     return this.admin.updateTemplate(id, dto);
   }
 
-  @RequirePermissions(PERMISSIONS.ADMIN_MAIL)
+  @RequireGlobalAdmin()
+  @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
   @Delete('email-templates/:id')
   deleteTemplate(@Param('id', ParseIntPipe) id: number) {
     return this.admin.deleteTemplate(id);

@@ -82,6 +82,46 @@ enum EmailQueueType {
   PIPE
 }
 
+// Inbound delivery ledger — durable record of every accepted inbound message so
+// processing failures never lose mail (raw MIME is replayable) and re-delivery is
+// idempotent by a unique transport key.
+enum InboundTransport {
+  IMAP
+  PIPE
+}
+
+enum InboundDeliveryState {
+  ACCEPTED // durably recorded (raw MIME stored); not yet processed
+  PROCESSING // claimed by a drain worker
+  PROCESSED // business op committed (ticket/post created or threaded)
+  RETRY // transient failure; retried with backoff, never discarded
+  QUARANTINED // permanent failure / attempts exhausted; needs operator, raw MIME retained
+  SKIPPED // intentionally not ticketed (loop/bounce/parser-ignore/duplicate)
+}
+
+// Per-queue IMAP sync health. NEEDS_RECONCILIATION halts polling (fail-closed) after a
+// UIDVALIDITY change so an operator explicitly chooses FROM_NOW or a bounded BACKFILL.
+// BOOTSTRAPPING is transient: an operator reconcile holds the queue here while it captures
+// UIDVALIDITY/UIDNEXT under the IMAP mailbox lock.  The same request durably commits that
+// exact baseline before it returns OK, so health never reports a cursor before it exists.
+enum EmailQueueSyncState {
+  OK
+  BOOTSTRAPPING
+  NEEDS_RECONCILIATION
+}
+
+// Why an IMAP queue is halted/reconciling.  This is deliberately durable and
+// server-side: the UI must never infer that a dangerous resume is safe from a
+// free-form lastError string.
+enum EmailQueueReconcileCause {
+  LEGACY_MIGRATION
+  UIDVALIDITY_CHANGED
+  MAILBOX_IDENTITY_CHANGED
+  MANUAL_FORCE
+  TRANSPORT_COLLISION
+  UNKNOWN
+}
+
 enum FlagType {
   NONE
   PURPLE
@@ -93,6 +133,49 @@ enum FlagType {
 }
 
 enum RecipientRole {
+  CC
+  BCC
+}
+
+// Durable transactional outbox for staff-originated public email. A post is not
+// reported as emailed merely because a Redis job was accepted: SENT means the
+// configured SMTP transport accepted the message with its persisted Message-ID.
+enum OutboundEmailState {
+  QUEUED
+  PROCESSING
+  SENT
+  RETRY
+  FAILED
+  AMBIGUOUS
+}
+
+// The persisted command kind determines both its delivery semantics and the
+// safe projections we update after SMTP acceptance.  Automated customer mail
+// must not masquerade as a human first response.
+enum OutboundEmailKind {
+  STAFF_REPLY
+  AUTORESPONDER
+  AUTO_CLOSE
+  WORKFLOW
+  REPORT
+  // Staff-facing, machine-generated alerts (assignment, watcher reply, SLA).
+  // They remain durable commands rather than an inline SMTP side effect.
+  INTERNAL_NOTIFICATION
+}
+
+/** Durable, ticket-transactional trigger for customer-facing workflow email actions. */
+enum WorkflowEmailEventState {
+  PENDING
+  PROCESSING
+  PROCESSED
+  RETRY
+  QUARANTINED
+}
+
+// Kept separate from TicketRecipient's CC/BCC roles because every immutable
+// outbox snapshot also owns its visible To recipients.
+enum OutboundRecipientRole {
+  TO
   CC
   BCC
 }
@@ -138,7 +221,9 @@ model Staff {
   authVersion     Int       @default(0)
   staffGroup      StaffGroup @relation(fields: [staffGroupId], references: [id])
   staffGroupId    Int
-  // departments this agent can act in (empty = all, governed by group)
+  // Explicit allow-list of departments this non-admin agent can act in. An
+  // empty list grants no ticket-department access; only staffGroup.isAdmin is
+  // globally unrestricted.
   departments     DepartmentStaff[]
   ownedTickets    Ticket[]  @relation("TicketOwner")
   posts           TicketPost[]
@@ -149,6 +234,7 @@ model Staff {
   timeEntries     TimeEntry[]
   followUps       FollowUp[]
   savedViews      SavedView[]
+  ownedReportSchedules ReportSchedule[] @relation("ReportScheduleOwner")
   lastLoginAt     DateTime?
   // D2 — per-account brute-force lockout (complements the per-IP rate limiter).
   failedLoginAttempts Int    @default(0)
@@ -355,6 +441,8 @@ model Department {
   tickets      Ticket[]
   staff        DepartmentStaff[]
   emailQueues  EmailQueue[]
+  routedInboundDeliveries InboundDelivery[]    @relation("InboundDeliveryRoutedDepartment")
+  inboundMessageClaims    InboundMessageClaim[] @relation("InboundMessageClaimDepartment")
   createdAt    DateTime       @default(now())
 }
 
@@ -469,6 +557,10 @@ model Ticket {
   recipients      TicketRecipient[]
   timeEntries     TimeEntry[]
   followUps       FollowUp[]
+  workflowEmailEvents WorkflowEmailEvent[]
+  slaEscalationEvents SlaEscalationEvent[]
+  inboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimTicket")
+  outboundEmails  OutboundEmail[]
 
   lastReplyAt     DateTime?
   lastActivityAt  DateTime       @default(now())
@@ -515,14 +607,24 @@ model TicketPost {
   isEmailed    Boolean    @default(false)
   isThirdParty Boolean    @default(false)
   creationMode CreationMode @default(WEB)
-  messageId    String?    @unique // RFC Message-ID for threading/idempotency; absent = NULL
+  // RFC Message-ID used only for threading. It is deliberately non-unique: an
+  // untrusted inbound sender may reuse a staff outbound Message-ID, and that
+  // must not suppress the inbound message or prevent it being recorded.
+  messageId        String?
+  // Idempotency identity assigned only to inbound EMAIL posts. This keeps the
+  // inbound deduplication namespace separate from staff/outbound threading IDs.
+  // PostgreSQL UNIQUE permits multiple NULLs, so web/staff/API posts leave it null.
+  inboundMessageId String?    @unique
   ipAddress    String     @default("0.0.0.0")
   attachments  Attachment[]
+  inboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimPost")
+  outboundEmail OutboundEmail?
   editedAt     DateTime?
   editedByStaffId Int?
   createdAt    DateTime   @default(now())
 
   @@index([ticketId])
+  @@index([messageId])
 }
 
 model TicketNote {
@@ -556,6 +658,11 @@ model Attachment {
   // echo it back to adopt these orphans (prevents cross-submitter IDOR). Cleared
   // once the rows are linked to a post.
   claimToken String?
+  // A queued staff email snapshots this attachment's metadata and storage key.
+  // AttachmentsService rejects direct manager deletion while a snapshot exists;
+  // the relation itself cascades only so ticket/post cascade-deletion can remove
+  // the whole coherent graph without a foreign-key deadlock.
+  outboundEmailAttachments OutboundEmailAttachment[] @relation("OutboundEmailAttachmentSource")
   createdAt  DateTime    @default(now())
 
   @@index([ticketId])
@@ -672,6 +779,25 @@ model EscalationRule {
   @@index([slaPlanId])
 }
 
+/**
+ * One durable, idempotent SLA breach event per ticket/target pair.  The event
+ * is claimed in the same transaction as the escalation mutation and any
+ * internal-notification outbox commands, so a second scheduler cannot repeat
+ * rule effects or silently lose the notification after a process crash.
+ */
+model SlaEscalationEvent {
+  id             String          @id @default(cuid())
+  ticket         Ticket          @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId       Int
+  breachType     SlaTargetType
+  sourceKey      String          @unique
+  outboundEmails OutboundEmail[]
+  createdAt      DateTime        @default(now())
+
+  @@unique([ticketId, breachType])
+  @@index([ticketId])
+}
+
 // ───────────────────────────── workflows / macros ─────────────────────────────
 
 model MacroCategory {
@@ -727,11 +853,326 @@ model EmailQueue {
   department     Department?    @relation(fields: [departmentId], references: [id])
   departmentId   Int?
   signature      String         @default("")
+  // Deterministic owner for a logical message delivered to multiple configured queues.
+  // Lower values win; equal priorities break ties by queue id.
+  routingPriority Int           @default(100)
   // Kayako `ticketautoresponder`: only send the autoresponder for EMAIL tickets
   // when the receiving queue opts in (noc@/rates@ are OFF in the source system).
   sendAutoresponder Boolean      @default(false)
+  // Optimistic configuration version. Every operator edit increments it, so a
+  // poller which fetched MIME under an older address/department/policy snapshot
+  // cannot accept that mail after the queue has been repointed.
+  configGeneration Int           @default(0)
   isEnabled      Boolean        @default(false)
   createdAt      DateTime       @default(now())
+
+  // Durable IMAP poll cursor (replaces the legacy Setting `imap/lastSeenUid:<id>`).
+  // `uidValidity` NULL means the queue has never been bootstrapped → the poller sets a
+  // synchronous baseline before its first fetch (no historical import). A UIDVALIDITY
+  // change flips `syncState` to NEEDS_RECONCILIATION and halts polling (fail-closed).
+  lastSeenUid    BigInt              @default(0)
+  uidValidity    BigInt?
+  syncState      EmailQueueSyncState @default(OK)
+  lastError      String?
+  // Bumped on every reconcile/rebootstrap. The cursor CAS is gated on this so a stale
+  // poller (finishing after a reconcile) can't write a cursor from the old UID space.
+  cursorGeneration Int               @default(0)
+  // Bumped whenever the IMAP mailbox identity changes (including IMAP <-> non-IMAP
+  // transitions). UIDVALIDITY/UID pairs are only meaningful within this epoch.
+  mailboxEpoch     Int               @default(1)
+  // A halted/reconciling mailbox carries a durable, typed reason. It determines the
+  // server-side allowed reconcile modes; never derive safety from lastError text.
+  reconcileCause       EmailQueueReconcileCause?
+  reconcileRequestedAt DateTime?
+  // Per-queue re-bootstrap intent set by an explicit operator reconcile (overrides the
+  // global TELECOM_HD_IMAP_BOOTSTRAP_POLICY for THIS queue's next bootstrap). NULL = use
+  // the global config. Only consulted while `uidValidity IS NULL` (never bootstrapped).
+  bootstrapPolicy       EmailQueueBootstrapPolicy?
+  bootstrapBackfillLimit Int?
+
+  // Operator liveness signal (advisory; not part of any cursor/acceptance CAS). These
+  // values make a disconnected/stuck poller visible without exposing credentials or raw
+  // driver errors. `lastPollAt` is retained for API compatibility; start/completed give
+  // the operator an honest distinction between a running and a completed cycle.
+  lastConnectionAttemptAt DateTime?
+  lastConnectedAt         DateTime?
+  lastDisconnectedAt      DateTime?
+  lastConnectionErrorAt   DateTime?
+  lastPollStartedAt       DateTime?
+  lastPollAt              DateTime?
+  lastPollCompletedAt     DateTime?
+  lastAcceptedAt          DateTime?
+
+  inboundDeliveries InboundDelivery[]
+  routedInboundDeliveries InboundDelivery[] @relation("InboundDeliveryRoutedQueue")
+  routedInboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimRoutedQueue")
+  outboundEmails OutboundEmail[]
+}
+
+/**
+ * Immutable, database-backed SMTP command created together with the staff post.
+ * BullMQ carries only this row's id as an accelerator; PostgreSQL remains the
+ * authoritative queue and is scanned on worker startup/recovery.
+ */
+model OutboundEmail {
+  id            String             @id @default(cuid())
+  // Staff/ticket automation rows belong to a ticket; scheduled report commands do not.
+  ticket        Ticket?            @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId      Int?
+  // Automated ticket mail has no TicketPost, but is still a first-class durable
+  // command tied to the ticket and visible to operators.
+  post          TicketPost?        @relation(fields: [postId], references: [id], onDelete: Cascade)
+  postId        Int?               @unique
+  emailQueue    EmailQueue?        @relation(fields: [emailQueueId], references: [id], onDelete: SetNull)
+  emailQueueId  Int?
+  reportRun     ReportRun?         @relation("ReportRunOutboundEmail", fields: [reportRunId], references: [id], onDelete: Cascade)
+  reportRunId   Int?               @unique
+  // SLA notifications are linked to their durable breach event.  This is a
+  // many-command relation because one rule/event may notify several staff.
+  slaEscalationEvent SlaEscalationEvent? @relation(fields: [slaEscalationEventId], references: [id], onDelete: Cascade)
+  slaEscalationEventId String?
+  // Command-level idempotency fence for non-post commands (workflow/report). PostgreSQL
+  // permits many NULL values, so existing ticket-mail behavior is unchanged.
+  idempotencyKey String?           @unique
+  kind          OutboundEmailKind  @default(STAFF_REPLY)
+
+  state         OutboundEmailState @default(QUEUED)
+  // Generated before the ticket transaction commits. It is reused by every
+  // retry/manual retry so an ambiguous SMTP outcome never gets a fresh identity.
+  messageId     String             @unique
+  fromAddress   String
+  replyToAddress String?
+  subject       String
+  htmlBody      String
+  textBody      String
+  inReplyTo     String?
+  references    String[]           @default([])
+
+  recipients    OutboundEmailRecipient[]
+  attachments   OutboundEmailAttachment[]
+
+  attempts      Int                @default(0)
+  nextAttemptAt DateTime?
+  leaseOwner    String?
+  leaseExpiresAt DateTime?
+  // Monotonic claim fence. A stale worker may never settle a later worker's lease.
+  leaseVersion  Int                @default(0)
+  // Bounded/sanitized diagnostic safe for the staff timeline. Never store SMTP
+  // credentials, recipient headers or raw message content here.
+  lastError     String?
+  providerResponse String?
+  acceptedAt    DateTime?
+  sentAt        DateTime?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([ticketId])
+  @@index([slaEscalationEventId])
+  @@index([state, nextAttemptAt])
+  @@index([leaseExpiresAt])
+}
+
+/** Recipient snapshot. BCC rows are never projected from staff ticket reads. */
+model OutboundEmailRecipient {
+  id              Int                   @id @default(autoincrement())
+  outboundEmail   OutboundEmail         @relation(fields: [outboundEmailId], references: [id], onDelete: Cascade)
+  outboundEmailId String
+  email           String
+  role            OutboundRecipientRole
+  createdAt       DateTime              @default(now())
+
+  @@unique([outboundEmailId, email])
+  @@index([outboundEmailId, role])
+}
+
+/** Immutable metadata/storage snapshot for a staff reply attachment. */
+model OutboundEmailAttachment {
+  id                 Int           @id @default(autoincrement())
+  outboundEmail      OutboundEmail @relation(fields: [outboundEmailId], references: [id], onDelete: Cascade)
+  outboundEmailId    String
+  // Cascade permits ticket/post cascade-delete to remove the outbox snapshot first.
+  // AttachmentsService separately rejects a manager's direct attachment delete while
+  // this relation exists, so a committed queued email cannot lose its bytes.
+  sourceAttachment   Attachment    @relation("OutboundEmailAttachmentSource", fields: [sourceAttachmentId], references: [id], onDelete: Cascade)
+  sourceAttachmentId Int
+  fileName           String
+  mimeType           String
+  size               Int
+  sha1               String
+  storageKey         String
+  createdAt          DateTime      @default(now())
+
+  @@unique([outboundEmailId, sourceAttachmentId])
+  @@index([sourceAttachmentId])
+}
+
+/** Per-queue bootstrap intent chosen by an operator reconcile (see EmailQueue). */
+enum EmailQueueBootstrapPolicy {
+  FROM_NOW
+  BACKFILL
+}
+
+model InboundDelivery {
+  id            Int              @id @default(autoincrement())
+  transport     InboundTransport
+  queue         EmailQueue?      @relation(fields: [queueId], references: [id])
+  queueId       Int?
+
+  // Canonical idempotency key — the atomic claim. Unique across all deliveries:
+  //   IMAP: `imap:<queueId>:<mailboxEpoch>:<uidValidity>:<uid>`
+  //   PIPE: `pipe:<queueId|->:<externalId or sha256:hash>`
+  transportKey  String           @unique
+
+  // IMAP transport identity (also stored structured for admin/observability). IMAP UIDs
+  // are unsigned 32-bit, so BigInt (not signed 32-bit INTEGER) to avoid overflow.
+  // `mailboxEpoch` snapshots the queue's identity generation at acceptance, preventing a
+  // new mailbox reusing UIDVALIDITY/UID from colliding with an older mailbox's delivery.
+  mailboxEpoch  Int?
+  uidValidity   BigInt?
+  uid           BigInt?
+  // PIPE/MTA transport identity (webhook idempotency id / MTA delivery id)
+  externalId    String?
+
+  // Compatibility-only legacy claim. It remains UNIQUE during the expand/contract rollout,
+  // but new runtime writes logical identity to `InboundMessageClaim` instead. It MUST NOT be
+  // used to collapse separate transport copies after the logical-claim cutover is complete.
+  messageId     String?          @unique
+  // The real RFC Message-ID seen on this particular transport copy. Unlike `messageId`, this
+  // is intentionally non-unique: every CC/forwarded copy is retained for forensic review.
+  observedMessageId String?
+  // SHA-256(normalized observed Message-ID), linked to the durable logical claim. Headerless
+  // deliveries leave this NULL and are deduplicated only by their transport key.
+  messageIdHash String?          @db.Char(64)
+  // SHA-256 of normalized logical content. This is never a raw-MIME hash: per-hop trace
+  // headers are excluded so CC copies compare as the same message.
+  semanticHash String?           @db.Char(64)
+  contentHash   String
+  envelopeFrom  String?
+  envelopeTo    String?
+  subject       String           @default("")
+  // Department resolved AT acceptance (snapshot) — a later queue change must not
+  // re-route an already-accepted message.
+  departmentId  Int?
+  // Receiving queue policy as it was when the bytes became durable. NULL is a
+  // legacy/unknown delivery and fails closed for EMAIL autoresponses.
+  sendAutoresponder Boolean?
+  // Every enabled recipient queue/policy at acceptance. It is used only to resolve a
+  // ledger delivery's owner deterministically; drains never re-read mutable queues.
+  routingSnapshot Json?
+  // Receiving queue/department above are transport snapshots. These fields hold the immutable
+  // deterministic business owner selected for this delivery/claim before ticket creation.
+  routedQueue   EmailQueue?      @relation("InboundDeliveryRoutedQueue", fields: [routedQueueId], references: [id], onDelete: SetNull)
+  routedQueueId Int?
+  routedDepartment Department?   @relation("InboundDeliveryRoutedDepartment", fields: [routedDepartmentId], references: [id], onDelete: SetNull)
+  routedDepartmentId Int?
+  messageClaim InboundMessageClaim? @relation("InboundDeliveryMessageClaim", fields: [messageIdHash], references: [messageIdHash], onDelete: SetNull)
+  winningMessageClaim InboundMessageClaim? @relation("InboundMessageClaimWinner")
+
+  // Durable raw MIME so a failed/quarantined delivery can be replayed. Inline for
+  // bounded messages; `rawStorageKey` is used when externalised to object storage.
+  // `rawMime` is pruned (set NULL) for terminal PROCESSED/SKIPPED deliveries older than
+  // the retention window; QUARANTINED rows keep it (needed for replay). `truncated` marks
+  // an IMAP fetch that hit the size ceiling — its raw bytes are incomplete (replay must
+  // re-fetch the original), so it is quarantined rather than partially ticketed.
+  rawMime       Bytes?
+  rawStorageKey String?
+  rawPrunedAt   DateTime?
+  truncated     Boolean          @default(false)
+  sizeBytes     Int              @default(0)
+
+  // Lifecycle
+  state         InboundDeliveryState @default(ACCEPTED)
+  attempts      Int              @default(0)
+  lastError     String?
+  nextAttemptAt DateTime?
+  // Lease: a worker sets leaseOwner + leaseExpiresAt when it claims PROCESSING. An
+  // expired lease is reclaimed by any worker, so a crash mid-processing can never strand
+  // a delivery in PROCESSING forever.
+  leaseOwner    String?
+  leaseExpiresAt DateTime?
+  ticketId      Int?
+  postId        Int?
+
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  processedAt   DateTime?
+
+  @@index([state, nextAttemptAt])
+  @@index([queueId, mailboxEpoch, uidValidity, uid])
+  @@index([messageIdHash])
+  @@index([observedMessageId])
+  @@index([routedQueueId])
+}
+
+/**
+ * Durable fence for a large raw-MIME file between filesystem staging and its ledger row.
+ * A reaper may delete an expired stage only after locking this row; acceptance deletes the
+ * same row in the transaction that creates InboundDelivery, so a slow transaction can never
+ * have its file removed underneath it.
+ */
+model InboundRawMimeStaging {
+  storageKey     String   @id
+  leaseExpiresAt DateTime
+  createdAt      DateTime @default(now())
+
+  @@index([leaseExpiresAt])
+}
+
+/**
+ * One logical inbound RFC Message-ID. A durable row is created before ticket routing, so
+ * concurrent pollers race on this primary key and exactly one winner delivery performs the
+ * business action. Every transport copy remains in InboundDelivery and points back here.
+ */
+model InboundMessageClaim {
+  // SHA-256(normalized Message-ID), fixed width for a bounded unique index.
+  messageIdHash       String  @id @db.Char(64)
+  normalizedMessageId String
+  // NULL/version 0 is allowed only for historical rows that cannot be reconstructed safely
+  // during the additive migration. New claims are always version 1 with a non-null hash;
+  // a later copy against an unknown historical claim is quarantined rather than silently
+  // deduplicated.
+  semanticHash        String? @db.Char(64)
+  semanticHashVersion Int     @default(1)
+
+  winnerDelivery      InboundDelivery @relation("InboundMessageClaimWinner", fields: [winnerDeliveryId], references: [id], onDelete: Restrict)
+  winnerDeliveryId    Int             @unique
+  routedQueue         EmailQueue?     @relation("InboundMessageClaimRoutedQueue", fields: [routedQueueId], references: [id], onDelete: SetNull)
+  routedQueueId       Int?
+  department          Department?     @relation("InboundMessageClaimDepartment", fields: [departmentId], references: [id], onDelete: SetNull)
+  departmentId        Int?
+  // Frozen alongside the selected owning queue, so a winner retry cannot consult a queue that
+  // was edited after acceptance to decide whether to send a customer autoresponder.
+  sendAutoresponder   Boolean?
+  ticket              Ticket?         @relation("InboundMessageClaimTicket", fields: [ticketId], references: [id], onDelete: SetNull)
+  ticketId            Int?
+  post                TicketPost?     @relation("InboundMessageClaimPost", fields: [postId], references: [id], onDelete: SetNull)
+  postId              Int?
+
+  deliveries          InboundDelivery[] @relation("InboundDeliveryMessageClaim")
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@index([routedQueueId])
+  @@index([departmentId])
+  @@index([ticketId])
+}
+
+/// Durable audit trail for inbound operator actions (reconcile / quarantine replay). Kept
+/// separate from RbacAuditLog (staff/group RBAC) so mail-ops history is queryable on its
+/// own with the queue/delivery it targeted, the acting staff, and the operator's reason.
+model InboundAuditLog {
+  id           Int      @id @default(autoincrement())
+  actorStaffId Int? // null for system/scheduled actions
+  actorEmail   String   @default("")
+  action       String // e.g. mail.reconcile, mail.quarantine_replay
+  queueId      Int?
+  deliveryId   Int?
+  reason       String?
+  metadata     Json     @default("{}")
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([queueId])
 }
 
 model EmailTemplate {
@@ -920,6 +1361,9 @@ model Report {
   kind       ReportKind       @default(SUMMARY)
   // declarative definition: { source, filters, groupBy, aggregates, orderBy, limit }
   definition Json             @default("{}")
+  // Every semantic edit advances this fence. A scanner that compiled an older
+  // definition/title must not create a ReportRun or SMTP command after the edit.
+  configGeneration Int        @default(0)
   schedules  ReportSchedule[]
   runs       ReportRun[]
   createdAt  DateTime         @default(now())
@@ -930,14 +1374,23 @@ model ReportSchedule {
   id          Int       @id @default(autoincrement())
   report      Report    @relation(fields: [reportId], references: [id], onDelete: Cascade)
   reportId    Int
+  // Scheduled execution has no request principal.  It always runs with this
+  // owner's current RBAC + department scope; legacy ownerless schedules are
+  // disabled by the ownership migration rather than executed globally.
+  ownerStaff  Staff?    @relation("ReportScheduleOwner", fields: [ownerStaffId], references: [id], onDelete: SetNull)
+  ownerStaffId Int?
   cron        String
   recipients  Json      @default("[]")
   isEnabled   Boolean   @default(true)
   format      String    @default("json")
+  // Changes to recipients, owner, cron, format or enabled state invalidate an
+  // in-flight schedule scan before it can persist a report/outbox command.
+  configGeneration Int @default(0)
   lastRunAt   DateTime?
   nextRunAt   DateTime?
 
   @@index([reportId])
+  @@index([ownerStaffId])
   // Load: the schedule scanner polls due+enabled schedules every 5 min.
   @@index([isEnabled, nextRunAt])
 }
@@ -952,9 +1405,41 @@ model ReportRun {
   durationMs  Int      @default(0)
   error       String?
   resultKey   String?  // storage key for large results (future)
+  outboundEmail OutboundEmail? @relation("ReportRunOutboundEmail")
   createdAt   DateTime @default(now())
 
   @@index([reportId])
+}
+
+/**
+ * Immutable snapshot of customer `send_email` workflow actions selected in the same ticket
+ * transaction as the event that triggered them. Redis/EventEmitter can wake this work, but
+ * never owns its correctness: the processor recovers PENDING/RETRY rows from PostgreSQL.
+ */
+model WorkflowEmailEvent {
+  id             String                  @id @default(cuid())
+  ticket         Ticket                  @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId       Int
+  eventType      String
+  // Immutable business mutation identity (post/audit/split), not a generated process id.
+  // This is the event-level retry/replay fence; action-level keys derive from it.
+  sourceKey      String                  @unique
+  // Validated action snapshots: workflow identity/version, index, recipient, subject, body.
+  actions        Json
+  state          WorkflowEmailEventState @default(PENDING)
+  attempts       Int                     @default(0)
+  nextAttemptAt  DateTime?
+  leaseOwner     String?
+  leaseExpiresAt DateTime?
+  leaseVersion   Int                     @default(0)
+  lastError      String?
+  processedAt    DateTime?
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  @@index([ticketId])
+  @@index([state, nextAttemptAt])
+  @@index([leaseExpiresAt])
 }
 
 // ───────────────────────────── agent productivity (P3) ─────────────────────────────
