@@ -24,6 +24,7 @@ export class OutboundEmailController {
     const status = await this.mailService.retryOutboundEmail(id, {
       staffId: staff.staffId,
       email: staff.email,
+      isAdmin: staff.isAdmin,
     });
     if (!status) throw new NotFoundException(`Outbound email ${id} is not retryable`);
     return status;

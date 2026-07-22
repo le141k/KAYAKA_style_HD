@@ -5,6 +5,7 @@ import { AuthService, MAIL_SERVICE_TOKEN } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { PermissionsGuard } from './permissions.guard';
+import { GlobalAdminGuard } from './global-admin.guard';
 import { ClientPortalGuard } from './client-portal.guard';
 import { TokenBlocklistService } from './token-blocklist.service';
 import { SessionRevocationService } from './session-revocation.service';
@@ -44,6 +45,7 @@ const config = loadConfig();
     AuthService,
     JwtAuthGuard,
     PermissionsGuard,
+    GlobalAdminGuard,
     ClientPortalGuard,
     TokenBlocklistService,
     SessionRevocationService,
@@ -55,6 +57,7 @@ const config = loadConfig();
     AuthService,
     JwtAuthGuard,
     PermissionsGuard,
+    GlobalAdminGuard,
     ClientPortalGuard,
     TokenBlocklistService,
     SessionRevocationService,

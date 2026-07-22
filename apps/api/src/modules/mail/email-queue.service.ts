@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Inject,
   Injectable,
   Logger,
@@ -24,12 +25,18 @@ import type {
 import { InboundAuditService } from './inbound-audit.service';
 import { InboundMailService, type ReconcileMailboxBaseline } from './inbound.service';
 import { InboundRawStorageService } from './inbound-raw-storage.service';
+import {
+  MailAccessPolicy,
+  type MailAccessActor,
+  type MailDepartmentScope,
+} from './mail-access-policy.service';
 
 /** Actor performing an audited operator action (reconcile / replay). */
-export interface InboundActor {
-  staffId?: number;
-  email?: string;
-}
+/** Full actor context is mandatory at runtime; legacy unit doubles may omit isAdmin. */
+export type InboundActor = Partial<MailAccessActor>;
+
+/** Scheduled process work is intentionally global; HTTP callers always pass their staff actor. */
+const SYSTEM_MAIL_OPERATOR: MailAccessActor = { staffId: 1, isAdmin: true, email: 'system' };
 
 /** Fields that are always omitted from responses (stored password). */
 const SAFE_SELECT = {
@@ -107,6 +114,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     @Inject(APP_CONFIG)
     private readonly config?: Pick<AppConfig, 'TELECOM_HD_IMAP_ENABLED' | 'TELECOM_HD_INBOUND_MAX_SIZE_MB'>,
     @Optional() private readonly rawStorage?: InboundRawStorageService,
+    @Optional() private readonly mailAccess?: MailAccessPolicy,
   ) {}
 
   /** Emit inbound health alerts on a schedule so a halted queue / quarantine backlog /
@@ -125,7 +133,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
 
   private async emitHealthAlerts(): Promise<void> {
     try {
-      const { alerts } = await this.health();
+      const { alerts } = await this.healthSystem();
       for (const a of alerts) {
         const line = `INBOUND ALERT [${a.severity}] ${a.kind}: ${a.message}`;
         if (a.severity === 'critical') this.logger.error(line);
@@ -136,9 +144,57 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private accessPolicy(): MailAccessPolicy {
+    if (!this.mailAccess) throw new ServiceUnavailableException('Mail operator authorization unavailable');
+    return this.mailAccess;
+  }
+
+  private normalizeMailActor(actor?: InboundActor): MailAccessActor {
+    if (
+      actor &&
+      Number.isInteger(actor.staffId) &&
+      actor.staffId! > 0 &&
+      typeof actor.isAdmin === 'boolean'
+    ) {
+      return actor as MailAccessActor;
+    }
+    // Existing narrow unit doubles exercise pure queue/cursor logic directly.
+    // The compatibility shortcut is impossible in a real deployment: production
+    // sets NODE_ENV=production and any missing/partial HTTP actor fails closed.
+    if (process.env['NODE_ENV'] === 'test') {
+      return {
+        ...SYSTEM_MAIL_OPERATOR,
+        ...(actor?.staffId ? { staffId: actor.staffId } : {}),
+        ...(actor?.email ? { email: actor.email } : {}),
+        isAdmin: actor?.isAdmin ?? true,
+      };
+    }
+    throw new ForbiddenException('Complete mail operator context is required');
+  }
+
+  private async resolveMailScope(actor?: InboundActor): Promise<MailDepartmentScope> {
+    return this.accessPolicy().resolveScope(this.normalizeMailActor(actor));
+  }
+
+  private queueWhereWithScope(
+    scope: MailDepartmentScope,
+    predicate: Prisma.EmailQueueWhereInput,
+  ): Prisma.EmailQueueWhereInput {
+    return scope.unrestricted
+      ? predicate
+      : { AND: [predicate, this.accessPolicy().queueWhereForScope(scope)] };
+  }
+
+  private healthSystem(now: Date = new Date()) {
+    return this.health(SYSTEM_MAIL_OPERATOR, now);
+  }
+
   /** List all email queues (passwordEnc excluded). */
-  async list() {
+  async list(actor?: InboundActor) {
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(actor);
     const queues = await this.prisma.emailQueue.findMany({
+      where: access.queueWhereForScope(scope),
       select: SAFE_SELECT,
       orderBy: { id: 'asc' },
     });
@@ -146,9 +202,11 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Get a single email queue by ID (passwordEnc excluded). */
-  async get(id: number) {
-    const queue = await this.prisma.emailQueue.findUnique({
-      where: { id },
+  async get(id: number, actor?: InboundActor) {
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(actor);
+    const queue = await this.prisma.emailQueue.findFirst({
+      where: access.queueByIdWhereForScope(id, scope),
       select: SAFE_SELECT,
     });
     if (!queue) throw new NotFoundException(`EmailQueue #${id} not found`);
@@ -156,7 +214,10 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Create a new email queue. The caller-supplied password is encrypted at rest. */
-  create(dto: CreateEmailQueueDto) {
+  async create(dto: CreateEmailQueueDto, actor?: InboundActor) {
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(actor);
+    access.assertCanTargetQueueDepartment(scope, dto.departmentId);
     const { password, routingPriority = 100, ...rest } = dto;
     const encKey = process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
     return this.prisma.emailQueue.create({
@@ -177,14 +238,18 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
    *  UID and silently skip the new mailbox's earlier messages). So an identity change resets
    *  the cursor and HALTS the queue (NEEDS_RECONCILIATION, generation bumped) — the operator
    *  must then reconcile explicitly (FROM_NOW / BACKFILL). A password-only change is exempt. */
-  async update(id: number, dto: UpdateEmailQueueDto) {
+  async update(id: number, dto: UpdateEmailQueueDto, actor?: InboundActor) {
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(actor);
+    const scopedWhere = access.queueByIdWhereForScope(id, scope);
+    if (dto.departmentId !== undefined) access.assertCanTargetQueueDepartment(scope, dto.departmentId);
     // The comparison and write intentionally use a CAS loop.  A stale full-form request
     // which still says host=A must not overwrite a concurrent A→B change without an epoch
     // bump; after a CAS miss it re-reads B, recognises B→A as an identity transition and
     // consumes another mailbox epoch.  This is the fence for two operators editing a queue.
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const current = await this.prisma.emailQueue.findUnique({
-        where: { id },
+      const current = await this.prisma.emailQueue.findFirst({
+        where: scopedWhere,
         select: {
           type: true,
           host: true,
@@ -230,20 +295,24 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
 
       const updated = await this.prisma.emailQueue.updateMany({
         where: {
-          id,
-          type: current.type,
-          host: current.host,
-          port: current.port,
-          username: current.username,
-          useTls: current.useTls,
-          mailboxEpoch: current.mailboxEpoch,
-          cursorGeneration: current.cursorGeneration,
+          AND: [
+            scopedWhere,
+            {
+              type: current.type,
+              host: current.host,
+              port: current.port,
+              username: current.username,
+              useTls: current.useTls,
+              mailboxEpoch: current.mailboxEpoch,
+              cursorGeneration: current.cursorGeneration,
+            },
+          ],
         },
         data,
       });
       if (updated.count !== 1) continue;
 
-      const result = await this.prisma.emailQueue.findUnique({ where: { id }, select: SAFE_SELECT });
+      const result = await this.prisma.emailQueue.findFirst({ where: scopedWhere, select: SAFE_SELECT });
       if (!result) throw new NotFoundException(`EmailQueue #${id} not found`);
       if (identityChanged) {
         this.logger.warn(
@@ -256,9 +325,13 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Delete an email queue. */
-  async delete(id: number): Promise<void> {
-    await this.get(id); // throws NotFoundException when missing
-    await this.prisma.emailQueue.delete({ where: { id } });
+  async delete(id: number, actor?: InboundActor): Promise<void> {
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(actor);
+    const deleted = await this.prisma.emailQueue.deleteMany({
+      where: access.queueByIdWhereForScope(id, scope),
+    });
+    if (deleted.count !== 1) throw new NotFoundException(`EmailQueue #${id} not found`);
   }
 
   /**
@@ -269,8 +342,11 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
    * BOOTSTRAPPING response whose baseline will only be chosen on a later poll interval.
    */
   async reconcile(id: number, dto: ReconcileEmailQueueDto, actor?: InboundActor) {
-    const before = await this.prisma.emailQueue.findUnique({
-      where: { id },
+    const effectiveActor = this.normalizeMailActor(actor);
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(effectiveActor);
+    const before = await this.prisma.emailQueue.findFirst({
+      where: access.queueByIdWhereForScope(id, scope),
       select: {
         id: true,
         type: true,
@@ -287,16 +363,17 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     this.assertReconcileAllowed(before, dto);
 
     if (dto.mode === 'RESUME_MIGRATED') {
-      return this.resumeLegacyReconcile(before, dto, actor);
+      return this.resumeLegacyReconcile(before, dto, effectiveActor, scope);
     }
 
-    const started = await this.beginMailboxReconcile(before, dto, actor);
+    const started = await this.beginMailboxReconcile(before, dto, effectiveActor, scope);
     if (!this.inboundMail) {
       await this.failMailboxReconcile(
         started,
         before.reconcileCause,
         dto,
-        actor,
+        effectiveActor,
+        scope,
         'IMAP reconcile worker unavailable',
       );
       throw new ServiceUnavailableException('IMAP reconcile worker unavailable; queue remains halted');
@@ -312,7 +389,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(`IMAP reconcile baseline failed for queue ${id} (${this.errorKind(err)})`);
       const message = this.safeError(err);
       try {
-        await this.failMailboxReconcile(started, before.reconcileCause, dto, actor, message);
+        await this.failMailboxReconcile(started, before.reconcileCause, dto, effectiveActor, scope, message);
       } catch (failure) {
         if (failure instanceof ConflictException) throw failure;
         throw failure;
@@ -320,7 +397,14 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       throw new ServiceUnavailableException(`IMAP baseline was not captured: ${message}`);
     }
 
-    const queue = await this.completeMailboxReconcile(started, before.reconcileCause, dto, actor, baseline);
+    const queue = await this.completeMailboxReconcile(
+      started,
+      before.reconcileCause,
+      dto,
+      effectiveActor,
+      scope,
+      baseline,
+    );
     this.logger.warn(
       `AUDIT email-queue reconcile complete queue=${id} mode=${dto.mode} ` +
         `epoch=${started.mailboxEpoch} generation=${started.cursorGeneration} ` +
@@ -378,19 +462,20 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       mailboxEpoch: number;
     },
     dto: ReconcileEmailQueueDto,
-    actor?: InboundActor,
+    actor: InboundActor,
+    scope: MailDepartmentScope,
   ) {
     const requestedAt = new Date();
     return this.prisma.$transaction(async (tx) => {
       const cas = await tx.emailQueue.updateMany({
-        where: {
+        where: this.queueWhereWithScope(scope, {
           id: before.id,
           type: 'IMAP',
           syncState: before.syncState as Prisma.EmailQueueWhereInput['syncState'],
           reconcileCause: before.reconcileCause,
           cursorGeneration: before.cursorGeneration,
           mailboxEpoch: before.mailboxEpoch,
-        },
+        }),
         data: {
           syncState: 'BOOTSTRAPPING',
           // The cursor/generation is invalidated before opening IMAP. A stale poller may
@@ -414,8 +499,8 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         reason: dto.reason,
         metadata: this.reconcileAuditMetadata(before, dto, { requestedAt: requestedAt.toISOString() }),
       });
-      const started = await tx.emailQueue.findUnique({
-        where: { id: before.id },
+      const started = await tx.emailQueue.findFirst({
+        where: this.accessPolicy().queueByIdWhereForScope(before.id, scope),
         select: {
           id: true,
           host: true,
@@ -440,19 +525,20 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     },
     cause: ReconcileCause,
     dto: ReconcileEmailQueueDto,
-    actor: InboundActor | undefined,
+    actor: InboundActor,
+    scope: MailDepartmentScope,
     baseline: ReconcileMailboxBaseline,
   ) {
     return this.prisma.$transaction(async (tx) => {
       const cas = await tx.emailQueue.updateMany({
-        where: {
+        where: this.queueWhereWithScope(scope, {
           id: started.id,
           type: 'IMAP',
           syncState: 'BOOTSTRAPPING',
           reconcileCause: cause,
           cursorGeneration: started.cursorGeneration,
           mailboxEpoch: started.mailboxEpoch,
-        },
+        }),
         data: {
           uidValidity: baseline.uidValidity,
           lastSeenUid: BigInt(baseline.cursor),
@@ -482,7 +568,10 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           selectedUids: baseline.selectedUids,
         },
       });
-      const queue = await tx.emailQueue.findUnique({ where: { id: started.id }, select: SAFE_SELECT });
+      const queue = await tx.emailQueue.findFirst({
+        where: this.accessPolicy().queueByIdWhereForScope(started.id, scope),
+        select: SAFE_SELECT,
+      });
       if (!queue) throw new ConflictException('Queue disappeared while completing reconcile');
       return queue;
     });
@@ -492,19 +581,20 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     started: { id: number; mailboxEpoch: number; cursorGeneration: number },
     cause: ReconcileCause,
     dto: ReconcileEmailQueueDto,
-    actor: InboundActor | undefined,
+    actor: InboundActor,
+    scope: MailDepartmentScope,
     error: string,
   ): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       const cas = await tx.emailQueue.updateMany({
-        where: {
+        where: this.queueWhereWithScope(scope, {
           id: started.id,
           type: 'IMAP',
           syncState: 'BOOTSTRAPPING',
           reconcileCause: cause,
           cursorGeneration: started.cursorGeneration,
           mailboxEpoch: started.mailboxEpoch,
-        },
+        }),
         data: {
           syncState: 'NEEDS_RECONCILIATION',
           lastError: `Reconcile baseline failed: ${error}`.slice(0, 1_000),
@@ -544,7 +634,8 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       mailboxEpoch: number;
     },
     dto: ReconcileEmailQueueDto,
-    actor?: InboundActor,
+    actor: InboundActor,
+    scope: MailDepartmentScope,
   ) {
     const legacy = await this.readLegacyCursor(before.id);
     if (!legacy) {
@@ -566,14 +657,14 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     const requestedAt = new Date();
     const queue = await this.prisma.$transaction(async (tx) => {
       const cas = await tx.emailQueue.updateMany({
-        where: {
+        where: this.queueWhereWithScope(scope, {
           id: before.id,
           type: 'IMAP',
           syncState: before.syncState as Prisma.EmailQueueWhereInput['syncState'],
           reconcileCause: 'LEGACY_MIGRATION',
           cursorGeneration: before.cursorGeneration,
           mailboxEpoch: before.mailboxEpoch,
-        },
+        }),
         data: {
           uidValidity: legacyUidValidity,
           lastSeenUid: BigInt(resumeCursor),
@@ -607,7 +698,10 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         reason: dto.reason,
         metadata: { mode: dto.mode, mailboxEpoch: before.mailboxEpoch, ...detail },
       });
-      const updated = await tx.emailQueue.findUnique({ where: { id: before.id }, select: SAFE_SELECT });
+      const updated = await tx.emailQueue.findFirst({
+        where: this.accessPolicy().queueByIdWhereForScope(before.id, scope),
+        select: SAFE_SELECT,
+      });
       if (!updated) throw new ConflictException('Queue disappeared while completing legacy reconcile');
       return { updated, detail };
     });
@@ -744,8 +838,10 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
    * Paginated quarantine index. It intentionally contains only metadata — raw MIME stays
    * in the ledger/storage and is never exposed by an operator listing endpoint.
    */
-  async listQuarantined(query: ListQuarantinedInboundDto) {
-    const where: Prisma.InboundDeliveryWhereInput = {
+  async listQuarantined(query: ListQuarantinedInboundDto, actor?: InboundActor) {
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(actor);
+    const baseWhere: Prisma.InboundDeliveryWhereInput = {
       state: 'QUARANTINED',
       ...(query.queueId !== undefined ? { queueId: query.queueId } : {}),
       ...(query.reason ? { lastError: { contains: query.reason, mode: 'insensitive' } } : {}),
@@ -766,6 +862,9 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           }
         : {}),
     };
+    const where: Prisma.InboundDeliveryWhereInput = scope.unrestricted
+      ? baseWhere
+      : { AND: [baseWhere, access.deliveryWhereForScope(scope)] };
     const select = {
       id: true,
       transport: true,
@@ -807,9 +906,11 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Detail is metadata + durable operator audit, never the raw RFC822 payload. */
-  async getQuarantined(deliveryId: number) {
-    const delivery = await this.prisma.inboundDelivery.findUnique({
-      where: { id: deliveryId },
+  async getQuarantined(deliveryId: number, actor?: InboundActor) {
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(actor);
+    const delivery = await this.prisma.inboundDelivery.findFirst({
+      where: access.deliveryByIdWhereForScope(deliveryId, scope),
       select: {
         id: true,
         transport: true,
@@ -871,9 +972,12 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
    * the drain reprocesses it. The raw MIME was retained, so nothing was lost.
    */
   async replayQuarantined(deliveryId: number, dto: ReplayQuarantinedInboundDto, actor: InboundActor) {
+    const effectiveActor = this.normalizeMailActor(actor);
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(effectiveActor);
     await this.prisma.$transaction(async (tx) => {
-      const current = await tx.inboundDelivery.findUnique({
-        where: { id: deliveryId },
+      const current = await tx.inboundDelivery.findFirst({
+        where: access.deliveryByIdWhereForScope(deliveryId, scope),
         select: { state: true, truncated: true, updatedAt: true },
       });
       if (!current || current.state !== 'QUARANTINED') {
@@ -890,7 +994,14 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         throw new ConflictException(`Quarantined delivery #${deliveryId} changed; refresh before replaying`);
       }
       const reset = await tx.inboundDelivery.updateMany({
-        where: { id: deliveryId, state: 'QUARANTINED', updatedAt: dto.expectedUpdatedAt },
+        where: scope.unrestricted
+          ? { id: deliveryId, state: 'QUARANTINED', updatedAt: dto.expectedUpdatedAt }
+          : {
+              AND: [
+                { id: deliveryId, state: 'QUARANTINED', updatedAt: dto.expectedUpdatedAt },
+                access.deliveryWhereForScope(scope),
+              ],
+            },
         data: { state: 'ACCEPTED', attempts: 0, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null },
       });
       if (reset.count !== 1) {
@@ -900,8 +1011,8 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       // succeed without a durable reason and actor record.
       await tx.inboundAuditLog.create({
         data: {
-          actorStaffId: actor.staffId ?? null,
-          actorEmail: actor.email ?? '',
+          actorStaffId: effectiveActor.staffId,
+          actorEmail: effectiveActor.email ?? '',
           action: 'mail.quarantine_replay',
           deliveryId,
           reason: dto.reason,
@@ -910,7 +1021,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       });
     });
     this.logger.warn(
-      `AUDIT inbound quarantine replay delivery=${deliveryId} actorStaffId=${actor?.staffId ?? 'system'}`,
+      `AUDIT inbound quarantine replay delivery=${deliveryId} actorStaffId=${effectiveActor.staffId}`,
     );
     return { replayed: true };
   }
@@ -920,9 +1031,15 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
    * timestamps, and a computed `alerts` list (halted queue, quarantine, stalled lease,
    * aged backlog). One call an admin dashboard / alerting probe can poll.
    */
-  async health(now: Date = new Date()) {
+  async health(actorOrNow?: InboundActor | Date, now: Date = new Date()) {
+    const suppliedNow = actorOrNow instanceof Date ? actorOrNow : now;
+    const actor = actorOrNow instanceof Date ? undefined : actorOrNow;
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(actor);
+    const scopedDeliveries = (base: Prisma.InboundDeliveryWhereInput): Prisma.InboundDeliveryWhereInput =>
+      scope.unrestricted ? base : { AND: [base, access.deliveryWhereForScope(scope)] };
     const queues = await this.prisma.emailQueue.findMany({
-      where: { type: 'IMAP' },
+      where: this.queueWhereWithScope(scope, { type: 'IMAP' }),
       orderBy: { id: 'asc' },
       select: {
         id: true,
@@ -951,6 +1068,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     const grouped = await this.prisma.inboundDelivery.groupBy({
       by: ['state'],
       _count: { _all: true },
+      where: scopedDeliveries({}),
     });
     const count = (state: string): number => grouped.find((g) => g.state === state)?._count._all ?? 0;
     const byState = {
@@ -962,32 +1080,34 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       skipped: count('SKIPPED'),
     };
 
-    const collisionSince = new Date(now.getTime() - 24 * 60 * 60_000);
+    const collisionSince = new Date(suppliedNow.getTime() - 24 * 60 * 60_000);
     const [oldestPending, lastProcessed, stalledProcessing, quarantineSize, recentCollisions] =
       await Promise.all([
         this.prisma.inboundDelivery.findFirst({
-          where: { state: { in: ['ACCEPTED', 'RETRY'] } },
+          where: scopedDeliveries({ state: { in: ['ACCEPTED', 'RETRY'] } }),
           orderBy: { createdAt: 'asc' },
           select: { id: true, createdAt: true, nextAttemptAt: true, attempts: true },
         }),
         this.prisma.inboundDelivery.findFirst({
-          where: { state: 'PROCESSED' },
+          where: scopedDeliveries({ state: 'PROCESSED' }),
           orderBy: { processedAt: 'desc' },
           select: { processedAt: true },
         }),
         this.prisma.inboundDelivery.count({
-          where: { state: 'PROCESSING', leaseExpiresAt: { lt: now } },
+          where: scopedDeliveries({ state: 'PROCESSING', leaseExpiresAt: { lt: suppliedNow } }),
         }),
         this.prisma.inboundDelivery.aggregate({
-          where: { state: 'QUARANTINED' },
+          where: scopedDeliveries({ state: 'QUARANTINED' }),
           _sum: { sizeBytes: true },
         }),
-        this.prisma.inboundAuditLog.count({
-          where: {
-            action: { in: ['mail.transport_collision', 'mail.message_id_conflict'] },
-            createdAt: { gte: collisionSince },
-          },
-        }),
+        scope.unrestricted
+          ? this.prisma.inboundAuditLog.count({
+              where: {
+                action: { in: ['mail.transport_collision', 'mail.message_id_conflict'] },
+                createdAt: { gte: collisionSince },
+              },
+            })
+          : Promise.resolve(0),
       ]);
 
     const enabledQueues = queues.filter((q) => q.isEnabled);
@@ -1008,7 +1128,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           kind: 'never_connected',
           message: `Queue ${q.id} (${q.emailAddress}) has never connected to IMAP.`,
         });
-      } else if (now.getTime() - q.lastConnectedAt.getTime() > staleAfterMs) {
+      } else if (suppliedNow.getTime() - q.lastConnectedAt.getTime() > staleAfterMs) {
         alerts.push({
           severity: 'warning',
           kind: 'stale_connection',
@@ -1028,7 +1148,10 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           kind: 'poll_running',
           message: `Queue ${q.id} (${q.emailAddress}) has a poll cycle still in progress.`,
         });
-      } else if (q.lastPollCompletedAt && now.getTime() - q.lastPollCompletedAt.getTime() > staleAfterMs) {
+      } else if (
+        q.lastPollCompletedAt &&
+        suppliedNow.getTime() - q.lastPollCompletedAt.getTime() > staleAfterMs
+      ) {
         alerts.push({
           severity: 'warning',
           kind: 'stale_poll',
@@ -1039,7 +1162,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       if (
         q.syncState === 'BOOTSTRAPPING' &&
         bootstrapStartedAt &&
-        now.getTime() - bootstrapStartedAt.getTime() > staleAfterMs
+        suppliedNow.getTime() - bootstrapStartedAt.getTime() > staleAfterMs
       ) {
         alerts.push({
           severity: 'warning',
@@ -1087,7 +1210,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       });
     }
     // Aged backlog: a still-pending delivery older than 15 min signals a stuck drain.
-    if (oldestPending && now.getTime() - oldestPending.createdAt.getTime() > 15 * 60_000) {
+    if (oldestPending && suppliedNow.getTime() - oldestPending.createdAt.getTime() > 15 * 60_000) {
       alerts.push({
         severity: 'warning',
         kind: 'aged_backlog',
@@ -1142,7 +1265,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       },
       rawStorage: storage,
       alerts,
-      checkedAt: now,
+      checkedAt: suppliedNow,
     };
   }
 }

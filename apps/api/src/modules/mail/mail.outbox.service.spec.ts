@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MailService, OUTBOUND_STATUS_SELECT } from './mail.service';
 import type { AppConfig } from '../../config/configuration';
+import { MailAccessPolicy } from './mail-access-policy.service';
 
 vi.mock('nodemailer', () => ({
   default: {
@@ -103,6 +104,10 @@ function makePrisma(outbound = row()) {
     };
     return Object.entries(where).every(([key, expected]) => {
       if (key === 'OR') return (expected as Record<string, any>[]).some((clause) => matches(clause));
+      if (key === 'AND') return (expected as Record<string, any>[]).every((clause) => matches(clause));
+      // Scope predicates are evaluated by Prisma against the related ticket in production.
+      // The retry test below uses an administrator, so they are intentionally absent here.
+      if (key === 'ticket') return true;
       return matchValue(outbound[key], expected);
     });
   };
@@ -121,6 +126,7 @@ function makePrisma(outbound = row()) {
       return { count: 1 };
     }),
     findUnique: vi.fn(async () => outbound),
+    findFirst: vi.fn(async () => outbound),
     findMany: vi.fn(async () => []),
   };
   const tx = {
@@ -135,6 +141,7 @@ function makePrisma(outbound = row()) {
     ticketPost: tx.ticketPost,
     ticket: tx.ticket,
     ticketAuditLog: tx.ticketAuditLog,
+    departmentStaff: { findMany: vi.fn().mockResolvedValue([]) },
     $transaction: vi.fn(async (callback: (client: typeof tx) => unknown) => callback(tx)),
     __outbound: outbound,
     __tx: tx,
@@ -306,9 +313,13 @@ describe('MailService durable outbound outbox', () => {
   it('manual retry requeues only terminal/uncertain mail without changing its Message-ID', async () => {
     const prisma = makePrisma(row({ state: 'AMBIGUOUS', attempts: 2 }));
     const queue = { add: vi.fn().mockResolvedValue(undefined) };
-    const service = new MailService(CONFIG, prisma, queue as never);
+    const service = new MailService(CONFIG, prisma, queue as never, undefined, new MailAccessPolicy(prisma));
 
-    await service.retryOutboundEmail(prisma.__outbound.id, { staffId: 44, email: 'operator@example.test' });
+    await service.retryOutboundEmail(prisma.__outbound.id, {
+      staffId: 44,
+      email: 'operator@example.test',
+      isAdmin: true,
+    });
 
     expect(prisma.__outbound.state).toBe('QUEUED');
     expect(prisma.__outbound.messageId).toBe('<stable-outbox@test.example>');

@@ -37,22 +37,25 @@ export class EmailQueueController {
   @Get()
   @RequirePermissions(PERMISSIONS.MAIL_VIEW)
   @ApiOperation({ summary: 'List all email queues (password excluded)' })
-  list() {
-    return this.emailQueueService.list();
+  list(@CurrentStaff() staff: AuthStaff) {
+    return this.emailQueueService.list(staff);
   }
 
   @Get(':id')
   @RequirePermissions(PERMISSIONS.MAIL_VIEW)
   @ApiOperation({ summary: 'Get an email queue by ID (password excluded)' })
-  get(@Param('id', ParseIntPipe) id: number) {
-    return this.emailQueueService.get(id);
+  get(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
+    return this.emailQueueService.get(id, staff);
   }
 
   @Post()
   @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
   @ApiOperation({ summary: 'Create an email queue' })
-  create(@Body(new ZodValidationPipe(CreateEmailQueueSchema)) dto: CreateEmailQueueDto) {
-    return this.emailQueueService.create(dto);
+  create(
+    @Body(new ZodValidationPipe(CreateEmailQueueSchema)) dto: CreateEmailQueueDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.emailQueueService.create(dto, staff);
   }
 
   @Put(':id')
@@ -61,16 +64,17 @@ export class EmailQueueController {
   update(
     @Param('id', ParseIntPipe) id: number,
     @Body(new ZodValidationPipe(UpdateEmailQueueSchema)) dto: UpdateEmailQueueDto,
+    @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.emailQueueService.update(id, dto);
+    return this.emailQueueService.update(id, dto, staff);
   }
 
   @Delete(':id')
   @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Delete an email queue' })
-  delete(@Param('id', ParseIntPipe) id: number) {
-    return this.emailQueueService.delete(id);
+  delete(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
+    return this.emailQueueService.delete(id, staff);
   }
 
   @Post(':id/reconcile')
@@ -83,14 +87,14 @@ export class EmailQueueController {
     @Body(new ZodValidationPipe(ReconcileEmailQueueSchema)) dto: ReconcileEmailQueueDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.emailQueueService.reconcile(id, dto, { staffId: staff.staffId, email: staff.email });
+    return this.emailQueueService.reconcile(id, dto, staff);
   }
 
   @Get('inbound/health')
   @RequirePermissions(PERMISSIONS.MAIL_VIEW)
   @ApiOperation({ summary: 'Inbound health: per-queue sync state, ledger backlog + staleness, alerts' })
-  health() {
-    return this.emailQueueService.health();
+  health(@CurrentStaff() staff: AuthStaff) {
+    return this.emailQueueService.health(staff);
   }
 
   @Get('inbound/quarantine')
@@ -98,15 +102,16 @@ export class EmailQueueController {
   @ApiOperation({ summary: 'Paginated inbound quarantine metadata, filters and totals' })
   listQuarantined(
     @Query(new ZodValidationPipe(ListQuarantinedInboundSchema)) query: ListQuarantinedInboundDto,
+    @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.emailQueueService.listQuarantined(query);
+    return this.emailQueueService.listQuarantined(query, staff);
   }
 
   @Get('inbound/quarantine/:deliveryId')
   @RequirePermissions(PERMISSIONS.MAIL_VIEW)
   @ApiOperation({ summary: 'Inbound quarantine metadata and audit history (never raw MIME)' })
-  getQuarantined(@Param('deliveryId', ParseIntPipe) deliveryId: number) {
-    return this.emailQueueService.getQuarantined(deliveryId);
+  getQuarantined(@Param('deliveryId', ParseIntPipe) deliveryId: number, @CurrentStaff() staff: AuthStaff) {
+    return this.emailQueueService.getQuarantined(deliveryId, staff);
   }
 
   @Post('inbound/quarantine/:deliveryId/replay')
@@ -117,9 +122,6 @@ export class EmailQueueController {
     @Body(new ZodValidationPipe(ReplayQuarantinedInboundSchema)) dto: ReplayQuarantinedInboundDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    return this.emailQueueService.replayQuarantined(deliveryId, dto, {
-      staffId: staff.staffId,
-      email: staff.email,
-    });
+    return this.emailQueueService.replayQuarantined(deliveryId, dto, staff);
   }
 }

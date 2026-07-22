@@ -8,6 +8,7 @@ import {
 import { EmailQueueService } from './email-queue.service';
 import { ReconcileEmailQueueSchema, ReplayQuarantinedInboundSchema } from './dto';
 import type { PrismaService } from '../../prisma/prisma.service';
+import { MailAccessPolicy } from './mail-access-policy.service';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -87,14 +88,29 @@ type SafeQueue = {
 };
 
 function makePrismaMock() {
+  const emailQueue = {
+    findMany: vi.fn(),
+    findUnique: vi.fn(),
+    findFirst: vi.fn(),
+    create: vi.fn(),
+    update: vi.fn(),
+    updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    delete: vi.fn(),
+    deleteMany: vi.fn(),
+  };
+  // Preserve the legacy focused tests' fixtures while exercising the scoped service APIs.
+  // Production uses `findFirst`/`deleteMany` so department predicates are enforceable.
+  emailQueue.findFirst.mockImplementation((args: unknown) => emailQueue.findUnique(args));
+  emailQueue.deleteMany.mockImplementation(async (args: { where: unknown }) => {
+    const current = await emailQueue.findUnique({ where: args.where });
+    if (!current) return { count: 0 };
+    await emailQueue.delete({ where: args.where });
+    return { count: 1 };
+  });
   const prisma = {
-    emailQueue: {
-      findMany: vi.fn(),
-      findUnique: vi.fn(),
-      create: vi.fn(),
-      update: vi.fn(),
-      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
-      delete: vi.fn(),
+    emailQueue,
+    departmentStaff: {
+      findMany: vi.fn().mockResolvedValue([]),
     },
     inboundDelivery: {
       findMany: vi.fn().mockResolvedValue([]),
@@ -114,6 +130,11 @@ function makePrismaMock() {
       count: vi.fn().mockResolvedValue(0),
     },
   } as unknown as Record<string, unknown>;
+  const inboundDelivery = prisma.inboundDelivery as {
+    findUnique: ReturnType<typeof vi.fn>;
+    findFirst: ReturnType<typeof vi.fn>;
+  };
+  inboundDelivery.findFirst.mockImplementation((args: unknown) => inboundDelivery.findUnique(args));
   (prisma as { $transaction: ReturnType<typeof vi.fn> }).$transaction = vi.fn(async (arg: unknown) =>
     typeof arg === 'function'
       ? (arg as (tx: unknown) => Promise<unknown>)(prisma)
@@ -159,6 +180,9 @@ describe('EmailQueueService', () => {
       prisma as unknown as PrismaService,
       undefined,
       baselineProbe as unknown as import('./inbound.service').InboundMailService,
+      undefined,
+      undefined,
+      new MailAccessPolicy(prisma as unknown as PrismaService),
     );
   });
 
@@ -312,7 +336,9 @@ describe('EmailQueueService', () => {
       expect(updateCall[0].data).toHaveProperty('passwordEnc');
       expect(typeof updateCall[0].data['passwordEnc']).toBe('string');
       expect(updateCall[0].data).not.toHaveProperty('password');
-      expect(updateCall[0].where).toMatchObject({ mailboxEpoch: 1, cursorGeneration: 0 });
+      expect(updateCall[0].where).toMatchObject({
+        AND: expect.arrayContaining([expect.objectContaining({ mailboxEpoch: 1, cursorGeneration: 0 })]),
+      });
     });
 
     it('does not touch passwordEnc when password not in dto', async () => {
@@ -407,10 +433,16 @@ describe('EmailQueueService', () => {
 
       const calls = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls;
       expect(calls[0]?.[0]).toMatchObject({
-        where: expect.objectContaining({ host: 'imap-a.example', mailboxEpoch: 1 }),
+        where: {
+          AND: expect.arrayContaining([expect.objectContaining({ host: 'imap-a.example', mailboxEpoch: 1 })]),
+        },
       });
       expect(calls[1]?.[0]).toMatchObject({
-        where: expect.objectContaining({ host: 'imap-b.example', mailboxEpoch: 2, cursorGeneration: 5 }),
+        where: {
+          AND: expect.arrayContaining([
+            expect.objectContaining({ host: 'imap-b.example', mailboxEpoch: 2, cursorGeneration: 5 }),
+          ]),
+        },
         data: expect.objectContaining({
           host: 'imap-a.example',
           mailboxEpoch: { increment: 1 },
@@ -852,9 +884,16 @@ describe('EmailQueueService', () => {
     });
 
     it('surfaces enabled IMAP that is disabled globally, never connected and stale', async () => {
-      const ops = new EmailQueueService(prisma as unknown as PrismaService, undefined, undefined, {
-        TELECOM_HD_IMAP_ENABLED: false,
-      } as never);
+      const ops = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        undefined,
+        {
+          TELECOM_HD_IMAP_ENABLED: false,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
       (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
         makeSafeQueue({
           id: 4,
@@ -901,6 +940,7 @@ describe('EmailQueueService', () => {
         undefined,
         { TELECOM_HD_IMAP_ENABLED: true, TELECOM_HD_INBOUND_MAX_SIZE_MB: 35 } as never,
         rawStorage as never,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
       );
       (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (prisma.inboundDelivery.aggregate as ReturnType<typeof vi.fn>).mockResolvedValue({

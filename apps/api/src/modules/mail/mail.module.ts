@@ -6,6 +6,7 @@ import { InboundMailService } from './inbound.service';
 import { EmailQueueService } from './email-queue.service';
 import { InboundAuditService } from './inbound-audit.service';
 import { InboundRawStorageService } from './inbound-raw-storage.service';
+import { MailAccessPolicy } from './mail-access-policy.service';
 import { EmailQueueController } from './email-queue.controller';
 import { ParserRulesController } from './parser-rules.controller';
 import { InboundController } from './inbound.controller';
@@ -25,6 +26,7 @@ import { loadConfig, APP_CONFIG } from '../../config/configuration';
     EmailQueueService,
     InboundAuditService,
     InboundRawStorageService,
+    MailAccessPolicy,
   ],
   exports: [MailService],
 })

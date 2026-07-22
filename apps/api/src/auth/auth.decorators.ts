@@ -8,6 +8,7 @@ import {
 import { ApiBearerAuth } from '@nestjs/swagger';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { PermissionsGuard, PERMISSIONS_KEY } from './permissions.guard';
+import { GlobalAdminGuard } from './global-admin.guard';
 import type { Permission } from './permissions';
 
 export interface AuthStaff {
@@ -34,6 +35,11 @@ export function RequirePermissions(...perms: Permission[]) {
     UseGuards(JwtAuthGuard, PermissionsGuard),
     ApiBearerAuth(),
   );
+}
+
+/** Requires an actual administrator for global configuration with no safe department scope. */
+export function RequireGlobalAdmin() {
+  return UseGuards(GlobalAdminGuard);
 }
 
 /** Injects the authenticated staff principal into a handler param. */

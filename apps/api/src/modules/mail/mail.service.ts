@@ -1,4 +1,12 @@
-import { Injectable, Logger, Inject, Optional, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  Inject,
+  Optional,
+  OnModuleDestroy,
+  OnModuleInit,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';
 import * as nodemailer from 'nodemailer';
@@ -8,6 +16,7 @@ import type { OutboundEmail, OutboundEmailState, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
 import { StorageService } from '../attachments/storage.service';
+import { MailAccessPolicy, type MailAccessActor } from './mail-access-policy.service';
 
 export interface SendMailOptions {
   to: string | string[];
@@ -99,6 +108,9 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
     // when absent, send() delivers inline instead of enqueuing.
     @Optional() @InjectQueue('mail') private readonly mailQueue?: Queue,
     @Optional() private readonly storageService?: StorageService,
+    // AuthModule owns a narrow reset-mail adapter without this policy; retry is
+    // unavailable there and must fail closed if it is ever called.
+    @Optional() private readonly mailAccess?: MailAccessPolicy,
   ) {
     this.transporter = nodemailer.createTransport({
       host: config.TELECOM_HD_SMTP_HOST,
@@ -264,18 +276,24 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
   /** Operator retry preserves the original Message-ID and snapshots. */
   async retryOutboundEmail(
     outboundEmailId: string,
-    actor?: { staffId: number; email: string },
+    actor: MailAccessActor,
   ): Promise<OutboundDeliveryStatus | null> {
+    if (!this.mailAccess) throw new ServiceUnavailableException('Mail operator authorization unavailable');
+    const scope = await this.mailAccess.resolveScope(actor);
+    const scopedWhere: Prisma.OutboundEmailWhereInput = scope.unrestricted
+      ? { id: outboundEmailId }
+      : {
+          AND: [{ id: outboundEmailId }, { ticket: { is: this.mailAccess.ticketWhereForScope(scope) } }],
+        };
     const result = await this.prisma.$transaction(async (tx) => {
-      const row = await tx.outboundEmail.findUnique({
-        where: { id: outboundEmailId },
+      const row = await tx.outboundEmail.findFirst({
+        where: scopedWhere,
         select: { id: true, ticketId: true, postId: true, state: true },
       });
       if (!row || row.state === 'SENT') return null;
       const changed = await tx.outboundEmail.updateMany({
         where: {
-          id: outboundEmailId,
-          state: { in: ['FAILED', 'AMBIGUOUS', 'RETRY'] },
+          AND: [scopedWhere, { state: { in: ['FAILED', 'AMBIGUOUS', 'RETRY'] } }],
         },
         data: {
           state: 'QUEUED',
@@ -289,15 +307,15 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
       await tx.ticketAuditLog.create({
         data: {
           ticketId: row.ticketId,
-          staffId: actor?.staffId,
+          staffId: actor.staffId,
           actorType: 'STAFF',
           action: 'OUTBOUND_RETRY',
           field: 'outboundEmailId',
           newValue: row.id,
         },
       });
-      return tx.outboundEmail.findUnique({
-        where: { id: outboundEmailId },
+      return tx.outboundEmail.findFirst({
+        where: scopedWhere,
         select: OUTBOUND_STATUS_SELECT,
       });
     });
