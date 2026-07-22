@@ -1940,7 +1940,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // True Message-IDs key the ticket-post idempotency backstop. Headerless mail gets a
+    // True Message-IDs key the inbound ticket-post idempotency backstop. Headerless mail gets a
     // per-transport synthetic key: identical bytes on different IMAP UIDs intentionally do
     // NOT collide, while a retry of the same ledger row still cannot create another post.
     const seed: string | Buffer = syntheticSeed ?? rawBuf;
@@ -1975,12 +1975,14 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       return finalize({ state: 'SKIPPED' });
     }
 
-    // Secondary fast dedup: if a post already bears this Message-ID it was ingested before
-    // (e.g. a retry after the post was created, or — via `legacyDedupIds` — the pre-ledger
-    // poller already ticketed this exact IMAP UID). Returns the existing ids for observability.
+    // Secondary fast dedup: only an inbound post bearing this idempotency key proves this
+    // message was ingested before (e.g. a retry after post creation, or — via
+    // `legacyDedupIds` — the pre-ledger poller already ticketed this IMAP UID). Do not query
+    // TicketPost.messageId here: it is a threading namespace and an attacker can reuse a
+    // staff outbound Message-ID. Returns the existing ids for observability.
     const dedupIds = [effectiveMessageId, ...legacyDedupIds];
     const existing = await this.prisma.ticketPost.findFirst({
-      where: { messageId: { in: dedupIds } },
+      where: { inboundMessageId: { in: dedupIds } },
       select: { id: true, ticketId: true },
     });
     if (existing) {

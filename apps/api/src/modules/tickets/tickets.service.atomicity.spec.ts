@@ -23,6 +23,7 @@ function post(overrides: Record<string, unknown> = {}): TicketPost {
     id: 10,
     ticketId: 1,
     messageId: '',
+    inboundMessageId: null,
     contents: 'body',
     ...overrides,
   } as TicketPost;
@@ -332,7 +333,7 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     expect(addNote).toHaveBeenCalledWith(1, 'private', 5, [8]);
   });
 
-  it('stores the trusted inbound Message-ID on the exact post', async () => {
+  it('stores the trusted inbound Message-ID and separate inbound idempotency key on the exact post', async () => {
     prisma.ticketPost.findFirst.mockResolvedValue(null);
     prisma.ticket.findUnique.mockResolvedValue(ticket());
     tx.ticketPost.create.mockResolvedValue(post({ messageId: '<inbound@example>' }));
@@ -350,7 +351,10 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
 
     expect(tx.ticketPost.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ messageId: '<inbound@example>' }),
+        data: expect.objectContaining({
+          messageId: '<inbound@example>',
+          inboundMessageId: '<inbound@example>',
+        }),
       }),
     );
   });
@@ -375,8 +379,12 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     },
   );
 
-  it('returns an existing post for a duplicate Message-ID without side effects', async () => {
-    const existing = post({ id: 77, messageId: '<duplicate@example>' });
+  it('returns an existing post for a duplicate inbound Message-ID without side effects', async () => {
+    const existing = post({
+      id: 77,
+      messageId: '<duplicate@example>',
+      inboundMessageId: '<duplicate@example>',
+    });
     prisma.ticketPost.findFirst.mockResolvedValue(existing);
 
     const result = await service.reply(999, {
@@ -394,10 +402,17 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
     expect(emitter.emit).not.toHaveBeenCalled();
     expect(mail.sendTemplate).not.toHaveBeenCalled();
+    expect(prisma.ticketPost.findFirst).toHaveBeenCalledWith({
+      where: { inboundMessageId: '<duplicate@example>' },
+    });
   });
 
-  it('turns a concurrent Message-ID unique conflict into an idempotent no-op', async () => {
-    const existing = post({ id: 77, messageId: '<race@example>' });
+  it('turns a concurrent inbound Message-ID unique conflict into an idempotent no-op', async () => {
+    const existing = post({
+      id: 77,
+      messageId: '<race@example>',
+      inboundMessageId: '<race@example>',
+    });
     prisma.ticketPost.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce(existing);
     prisma.ticket.findUnique.mockResolvedValue(ticket());
     prisma.$transaction.mockRejectedValue({ code: 'P2002' });
@@ -441,7 +456,12 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     expect(tx.ticket.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          posts: { create: expect.objectContaining({ messageId: '<new@example>' }) },
+          posts: {
+            create: expect.objectContaining({
+              messageId: '<new@example>',
+              inboundMessageId: '<new@example>',
+            }),
+          },
         }),
       }),
     );
@@ -470,5 +490,40 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     expect(users.findOrCreate).not.toHaveBeenCalled();
     expect(prisma.$transaction).not.toHaveBeenCalled();
     expect(emitter.emit).not.toHaveBeenCalled();
+  });
+
+  it('does not let a staff outbound threading Message-ID suppress a distinct inbound message', async () => {
+    const spoofedId = '<staff-outbound@example.test>';
+    const staffOutbound = post({ id: 71, ticketId: 71, messageId: spoofedId, inboundMessageId: null });
+    const inboundPost = post({ id: 72, ticketId: 1, messageId: spoofedId, inboundMessageId: spoofedId });
+    prisma.ticketPost.findFirst.mockImplementation(({ where }: { where: Record<string, unknown> }) => {
+      // A pre-fix lookup against `messageId` would return this staff post and incorrectly
+      // treat the inbound delivery as already processed. The inbound namespace must not.
+      if (where.messageId === spoofedId) return Promise.resolve(staffOutbound);
+      return Promise.resolve(null);
+    });
+    prisma.ticket.findUnique.mockResolvedValue(ticket());
+    tx.ticketPost.create.mockResolvedValue(inboundPost);
+    tx.ticket.update.mockResolvedValue(ticket());
+
+    const result = await service.reply(1, {
+      contents: 'new inbound mail',
+      isHtml: false,
+      isNote: false,
+      isEmailed: true,
+      isThirdParty: false,
+      creationMode: 'EMAIL',
+      incomingMessageId: spoofedId,
+    });
+
+    expect(result).toBe(inboundPost);
+    expect(prisma.ticketPost.findFirst).toHaveBeenCalledWith({
+      where: { inboundMessageId: spoofedId },
+    });
+    expect(tx.ticketPost.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ messageId: spoofedId, inboundMessageId: spoofedId }),
+      }),
+    );
   });
 });
