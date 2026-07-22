@@ -1,4 +1,3 @@
-import { timingSafeEqual } from 'node:crypto';
 import {
   BadRequestException,
   Body,
@@ -14,6 +13,8 @@ import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { InboundMailService } from './inbound.service';
 import { Public } from '../../auth/auth.decorators';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
+import { inboundSecretMatches } from '../../common/inbound-secret.util';
+import { normalizePipeDeliveryId, parsePipeQueueId } from './pipe-input.util';
 
 /** Body shape for the inbound pipe webhook. */
 interface InboundPipeBody {
@@ -55,13 +56,7 @@ export class InboundController {
     @Headers('x-inbound-queue-id') queueId?: string,
   ) {
     const expected = this.config.TELECOM_HD_INBOUND_WEBHOOK_SECRET;
-    let secretOk = false;
-    if (secret) {
-      const provided = Buffer.from(secret, 'utf8');
-      const expectedBuf = Buffer.from(expected, 'utf8');
-      secretOk = provided.byteLength === expectedBuf.byteLength && timingSafeEqual(provided, expectedBuf);
-    }
-    if (!secretOk) {
+    if (!inboundSecretMatches(secret, expected)) {
       throw new ForbiddenException('Invalid inbound webhook secret');
     }
 
@@ -77,20 +72,11 @@ export class InboundController {
       throw new BadRequestException('Missing message body (raw RFC822 bytes or JSON { raw })');
     }
 
-    // An optional `x-inbound-delivery-id` header gives the MTA an explicit idempotency key
-    // (else the ledger de-dups by content hash). An optional `x-inbound-queue-id` binds the
-    // message to a specific queue (its department routes it, and the delivery records the
-    // queue) — reliable routing for a multi-queue MTA; absent, the department is resolved
-    // downstream by parser rules / the default department.
-    const externalId = deliveryId && deliveryId.trim().length > 0 ? deliveryId.trim() : undefined;
-    let boundQueueId: number | undefined;
-    if (queueId && queueId.trim().length > 0) {
-      const parsed = Number(queueId.trim());
-      if (!Number.isInteger(parsed) || parsed <= 0) {
-        throw new BadRequestException('x-inbound-queue-id must be a positive integer');
-      }
-      boundQueueId = parsed;
-    }
+    // A PIPE request has no safe implicit identity or routing fallback. The trusted MTA
+    // supplies both a bounded delivery id and an enabled PIPE queue id; content hashes are
+    // forensic data only and never collapse two independent deliveries.
+    const externalId = normalizePipeDeliveryId(deliveryId);
+    const boundQueueId = parsePipeQueueId(queueId);
     await this.inbound.ingestRawMessage(raw, undefined, externalId, boundQueueId);
     return { accepted: true };
   }

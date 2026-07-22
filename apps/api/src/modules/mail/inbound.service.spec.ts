@@ -12,6 +12,7 @@ import type { PrismaService } from '../../prisma/prisma.service';
 import type { TicketsService } from '../tickets/tickets.service';
 import type { MailService } from './mail.service';
 import type { AppConfig } from '../../config/configuration';
+import type { InboundRawStorageService } from './inbound-raw-storage.service';
 
 // Fake ImapFlow so connectQueue() can be exercised without a real IMAP server. The
 // mailbox advertises UIDVALIDITY/UIDNEXT so the connect-time bootstrap barrier runs.
@@ -94,6 +95,9 @@ function makePrismaMock() {
       update: vi.fn().mockResolvedValue({}),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
+    inboundAuditLog: {
+      create: vi.fn().mockResolvedValue({ id: 1 }),
+    },
     department: { findFirst: vi.fn().mockResolvedValue({ id: 1 }) },
     setting: {
       findUnique: vi.fn().mockResolvedValue(null),
@@ -104,7 +108,11 @@ function makePrismaMock() {
   } as unknown as PrismaService;
 }
 
-function makeInboundService(prisma: PrismaService, config: AppConfig = TEST_CONFIG): InboundMailService {
+function makeInboundService(
+  prisma: PrismaService,
+  config: AppConfig = TEST_CONFIG,
+  rawStorage?: InboundRawStorageService,
+): InboundMailService {
   const ticketsService = {
     reply: vi.fn().mockResolvedValue({ id: 1 }),
     getTicketByMask: vi.fn(),
@@ -121,6 +129,7 @@ function makeInboundService(prisma: PrismaService, config: AppConfig = TEST_CONF
     ticketsService,
     mailService,
     undefined, // attachmentsService
+    rawStorage,
   );
 }
 
@@ -652,6 +661,61 @@ describe('InboundMailService — parser rule helpers', () => {
       );
     });
 
+    it('P1-H: stores large raw MIME outside PostgreSQL before durable acceptance', async () => {
+      const storage = {
+        write: vi.fn().mockResolvedValue('inbound-raw/00000000-0000-4000-8000-000000000001.eml'),
+        commit: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
+      } as unknown as InboundRawStorageService;
+      const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
+      const accept = (
+        svc as unknown as {
+          acceptImapMessage: (
+            q: number,
+            d: number | null,
+            uv: bigint,
+            uid: number,
+            source: Buffer,
+          ) => Promise<void>;
+        }
+      ).acceptImapMessage;
+      const large = Buffer.alloc(1024 * 1024 + 1, 0x61);
+      await accept.call(svc, 1, 4, 7n, 101, large);
+      expect(storage.write).toHaveBeenCalledWith(large);
+      expect(storage.commit).toHaveBeenCalledWith('inbound-raw/00000000-0000-4000-8000-000000000001.eml');
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            rawMime: null,
+            rawStorageKey: expect.stringMatching(/^inbound-raw\//),
+          }),
+        }),
+      );
+    });
+
+    it('P1-H: bounded marker cleanup removes only stale unreferenced raw MIME files', async () => {
+      const referenced = 'inbound-raw/00000000-0000-4000-8000-000000000001.eml';
+      const orphan = 'inbound-raw/00000000-0000-4000-8000-000000000002.eml';
+      const storage = {
+        listPending: vi.fn().mockResolvedValue([referenced, orphan]),
+        commit: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
+      } as unknown as InboundRawStorageService;
+      const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { rawStorageKey: referenced },
+      ]);
+
+      await (
+        svc as unknown as { cleanupUncommittedRawStorage: () => Promise<void> }
+      ).cleanupUncommittedRawStorage();
+
+      expect(storage.listPending).toHaveBeenCalledWith(100, expect.any(Date));
+      expect(storage.commit).toHaveBeenCalledWith(referenced);
+      expect(storage.remove).toHaveBeenCalledWith(orphan);
+      expect(storage.remove).not.toHaveBeenCalledWith(referenced);
+    });
+
     it('processes out-of-order UIDs and advances the cursor to the max (no loss)', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
       await poll(makeLedgerClient([103, 101], { uidValidity: 7n, uidNext: 104 }));
@@ -698,6 +762,17 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({ data: { lastSeenUid: 102n } }),
       );
+    });
+
+    it('does not report a vanished UID as an accepted message', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }, { vanish: [101] }));
+
+      const livenessWrites = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls.map(
+        ([input]) => (input as { data?: Record<string, unknown> }).data ?? {},
+      );
+      expect(livenessWrites).toContainEqual(expect.objectContaining({ lastPollAt: expect.any(Date) }));
+      expect(livenessWrites.some((data) => 'lastAcceptedAt' in data)).toBe(false);
     });
 
     it('P0-3: a UIDVALIDITY change HALTS the queue (NEEDS_RECONCILIATION), accepts nothing', async () => {
@@ -844,6 +919,116 @@ describe('InboundMailService — parser rule helpers', () => {
       const svc = makeInboundService(prisma as unknown as PrismaService, imapOn);
       await expect(reconcile(svc)).resolves.toBeUndefined();
       expect(conns(svc).size).toBe(0);
+    });
+
+    it('P1-F: concurrent pollNow calls share one single-flight supervisor cycle', async () => {
+      const svc = makeInboundService(prisma as unknown as PrismaService, imapOn);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const reconcileSpy = vi.fn(() => gate);
+      const drainSpy = vi.fn().mockResolvedValue(undefined);
+      (svc as unknown as { reconcileConnections: () => Promise<void> }).reconcileConnections = reconcileSpy;
+      (svc as unknown as { drainDeliveries: () => Promise<void> }).drainDeliveries = drainSpy;
+
+      const first = svc.pollNow();
+      const second = svc.pollNow();
+      expect(reconcileSpy).toHaveBeenCalledTimes(1);
+      release();
+      await Promise.all([first, second]);
+      expect(drainSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('P1-F: one queue cannot be polled twice concurrently in this process', async () => {
+      const svc = makeInboundService(prisma as unknown as PrismaService, imapOn);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const once = vi.fn(() => gate);
+      (svc as unknown as { pollQueueOnce: (q: number, c: unknown) => Promise<void> }).pollQueueOnce = once;
+      const poll = (svc as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue.bind(
+        svc,
+      );
+
+      const first = poll(1, {});
+      const second = poll(1, {});
+      await vi.waitFor(() => expect(once).toHaveBeenCalledTimes(1));
+      expect(once).toHaveBeenCalledTimes(1);
+      release();
+      await Promise.all([first, second]);
+      expect((svc as unknown as { pollingQueues: Set<number> }).pollingQueues.size).toBe(0);
+    });
+
+    it('P1-F: overlapping drain ticks share one in-flight cycle', async () => {
+      const svc = makeInboundService(prisma as unknown as PrismaService, imapOn);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        await gate;
+        return [];
+      });
+      const drain = (svc as unknown as { drainDeliveries: () => Promise<void> }).drainDeliveries.bind(svc);
+
+      const first = drain();
+      const second = drain();
+      expect(prisma.inboundDelivery.findMany).toHaveBeenCalledTimes(1);
+      release();
+      await Promise.all([first, second]);
+    });
+
+    it('P1-F: refreshes PIPE loop-suppression addresses even when global IMAP is disabled', async () => {
+      vi.useFakeTimers();
+      try {
+        const svc = makeInboundService(prisma as unknown as PrismaService, {
+          ...TEST_CONFIG,
+          TELECOM_HD_IMAP_ENABLED: false,
+        });
+        const refresh = vi.spyOn(
+          svc as unknown as { refreshOwnAddresses: () => Promise<void> },
+          'refreshOwnAddresses',
+        );
+        await svc.onModuleInit();
+        expect(refresh).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(refresh).toHaveBeenCalledTimes(2);
+        await svc.onModuleDestroy();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('P1-F: stamps poll start and completion separately for honest operator liveness', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        isEnabled: true,
+        departmentId: null,
+        lastSeenUid: 10n,
+        uidValidity: 7n,
+        syncState: 'OK',
+        lastError: null,
+        cursorGeneration: 0,
+      });
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const svc = makeInboundService(prisma as unknown as PrismaService, imapOn);
+      const client = {
+        mailbox: { uidValidity: 7n, uidNext: 11 },
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        fetch: vi.fn(function* () {
+          // empty mailbox delta
+        }),
+      };
+      await (svc as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(1, client);
+      const livenessWrites = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls.map(
+        ([arg]) => arg.data,
+      );
+      expect(livenessWrites).toContainEqual(expect.objectContaining({ lastPollStartedAt: expect.any(Date) }));
+      expect(livenessWrites).toContainEqual(
+        expect.objectContaining({ lastPollCompletedAt: expect.any(Date) }),
+      );
     });
   });
 
@@ -1026,20 +1211,40 @@ describe('InboundMailService — parser rule helpers', () => {
 
   // ─── PIPE ingress: idempotency-key collision ─────────────────────────────────
   describe('ingestRawMessage (PIPE) — delivery-id collision', () => {
-    const ingest = (raw: string, extId?: string) =>
+    const ingest = (raw: string, extId = 'mta-77', queueId = 7) =>
       (
         service as unknown as {
-          ingestRawMessage: (s: string, d: number | undefined, e?: string) => Promise<void>;
+          ingestRawMessage: (s: string, d: number | undefined, e: string, q: number) => Promise<void>;
         }
-      ).ingestRawMessage(raw, undefined, extId);
+      ).ingestRawMessage(raw, undefined, extId, queueId);
+
+    beforeEach(() => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 7,
+        emailAddress: 'pipe-support@example.test',
+        departmentId: 3,
+        type: 'PIPE',
+        isEnabled: true,
+      });
+    });
 
     it('#8: a reused delivery-id with DIFFERENT content is rejected (409), not silently lost', async () => {
       (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
       // The stored delivery under this key had a different message (different hash).
       (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 81,
         contentHash: 'a-different-hash',
       });
-      await expect(ingest('a brand new message', 'mta-77')).rejects.toBeInstanceOf(ConflictException);
+      await expect(ingest('a brand new message')).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.inboundAuditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: 'mail.transport_collision',
+            queueId: 7,
+            deliveryId: 81,
+          }),
+        }),
+      );
     });
 
     it('#8: a reused delivery-id with the SAME content is an idempotent no-op', async () => {
@@ -1049,7 +1254,51 @@ describe('InboundMailService — parser rule helpers', () => {
       (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         contentHash: sameHash,
       });
-      await expect(ingest(raw, 'mta-77')).resolves.toBeUndefined();
+      await expect(ingest(raw)).resolves.toBeUndefined();
+    });
+
+    it('requires an enabled PIPE queue and snapshots its department', async () => {
+      await ingest('message', 'mta-88', 7);
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ queueId: 7, departmentId: 3, externalId: 'mta-88' }),
+        }),
+      );
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ envelopeTo: 'pipe-support@example.test' }),
+        }),
+      );
+      const key = (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mock.calls[0]![0].data
+        .transportKey as string;
+      expect(key).toMatch(/^pipe:7:id-sha256:[a-f0-9]{64}$/);
+      expect(key).not.toContain('mta-88');
+    });
+
+    it('rejects disabled and non-PIPE queues before attempting a ledger insert', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        id: 7,
+        emailAddress: 'pipe-support@example.test',
+        departmentId: null,
+        type: 'PIPE',
+        isEnabled: false,
+      });
+      await expect(ingest('message')).rejects.toThrow(/disabled/i);
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        id: 7,
+        emailAddress: 'imap@example.test',
+        departmentId: null,
+        type: 'IMAP',
+        isEnabled: true,
+      });
+      await expect(ingest('message')).rejects.toThrow(/type PIPE/i);
+      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when a P2002 cannot be verified against a transport row', async () => {
+      (prisma.inboundDelivery.create as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(ingest('message')).rejects.toBeInstanceOf(ConflictException);
     });
   });
 
@@ -1114,11 +1363,12 @@ describe('InboundMailService — parser rule helpers', () => {
   describe('pruneRawMime (retention)', () => {
     it('nulls raw MIME for terminal deliveries older than the retention window; keeps quarantined', async () => {
       const svc = makeInboundService(prisma as unknown as PrismaService);
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: 44 }]);
       await (svc as unknown as { pruneRawMime: () => Promise<void> }).pruneRawMime();
       expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
-            state: { in: ['PROCESSED', 'SKIPPED'] },
+            id: { in: [44] },
             rawPrunedAt: null,
           }),
           data: expect.objectContaining({ rawMime: null }),

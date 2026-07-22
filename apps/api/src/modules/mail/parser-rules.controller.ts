@@ -53,7 +53,7 @@ type ReorderDto = z.infer<typeof ReorderSchema>;
 
 @ApiTags('admin/parser-rules')
 @Controller('admin/parser-rules')
-@RequirePermissions(PERMISSIONS.ADMIN_MAIL)
+@RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
 export class ParserRulesController {
   constructor(private readonly prisma: PrismaService) {}
 

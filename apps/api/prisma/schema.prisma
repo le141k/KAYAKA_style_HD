@@ -778,12 +778,18 @@ model EmailQueue {
   bootstrapPolicy       EmailQueueBootstrapPolicy?
   bootstrapBackfillLimit Int?
 
-  // Operator liveness signal (advisory; not part of any CAS). The supervisor stamps
-  // lastConnectedAt on a successful IMAP connect, the poller lastPollAt each cycle, and
-  // the accept path lastAcceptedAt when a message is durably recorded.
-  lastConnectedAt DateTime?
-  lastPollAt      DateTime?
-  lastAcceptedAt  DateTime?
+  // Operator liveness signal (advisory; not part of any cursor/acceptance CAS). These
+  // values make a disconnected/stuck poller visible without exposing credentials or raw
+  // driver errors. `lastPollAt` is retained for API compatibility; start/completed give
+  // the operator an honest distinction between a running and a completed cycle.
+  lastConnectionAttemptAt DateTime?
+  lastConnectedAt         DateTime?
+  lastDisconnectedAt      DateTime?
+  lastConnectionErrorAt   DateTime?
+  lastPollStartedAt       DateTime?
+  lastPollAt              DateTime?
+  lastPollCompletedAt     DateTime?
+  lastAcceptedAt          DateTime?
 
   inboundDeliveries InboundDelivery[]
 }

@@ -69,3 +69,26 @@ export const ReconcileEmailQueueSchema = z
     }
   });
 export type ReconcileEmailQueueDto = z.infer<typeof ReconcileEmailQueueSchema>;
+
+// ─────────────────── Inbound quarantine operator actions ───────────────────
+
+export const ListQuarantinedInboundSchema = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().positive().max(100).default(25),
+  queueId: z.coerce.number().int().positive().optional(),
+  // `reason` filters the safe persisted failure summary; raw MIME is never returned.
+  reason: z.string().trim().min(1).max(300).optional(),
+  messageId: z.string().trim().min(1).max(512).optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+});
+export type ListQuarantinedInboundDto = z.infer<typeof ListQuarantinedInboundSchema>;
+
+/** A replay is a business-changing action, never a button with an empty audit trail. */
+export const ReplayQuarantinedInboundSchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+  // The UI sends the row version it inspected. A changed row is a 409, never a
+  // second replay that races an already-running operator action.
+  expectedUpdatedAt: z.coerce.date(),
+});
+export type ReplayQuarantinedInboundDto = z.infer<typeof ReplayQuarantinedInboundSchema>;
