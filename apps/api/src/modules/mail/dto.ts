@@ -12,9 +12,16 @@ export const CreateEmailQueueSchema = z.object({
   useTls: z.boolean().default(true),
   departmentId: z.number().int().positive().nullable().optional(),
   signature: z.string().default(''),
+  // Lower values win deterministic routing when one logical message is delivered to
+  // multiple enabled queue addresses; queue id is the stable tie-breaker.
+  routingPriority: z.number().int().min(0).max(1_000_000).default(100),
   isEnabled: z.boolean().default(false),
 });
-export type CreateEmailQueueDto = z.infer<typeof CreateEmailQueueSchema>;
+// Zod supplies routingPriority=100 at the HTTP boundary. Keep it optional in the service
+// input too, so internal callers/older seeds remain backward-compatible during rollout.
+export type CreateEmailQueueDto = Omit<z.infer<typeof CreateEmailQueueSchema>, 'routingPriority'> & {
+  routingPriority?: number;
+};
 
 export const UpdateEmailQueueSchema = CreateEmailQueueSchema.partial();
 export type UpdateEmailQueueDto = z.infer<typeof UpdateEmailQueueSchema>;

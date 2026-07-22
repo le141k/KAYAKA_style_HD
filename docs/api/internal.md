@@ -388,23 +388,28 @@ state = PROCESSING`): a **0-row settle** means the lease was lost mid-processing
   explicitly via `POST /api/admin/email-queues/:id/reconcile`, which reads the legacy `Setting`
   state (`imap/state:<id>` primary, `imap/lastSeenUid:<id>` fallback) and carries UIDVALIDITY +
   watermark forward before clearing the halt.
-- **Routing / idempotency (content-aware):** de-dups by an _effective_ Message-ID — the RFC id, or
-  a deterministic `<inbound-<sha256>@23telecom.local>` synthesised when absent. The synthetic id is
-  **seeded from a queue-scoped CONTENT identity** (`imap:<queueId>:<contentHash>` for IMAP; the
-  transport key for PIPE), so it is stable across a re-fetch of the same message (a `BACKFILL` after a
-  UIDVALIDITY reset dedups instead of double-ticketing) yet distinct per queue (identical bytes to two
-  queues are BOTH ticketed, never silently collapsed). The effective id is claimed **atomically** by
-  stamping it on this ledger row (unique `InboundDelivery.messageId`): a conflict means another
-  delivery already owns that id — a shared RFC Message-ID (e.g. a message CC'd to two polled mailboxes,
-  whose copies differ only in per-hop trace headers) or a same queue+content synthetic id **is the
-  same logical message**, so the duplicate is `SKIPPED` (never quarantined as a spoof). The id is also
-  written atomically with the ticket/post create (`TicketsService.reply()` / `createTicket()` accept
-  an internal `incomingMessageId`); a unique `TicketPost.messageId` plus the ledger's unique
-  `messageId`/`transportKey` make redelivery an idempotent no-op. A `RESUME_MIGRATED` re-fetch of
-  pre-ledger header-less mail also de-dups against the legacy transport id form
-  (`<imap-<queueId>-<uidValidity>-<uid>@helpdesk.invalid>`). Subject-mask threading is fail-closed:
-  unresolved / unauthorized sender → new ticket; a DB error propagates (delivery retried, never a
-  silent duplicate ticket).
+- **Routing / idempotency (P1-E logical claim):** each transport copy remains a separate
+  `InboundDelivery` and stores its non-unique `observedMessageId`, `messageIdHash`, `semanticHash`
+  and immutable route snapshot. A real RFC Message-ID is normalized, SHA-256 hashed and claimed in
+  one transaction through `InboundMessageClaim(messageIdHash PK, winnerDeliveryId UNIQUE)`. The
+  semantic hash contains normalized From/To/Cc/Reply-To, subject, text/HTML and attachment metadata
+  + content hashes; it deliberately excludes per-hop `Received`, `Return-Path` and `Delivered-To`.
+  Same real ID + same semantic content → loser `SKIPPED`; same ID + differing (or legacy unknown)
+  semantic content → loser `QUARANTINED` with a durable `mail.message_id_conflict` audit.
+  `TicketPost.messageId` stays the independent retry backstop. Headerless mail has **no logical
+  content claim**: it receives an internal post key from its exact transport key, so two different
+  IMAP UIDs with identical bytes become two tickets, while a retry of one transport remains
+  idempotent. A headerless re-fetch after UIDVALIDITY reset may visibly duplicate — this is the
+  intentional safe trade-off over silent loss. During the forward-only expand/contract rollout,
+  legacy `InboundDelivery.messageId @unique` remains as compatibility state; it is not written by
+  new runtime and cannot be removed before real-PostgreSQL backfill/cutover verification. Deploy
+  must quiesce all old inbound workers first: old headerless content-derived keys and new
+  transport-derived keys are deliberately never mixed in a rolling worker fleet.
+- **Deterministic owner:** before any ticket work, enabled queues matching normalized To/Cc or a
+  trusted envelope recipient are sorted by `routingPriority` (ascending), then queue `id`. The chosen
+  queue/department is persisted once on the logical claim and every copy reuses it, independent of
+  poller arrival order. No match falls back explicitly to the receiving queue/default department and
+  records `mail.route_fallback` audit metadata.
 - **Liveness + retention (advisory):** the supervisor stamps `EmailQueue.lastConnectedAt` on a
   successful connect, the poller `lastPollAt` each cycle, and the accept path `lastAcceptedAt` on a
   durable record (best-effort `stampQueue`, never breaks a poll; surfaced by health). A **raw-MIME

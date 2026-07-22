@@ -22,7 +22,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { decryptField } from '../../common/field-encrypt.util';
 import { normalizeEmail } from '../../common/email.util';
 import { stripQuotedReply } from './quoted-reply.util';
-import type { EmailParserRule } from '@prisma/client';
+import type { EmailParserRule, Prisma } from '@prisma/client';
 
 /** Parsed email fields used for rule evaluation */
 interface ParsedEmail {
@@ -47,6 +47,45 @@ interface ProcessOutcome {
   state: 'PROCESSED' | 'SKIPPED';
   ticketId?: number;
   postId?: number;
+}
+
+/** Immutable business route selected before a delivery can create a ticket. */
+interface InboundRoute {
+  queueId?: number;
+  departmentId?: number;
+  /** No configured recipient address matched; receiving queue/default was used explicitly. */
+  fallback: boolean;
+  fallbackReason?: 'RECEIVING_QUEUE' | 'DEFAULT_DEPARTMENT';
+}
+
+/** Context snapshotted from the ledger row, never inferred from mutable queue state later. */
+interface DeliveryRoutingContext {
+  queueId?: number;
+  transportKey?: string;
+  envelopeTo?: string;
+  routedQueueId?: number;
+  routedDepartmentId?: number;
+}
+
+interface LogicalClaimWinner {
+  messageIdHash: string;
+  route: InboundRoute;
+}
+
+type LogicalClaimResult =
+  | { kind: 'WINNER'; winner: LogicalClaimWinner }
+  | { kind: 'DUPLICATE'; route: InboundRoute }
+  | { kind: 'CONFLICT'; route: InboundRoute; existingSemanticHash: string | null };
+
+/**
+ * A real Message-ID was reused with different logical content, or points at a legacy claim
+ * whose semantic content cannot be reconstructed safely. This is an input/forensics conflict,
+ * not a transient DB error, so the delivery is quarantined (with its raw MIME retained).
+ */
+class SemanticMessageIdConflictError extends BadRequestException {
+  constructor(message: string) {
+    super(message);
+  }
 }
 
 /** Ticket mask pattern used to thread inbound replies, e.g. TT-000042 */
@@ -973,20 +1012,23 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         });
     }, InboundMailService.LEASE_MS / 2);
     heartbeat.unref?.();
-    // Synthetic-id seed for header-less mail: a QUEUE-SCOPED CONTENT identity, not the raw
-    // UID. For IMAP use `imap:<queueId>:<contentHash>` — stable across a UIDVALIDITY reset +
-    // BACKFILL re-fetch (same queue+bytes → same id → deduped, no double ticket) yet distinct
-    // per queue (identical bytes to two queues → two ids → both ticketed, no silent collapse).
-    // For PIPE the transport key already encodes queue + the caller's externalId/content.
-    const syntheticSeed =
-      delivery.transport === 'IMAP'
-        ? `imap:${delivery.queueId ?? '-'}:${delivery.contentHash}`
-        : delivery.transportKey;
+    // Header-less mail is deliberately idempotent ONLY by transport identity. Do not seed an
+    // id from `contentHash`: two distinct IMAP UIDs carrying identical bytes are independent
+    // deliveries and must create two tickets. `transportKey` contains the full IMAP identity
+    // (including mailbox epoch after P0-A) and the trusted PIPE delivery identity after P1-G.
+    const syntheticSeed = delivery.transportKey;
     try {
       const outcome = await this.processRawMessage(Buffer.from(delivery.rawMime), departmentId, {
         deliveryId,
         legacyDedupIds,
         syntheticSeed,
+        deliveryContext: {
+          queueId: delivery.queueId ?? undefined,
+          transportKey: delivery.transportKey,
+          envelopeTo: delivery.envelopeTo ?? undefined,
+          routedQueueId: delivery.routedQueueId ?? undefined,
+          routedDepartmentId: delivery.routedDepartmentId ?? undefined,
+        },
       });
       await settle({
         state: outcome.state,
@@ -1044,14 +1086,13 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     opts: {
       deliveryId?: number;
       legacyDedupIds?: string[];
-      /** Queue-scoped CONTENT identity used to synthesize the effective Message-ID for
-       *  header-less mail — stable across a re-fetch of the same message (so a BACKFILL
-       *  re-import dedups) yet distinct per queue (so identical bytes to two queues are both
-       *  ticketed, never silently collapsed). Falls back to the raw bytes when absent. */
+      /** Stable transport identity used only for the ticket-post retry key of headerless mail. */
       syntheticSeed?: string;
+      /** Immutable transport/route snapshot read from the ledger row that owns this attempt. */
+      deliveryContext?: DeliveryRoutingContext;
     } = {},
   ): Promise<ProcessOutcome> {
-    const { deliveryId, legacyDedupIds = [], syntheticSeed } = opts;
+    const { deliveryId, legacyDedupIds = [], syntheticSeed, deliveryContext } = opts;
     // Reject oversized raw before parsing (an IMAP fetch capped at the size limit + 1 byte
     // arrives here truncated; the PIPE path already rejects at ingress).
     const sourceBytes = typeof source === 'string' ? Buffer.byteLength(source) : source.length;
@@ -1065,6 +1106,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       const { simpleParser } = await import('mailparser');
       return simpleParser(source);
     });
+    const realMessageId = this.resolveRealMessageId(parsed);
     this.validateParsedMail(parsed);
 
     const subject = (parsed.subject ?? '(no subject)').trim() || '(no subject)';
@@ -1079,50 +1121,92 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       normalizeEmail(
         (!Array.isArray(toField) ? toField?.value?.[0]?.address : toField?.[0]?.value?.[0]?.address) ?? '',
       ) || undefined;
+    // The envelope recipient is a trusted transport snapshot (needed for BCC routing). Never
+    // overwrite it with the visible To header when processing an already-accepted delivery.
+    const persistedEnvelopeTo = deliveryContext?.envelopeTo ?? toAddress;
+    const rawBuf = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
+    const semanticHash = this.computeSemanticHash(parsed);
+    let route: InboundRoute = { departmentId, fallback: false };
+    let winnerClaim: LogicalClaimWinner | undefined;
 
-    // A5(ii): drop machine-generated / looping mail before it can create a ticket/reply.
-    if (this.isLoopMessage(parsed, fromEmail)) {
-      this.logger.log('Inbound: skipped auto/loop message');
-      return { state: 'SKIPPED' };
+    // Every ledger delivery records the observed real Message-ID (if present), semantic hash,
+    // and deterministic business route BEFORE loop/rule/ticket decisions. That makes CC copies,
+    // parser skips, and quarantined semantic conflicts forensic-visible rather than invisible
+    // side effects of a unique field on InboundDelivery.
+    if (deliveryId != null) {
+      const proposedRoute = await this.resolveInboundRoute(parsed, deliveryContext, departmentId);
+      if (realMessageId) {
+        const claim = await this.claimRealMessage({
+          deliveryId,
+          messageId: realMessageId,
+          semanticHash,
+          route: proposedRoute,
+          deliveryContext,
+          envelopeFrom: fromEmail,
+          envelopeTo: persistedEnvelopeTo,
+          subject,
+        });
+        if (claim.kind === 'DUPLICATE') {
+          this.logger.log(`Inbound: logical duplicate ${realMessageId} from ${fromEmail} — skipped`);
+          return { state: 'SKIPPED' };
+        }
+        if (claim.kind === 'CONFLICT') {
+          this.logger.error(
+            `Inbound: Message-ID semantic conflict ${realMessageId} delivery=${deliveryId} ` +
+              `(existing=${claim.existingSemanticHash ?? 'legacy/unknown'})`,
+          );
+          throw new SemanticMessageIdConflictError(
+            'Message-ID was already claimed by different or unreconstructable logical content',
+          );
+        }
+        route = claim.winner.route;
+        winnerClaim = claim.winner;
+      } else {
+        route = await this.recordHeaderlessDelivery({
+          deliveryId,
+          semanticHash,
+          route: proposedRoute,
+          deliveryContext,
+          envelopeFrom: fromEmail,
+          envelopeTo: persistedEnvelopeTo,
+          subject,
+        });
+      }
     }
 
-    // Effective Message-ID: the real (normalized) RFC id, or a deterministic synthetic one
-    // when the message carries none. The synthetic id is seeded from a QUEUE-SCOPED CONTENT
-    // identity (`imap:<queueId>:<contentHash>` for IMAP; the transport key for PIPE), so it is
-    // stable across a re-fetch of the same message (a BACKFILL after a UIDVALIDITY reset dedups
-    // instead of double-ticketing) yet distinct per queue (identical bytes to two queues are
-    // BOTH ticketed, never silently collapsed). Falls back to the raw bytes when no seed given.
-    const rawBuf = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
-    const realMessageId = this.normalizeMessageId(parsed.messageId);
+    // True Message-IDs key the ticket-post idempotency backstop. Headerless mail gets a
+    // per-transport synthetic key: identical bytes on different IMAP UIDs intentionally do
+    // NOT collide, while a retry of the same ledger row still cannot create another post.
     const seed: string | Buffer = syntheticSeed ?? rawBuf;
     const effectiveMessageId =
       realMessageId ?? `<inbound-${createHash('sha256').update(seed).digest('hex')}@23telecom.local>`;
 
-    // ATOMIC dedup claim (race-safe): stamp the effective Message-ID + parsed identity on THIS
-    // ledger row. The unique index on `messageId` means only one delivery can own it — a
-    // concurrent IMAP+PIPE (or two-poller) duplicate loses the race with P2002 and is SKIPPED,
-    // instead of both check-then-act creating a ticket. A shared Message-ID (real RFC id, or a
-    // same queue+content synthetic id) IS the same logical message — e.g. a message CC'd to two
-    // polled mailboxes gets per-hop trace headers that differ byte-for-byte but is still ONE
-    // message — so a conflict is a duplicate to SKIP, never a spoof to quarantine.
-    if (deliveryId != null) {
-      try {
-        await this.prisma.inboundDelivery.update({
-          where: { id: deliveryId },
+    const finalize = async (outcome: ProcessOutcome): Promise<ProcessOutcome> => {
+      if (winnerClaim && deliveryId != null && (outcome.ticketId != null || outcome.postId != null)) {
+        const updated = await this.prisma.inboundMessageClaim.updateMany({
+          where: {
+            messageIdHash: winnerClaim.messageIdHash,
+            winnerDeliveryId: deliveryId,
+          },
           data: {
-            messageId: effectiveMessageId,
-            envelopeFrom: fromEmail,
-            envelopeTo: toAddress ?? null,
-            subject: subject.slice(0, 500),
+            ticketId: outcome.ticketId ?? null,
+            postId: outcome.postId ?? null,
           },
         });
-      } catch (err) {
-        if (this.isUniqueViolation(err)) {
-          this.logger.log(`Inbound: duplicate message ${effectiveMessageId} from ${fromEmail} — skipped`);
-          return { state: 'SKIPPED' };
+        if (updated.count !== 1) {
+          throw new ServiceUnavailableException(
+            `Logical Message-ID claim ${winnerClaim.messageIdHash} changed before finalization`,
+          );
         }
-        throw err;
       }
+      return outcome;
+    };
+
+    // A5(ii): drop machine-generated / looping mail before it can create a ticket/reply. The
+    // delivery/claim was intentionally recorded above, so a loop is auditable and idempotent.
+    if (this.isLoopMessage(parsed, fromEmail)) {
+      this.logger.log('Inbound: skipped auto/loop message');
+      return finalize({ state: 'SKIPPED' });
     }
 
     // Secondary fast dedup: if a post already bears this Message-ID it was ingested before
@@ -1135,7 +1219,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     });
     if (existing) {
       this.logger.log(`Inbound: duplicate message ${effectiveMessageId} from ${fromEmail} — skipped`);
-      return { state: 'SKIPPED', ticketId: existing.ticketId, postId: existing.id };
+      return finalize({ state: 'SKIPPED', ticketId: existing.ticketId, postId: existing.id });
     }
 
     const textBody = stripQuotedReply(parsed.text ?? '');
@@ -1204,7 +1288,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           incomingMessageId: effectiveMessageId,
         });
         this.logger.log(`Inbound: RFC-threaded reply to ${linkedPost.ticket.mask} from ${fromEmail}`);
-        return { state: 'PROCESSED', ticketId: linkedPost.ticketId, postId: post.id };
+        return finalize({ state: 'PROCESSED', ticketId: linkedPost.ticketId, postId: post.id });
       }
       if (linkedPost) {
         this.logger.warn('Inbound: RFC-thread sender not authorized for the ticket — creating new');
@@ -1239,7 +1323,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           incomingMessageId: effectiveMessageId,
         });
         this.logger.log(`Inbound: threaded reply to ${mask} from ${fromEmail}`);
-        return { state: 'PROCESSED', ticketId: maskTicket.id, postId: post.id };
+        return finalize({ state: 'PROCESSED', ticketId: maskTicket.id, postId: post.id });
       }
       this.logger.warn(
         maskTicket
@@ -1250,14 +1334,15 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
 
     // 3. PRE_PARSE parser rules (before creating a new ticket)
     const parsedEmail: ParsedEmail = { subject, fromEmail, fromName, toEmail: toAddress, body: textBody };
-    const ruleResult = await this.applyParserRules(parsedEmail, departmentId);
+    const routedDepartmentId = route.departmentId ?? departmentId;
+    const ruleResult = await this.applyParserRules(parsedEmail, routedDepartmentId);
     if (ruleResult.skip) {
       this.logger.log(`Inbound: message from ${fromEmail} discarded by parser rule — "${subject}"`);
-      return { state: 'SKIPPED' };
+      return finalize({ state: 'SKIPPED' });
     }
 
     // 4. Create a new ticket. Message-ID written atomically with the first post.
-    const deptId = ruleResult.departmentId ?? departmentId ?? (await this.defaultDeptId());
+    const deptId = ruleResult.departmentId ?? routedDepartmentId ?? (await this.defaultDeptId());
     const newTicket = await this.ticketsService.createTicket({
       subject,
       contents: htmlBody ?? textBody,
@@ -1280,7 +1365,299 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       select: { id: true },
     });
     this.logger.log(`Inbound: new ticket ${newTicket.mask} from ${fromEmail} — "${subject}"`);
-    return { state: 'PROCESSED', ticketId: newTicket.id, postId: firstPost?.id };
+    return finalize({ state: 'PROCESSED', ticketId: newTicket.id, postId: firstPost?.id });
+  }
+
+  // ─────────────────── logical Message-ID claim + deterministic route ───────────────────
+
+  /**
+   * Select the one business owner deterministically. We only use trusted, normalized
+   * recipients (To/Cc plus the envelope recipient captured at accept) and rank matching
+   * enabled queues by routingPriority then id. On retry, an already-persisted route wins over
+   * any later queue configuration change.
+   */
+  private async resolveInboundRoute(
+    parsed: ParsedMail,
+    context: DeliveryRoutingContext | undefined,
+    fallbackDepartmentId: number | undefined,
+  ): Promise<InboundRoute> {
+    if (context?.routedQueueId != null || context?.routedDepartmentId != null) {
+      return {
+        queueId: context.routedQueueId,
+        departmentId: context.routedDepartmentId ?? fallbackDepartmentId,
+        fallback: false,
+      };
+    }
+
+    const recipients = new Set<string>();
+    for (const field of [parsed.to, parsed.cc]) {
+      for (const entry of this.addressEntries(field)) {
+        const email = normalizeEmail(entry.address ?? '');
+        if (email) recipients.add(email);
+      }
+    }
+    const envelopeRecipient = normalizeEmail(context?.envelopeTo ?? '');
+    if (envelopeRecipient) recipients.add(envelopeRecipient);
+
+    const queues = await this.prisma.emailQueue.findMany({
+      where: { isEnabled: true },
+      select: { id: true, emailAddress: true, departmentId: true, routingPriority: true },
+    });
+    const matched = queues
+      .filter((queue) => recipients.has(normalizeEmail(queue.emailAddress)))
+      .sort((a, b) => a.routingPriority - b.routingPriority || a.id - b.id);
+    const winner = matched[0];
+    if (winner) {
+      return {
+        queueId: winner.id,
+        departmentId: winner.departmentId ?? fallbackDepartmentId,
+        fallback: false,
+      };
+    }
+
+    // A message with no unambiguous configured recipient is never silently routed according
+    // to poller arrival order. The receiving queue is the explicit, durable fallback when it
+    // is known; otherwise only the already-snapshotted department remains available.
+    if (context?.queueId != null) {
+      const receiving = queues.find((queue) => queue.id === context.queueId);
+      return {
+        queueId: context.queueId,
+        departmentId: receiving?.departmentId ?? fallbackDepartmentId ?? (await this.defaultDeptId()),
+        fallback: true,
+        fallbackReason: 'RECEIVING_QUEUE',
+      };
+    }
+    return {
+      departmentId: fallbackDepartmentId ?? (await this.defaultDeptId()),
+      fallback: true,
+      fallbackReason: 'DEFAULT_DEPARTMENT',
+    };
+  }
+
+  /**
+   * Create/read the durable logical claim inside one database transaction. A unique hash
+   * collision is resolved by reading the winning claim in the same transaction; only the
+   * winner is allowed into ticket routing. A semantic mismatch is durably audited and returned
+   * to the caller as a permanent quarantine outcome.
+   */
+  private async claimRealMessage(args: {
+    deliveryId: number;
+    messageId: string;
+    semanticHash: string;
+    route: InboundRoute;
+    deliveryContext?: DeliveryRoutingContext;
+    envelopeFrom: string;
+    envelopeTo?: string;
+    subject: string;
+  }): Promise<LogicalClaimResult> {
+    const messageIdHash = createHash('sha256').update(args.messageId).digest('hex');
+    return this.prisma.$transaction<LogicalClaimResult>(async (tx: Prisma.TransactionClient) => {
+      // Do NOT catch P2002 then read in this transaction: PostgreSQL marks a transaction
+      // aborted after a unique violation. `createMany(skipDuplicates)` emits INSERT .. ON
+      // CONFLICT DO NOTHING instead, so the subsequent read is valid for both the winner and
+      // a concurrent loser (and any other DB failure still propagates/retries).
+      await tx.inboundMessageClaim.createMany({
+        data: {
+          messageIdHash,
+          normalizedMessageId: args.messageId,
+          semanticHash: args.semanticHash,
+          semanticHashVersion: 1,
+          winnerDeliveryId: args.deliveryId,
+          routedQueueId: args.route.queueId ?? null,
+          departmentId: args.route.departmentId ?? null,
+        },
+        skipDuplicates: true,
+      });
+      const claim = await tx.inboundMessageClaim.findUnique({ where: { messageIdHash } });
+      if (!claim) {
+        // `skipDuplicates` can also be triggered by winnerDeliveryId's unique constraint.
+        // If the expected hash is absent, do not assume duplicate semantics; retry/fail closed.
+        throw new ServiceUnavailableException(
+          `Logical Message-ID claim ${messageIdHash} was not readable after atomic insert`,
+        );
+      }
+
+      const persistedRoute: InboundRoute = {
+        queueId: claim.routedQueueId ?? undefined,
+        departmentId: claim.departmentId ?? undefined,
+        fallback: false,
+      };
+      await this.recordDeliveryIdentity(tx, {
+        deliveryId: args.deliveryId,
+        observedMessageId: args.messageId,
+        messageIdHash,
+        semanticHash: args.semanticHash,
+        route: persistedRoute,
+        envelopeFrom: args.envelopeFrom,
+        envelopeTo: args.envelopeTo,
+        subject: args.subject,
+      });
+
+      if (claim.winnerDeliveryId === args.deliveryId) {
+        // A retry of the original winner after ticket creation but before settle must retain
+        // ownership. A malformed changed raw payload on that same delivery is still unsafe.
+        if (claim.semanticHashVersion !== 1 || claim.semanticHash !== args.semanticHash) {
+          await this.writeSemanticConflictAudit(tx, args, messageIdHash, claim.semanticHash);
+          return { kind: 'CONFLICT', route: persistedRoute, existingSemanticHash: claim.semanticHash };
+        }
+        if (args.route.fallback) await this.writeRouteFallbackAudit(tx, args.deliveryId, args.route);
+        return { kind: 'WINNER', winner: { messageIdHash, route: persistedRoute } };
+      }
+
+      // A historical claim with no semantic content is intentionally fail-closed. Treating raw
+      // bytes as a semantic hash would falsely conflict valid CC copies; treating it as equal
+      // would silently discard a genuinely different message that reused a Message-ID.
+      if (claim.semanticHashVersion !== 1 || !claim.semanticHash || claim.semanticHash !== args.semanticHash) {
+        await this.writeSemanticConflictAudit(tx, args, messageIdHash, claim.semanticHash);
+        return { kind: 'CONFLICT', route: persistedRoute, existingSemanticHash: claim.semanticHash };
+      }
+
+      return { kind: 'DUPLICATE', route: persistedRoute };
+    });
+  }
+
+  /** Persist an identity/route for headerless mail without creating a logical claim. */
+  private async recordHeaderlessDelivery(args: {
+    deliveryId: number;
+    semanticHash: string;
+    route: InboundRoute;
+    deliveryContext?: DeliveryRoutingContext;
+    envelopeFrom: string;
+    envelopeTo?: string;
+    subject: string;
+  }): Promise<InboundRoute> {
+    return this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await this.recordDeliveryIdentity(tx, {
+        deliveryId: args.deliveryId,
+        observedMessageId: null,
+        messageIdHash: null,
+        semanticHash: args.semanticHash,
+        route: args.route,
+        envelopeFrom: args.envelopeFrom,
+        envelopeTo: args.envelopeTo,
+        subject: args.subject,
+      });
+      if (args.route.fallback) await this.writeRouteFallbackAudit(tx, args.deliveryId, args.route);
+      return args.route;
+    });
+  }
+
+  private async recordDeliveryIdentity(
+    tx: Prisma.TransactionClient,
+    args: {
+      deliveryId: number;
+      observedMessageId: string | null;
+      messageIdHash: string | null;
+      semanticHash: string;
+      route: InboundRoute;
+      envelopeFrom: string;
+      envelopeTo?: string;
+      subject: string;
+    },
+  ): Promise<void> {
+    await tx.inboundDelivery.update({
+      where: { id: args.deliveryId },
+      data: {
+        observedMessageId: args.observedMessageId,
+        messageIdHash: args.messageIdHash,
+        semanticHash: args.semanticHash,
+        routedQueueId: args.route.queueId ?? null,
+        routedDepartmentId: args.route.departmentId ?? null,
+        envelopeFrom: args.envelopeFrom,
+        envelopeTo: args.envelopeTo ?? null,
+        subject: args.subject.slice(0, MAX_SUBJECT_CHARS),
+      },
+    });
+  }
+
+  private async writeRouteFallbackAudit(
+    tx: Prisma.TransactionClient,
+    deliveryId: number,
+    route: InboundRoute,
+  ): Promise<void> {
+    await tx.inboundAuditLog.create({
+      data: {
+        action: 'mail.route_fallback',
+        queueId: route.queueId ?? null,
+        deliveryId,
+        reason: route.fallbackReason ?? 'unknown',
+        metadata: {
+          routedQueueId: route.queueId ?? null,
+          routedDepartmentId: route.departmentId ?? null,
+        } as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  private async writeSemanticConflictAudit(
+    tx: Prisma.TransactionClient,
+    args: {
+      deliveryId: number;
+      messageId: string;
+      semanticHash: string;
+      route: InboundRoute;
+      deliveryContext?: DeliveryRoutingContext;
+    },
+    messageIdHash: string,
+    existingSemanticHash: string | null,
+  ): Promise<void> {
+    await tx.inboundAuditLog.create({
+      data: {
+        action: 'mail.message_id_conflict',
+        queueId: args.route.queueId ?? args.deliveryContext?.queueId ?? null,
+        deliveryId: args.deliveryId,
+        reason: 'Message-ID reused with different or unreconstructable logical content',
+        metadata: {
+          messageId: args.messageId,
+          messageIdHash,
+          incomingSemanticHash: args.semanticHash,
+          existingSemanticHash,
+        } as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  /** SHA-256 over logical RFC content only; never raw MIME / per-hop trace headers. */
+  private computeSemanticHash(parsed: ParsedMail): string {
+    const normalizeText = (value: string | undefined): string =>
+      (value ?? '')
+        .normalize('NFC')
+        .replace(/\r\n?/g, '\n')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    const addressField = (field: AddressObject | AddressObject[] | undefined) =>
+      this.addressEntries(field)
+        .map((entry) => ({
+          address: normalizeEmail(entry.address ?? ''),
+          name: normalizeText(entry.name).toLowerCase(),
+        }))
+        .filter((entry) => entry.address)
+        .sort((a, b) => `${a.address}\u0000${a.name}`.localeCompare(`${b.address}\u0000${b.name}`));
+    const attachmentSummary = (parsed.attachments ?? [])
+      .map((attachment) => {
+        const content = attachment.content instanceof Buffer ? attachment.content : Buffer.alloc(0);
+        const reportedSize = (attachment as { size?: unknown }).size;
+        return {
+          filename: normalizeText(attachment.filename),
+          mimeType: normalizeText(attachment.contentType).toLowerCase(),
+          size: typeof reportedSize === 'number' && Number.isSafeInteger(reportedSize) ? reportedSize : content.length,
+          hash: createHash('sha256').update(content).digest('hex'),
+        };
+      })
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    const canonical = JSON.stringify({
+      version: 1,
+      from: addressField(parsed.from),
+      to: addressField(parsed.to),
+      cc: addressField(parsed.cc),
+      replyTo: addressField(parsed.replyTo),
+      subject: normalizeText(parsed.subject),
+      text: normalizeText(parsed.text),
+      html: normalizeText(typeof parsed.html === 'string' ? parsed.html : undefined),
+      attachments: attachmentSummary,
+    });
+    return createHash('sha256').update(canonical).digest('hex');
   }
 
   // ─────────────────── helpers: mailbox / locks ───────────────────
@@ -1437,7 +1814,12 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       this.assertFieldLength(entry.name, MAX_NAME_CHARS, 'Address display name');
     }
 
-    this.assertValidMessageId(parsed.messageId, 'Message-ID');
+    // Message-ID has deliberately stricter handling than the reply/reference headers:
+    // mailparser may synthesize angle brackets around a malformed raw value, and an empty
+    // raw header is represented as `undefined`. resolveRealMessageId() checks the original
+    // header line, so a *present* invalid Message-ID quarantines rather than falling through
+    // to headerless transport deduplication.
+    this.resolveRealMessageId(parsed);
     this.assertValidMessageId(parsed.inReplyTo, 'In-Reply-To');
     const references = this.referenceValues(parsed.references);
     if (references.length > MAX_REFERENCES) {
@@ -1490,14 +1872,58 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Trim + reject control/space chars; bound the length. Returns undefined if invalid. */
+  /**
+   * Return a normalized real Message-ID, or undefined only when the header is absent.
+   *
+   * `mailparser` normalizes an unbracketed `Message-ID: broken` to `<broken>`, and omits an
+   * empty `Message-ID:` from `headers` entirely. Looking solely at `parsed.messageId` would
+   * therefore silently classify attacker/broken-sender input as either a valid ID or a
+   * headerless message. The raw header line is the authoritative presence check.
+   */
+  private resolveRealMessageId(parsed: ParsedMail): string | undefined {
+    const messageIdLines = parsed.headerLines.filter((line) => line.key.toLowerCase() === 'message-id');
+    if (messageIdLines.length === 0) {
+      if (parsed.messageId === undefined || parsed.messageId === null || parsed.messageId === '') return undefined;
+      const normalized = this.normalizeMessageId(parsed.messageId);
+      if (!normalized) throw new BadRequestException('Message-ID is invalid or too long');
+      return normalized;
+    }
+    if (messageIdLines.length !== 1) {
+      throw new BadRequestException('Inbound message contains multiple Message-ID headers');
+    }
+
+    const rawLine = messageIdLines[0]!.line;
+    const separator = rawLine.indexOf(':');
+    if (separator < 0) throw new BadRequestException('Message-ID is invalid or too long');
+    // Unfold legal RFC header folding, then validate the actual header value. Whitespace inside
+    // the ID itself remains invalid in normalizeMessageId().
+    const rawValue = rawLine.slice(separator + 1).replace(/\r?\n[\t ]+/g, '').trim();
+    const normalized = this.normalizeMessageId(rawValue);
+    if (!normalized) throw new BadRequestException('Message-ID is invalid or too long');
+    return normalized;
+  }
+
+  /**
+   * Normalize a real RFC Message-ID for its bounded SHA-256 claim key. Invalid/oversized
+   * headers are rejected by validateParsedMail and therefore quarantined; they are never
+   * silently downgraded into headerless mail.
+   */
   private normalizeMessageId(value: unknown): string | undefined {
     if (typeof value !== 'string') return undefined;
     const normalized = value.trim();
-    if (!normalized || normalized.length > MAX_MESSAGE_ID_CHARS) return undefined;
-    for (const char of normalized) {
+    if (
+      !normalized ||
+      normalized.length > MAX_MESSAGE_ID_CHARS ||
+      !normalized.startsWith('<') ||
+      !normalized.endsWith('>') ||
+      normalized.length < 3
+    ) {
+      return undefined;
+    }
+    const body = normalized.slice(1, -1);
+    for (const char of body) {
       const code = char.charCodeAt(0);
-      if (code <= 0x20 || code === 0x7f) return undefined;
+      if (code <= 0x20 || code === 0x7f || char === '<' || char === '>') return undefined;
     }
     return normalized;
   }

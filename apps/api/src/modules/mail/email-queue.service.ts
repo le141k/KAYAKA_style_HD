@@ -30,6 +30,7 @@ const SAFE_SELECT = {
   useTls: true,
   departmentId: true,
   signature: true,
+  routingPriority: true,
   isEnabled: true,
   createdAt: true,
   // Inbound sync health (operator visibility).
@@ -102,11 +103,12 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
 
   /** Create a new email queue. The caller-supplied password is encrypted at rest. */
   create(dto: CreateEmailQueueDto) {
-    const { password, ...rest } = dto;
+    const { password, routingPriority = 100, ...rest } = dto;
     const encKey = process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
     return this.prisma.emailQueue.create({
       data: {
         ...rest,
+        routingPriority,
         passwordEnc: encryptField(password ?? '', encKey),
       },
       select: SAFE_SELECT,
@@ -370,7 +372,14 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         id: true,
         transport: true,
         queueId: true,
+        // `messageId` is legacy compatibility state; new logical-message runtime records the
+        // non-unique observed RFC id plus hashes on every transport copy for operator forensics.
         messageId: true,
+        observedMessageId: true,
+        messageIdHash: true,
+        semanticHash: true,
+        routedQueueId: true,
+        routedDepartmentId: true,
         envelopeFrom: true,
         envelopeTo: true,
         subject: true,

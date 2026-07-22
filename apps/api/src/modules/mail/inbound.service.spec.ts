@@ -75,7 +75,11 @@ const TEST_CONFIG: AppConfig = {
 };
 
 function makePrismaMock() {
-  return {
+  // Keep logical claims stateful by default. A stateless `findUnique: null` mock would
+  // falsely make every `INSERT .. ON CONFLICT DO NOTHING` look like a database outage,
+  // hiding the winner/loser behavior that PostgreSQL provides in production.
+  const claims = new Map<string, Record<string, unknown>>();
+  const prisma = {
     emailQueue: {
       findMany: vi.fn().mockResolvedValue([]),
       findUnique: vi.fn(),
@@ -94,6 +98,24 @@ function makePrismaMock() {
       update: vi.fn().mockResolvedValue({}),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
+    inboundMessageClaim: {
+      findUnique: vi.fn(({ where }: { where: { messageIdHash: string } }) =>
+        Promise.resolve(claims.get(where.messageIdHash) ?? null),
+      ),
+      createMany: vi.fn(({ data }: { data: Record<string, unknown> }) => {
+        const messageIdHash = data.messageIdHash as string;
+        if (claims.has(messageIdHash)) return Promise.resolve({ count: 0 });
+        claims.set(messageIdHash, { ...data });
+        return Promise.resolve({ count: 1 });
+      }),
+      // Retained only for older non-P1-E test helpers; runtime claim code must use
+      // createMany(skipDuplicates), never catch P2002 inside an interactive transaction.
+      create: vi.fn().mockImplementation(({ data }: { data: Record<string, unknown> }) =>
+        Promise.resolve({ ...data }),
+      ),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    inboundAuditLog: { create: vi.fn().mockResolvedValue({}) },
     department: { findFirst: vi.fn().mockResolvedValue({ id: 1 }) },
     setting: {
       findUnique: vi.fn().mockResolvedValue(null),
@@ -101,7 +123,18 @@ function makePrismaMock() {
     },
     // Advisory-lock raw query — default to "lock acquired".
     $queryRaw: vi.fn().mockResolvedValue([{ locked: true }]),
-  } as unknown as PrismaService;
+  };
+  // Interactive transactions execute against the same mock delegates. This keeps tests close
+  // to the real atomic logical-claim path rather than falsely bypassing it.
+  Object.assign(prisma, {
+    $transaction: vi.fn(async (input: unknown) => {
+      if (typeof input === 'function') {
+        return (input as (tx: typeof prisma) => Promise<unknown>)(prisma);
+      }
+      return Promise.all(input as Promise<unknown>[]);
+    }),
+  });
+  return prisma as unknown as PrismaService;
 }
 
 function makeInboundService(prisma: PrismaService, config: AppConfig = TEST_CONFIG): InboundMailService {
@@ -335,6 +368,13 @@ describe('InboundMailService — parser rule helpers', () => {
         deliveryId?: number;
         legacyDedupIds?: string[];
         syntheticSeed?: string;
+        deliveryContext?: {
+          queueId?: number;
+          transportKey?: string;
+          envelopeTo?: string;
+          routedQueueId?: number;
+          routedDepartmentId?: number;
+        };
       },
     ) => Promise<{ state: string; ticketId?: number; postId?: number }>;
     ticketsService: {
@@ -376,15 +416,25 @@ describe('InboundMailService — parser rule helpers', () => {
       );
     });
 
-    it('#4: stamps the effective Message-ID + envelope + subject on the ledger row (atomic claim)', async () => {
+    it('P1-E: writes non-unique observed identity and a durable logical Message-ID claim', async () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       const svc = svcOf();
       await svc.processRawMessage(Buffer.from(rawEmail), 1, { deliveryId: 77 });
+      expect(prisma.inboundMessageClaim.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            normalizedMessageId: '<dup-123@acme.example>',
+            winnerDeliveryId: 77,
+            semanticHashVersion: 1,
+          }),
+          skipDuplicates: true,
+        }),
+      );
       expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 77 },
           data: expect.objectContaining({
-            messageId: '<dup-123@acme.example>',
+            observedMessageId: '<dup-123@acme.example>',
             envelopeFrom: 'customer@acme.example',
             subject: 'Need help',
           }),
@@ -392,9 +442,18 @@ describe('InboundMailService — parser rule helpers', () => {
       );
     });
 
-    it('#4: a concurrent duplicate loses the atomic claim (P2002) → SKIPPED, no ticket', async () => {
+    it('P1-E: a concurrent same-semantic Message-ID loses the claim race → SKIPPED, no ticket', async () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (prisma.inboundDelivery.update as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      let racingClaim: Record<string, unknown> | null = null;
+      (prisma.inboundMessageClaim.createMany as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ data }: { data: Record<string, unknown> }) => {
+          racingClaim = { ...data, winnerDeliveryId: 88 };
+          return Promise.resolve({ count: 0 });
+        },
+      );
+      (prisma.inboundMessageClaim.findUnique as ReturnType<typeof vi.fn>).mockImplementation(() =>
+        Promise.resolve(racingClaim),
+      );
       const svc = svcOf();
       const out = await svc.processRawMessage(Buffer.from(rawEmail), 1, { deliveryId: 77 });
       expect(out.state).toBe('SKIPPED');
@@ -407,12 +466,63 @@ describe('InboundMailService — parser rule helpers', () => {
       // headers, so the two stored copies differ byte-for-byte while sharing one Message-ID.
       // It is ONE logical message → SKIP the second copy; NEVER quarantine it as a "spoof".
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (prisma.inboundDelivery.update as ReturnType<typeof vi.fn>).mockRejectedValue({ code: 'P2002' });
+      let storedClaim: Record<string, unknown> | null = null;
+      (prisma.inboundMessageClaim.findUnique as ReturnType<typeof vi.fn>).mockImplementation(() =>
+        Promise.resolve(storedClaim),
+      );
+      (prisma.inboundMessageClaim.createMany as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ data }: { data: Record<string, unknown> }) => {
+          if (storedClaim) return Promise.resolve({ count: 0 });
+          storedClaim = { ...data };
+          return Promise.resolve({ count: 1 });
+        },
+      );
       const svc = svcOf();
-      const out = await svc.processRawMessage(Buffer.from(rawEmail), 1, { deliveryId: 77 });
+      await svc.processRawMessage(Buffer.from(rawEmail), 1, { deliveryId: 77 });
+      const perHopCopy = [
+        'Received: from mta-2.example by mx.example',
+        'Delivered-To: support@test.example',
+        rawEmail,
+      ].join('\r\n');
+      const out = await svc.processRawMessage(Buffer.from(perHopCopy), 1, { deliveryId: 78 });
       expect(out.state).toBe('SKIPPED');
-      expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+      expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
       expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+    });
+
+    it('P1-E: same real Message-ID with different logical content is audited and fail-closed', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      let storedClaim: Record<string, unknown> | null = null;
+      (prisma.inboundMessageClaim.findUnique as ReturnType<typeof vi.fn>).mockImplementation(() =>
+        Promise.resolve(storedClaim),
+      );
+      (prisma.inboundMessageClaim.createMany as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ data }: { data: Record<string, unknown> }) => {
+          if (storedClaim) return Promise.resolve({ count: 0 });
+          storedClaim = { ...data };
+          return Promise.resolve({ count: 1 });
+        },
+      );
+      const svc = svcOf();
+      await svc.processRawMessage(Buffer.from(rawEmail), 1, { deliveryId: 77 });
+      const changedBody = rawEmail.replace('Body text', 'This is a different logical body');
+      await expect(svc.processRawMessage(Buffer.from(changedBody), 1, { deliveryId: 78 })).rejects.toThrow(
+        'Message-ID was already claimed',
+      );
+      expect(prisma.inboundAuditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: 'mail.message_id_conflict',
+            deliveryId: 78,
+          }),
+        }),
+      );
+      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 78 },
+          data: expect.objectContaining({ observedMessageId: '<dup-123@acme.example>' }),
+        }),
+      );
     });
 
     it('scopes the synthetic id per queue so identical-byte mail to DIFFERENT queues is both ticketed', async () => {
@@ -429,21 +539,128 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(calls[0]![0].incomingMessageId).not.toBe(calls[1]![0].incomingMessageId);
     });
 
-    it('a content-stable seed makes a re-fetch of the SAME header-less mail dedup to one id', async () => {
+    it('P1-E: headerless mail is NOT content-deduplicated across different IMAP transport identities', async () => {
       const noId = ['From: a@b.example', 'To: s@t.example', 'Subject: hi', '', 'body', ''].join('\r\n');
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       const svc = svcOf();
-      // Same queue + same content but re-fetched under a new UID (UIDVALIDITY reset + BACKFILL)
-      // → same content-scoped seed → same synthetic id, so the second is deduped, not doubled.
-      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 1, syntheticSeed: 'imap:1:HASH' });
+      // Same bytes but distinct UID transport keys are two independent logical deliveries.
+      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 1, syntheticSeed: 'imap:1:42:100' });
       const first = (svc.ticketsService.createTicket as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
         incomingMessageId: string;
       };
-      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 2, syntheticSeed: 'imap:1:HASH' });
+      await svc.processRawMessage(Buffer.from(noId), 1, { deliveryId: 2, syntheticSeed: 'imap:1:42:101' });
       const second = (svc.ticketsService.createTicket as ReturnType<typeof vi.fn>).mock.calls[1]![0] as {
         incomingMessageId: string;
       };
-      expect(first.incomingMessageId).toBe(second.incomingMessageId);
+      expect(first.incomingMessageId).not.toBe(second.incomingMessageId);
+    });
+
+    it.each([
+      ['empty', 'Message-ID:'],
+      ['unbracketed', 'Message-ID: broken-id@example.test'],
+      ['oversized', `Message-ID: <${'x'.repeat(600)}@example.test>`],
+    ])(
+      'P1-E: a present but %s Message-ID is rejected, never silently treated as headerless',
+      async (_kind, messageIdHeader) => {
+        const malformed = [
+          'From: a@b.example',
+          'To: s@t.example',
+          'Subject: malformed id',
+          messageIdHeader,
+          '',
+          'body',
+          '',
+        ].join('\r\n');
+        (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+        const svc = svcOf();
+
+        await expect(svc.processRawMessage(Buffer.from(malformed), 1, { deliveryId: 87 })).rejects.toThrow(
+          'Message-ID is invalid or too long',
+        );
+        expect(svc.ticketsService.createTicket).not.toHaveBeenCalled();
+        expect(svc.ticketsService.reply).not.toHaveBeenCalled();
+        expect(prisma.inboundMessageClaim.createMany).not.toHaveBeenCalled();
+      },
+    );
+
+    it('P1-E: a headerless retry of the SAME transport key produces only one ticket post', async () => {
+      const noId = ['From: a@b.example', 'To: s@t.example', 'Subject: hi', '', 'body', ''].join('\r\n');
+      let existing = false;
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockImplementation(() =>
+        Promise.resolve(existing ? { id: 901, ticketId: 91 } : null),
+      );
+      const svc = svcOf();
+      const opts = { deliveryId: 1, syntheticSeed: 'imap:1:7:42:100' };
+      await svc.processRawMessage(Buffer.from(noId), 1, opts);
+      existing = true;
+      const retry = await svc.processRawMessage(Buffer.from(noId), 1, opts);
+      expect(retry).toMatchObject({ state: 'SKIPPED', ticketId: 91, postId: 901 });
+      expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
+    });
+
+    it('P1-E: deterministic route uses priority then queue id, independent of receiving queue order', async () => {
+      const queues = [
+        { id: 1, emailAddress: 'priority-100@example.test', departmentId: 11, routingPriority: 100 },
+        { id: 2, emailAddress: 'priority-5@example.test', departmentId: 22, routingPriority: 5 },
+        { id: 3, emailAddress: 'tie@example.test', departmentId: 33, routingPriority: 5 },
+      ];
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue(queues);
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = svcOf();
+      const twoRecipients = rawEmail.replace(
+        'To: support@test.example',
+        'To: priority-100@example.test, priority-5@example.test, tie@example.test',
+      );
+      await svc.processRawMessage(Buffer.from(twoRecipients.replace('dup-123', 'route-1')), 11, {
+        deliveryId: 101,
+        deliveryContext: { queueId: 1, transportKey: 'imap:1:1:7:101' },
+      });
+      await svc.processRawMessage(Buffer.from(twoRecipients.replace('dup-123', 'route-2')), 22, {
+        deliveryId: 102,
+        deliveryContext: { queueId: 2, transportKey: 'imap:2:1:7:102' },
+      });
+      const claimData = (prisma.inboundMessageClaim.createMany as ReturnType<typeof vi.fn>).mock.calls.map(
+        (call) => (call[0] as { data: { routedQueueId: number; departmentId: number } }).data,
+      );
+      expect(claimData).toHaveLength(2);
+      expect(claimData).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ routedQueueId: 2, departmentId: 22 }),
+          expect.objectContaining({ routedQueueId: 2, departmentId: 22 }),
+        ]),
+      );
+    });
+
+    it('P1-E: routes a BCC-style delivery by the persisted trusted envelope recipient', async () => {
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 8, emailAddress: 'visible@example.test', departmentId: 8, routingPriority: 100 },
+        { id: 2, emailAddress: 'bcc@example.test', departmentId: 22, routingPriority: 5 },
+      ]);
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = svcOf();
+      const bccCopy = rawEmail
+        .replace('To: support@test.example\r\n', '')
+        .replace('dup-123', 'bcc-route-1');
+      await svc.processRawMessage(Buffer.from(bccCopy), 8, {
+        deliveryId: 103,
+        deliveryContext: {
+          queueId: 8,
+          envelopeTo: 'bcc@example.test',
+          transportKey: 'imap:8:1:7:103',
+        },
+      });
+
+      expect(prisma.inboundMessageClaim.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ routedQueueId: 2, departmentId: 22 }),
+        }),
+      );
+      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 103 },
+          data: expect.objectContaining({ envelopeTo: 'bcc@example.test' }),
+        }),
+      );
     });
 
     it('synthesises a deterministic Message-ID from content when the mail carries none', async () => {
@@ -876,6 +1093,101 @@ describe('InboundMailService — parser rule helpers', () => {
           data: expect.objectContaining({ state: 'PROCESSED', leaseOwner: null }),
         }),
       );
+    });
+
+    it('P1-E: semantic Message-ID conflict is settled QUARANTINED with durable forensic identity', async () => {
+      const firstRaw = Buffer.from(
+        'From: a@b.example\r\nTo: support@test.example\r\nMessage-ID: <semantic-conflict@x>\r\n\r\nfirst body',
+      );
+      const conflictingRaw = Buffer.from(
+        'Received: from relay.example\r\nFrom: a@b.example\r\nTo: support@test.example\r\nMessage-ID: <semantic-conflict@x>\r\n\r\nDIFFERENT body',
+      );
+      let storedClaim: Record<string, unknown> | null = null;
+      (prisma.inboundMessageClaim.findUnique as ReturnType<typeof vi.fn>).mockImplementation(() =>
+        Promise.resolve(storedClaim),
+      );
+      (prisma.inboundMessageClaim.createMany as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ data }: { data: Record<string, unknown> }) => {
+          if (storedClaim) return Promise.resolve({ count: 0 });
+          storedClaim = { ...data };
+          return Promise.resolve({ count: 1 });
+        },
+      );
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await (
+        service as unknown as {
+          processRawMessage: (
+            source: Buffer,
+            departmentId: number | undefined,
+            opts: { deliveryId: number; syntheticSeed: string },
+          ) => Promise<unknown>;
+        }
+      ).processRawMessage(firstRaw, 1, { deliveryId: 54, syntheticSeed: 'imap:1:1:7:54' });
+
+      stageDelivery({
+        rawMime: conflictingRaw,
+        attempts: 1,
+        transport: 'IMAP',
+        queueId: 1,
+        transportKey: 'imap:1:1:7:55',
+      });
+      await drain();
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ state: 'QUARANTINED' }),
+        }),
+      );
+      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 55 },
+          data: expect.objectContaining({ observedMessageId: '<semantic-conflict@x>' }),
+        }),
+      );
+      expect(prisma.inboundAuditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ action: 'mail.message_id_conflict' }) }),
+      );
+    });
+
+    it('P1-E: two different IMAP UIDs with byte-identical headerless MIME create two tickets', async () => {
+      const headerless = Buffer.from('From: a@b.example\r\nTo: support@test.example\r\nSubject: same\r\n\r\nsame');
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, departmentId: 1 },
+        { id: 56, departmentId: 1 },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ where }: { where: { id: number } }) =>
+          Promise.resolve({
+            id: where.id,
+            rawMime: headerless,
+            attempts: 1,
+            transport: 'IMAP',
+            queueId: 9,
+            uidValidity: 77n,
+            uid: BigInt(where.id),
+            transportKey: `imap:9:1:77:${where.id}`,
+          }),
+      );
+      // Behave like TicketPost.messageId's real unique backstop: if production code wrongly
+      // seeds headerless identity from bytes/contentHash, the second lookup finds the first post
+      // and this test turns red rather than false-greening on a stateless mock.
+      const seenPostKey = new Map<string, { id: number; ticketId: number }>();
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ where }: { where: { messageId?: { in?: string[] }; ticketId?: number } }) => {
+          const key = where.messageId?.in?.[0];
+          if (!key) return Promise.resolve(null);
+          const existing = seenPostKey.get(key);
+          if (existing) return Promise.resolve(existing);
+          seenPostKey.set(key, { id: seenPostKey.size + 900, ticketId: seenPostKey.size + 90 });
+          return Promise.resolve(null);
+        },
+      );
+      await drain();
+      expect(
+        (service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }).ticketsService
+          .createTicket,
+      ).toHaveBeenCalledTimes(2);
     });
 
     it('a claim that loses the CAS race (count 0) is a no-op', async () => {

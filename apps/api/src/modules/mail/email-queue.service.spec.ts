@@ -209,6 +209,27 @@ describe('EmailQueueService', () => {
       ];
       expect(createCall[0].data.passwordEnc).toBe('');
     });
+
+    it('defaults routingPriority to 100 for backward-compatible internal queue creation', async () => {
+      (prisma.emailQueue.create as ReturnType<typeof vi.fn>).mockResolvedValue(makeSafeQueue());
+
+      await service.create({
+        type: 'IMAP',
+        emailAddress: 'priority-default@example.com',
+        host: '',
+        port: 993,
+        username: '',
+        password: '',
+        useTls: true,
+        signature: '',
+        isEnabled: false,
+      });
+
+      const createCall = (prisma.emailQueue.create as ReturnType<typeof vi.fn>).mock.calls[0] as [
+        { data: Record<string, unknown> },
+      ];
+      expect(createCall[0].data.routingPriority).toBe(100);
+    });
   });
 
   // ── update ────────────────────────────────────────────────────────────────

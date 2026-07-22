@@ -383,6 +383,8 @@ model Department {
   tickets      Ticket[]
   staff        DepartmentStaff[]
   emailQueues  EmailQueue[]
+  routedInboundDeliveries InboundDelivery[]    @relation("InboundDeliveryRoutedDepartment")
+  inboundMessageClaims    InboundMessageClaim[] @relation("InboundMessageClaimDepartment")
   createdAt    DateTime       @default(now())
 }
 
@@ -497,6 +499,7 @@ model Ticket {
   recipients      TicketRecipient[]
   timeEntries     TimeEntry[]
   followUps       FollowUp[]
+  inboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimTicket")
 
   lastReplyAt     DateTime?
   lastActivityAt  DateTime       @default(now())
@@ -546,6 +549,7 @@ model TicketPost {
   messageId    String?    @unique // RFC Message-ID for threading/idempotency; absent = NULL
   ipAddress    String     @default("0.0.0.0")
   attachments  Attachment[]
+  inboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimPost")
   editedAt     DateTime?
   editedByStaffId Int?
   createdAt    DateTime   @default(now())
@@ -755,6 +759,9 @@ model EmailQueue {
   department     Department?    @relation(fields: [departmentId], references: [id])
   departmentId   Int?
   signature      String         @default("")
+  // Deterministic owner for a logical message delivered to multiple configured queues.
+  // Lower values win; equal priorities break ties by queue id.
+  routingPriority Int           @default(100)
   // Kayako `ticketautoresponder`: only send the autoresponder for EMAIL tickets
   // when the receiving queue opts in (noc@/rates@ are OFF in the source system).
   sendAutoresponder Boolean      @default(false)
@@ -786,6 +793,8 @@ model EmailQueue {
   lastAcceptedAt  DateTime?
 
   inboundDeliveries InboundDelivery[]
+  routedInboundDeliveries InboundDelivery[] @relation("InboundDeliveryRoutedQueue")
+  routedInboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimRoutedQueue")
 }
 
 /** Per-queue bootstrap intent chosen by an operator reconcile (see EmailQueue). */
@@ -812,9 +821,19 @@ model InboundDelivery {
   // PIPE/MTA transport identity (webhook idempotency id / MTA delivery id)
   externalId    String?
 
-  // Message identity. UNIQUE (Postgres allows multiple NULLs) = the atomic logical-message
-  // claim: at most one delivery may own a given effective Message-ID (race-safe dedup).
+  // Compatibility-only legacy claim. It remains UNIQUE during the expand/contract rollout,
+  // but new runtime writes logical identity to `InboundMessageClaim` instead. It MUST NOT be
+  // used to collapse separate transport copies after the logical-claim cutover is complete.
   messageId     String?          @unique
+  // The real RFC Message-ID seen on this particular transport copy. Unlike `messageId`, this
+  // is intentionally non-unique: every CC/forwarded copy is retained for forensic review.
+  observedMessageId String?
+  // SHA-256(normalized observed Message-ID), linked to the durable logical claim. Headerless
+  // deliveries leave this NULL and are deduplicated only by their transport key.
+  messageIdHash String?          @db.Char(64)
+  // SHA-256 of normalized logical content. This is never a raw-MIME hash: per-hop trace
+  // headers are excluded so CC copies compare as the same message.
+  semanticHash String?           @db.Char(64)
   contentHash   String
   envelopeFrom  String?
   envelopeTo    String?
@@ -822,6 +841,14 @@ model InboundDelivery {
   // Department resolved AT acceptance (snapshot) — a later queue change must not
   // re-route an already-accepted message.
   departmentId  Int?
+  // Receiving queue/department above are transport snapshots. These fields hold the immutable
+  // deterministic business owner selected for this delivery/claim before ticket creation.
+  routedQueue   EmailQueue?      @relation("InboundDeliveryRoutedQueue", fields: [routedQueueId], references: [id], onDelete: SetNull)
+  routedQueueId Int?
+  routedDepartment Department?   @relation("InboundDeliveryRoutedDepartment", fields: [routedDepartmentId], references: [id], onDelete: SetNull)
+  routedDepartmentId Int?
+  messageClaim InboundMessageClaim? @relation("InboundDeliveryMessageClaim", fields: [messageIdHash], references: [messageIdHash], onDelete: SetNull)
+  winningMessageClaim InboundMessageClaim? @relation("InboundMessageClaimWinner")
 
   // Durable raw MIME so a failed/quarantined delivery can be replayed. Inline for
   // bounded messages; `rawStorageKey` is used when externalised to object storage.
@@ -854,6 +881,45 @@ model InboundDelivery {
 
   @@index([state, nextAttemptAt])
   @@index([queueId, uidValidity, uid])
+  @@index([messageIdHash])
+  @@index([observedMessageId])
+  @@index([routedQueueId])
+}
+
+/**
+ * One logical inbound RFC Message-ID. A durable row is created before ticket routing, so
+ * concurrent pollers race on this primary key and exactly one winner delivery performs the
+ * business action. Every transport copy remains in InboundDelivery and points back here.
+ */
+model InboundMessageClaim {
+  // SHA-256(normalized Message-ID), fixed width for a bounded unique index.
+  messageIdHash       String  @id @db.Char(64)
+  normalizedMessageId String
+  // NULL/version 0 is allowed only for historical rows that cannot be reconstructed safely
+  // during the additive migration. New claims are always version 1 with a non-null hash;
+  // a later copy against an unknown historical claim is quarantined rather than silently
+  // deduplicated.
+  semanticHash        String? @db.Char(64)
+  semanticHashVersion Int     @default(1)
+
+  winnerDelivery      InboundDelivery @relation("InboundMessageClaimWinner", fields: [winnerDeliveryId], references: [id], onDelete: Restrict)
+  winnerDeliveryId    Int             @unique
+  routedQueue         EmailQueue?     @relation("InboundMessageClaimRoutedQueue", fields: [routedQueueId], references: [id], onDelete: SetNull)
+  routedQueueId       Int?
+  department          Department?     @relation("InboundMessageClaimDepartment", fields: [departmentId], references: [id], onDelete: SetNull)
+  departmentId        Int?
+  ticket              Ticket?         @relation("InboundMessageClaimTicket", fields: [ticketId], references: [id], onDelete: SetNull)
+  ticketId            Int?
+  post                TicketPost?     @relation("InboundMessageClaimPost", fields: [postId], references: [id], onDelete: SetNull)
+  postId              Int?
+
+  deliveries          InboundDelivery[] @relation("InboundDeliveryMessageClaim")
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@index([routedQueueId])
+  @@index([departmentId])
+  @@index([ticketId])
 }
 
 /// Durable audit trail for inbound operator actions (reconcile / quarantine replay). Kept
