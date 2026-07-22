@@ -1,145 +1,176 @@
-# Как проверить: durable InboundDelivery ledger (production-ready inbound)
+# Проверка production-ready inbound mail → ticket
 
-Дата: 2026-07-17
-Ветка: `claude/inbound-delivery-ledger` (от актуального `origin/main` = `9b48fa8`)
-Область: полностью переработанный входящий поток (IMAP + PIPE) поверх durable-леджера.
-Закрывает 7 блокеров из повторного ревью PR #6. PR #6 **не** тронут (без force-push, без merge).
+Этот документ описывает проверку текущей схемы `InboundDelivery` перед merge и
+production cutover. Он намеренно не привязан к старой ветке, SHA или числу тестов:
+проверяется именно код, который будет развёрнут.
 
-> **Раунд 2 (после 3-го ревью).** Дополнительно закрыты 10 пунктов + false-green тесты —
-> см. раздел **«12. Раунд 2»** в конце. Быстрая проверка: `cd apps/api && npm install &&
-npx prisma generate && npx vitest run src/modules/mail src/modules/tickets src/auth
---reporter=dot` → **265 passed**, `npx tsc --noEmit` и `eslint` чисто. На чистом чекауте
-> сначала `npm install` в КОРНЕ монорепо (иначе eslint не поднимется).
+## Инварианты
 
-## 1. Что сделано (по блокерам ревью)
+- IMAP cursor продвигается только после durable acceptance и не перепрыгивает failure.
+- Старый poller не может принять delivery или сдвинуть cursor после reconcile, смены
+  mailbox identity или UIDVALIDITY.
+- Повтор одного transport delivery не создаёт второй ticket/post.
+- Две независимые headerless IMAP доставки не склеиваются только из-за одинаковых байтов.
+- Настоящий одинаковый Message-ID с одинаковой semantic content даёт один logical ticket;
+  semantic conflict остаётся в ledger/quarantine и поднимает alert.
+- PIPE принимает body только после проверки секрета, только в enabled `PIPE` queue и только с
+  ограниченным `x-inbound-delivery-id`; transport key использует его SHA-256.
+- Truncated MIME нельзя replay без безопасного original-message refetch.
+- Операторское действие имеет permission, reason и durable audit; raw MIME/credentials не
+  выдаются через API/UI.
 
-| Блокер                               | Было                                                                               | Стало                                                                                                                                                                                                                                                                                                      |
-| ------------------------------------ | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **P0-1** «карантин удаляет письмо»   | после 5 любых ошибок UID считался обработанным, cursor двигался, raw не сохранялся | Каждое письмо durably сохраняется в `InboundDelivery` (raw MIME) со state-машиной `ACCEPTED→PROCESSING→PROCESSED/RETRY/QUARANTINED`. Инфра-ошибка → `RETRY` (backoff), исчерпание → `QUARANTINED` с сохранённым raw для replay. Cursor двигается только по факту durable-accept, а не по исходу обработки. |
-| **P0-2** bootstrap-гонка             | baseline на первом poll (через 60с) → письма между connect и poll терялись         | Baseline фиксируется **синхронно при connect**. Политика `FROM_NOW` / `BACKFILL`. Никогда не fail-open в `1:*`.                                                                                                                                                                                            |
-| **P0-3** UIDVALIDITY fail-open       | авто-переустановка high-water → пропуск писем в новом UID-space                    | Fail-closed: `syncState=NEEDS_RECONCILIATION`, очередь **останавливается**, оператор выбирает `FROM_NOW`/`BACKFILL`.                                                                                                                                                                                       |
-| **P1-4** атомарность                 | messageId писался follow-up UPDATE, ретрай после сбоя → дубль/частичная обработка  | messageId пишется в тот же Prisma `create`, что и пост. Ретрай ловится дедупом → без второго поста.                                                                                                                                                                                                        |
-| **P1-5** out-of-order без Message-ID | дубли при повторной обработке                                                      | Идемпотентность прежде всего по `(queueId, uidValidity, uid)` (unique transportKey — atomic claim). Плюс дедуп по **effective Message-ID**: реальный или синтетический `<inbound-<sha256>@23telecom.local>` из хэша контента.                                                                              |
-| **P1-6** multi-poller                | check-then-act, немонотонный cursor                                                | Atomic claim (unique transportKey INSERT) + монотонный CAS cursor (`updateMany where lastSeenUid < cursor`) + best-effort advisory lock.                                                                                                                                                                   |
-| **P1-7** тестовые пробелы            | mask-error swallow и messageId не покрыты                                          | Прямые тесты: NotFound→новый тикет; non-NotFound→проброс без создания; фактический `messageId` внутри Prisma `create` (не только в mock).                                                                                                                                                                  |
+## Локальные автоматические gates
 
-Сохранено из `main`: shared `ingestRawMessage`/PIPE `/api/inbound/pipe`, loop/bounce guard,
-References cleaning, mask requester-ownership guard, trusted `creationMode`/`ipAddress`,
-security/RBAC-тесты.
-
-## 2. Быстрая проверка (2–3 минуты)
+В чистом worktree, из корня монорепо:
 
 ```bash
-cd /home/user/KAYAKA_style_HD/apps/api
-npm install && npx prisma generate     # на чистом чекауте
-
+node --version                         # 22+
+npm ci
+cd apps/api
+npx prisma generate
+npx prisma validate
 npx vitest run src/modules/mail src/modules/tickets src/auth --reporter=dot
-#   → ожидается: 249 passed
 npx tsc --noEmit
-npx eslint "src/modules/mail/**/*.ts" "src/modules/tickets/tickets.service.ts" --max-warnings=0
+npx eslint "src/**/*.ts" --max-warnings=0
+
+cd ../web
+npx tsc --noEmit
+npx eslint . --max-warnings=0
+npx vitest run --reporter=dot
 ```
 
-Ключевые тесты (`src/modules/mail/inbound.service.spec.ts`) — матрица ревью:
+Проверить также:
 
-- accept: `advances the cursor via monotonic CAS`, `out-of-order … no loss`,
-  `fail-closed: fetch error … WITHOUT advancing`, `fail-closed: ledger DB error … does NOT advance`,
-  `duplicate transport key (P2002) … no-op … cursor still advances`, `EXPUNGE-vanished … advances past`,
-  `UIDVALIDITY change HALTS the queue`, `halted queue … does not fetch`.
-- bootstrap: `FROM_NOW records high-water and imports nothing`.
-- drain: `PROCESSED`, `CAS race (count 0) → no-op`, `transient … RETRY … raw retained`,
-  `exhausted → QUARANTINED (never discarded)`, `missing rawMime → QUARANTINED`.
-- routing: dedup SKIPPED, synthetic Message-ID, mask ownership (owner/attacker),
-  `IN-10: NotFound → new ticket`, `IN-10: non-NotFound error propagates`.
-- атомарность (`tickets.service.spec.ts`): `createTicket writes messageId … in the SAME Prisma create`,
-  `reply writes messageId … in the SAME Prisma create`.
+```bash
+cd /path/to/repository
+git diff --check
+git status --short
+git diff --name-only -z BASE..HEAD | \
+  xargs -0 -r perl -0777 -ne 'if (index($_, "\0") >= 0) { print "$ARGV\n"; $bad=1 } END { exit($bad ? 1 : 0) }'
+```
 
-### Анти-false-green (мутации, которые ДОЛЖНЫ ломать тесты)
+`BASE` — фактический merge-base review branch и `main`. Нельзя заменить чистую установку
+старыми `node_modules`; lockfile должен быть единственным источником версий.
 
-1. Вернуть fail-open cursor (двигать cursor в `catch`) → упадут `fail-closed` тесты.
-2. Убрать `if (!(err instanceof NotFoundException)) throw err` → упадёт `IN-10: non-NotFound … propagates`.
-3. Убрать `...(dto.messageId ? { messageId } : {})` из Prisma `create` → упадут атомик-тесты.
-4. Двигать cursor при UIDVALIDITY-смене → упадёт `HALTS the queue`.
+## Что проверяют unit/HTTP тесты
 
-## 3. Ручная проверка кода
+### IMAP acceptance и fencing
 
-- `apps/api/prisma/schema.prisma` — модели `InboundDelivery` (unique `transportKey`, `rawMime`,
-  state enum) и поля `EmailQueue` (`lastSeenUid`, `uidValidity`, `syncState`).
-  Миграция: `prisma/migrations/20260717000000_inbound_delivery_ledger/migration.sql`.
-- `inbound.service.ts`:
-  - `pollQueue` — UID discovery → `fetchOne` ascending → `acceptImapMessage` (durable) → CAS cursor;
-    `catch → break` без advance; UIDVALIDITY-ветка → `syncState=NEEDS_RECONCILIATION`.
-  - `bootstrapQueue` — синхронно при `connectQueue`; `resolveHighWaterUid`; никогда `1:*`.
-  - `processDelivery` — CAS-claim → `processRawMessage` → PROCESSED/RETRY/QUARANTINED (raw kept).
-  - `processRawMessage` — effective Message-ID (реальный/синтетический), dedup, thread/create,
-    fail-closed mask.
-- `tickets.service.ts` — `reply()`/`createTicket()` пишут `messageId` в тот же `create`.
+- mailbox epoch входит в IMAP transport key; смена identity повышает epoch даже при
+  `uidValidity = NULL`; password-only update epoch не меняет;
+- collision старого и нового mailbox UID-space с разным content hash halt-ит очередь и не
+  сдвигает cursor;
+- cursor CAS включает fixed snapshot (`generation`, `epoch`, `uidValidity`, `syncState`,
+  исходный cursor);
+- barrier `fetch → identity/reconcile → insert` доказывает, что stale poller не создаёт
+  delivery/ticket;
+- lower UID failure удерживает safe frontier, даже если higher UID уже принят;
+- `FROM_NOW` фиксирует `UIDNEXT - 1` под mailbox lock до HTTP success; `BACKFILL` берёт
+  последние N реально существующих UID, а не арифметический диапазон.
 
-## 4. Обязательный pre-cutover gate (инфраструктура, не в этом окружении)
+### Logical identity и routing
 
-Юнит-тесты моделируют IMAP через fake ImapFlow. Перед реальным cutover прогнать на живом
-IMAP (GreenMail/Dovecot — **не** MailHog, у него нет IMAP EXPUNGE/UIDVALIDITY). Метод
-`InboundMailService.pollNow()` запускает один accept+drain немедленно. Сценарии:
+- `InboundMessageClaim` — отдельный atomic claim для нормализованного настоящего Message-ID;
+  delivery хранит observed ID, raw content hash и semantic hash;
+- same Message-ID + same semantic content → loser `SKIPPED`; same Message-ID + different
+  semantic content → loser `QUARANTINED`, audit/critical alert;
+- headerless IMAP identity строится из transport identity; одинаковые bytes под разными UID
+  создают отдельные tickets;
+- PIPE всегда требует MTA delivery id; его trusted queue address snapshot хранится как
+  `envelopeTo` для BCC/deterministic routing;
+- routing owner выбирается по enabled queue address, `routingPriority` (меньше лучше) и queue id;
+  persisted route не зависит от arrival order двух poller.
 
-1. APPEND письма → один тикет + `InboundDelivery.state=PROCESSED`.
-2. EXPUNGE старого письма + APPEND нового → новое обработано ровно один раз (UID, не sequence).
-3. Рестарт/повторный poll → без дублей (unique transportKey).
-4. Письмо без Message-ID, доставленное дважды → один тикет (синтетический id).
-5. Пересоздание mailbox (UIDVALIDITY) → очередь встаёт в `NEEDS_RECONCILIATION`.
-6. БД недоступна > 5 poll → cursor не двигается; после восстановления — ровно один пост.
-7. Интеграционный `npm run test:integration` (Testcontainers Postgres) прогоняет PIPE→тикет→
-   dedup→threading через реальный леджер и миграцию.
+### PIPE HTTP pipeline
 
-## 5. Осознанные остатки (честно)
+- middleware проверяет `x-inbound-secret` до route-specific large parser;
+- `message/rfc822` и `application/octet-stream` доходят byte-exact `Buffer`;
+- JSON `{ raw }` не перехватывается глобальным parser;
+- missing/unsafe/over-256-byte delivery id, missing queue id, disabled queue или IMAP/POP3 queue
+  возвращают 4xx до ticket work;
+- body больше `TELECOM_HD_INBOUND_MAX_SIZE_MB` получает 413;
+- reused delivery id с другим content hash возвращает 409 и пишет `mail.transport_collision`;
+- BigInt в queue/health response сериализуется строкой.
 
-- Полная транзакционность счётчиков/audit тикета вместе с постом (LIFE-03) — отдельный
-  follow-up; леджер уже гарантирует отсутствие потерь и дублей постов.
-- Raw MIME хранится inline; очень большие письма стоит выносить в object storage (`rawStorageKey`).
-- Advisory-lock — best-effort; корректность держится на unique transportKey, а не на локе.
-- Live-IMAP прогон (раздел 4) авторизован как обязательный ручной gate, но в этом окружении
-  (без Docker/GreenMail) не запускался.
+### Supervisor и health
 
-## 6. Дальше по аудиту (отдельными PR)
+- concurrent timer/manual `pollNow()` делят один poll cycle; один queue не poll-ится параллельно;
+- drain ticks также single-flight, shutdown ждёт уже начатый poll/drain перед logout;
+- even with `TELECOM_HD_IMAP_ENABLED=false` обновляется `ownAddresses` для PIPE self-loop guard;
+- health возвращает attempt/connect/disconnect/error/poll started/poll completed/accepted,
+  backlog, quarantine count+bytes, raw-storage reserve и alerts;
+- disabled queues не создают critical alert; enabled IMAP + global disable, stale connection/poll,
+  BOOTSTRAPPING, halted queue, backlog, lease, quarantine и recent collision видимы оператору.
 
-SEC-01 (аутентификация клиентского портала — Internet-facing, приоритет) → ACL-01 (department
-scoping) → OUT-01 (durable outbox / честный статус доставки) → репетиция миграции Kayako и cutover.
+### Quarantine, raw storage и RBAC
 
----
+- list quarantine server-paginated, filterable и не возвращает `rawMime` или `rawStorageKey`;
+  detail содержит metadata, capability replay и audit history;
+- replay требует reason + `expectedUpdatedAt`, использует state/version CAS, а audit insert живёт
+  в той же transaction; concurrency loser получает 409;
+- large raw MIME хранится в existing uploads volume под opaque key; write = pending marker →
+  temp file/fsync → atomic rename → ledger pointer → marker commit. Bounded reaper удаляет только
+  stale unreferenced marker/file pairs. Quarantined MIME retention job не удаляет;
+- storage reserve проверяется fail-closed для oversized ingress; ответ пользователю не раскрывает
+  filesystem path;
+- `mail.view`, `mail.replay`, `mail.reconcile`, `mail.configure` проверяются backend guard-ом.
+  Upgrade переносит старый `admin.mail` в все четыре права; Manager получает только `mail.view`,
+  Agent — ни одного mail permission.
 
-## 12. Раунд 2 — что закрыто (10 пунктов + false-green)
+## Anti-false-green мутации
 
-Коммиты `5fabf2d`..`a324c3d` (все на этой ветке, обычные коммиты, без force-push).
+Вносить временно, убедиться в RED, затем полностью откатить и повторить GREEN:
 
-| #           | Пункт                                 | Как проверить                                                                                                                                                                                                                                                  |
-| ----------- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| false-green | 3 теста не проверяли то, что заявляли | Мутации: снять 3-й `{uid:true}` у `fetch` / вызов bootstrap в `connectQueue` / запись `rawMime` — каждое роняет тест `inbound.service.spec.ts` (`passes { uid: true }…`, `P0-2: connectQueue captures the baseline…`, `accepts new UIDs…rawMime`).             |
-| #6          | небезопасный advisory-lock            | удалён; корректность на unique claim + CAS.                                                                                                                                                                                                                    |
-| #7 (flag)   | `TELECOM_HD_IMAP_ENABLED` не читался  | теперь гейтит поллер (`onModuleInit`).                                                                                                                                                                                                                         |
-| **#1**      | stale `PROCESSING` навсегда           | lease (`leaseOwner`/`leaseExpiresAt`): claim реклеймит протухший `PROCESSING`; settle lease-gated; startup-drain. Тесты `drain — retry/quarantine` + `reclaims a stale PROCESSING…`.                                                                           |
-| **#2**      | миграция теряла письма                | миграция ставит enabled IMAP-очереди в `NEEDS_RECONCILIATION` + копирует legacy Setting-курсор; `bootstrapQueue` не FROM_NOW-ит halted.                                                                                                                        |
-| **#4**      | check-then-act dedup                  | partial-unique index на непустой `InboundDelivery.messageId`; claim эффективного Message-ID (P2002→SKIPPED). Тесты `#4: stamps…`, `#4: concurrent duplicate loses…`.                                                                                           |
-| **#3**      | LIFE-03 частичная обработка           | `reply()`: пост+attachments+counters+audit в одной `$transaction`. Тест `LIFE-03: reply runs … in a single $transaction`.                                                                                                                                      |
-| **#5**      | cursor из старого UID-space           | `cursorGeneration` + CAS gated (generation/uidValidity/syncState/isEnabled); bootstrap CAS на `uidValidity IS NULL`.                                                                                                                                           |
-| **#7**      | нет reconnect/reconcile               | supervisor `reconcileConnections()` (connect/disconnect по enabled); API `POST /admin/email-queues/{id}/reconcile`, `GET …/inbound/quarantine`, `POST …/replay`; `syncState` в ответе очереди.                                                                 |
-| **#8**      | PIPE не byte-safe                     | `main.ts` свои body-parsers: raw `message/rfc822`/`octet-stream` как Buffer + лимит `TELECOM_HD_INBOUND_MAX_MB`; коллизия `x-inbound-delivery-id`↔contentHash → 409. Тесты в `inbound.controller.spec.ts` + `ingestRawMessage (PIPE) — delivery-id collision`. |
-| **#9**      | orphan-вложения / swallow             | attachments staged лениво (loop/skip/ignore не грузят файлы); DB-ошибка parser-rule → rethrow (RETRY).                                                                                                                                                         |
-| **#10**     | Int32 overflow UID + прочее           | `lastSeenUid`/`uid` → BigInt; dept-snapshot при acceptance; заполнение envelope/subject/messageId в леджере; self-loop с `Name <addr>`.                                                                                                                        |
+1. Убрать epoch из IMAP transport key → test same UIDVALIDITY/UID after identity change падает.
+2. Убрать generation/epoch/state из accept/cursor CAS → stale-poller barrier падает.
+3. Сделать `FROM_NOW` success до UIDNEXT snapshot/write → post-boundary test падает.
+4. Синтезировать headerless identity из `queueId + contentHash` → two same-bytes different-UID test
+   падает.
+5. При semantic conflict вернуть `SKIPPED` → conflict quarantine/audit test падает.
+6. Разрешить PIPE без queue/delivery id или убрать secret middleware → HTTP binding/early-secret
+   test падает.
+7. Снять `truncated` guard при replay → truncated replay test падает.
+8. Убрать poll/drain single-flight flag → overlapping timer test падает.
+9. Записать replay state вне transaction/audit → transaction mock, разделяющий root Prisma и `tx`,
+   падает.
+10. Удалить raw pending marker/DB reference proof → orphan cleanup test падает.
 
-### Анти-false-green (мутации, которые ДОЛЖНЫ ронять тесты)
+## Обязательные реальные gates до production cutover
 
-1. Снять `inboundDelivery.update` (atomic claim) → `#4: concurrent duplicate…` зелёным НЕ останется.
-2. Вернуть `reply()` к не-транзакционному → `LIFE-03: reply runs … in a single $transaction` падает.
-3. Убрать generation/syncState-guard из cursor CAS → `accepts new UIDs … monotonic CAS` падает.
-4. Игнорировать Buffer body в контроллере → `#8: accepts a raw Buffer body` падает.
+Unit mocks не заменяют PostgreSQL и IMAP. Красный или не проведённый gate блокирует merge/deploy.
 
-### CI (осознанно НЕ добавлено)
+### Disposable PostgreSQL
 
-`CLAUDE.md` явно запрещает CI («No CI/CD… Do not add CI»). Поэтому GitHub Actions не добавлял;
-тесты гоняются локально (`npm test` / vitest). Это hard-constraint репозитория, не пропуск.
+1. Применить все migrations через `prisma migrate deploy` на production-like fixture.
+2. Проверить `prisma migrate diff`, schema/migration parity, BigInt UID > 2³¹ и counts legacy rows.
+3. Проверить permission backfill: custom `admin.mail` group → 4 new permissions; Manager → view;
+   Agent/custom group without legacy right → no write rights.
+4. Проверить interrupted migration/roll-forward, mailbox epoch rewrite/claim backfill и backup+restore
+   PostgreSQL + uploads/raw MIME + Redis recovery triplet.
+5. Поднять два API process: concurrent reconcile, stale acceptance fence, Message-ID claim and slow
+   lease processing must have one correct durable outcome.
 
-### Обязательный live-gate (не в этом окружении — нет Docker/GreenMail/PG)
+### GreenMail/Dovecot
 
-Юнит-слой (265 тестов) моделирует IMAP через fake ImapFlow и Prisma-моки. Перед cutover прогнать
-на реальном IMAP (GreenMail/Dovecot) + реальном Postgres через `InboundMailService.pollNow()`:
-restart-recovery (lease), EXPUNGE, UIDVALIDITY halt+reconcile, DB-outage > 5 poll (cursor стоит),
-два поллера (unique claim / CAS), upgrade со старого Setting-курсора. Testcontainers-спек
-`inbound.int-spec.ts` (PIPE→ticket→dedup→threading) гоняется через `npm run test:integration`.
+Run via `InboundMailService.pollNow()` against a disposable real mailbox:
+
+- fresh FROM_NOW and first UID after exact boundary;
+- sparse UID BACKFILL + EXPUNGE;
+- reconnect, DB outage during acceptance, restart and stale lease reclaim;
+- UIDVALIDITY reset and different mailbox with same UIDVALIDITY/UID after identity change;
+- two identical headerless messages under different UIDs;
+- same Message-ID CC'd to two queues in opposite arrival order;
+- spoofed same Message-ID with different semantic content;
+- oversized/truncated fetch and refused replay;
+- PIPE retry/collision and PIPE ↔ IMAP logical-copy behaviour.
+
+For each scenario record ledger states, ticket/post count, cursor/generation/epoch, audit rows and
+`GET /api/admin/email-queues/inbound/health` alerts.
+
+## Cutover and rollback rule
+
+Before deploy: quiesce inbound workers, drain/record outstanding deliveries, take and verify a
+matching PostgreSQL + uploads/raw storage + Redis backup, run migrations, deploy one canary queue,
+then enable remaining queues only after the live matrix is green. Schema changes are forward-only:
+application-code rollback may be possible, but data rollback may require roll-forward rather than
+running an old binary against the new schema. Do not delete ledger/raw evidence as a rollback step.

@@ -165,6 +165,24 @@ docker compose --profile scanner -f docker-compose.prod.yml \
 ss -lntup
 ```
 
+### Inbound-mail migration/canary gate
+
+The deploy helper's generic quiesce is necessary but does not prove an IMAP mailbox boundary.
+Before enabling production queues after an inbound-ledger migration:
+
+1. Keep all inbound workers/queues quiesced while the matching PostgreSQL + `uploads` (including
+   `inbound-raw`) + Redis recovery triplet is backed up and restore-rehearsed.
+2. Apply migrations forward only. Do not start an old API binary against an epoch/claim/reconcile
+   schema, and do not invent a down migration.
+3. Run the real PostgreSQL migration/upgrade rehearsal and the GreenMail/Dovecot matrix from
+   `docs/INBOUND_LEDGER_VERIFICATION_RU.md`. A missing/red gate blocks queue enablement.
+4. Configure exactly one non-customer-impacting canary mailbox/PIPE queue. Verify `/admin/mail`
+   health: connection/poll/accepted stamps, epoch/generation, no unexplained alert, and raw-storage
+   reserve. Deliver a controlled message, retry it, and inspect its ledger/audit outcome.
+5. Only then enable the remaining queues one at a time. Stop immediately on a halted queue,
+   transport/semantic collision, stale poll, quarantine growth, storage-reserve alert or unexpected
+   ticket/post count. Preserve ledger/raw evidence; do not delete rows as a recovery shortcut.
+
 ## 5. HTTPS edge gate
 
 `docker-compose.proxy.yml`, the Caddy file and nftables examples are reference components; the
