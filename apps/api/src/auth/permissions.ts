@@ -31,7 +31,12 @@ export const PERMISSIONS = {
   ADMIN_SETTINGS: 'admin.settings',
   ADMIN_SLA: 'admin.sla',
   ADMIN_WORKFLOW: 'admin.workflow',
-  ADMIN_MAIL: 'admin.mail',
+  // Mail operations are intentionally split: observing a queue must not grant the
+  // destructive/configuration actions that can discard history or re-deliver mail.
+  MAIL_VIEW: 'mail.view',
+  MAIL_REPLAY: 'mail.replay',
+  MAIL_RECONCILE: 'mail.reconcile',
+  MAIL_CONFIGURE: 'mail.configure',
   ADMIN_DEPARTMENTS: 'admin.departments',
   ADMIN_CUSTOMFIELDS: 'admin.customfields',
   ADMIN_ALARIS: 'admin.alaris',
@@ -88,7 +93,10 @@ export const PERMISSION_CATALOG: PermissionMeta[] = [
   { key: PERMISSIONS.ADMIN_SETTINGS, label: 'Настройки (статусы, приоритеты…)', category: 'admin' },
   { key: PERMISSIONS.ADMIN_SLA, label: 'SLA', category: 'admin' },
   { key: PERMISSIONS.ADMIN_WORKFLOW, label: 'Правила и макросы', category: 'admin' },
-  { key: PERMISSIONS.ADMIN_MAIL, label: 'Email-интеграция', category: 'admin' },
+  { key: PERMISSIONS.MAIL_VIEW, label: 'Почта: просмотр состояния и карантина', category: 'admin' },
+  { key: PERMISSIONS.MAIL_REPLAY, label: 'Почта: повтор карантинных писем', category: 'admin' },
+  { key: PERMISSIONS.MAIL_RECONCILE, label: 'Почта: реконсиляция IMAP', category: 'admin' },
+  { key: PERMISSIONS.MAIL_CONFIGURE, label: 'Почта: настройка очередей и правил', category: 'admin' },
   { key: PERMISSIONS.ADMIN_DEPARTMENTS, label: 'Отделы', category: 'admin' },
   { key: PERMISSIONS.ADMIN_CUSTOMFIELDS, label: 'Пользовательские поля', category: 'admin' },
   { key: PERMISSIONS.ADMIN_ALARIS, label: 'Интеграция Alaris', category: 'admin' },
@@ -116,6 +124,9 @@ const MANAGER_PERMISSIONS: Permission[] = [
   PERMISSIONS.ORG_MANAGE,
   PERMISSIONS.REPORT_RUN,
   PERMISSIONS.REPORT_MANAGE,
+  // Operational visibility only. A manager can diagnose an incoming-mail outage,
+  // but cannot replay/reconcile or alter routing without an explicit grant.
+  PERMISSIONS.MAIL_VIEW,
 ];
 
 const AGENT_PERMISSIONS: Permission[] = [

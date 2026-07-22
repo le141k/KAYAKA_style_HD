@@ -24,8 +24,18 @@ export interface AdminEmailQueue {
   cursorGeneration: number;
   bootstrapPolicy: 'FROM_NOW' | 'BACKFILL' | null;
   bootstrapBackfillLimit: number | null;
+  mailboxEpoch?: number;
+  reconcileCause?: string | null;
+  reconcileRequestedAt?: string | null;
+  allowedModes?: ReconcileMode[];
+  routingPriority?: number;
+  lastConnectionAttemptAt?: string | null;
   lastConnectedAt: string | null;
+  lastDisconnectedAt?: string | null;
+  lastConnectionErrorAt?: string | null;
+  lastPollStartedAt?: string | null;
   lastPollAt: string | null;
+  lastPollCompletedAt?: string | null;
   lastAcceptedAt: string | null;
 }
 
@@ -48,8 +58,16 @@ export interface InboundHealth {
       | 'uidValidity'
       | 'cursorGeneration'
       | 'bootstrapPolicy'
+      | 'mailboxEpoch'
+      | 'reconcileCause'
+      | 'reconcileRequestedAt'
+      | 'lastConnectionAttemptAt'
       | 'lastConnectedAt'
+      | 'lastDisconnectedAt'
+      | 'lastConnectionErrorAt'
+      | 'lastPollStartedAt'
       | 'lastPollAt'
+      | 'lastPollCompletedAt'
       | 'lastAcceptedAt'
     >
   >;
@@ -63,10 +81,16 @@ export interface InboundHealth {
       processed: number;
       skipped: number;
     };
+    quarantineBytes: number;
     stalledProcessing: number;
     oldestPendingAt: string | null;
     lastProcessedAt: string | null;
   };
+  rawStorage: {
+    availableBytes: string;
+    reserveBytes: string;
+    nearReserve: boolean;
+  } | null;
   alerts: InboundAlert[];
   checkedAt: string;
 }
@@ -75,15 +99,49 @@ export interface QuarantinedDelivery {
   id: number;
   transport: 'IMAP' | 'PIPE';
   queueId: number | null;
-  messageId: string | null;
+  /** Legacy API name during the delivery-claim expand phase. */
+  messageId?: string | null;
+  /** Non-unique observed RFC Message-ID after the claim cutover. */
+  observedMessageId?: string | null;
   envelopeFrom: string | null;
   envelopeTo: string | null;
   subject: string;
   sizeBytes: number;
   attempts: number;
   lastError: string | null;
+  truncated: boolean;
+  /** Server capability; never infer safety from only a local UI flag. */
+  replayAllowed: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface QuarantinePage {
+  items: QuarantinedDelivery[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface QuarantineDetail {
+  delivery: QuarantinedDelivery & { state: 'QUARANTINED'; replayBlockReason?: string | null };
+  audit: Array<{
+    id: number;
+    actorStaffId: number | null;
+    actorEmail: string;
+    action: string;
+    reason: string | null;
+    metadata: Record<string, unknown>;
+    createdAt: string;
+  }>;
+}
+
+export interface QuarantineFilters {
+  page?: number;
+  limit?: number;
+  queueId?: number;
+  reason?: string;
+  messageId?: string;
 }
 
 export type ReconcileMode = 'RESUME_MIGRATED' | 'FROM_NOW' | 'BACKFILL';
@@ -94,12 +152,14 @@ export interface ReconcileInput {
   reason?: string;
   confirm?: boolean;
   backfillLimit?: number;
+  expectedCursorGeneration?: number;
 }
 
 const mailKeys = {
   queues: ['admin', 'email-queues'] as const,
   health: ['admin', 'inbound-health'] as const,
-  quarantine: ['admin', 'inbound-quarantine'] as const,
+  quarantine: (filters: QuarantineFilters) => ['admin', 'inbound-quarantine', filters] as const,
+  quarantineDetail: (id: number) => ['admin', 'inbound-quarantine', id] as const,
 };
 
 export function useEmailQueues() {
@@ -118,10 +178,23 @@ export function useInboundHealth() {
   });
 }
 
-export function useQuarantine() {
+export function useQuarantine(filters: QuarantineFilters = {}) {
+  const normalized = { page: 1, limit: 25, ...filters };
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(normalized)) {
+    if (value !== undefined && value !== '') params.set(key, String(value));
+  }
   return useQuery({
-    queryKey: mailKeys.quarantine,
-    queryFn: () => api.get<QuarantinedDelivery[]>('/admin/email-queues/inbound/quarantine'),
+    queryKey: mailKeys.quarantine(normalized),
+    queryFn: () => api.get<QuarantinePage>(`/admin/email-queues/inbound/quarantine?${params.toString()}`),
+  });
+}
+
+export function useQuarantineDetail(deliveryId: number | null) {
+  return useQuery({
+    queryKey: mailKeys.quarantineDetail(deliveryId ?? 0),
+    queryFn: () => api.get<QuarantineDetail>(`/admin/email-queues/inbound/quarantine/${deliveryId}`),
+    enabled: deliveryId !== null,
   });
 }
 
@@ -140,10 +213,21 @@ export function useReconcileQueue() {
 export function useReplayQuarantined() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (deliveryId: number) =>
-      api.post<{ replayed: boolean }>(`/admin/email-queues/inbound/quarantine/${deliveryId}/replay`, {}),
+    mutationFn: ({
+      deliveryId,
+      reason,
+      expectedUpdatedAt,
+    }: {
+      deliveryId: number;
+      reason: string;
+      expectedUpdatedAt: string;
+    }) =>
+      api.post<{ replayed: boolean }>(`/admin/email-queues/inbound/quarantine/${deliveryId}/replay`, {
+        reason,
+        expectedUpdatedAt,
+      }),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: mailKeys.quarantine });
+      void qc.invalidateQueries({ queryKey: ['admin', 'inbound-quarantine'] });
       void qc.invalidateQueries({ queryKey: mailKeys.health });
     },
   });

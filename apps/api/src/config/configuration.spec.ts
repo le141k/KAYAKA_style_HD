@@ -41,7 +41,7 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
     TELECOM_HD_CLAMAV_PORT: 3310,
     TELECOM_HD_CLAMAV_TIMEOUT_MS: 15000,
     TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
-    TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined,
+    TELECOM_HD_FIELD_ENCRYPTION_KEY: 'e'.repeat(64),
     ...over,
   } as AppConfig;
 }
@@ -88,6 +88,12 @@ describe('assertProductionSecrets', () => {
   it('rejects a malformed field-encryption key', () => {
     expect(() => assertProductionSecrets(makeConfig({ TELECOM_HD_FIELD_ENCRYPTION_KEY: 'not-hex' }))).toThrow(
       /64 hex/i,
+    );
+  });
+
+  it('rejects a missing field-encryption key in production', () => {
+    expect(() => assertProductionSecrets(makeConfig({ TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined }))).toThrow(
+      /FIELD_ENCRYPTION_KEY.*required/i,
     );
   });
 

@@ -14,7 +14,7 @@
 - schema: `EmailParserRule{id,title,ruleType(PRE/POST_PARSE),matchType(ALL/ANY),stopProcessing,isEnabled,sortOrder,criteria Json,actions Json}`.
 - parser-rule.types.ts: ParserCriterion{field:subject|sender|sendername|recipient|body, op:contains|not_contains|eq|starts_with|ends_with|regex, value} ; ParserAction{type:ignore|route_dept|set_priority|assign_staff|add_tag, value}.
 - inbound.service: applyParserRules(parsed,deptId)→{skip,departmentId,priorityId?,ownerStaffId?,tags[]} evaluated before threading; skip→discard (no ticket); else pass overrides to createTicket. evaluateCriteria(ALL/ANY)+extractField.
-- admin CRUD parser-rules.controller (ADMIN_MAIL): GET/POST/PATCH/DELETE /admin/parser-rules + /reorder.
+- admin CRUD parser-rules.controller (`mail.configure`): GET/POST/PATCH/DELETE /admin/parser-rules + /reorder.
 - migration: swparserrules + swparserrulecriteria(ruleop 1eq/3contains/4not_contains/5starts/6ends/7regex) + swparserruleactions(setdepartment→route_dept etc).
 
 ## C [P0] IMAP password encryption (prod queues fail auth today; inbound.service.ts:57 TODO passes ciphertext)

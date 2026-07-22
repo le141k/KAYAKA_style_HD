@@ -3,6 +3,9 @@
 PostgreSQL and the `uploads` volume form one application-data recovery pair. A deployment rollback
 also needs the matching Redis/BullMQ snapshot recorded by `scripts/deploy-prod.sh`; treat the three
 artifacts as one triplet because queued external side effects must not be separated from DB state.
+`uploads/inbound-raw` is part of that same volume: its opaque MIME files are referenced by
+`InboundDelivery.rawStorageKey`, so restoring only PostgreSQL can leave quarantined/retry evidence
+unreadable even when the ledger rows themselves exist.
 
 ## Prerequisites
 
@@ -106,8 +109,10 @@ docker compose --profile scanner -f docker-compose.prod.yml --env-file .env.prod
 ```
 
 Check API/web/database/scanner health and the expected migration version, user/ticket/post counts,
-attachment aggregate counts/bytes and a representative owner-scoped download. Reopening the edge is
-a separate decision.
+attachment aggregate counts/bytes, a representative owner-scoped download, and inbound ledger/raw
+storage consistency. Before reopening mail workers, verify that a known `rawStorageKey` (if one is
+present in the restored ledger) resolves under `uploads/inbound-raw`, then run the controlled inbound
+canary from `docs/INBOUND_LEDGER_VERIFICATION_RU.md`. Reopening the edge is a separate decision.
 
 Deployment recovery is fail-closed. Before the migration boundary, `deploy-prod.sh` reopens the old
 internal release only after it proves old API/web health and BullMQ resume. After the boundary it

@@ -108,7 +108,8 @@ const schema = z.object({
   // inline raw MIME pruned (metadata + contentHash kept) to bound the ledger's on-disk growth.
   // QUARANTINED deliveries are NEVER pruned (raw MIME is needed to replay). 0 disables pruning.
   TELECOM_HD_INBOUND_RAW_RETENTION_DAYS: z.coerce.number().int().min(0).max(3650).default(30),
-  // Optional 256-bit AES key for field-level encryption (IMAP passwords, etc.)
+  // 256-bit AES key for field-level encryption (IMAP passwords, etc.). Development/test
+  // may omit it for fixture compatibility; production rejects a missing or malformed key.
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   TELECOM_HD_FIELD_ENCRYPTION_KEY: z.string().optional(),
   // Fail-closed gate for the anonymous client portal (GOAL_PUBLIC_SECURITY S2-1).
@@ -158,9 +159,12 @@ export function assertProductionSecrets(cfg: AppConfig): void {
   if (cfg.TELECOM_HD_JWT_ACCESS_SECRET === cfg.TELECOM_HD_JWT_REFRESH_SECRET) {
     problems.push('  - TELECOM_HD_JWT_REFRESH_SECRET: must differ from the access secret');
   }
-  // Field-encryption key, if provided, must be a real 64-hex (256-bit) key.
-  if (cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY && !/^[0-9a-f]{64}$/i.test(cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY)) {
-    problems.push('  - TELECOM_HD_FIELD_ENCRYPTION_KEY: must be 64 hex chars (256-bit) when set');
+  // IMAP credentials are a production secret. Never silently fall back to plaintext storage
+  // just because the key was omitted from a new environment file.
+  if (!cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY || !/^[0-9a-f]{64}$/i.test(cfg.TELECOM_HD_FIELD_ENCRYPTION_KEY)) {
+    problems.push(
+      '  - TELECOM_HD_FIELD_ENCRYPTION_KEY: is required and must be 64 hex chars (256-bit) in production',
+    );
   }
 
   // S5-7: the public origin and mail host must be REAL in production — the dev localhost defaults

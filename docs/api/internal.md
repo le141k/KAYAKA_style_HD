@@ -336,6 +336,10 @@ sendTemplateStrict(to: string | string[], templateKey: string, locale: string, v
 
 ## InboundMailService (`apps/api/src/modules/mail/inbound.service.ts`)
 
+> **Superseded implementation notes.** The detailed bullets immediately below describe the
+> pre-epoch/pre-claim implementation retained for migration history. They are not the current
+> contract; use **Current inbound contract** below when changing or operating the service.
+
 Durable, idempotent, fail-closed inbound pipeline backed by the **`InboundDelivery` ledger**.
 Both transports (IMAP poll, `POST /api/inbound/pipe`) record every message in the ledger under a
 UNIQUE `transportKey` before it is processed.
@@ -425,11 +429,33 @@ state = PROCESSING`): a **0-row settle** means the lease was lost mid-processing
   inline `rawMime` (setting `rawPrunedAt`) of terminal `PROCESSED`/`SKIPPED` deliveries older than
   `TELECOM_HD_INBOUND_RAW_RETENTION_DAYS` (default 30; 0 disables), keeping metadata + `contentHash`;
   `QUARANTINED` rows are never pruned (raw MIME is needed to replay).
-- TODO: IMAP IDLE push; externalise raw MIME for very large messages to object storage.
+- TODO: IMAP IDLE push.
+
+### Current inbound contract
+
+- IMAP acceptance is a transaction fenced by enabled IMAP queue, `mailboxEpoch`,
+  `cursorGeneration`, `syncState=OK` and `uidValidity`. Transport key is
+  `imap:<queue>:<epoch>:<uidValidity>:<uid>`; stale pollers cannot insert after an identity or
+  reconcile boundary. Cursor safe frontier uses the same fixed snapshot.
+- Reconcile is server-side cause/mode gated and returns `allowedModes`. `FROM_NOW` and BACKFILL
+  obtain UIDNEXT/UIDVALIDITY under mailbox lock and persist their baseline before HTTP success.
+- PIPE requires secret, enabled PIPE queue id and normalized delivery id. The factory middleware
+  validates secret before a bounded raw parser; transport key stores SHA-256(delivery id), and the
+  trusted queue address is snapshotted as `envelopeTo`.
+- `InboundDelivery` records each transport copy. Real Message-ID logical identity is an atomic
+  `InboundMessageClaim`; `observedMessageId`/semantic hash stay on every copy. Headerless IMAP
+  messages use transport identity, never content hash alone.
+- Poll and drain are single-flight. Liveness distinguishes connection attempt/connect/disconnect,
+  poll started/completed and accepted. Large raw MIME is stored privately under uploads using a
+  pending marker + fsync/rename + bounded DB-proven orphan reaper; user-visible storage errors are
+  sanitized.
 
 ---
 
 ## EmailQueueService (`apps/api/src/modules/mail/email-queue.service.ts`)
+
+> **Superseded implementation notes.** The following legacy pseudo-signatures predate mandatory
+> reconcile audit transactions and split mail permissions. The current contract is below.
 
 Consumed by: `EmailQueueController`. Owns queue CRUD (password `passwordEnc` never returned) plus
 the inbound operator actions. Injects `InboundAuditService` (`@Optional()`).
@@ -466,7 +492,25 @@ listQuarantined() / replayQuarantined(deliveryId, actor?)
 queue / quarantine backlog / stalled processing surfaces to a log-based monitor without an operator
 polling the endpoint. Cleared in `onModuleDestroy`.
 
+### Current queue/operator contract
+
+- Queue update atomically advances mailbox epoch for IMAP identity/transport transitions; it does
+  not rely on an in-memory epoch. Password-only changes do not invalidate the mailbox snapshot.
+- Reconcile requires expected generation and a server-allowed mode. Request, terminal completion or
+  failure audit entries are written with their conditional state transitions; a CAS loser is 409 and
+  produces no false audit.
+- `listQuarantined(query)` returns server pagination/filter metadata only. Detail returns audit and
+  `replayAllowed`/block reason, never raw bytes or `rawStorageKey`. Replay requires reason + row
+  version and writes state/audit in one transaction.
+- `health()` includes quarantine bytes, raw-storage reserve and collision alerts as well as queue
+  liveness. All mail operator routes use `mail.view`, `mail.replay`, `mail.reconcile` or
+  `mail.configure`; backend guard is authoritative.
+
 ## InboundAuditService (`apps/api/src/modules/mail/inbound-audit.service.ts`)
+
+`InboundAuditService` remains suitable for non-critical observability. It is **not** the authority
+for reconcile/replay: correctness-critical operator state transitions insert `InboundAuditLog`
+directly through the same Prisma transaction, so an audit failure rolls back that action.
 
 Consumed by: `EmailQueueService`. Append-only writer for `InboundAuditLog` — the durable audit trail
 for inbound operator actions, kept separate from `RbacAuditLog` so mail-ops history is queryable per
@@ -474,10 +518,10 @@ queue/delivery.
 
 ```ts
 log(entry): Promise<void>
-// action ∈ mail.reconcile | mail.quarantine_replay. entry = { actorStaffId?, actorEmail?,
-// action, queueId?, deliveryId?, reason?, metadata? }. BEST-EFFORT: a failed insert is logged,
-// NEVER propagated — the reconcile/replay it records is the source of truth and must not roll
-// back because the audit row failed.
+// Non-critical observability helper. May log a failed insert, but MUST NOT be used for a
+// correctness-critical reconcile/replay transition. Those paths call tx.inboundAuditLog.create
+// in their owning transaction. Actions also include mail.transport_collision and
+// mail.message_id_conflict.
 
 list({ page, limit }): Promise<[rows, total]>   // newest first (id desc)
 ```

@@ -15,6 +15,8 @@ describe('permissions catalog', () => {
     expect(isKnownPermission('ticket.view')).toBe(true);
     expect(isKnownPermission('staff.manage')).toBe(true);
     expect(isKnownPermission('does.not.exist')).toBe(false);
+    expect(isKnownPermission('admin.mail')).toBe(false);
+    expect(isKnownPermission('mail.reconcile')).toBe(true);
   });
 
   it('unknownPermissions returns only the keys outside the catalog', () => {
@@ -43,14 +45,31 @@ describe('role presets', () => {
     expect(m).toContain(PERMISSIONS.ORG_MANAGE);
     expect(m).toContain(PERMISSIONS.KB_MANAGE);
     expect(m).toContain(PERMISSIONS.REPORT_MANAGE);
+    expect(m).toContain(PERMISSIONS.MAIL_VIEW);
     // lacks
     expect(m).not.toContain(PERMISSIONS.STAFF_MANAGE);
     expect(m).not.toContain(PERMISSIONS.ORG_DELETE);
     expect(m).not.toContain(PERMISSIONS.ADMIN_SETTINGS);
     expect(m).not.toContain(PERMISSIONS.ADMIN_SLA);
     expect(m).not.toContain(PERMISSIONS.ADMIN_ALARIS);
+    expect(m).not.toContain(PERMISSIONS.MAIL_REPLAY);
+    expect(m).not.toContain(PERMISSIONS.MAIL_RECONCILE);
+    expect(m).not.toContain(PERMISSIONS.MAIL_CONFIGURE);
     // no admin.* keys at all
     expect(m.some((k) => k.startsWith('admin.'))).toBe(false);
+  });
+
+  it('administrator has every split mail permission while agent has none', () => {
+    for (const permission of [
+      PERMISSIONS.MAIL_VIEW,
+      PERMISSIONS.MAIL_REPLAY,
+      PERMISSIONS.MAIL_RECONCILE,
+      PERMISSIONS.MAIL_CONFIGURE,
+    ]) {
+      expect(ROLE_PRESETS.administrator).toContain(permission);
+      expect(ROLE_PRESETS.agent).not.toContain(permission);
+    }
+    expect(ALL_PERMISSIONS as string[]).not.toContain('admin.mail');
   });
 
   it('manager is strictly more privileged than agent', () => {

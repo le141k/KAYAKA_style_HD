@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  Inject,
   Injectable,
   Logger,
   NotFoundException,
@@ -12,9 +13,17 @@ import {
 import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { encryptField } from '../../common/field-encrypt.util';
-import type { CreateEmailQueueDto, ReconcileEmailQueueDto, UpdateEmailQueueDto } from './dto';
+import { APP_CONFIG, type AppConfig } from '../../config/configuration';
+import type {
+  CreateEmailQueueDto,
+  ListQuarantinedInboundDto,
+  ReconcileEmailQueueDto,
+  ReplayQuarantinedInboundDto,
+  UpdateEmailQueueDto,
+} from './dto';
 import { InboundAuditService } from './inbound-audit.service';
 import { InboundMailService, type ReconcileMailboxBaseline } from './inbound.service';
+import { InboundRawStorageService } from './inbound-raw-storage.service';
 
 /** Actor performing an audited operator action (reconcile / replay). */
 export interface InboundActor {
@@ -48,7 +57,12 @@ const SAFE_SELECT = {
   bootstrapPolicy: true,
   bootstrapBackfillLimit: true,
   lastConnectedAt: true,
+  lastConnectionAttemptAt: true,
+  lastDisconnectedAt: true,
+  lastConnectionErrorAt: true,
+  lastPollStartedAt: true,
   lastPollAt: true,
+  lastPollCompletedAt: true,
   lastAcceptedAt: true,
 } as const;
 
@@ -89,6 +103,10 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     private readonly prisma: PrismaService,
     @Optional() private readonly inboundAudit?: InboundAuditService,
     @Optional() private readonly inboundMail?: InboundMailService,
+    @Optional()
+    @Inject(APP_CONFIG)
+    private readonly config?: Pick<AppConfig, 'TELECOM_HD_IMAP_ENABLED' | 'TELECOM_HD_INBOUND_MAX_SIZE_MB'>,
+    @Optional() private readonly rawStorage?: InboundRawStorageService,
   ) {}
 
   /** Emit inbound health alerts on a schedule so a halted queue / quarantine backlog /
@@ -114,7 +132,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         else this.logger.warn(line);
       }
     } catch (err) {
-      this.logger.error(`Inbound health alert emit failed: ${String(err)}`);
+      this.logger.error(`Inbound health alert emit failed (${this.errorKind(err)})`);
     }
   }
 
@@ -722,12 +740,76 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     return null;
   }
 
-  /** List quarantined inbound deliveries (metadata only — never the raw MIME blob). */
-  listQuarantined() {
-    return this.prisma.inboundDelivery.findMany({
-      where: { state: 'QUARANTINED' },
-      orderBy: { id: 'desc' },
-      take: 200,
+  /**
+   * Paginated quarantine index. It intentionally contains only metadata — raw MIME stays
+   * in the ledger/storage and is never exposed by an operator listing endpoint.
+   */
+  async listQuarantined(query: ListQuarantinedInboundDto) {
+    const where: Prisma.InboundDeliveryWhereInput = {
+      state: 'QUARANTINED',
+      ...(query.queueId !== undefined ? { queueId: query.queueId } : {}),
+      ...(query.reason ? { lastError: { contains: query.reason, mode: 'insensitive' } } : {}),
+      ...(query.messageId
+        ? {
+            OR: [
+              { messageId: { contains: query.messageId, mode: 'insensitive' } },
+              { observedMessageId: { contains: query.messageId, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+      ...(query.from || query.to
+        ? {
+            createdAt: {
+              ...(query.from ? { gte: query.from } : {}),
+              ...(query.to ? { lte: query.to } : {}),
+            },
+          }
+        : {}),
+    };
+    const select = {
+      id: true,
+      transport: true,
+      queueId: true,
+      messageId: true,
+      envelopeFrom: true,
+      envelopeTo: true,
+      subject: true,
+      sizeBytes: true,
+      attempts: true,
+      lastError: true,
+      truncated: true,
+      createdAt: true,
+      updatedAt: true,
+    } as const;
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.inboundDelivery.findMany({
+        where,
+        orderBy: { id: 'desc' },
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
+        select,
+      }),
+      this.prisma.inboundDelivery.count({ where }),
+    ]);
+    return {
+      items: items.map((rawItem) => {
+        // Defence in depth: Prisma select already omits the opaque key, but never reflect it if
+        // a mock/future projection accidentally includes it.
+        const { rawStorageKey: _rawStorageKey, ...item } = rawItem as typeof rawItem & {
+          rawStorageKey?: string | null;
+        };
+        return { ...item, replayAllowed: !item.truncated };
+      }),
+      total,
+      page: query.page,
+      limit: query.limit,
+    };
+  }
+
+  /** Detail is metadata + durable operator audit, never the raw RFC822 payload. */
+  async getQuarantined(deliveryId: number) {
+    const delivery = await this.prisma.inboundDelivery.findUnique({
+      where: { id: deliveryId },
       select: {
         id: true,
         transport: true,
@@ -746,29 +828,86 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         sizeBytes: true,
         attempts: true,
         lastError: true,
+        truncated: true,
         createdAt: true,
         updatedAt: true,
+        state: true,
       },
     });
+    if (!delivery || delivery.state !== 'QUARANTINED') {
+      throw new NotFoundException(`Quarantined delivery #${deliveryId} not found`);
+    }
+    const audit = await this.prisma.inboundAuditLog.findMany({
+      where: { deliveryId },
+      orderBy: { id: 'desc' },
+      take: 100,
+      select: {
+        id: true,
+        actorStaffId: true,
+        actorEmail: true,
+        action: true,
+        reason: true,
+        metadata: true,
+        createdAt: true,
+      },
+    });
+    const { rawStorageKey: _rawStorageKey, ...safeDelivery } = delivery as typeof delivery & {
+      rawStorageKey?: string | null;
+    };
+    return {
+      delivery: {
+        ...safeDelivery,
+        replayAllowed: !safeDelivery.truncated,
+        replayBlockReason: safeDelivery.truncated
+          ? 'The stored MIME is truncated; safely replaying it requires a future original-message re-fetch.'
+          : null,
+      },
+      audit,
+    };
   }
 
   /**
    * Replay a quarantined delivery: reset it to ACCEPTED (attempts 0, lease cleared) so
    * the drain reprocesses it. The raw MIME was retained, so nothing was lost.
    */
-  async replayQuarantined(deliveryId: number, actor?: InboundActor) {
-    const reset = await this.prisma.inboundDelivery.updateMany({
-      where: { id: deliveryId, state: 'QUARANTINED' },
-      data: { state: 'ACCEPTED', attempts: 0, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null },
-    });
-    if (reset.count === 0) {
-      throw new NotFoundException(`Quarantined delivery #${deliveryId} not found`);
-    }
-    await this.inboundAudit?.log({
-      actorStaffId: actor?.staffId ?? null,
-      actorEmail: actor?.email,
-      action: 'mail.quarantine_replay',
-      deliveryId,
+  async replayQuarantined(deliveryId: number, dto: ReplayQuarantinedInboundDto, actor: InboundActor) {
+    await this.prisma.$transaction(async (tx) => {
+      const current = await tx.inboundDelivery.findUnique({
+        where: { id: deliveryId },
+        select: { state: true, truncated: true, updatedAt: true },
+      });
+      if (!current || current.state !== 'QUARANTINED') {
+        throw new NotFoundException(`Quarantined delivery #${deliveryId} not found`);
+      }
+      // A truncated raw MIME is not the original message. Replaying it would create a
+      // partial/incorrect ticket, so require an explicit future re-fetch capability first.
+      if (current.truncated) {
+        throw new BadRequestException(
+          `Quarantined delivery #${deliveryId} has truncated raw MIME and cannot be replayed safely`,
+        );
+      }
+      if (current.updatedAt.getTime() !== dto.expectedUpdatedAt.getTime()) {
+        throw new ConflictException(`Quarantined delivery #${deliveryId} changed; refresh before replaying`);
+      }
+      const reset = await tx.inboundDelivery.updateMany({
+        where: { id: deliveryId, state: 'QUARANTINED', updatedAt: dto.expectedUpdatedAt },
+        data: { state: 'ACCEPTED', attempts: 0, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null },
+      });
+      if (reset.count !== 1) {
+        throw new ConflictException(`Quarantined delivery #${deliveryId} changed; refresh before replaying`);
+      }
+      // An audit insert failure rolls back the state change. Operator actions must never
+      // succeed without a durable reason and actor record.
+      await tx.inboundAuditLog.create({
+        data: {
+          actorStaffId: actor.staffId ?? null,
+          actorEmail: actor.email ?? '',
+          action: 'mail.quarantine_replay',
+          deliveryId,
+          reason: dto.reason,
+          metadata: { expectedUpdatedAt: dto.expectedUpdatedAt.toISOString() },
+        },
+      });
     });
     this.logger.warn(
       `AUDIT inbound quarantine replay delivery=${deliveryId} actorStaffId=${actor?.staffId ?? 'system'}`,
@@ -798,8 +937,13 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         reconcileCause: true,
         reconcileRequestedAt: true,
         bootstrapPolicy: true,
+        lastConnectionAttemptAt: true,
         lastConnectedAt: true,
+        lastDisconnectedAt: true,
+        lastConnectionErrorAt: true,
+        lastPollStartedAt: true,
         lastPollAt: true,
+        lastPollCompletedAt: true,
         lastAcceptedAt: true,
       },
     });
@@ -818,24 +962,92 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       skipped: count('SKIPPED'),
     };
 
-    const [oldestPending, lastProcessed, stalledProcessing] = await Promise.all([
-      this.prisma.inboundDelivery.findFirst({
-        where: { state: { in: ['ACCEPTED', 'RETRY'] } },
-        orderBy: { createdAt: 'asc' },
-        select: { id: true, createdAt: true, nextAttemptAt: true, attempts: true },
-      }),
-      this.prisma.inboundDelivery.findFirst({
-        where: { state: 'PROCESSED' },
-        orderBy: { processedAt: 'desc' },
-        select: { processedAt: true },
-      }),
-      this.prisma.inboundDelivery.count({
-        where: { state: 'PROCESSING', leaseExpiresAt: { lt: now } },
-      }),
-    ]);
+    const collisionSince = new Date(now.getTime() - 24 * 60 * 60_000);
+    const [oldestPending, lastProcessed, stalledProcessing, quarantineSize, recentCollisions] =
+      await Promise.all([
+        this.prisma.inboundDelivery.findFirst({
+          where: { state: { in: ['ACCEPTED', 'RETRY'] } },
+          orderBy: { createdAt: 'asc' },
+          select: { id: true, createdAt: true, nextAttemptAt: true, attempts: true },
+        }),
+        this.prisma.inboundDelivery.findFirst({
+          where: { state: 'PROCESSED' },
+          orderBy: { processedAt: 'desc' },
+          select: { processedAt: true },
+        }),
+        this.prisma.inboundDelivery.count({
+          where: { state: 'PROCESSING', leaseExpiresAt: { lt: now } },
+        }),
+        this.prisma.inboundDelivery.aggregate({
+          where: { state: 'QUARANTINED' },
+          _sum: { sizeBytes: true },
+        }),
+        this.prisma.inboundAuditLog.count({
+          where: {
+            action: { in: ['mail.transport_collision', 'mail.message_id_conflict'] },
+            createdAt: { gte: collisionSince },
+          },
+        }),
+      ]);
 
-    const halted = queues.filter((q) => q.syncState === 'NEEDS_RECONCILIATION').map((q) => q.id);
+    const enabledQueues = queues.filter((q) => q.isEnabled);
+    const halted = enabledQueues.filter((q) => q.syncState === 'NEEDS_RECONCILIATION').map((q) => q.id);
     const alerts: Array<{ severity: 'warning' | 'critical'; kind: string; message: string }> = [];
+    if (enabledQueues.length > 0 && this.config?.TELECOM_HD_IMAP_ENABLED === false) {
+      alerts.push({
+        severity: 'critical',
+        kind: 'imap_disabled',
+        message: `${enabledQueues.length} enabled IMAP queue(s) exist but TELECOM_HD_IMAP_ENABLED is disabled.`,
+      });
+    }
+    const staleAfterMs = 10 * 60_000;
+    for (const q of enabledQueues) {
+      if (!q.lastConnectedAt) {
+        alerts.push({
+          severity: 'critical',
+          kind: 'never_connected',
+          message: `Queue ${q.id} (${q.emailAddress}) has never connected to IMAP.`,
+        });
+      } else if (now.getTime() - q.lastConnectedAt.getTime() > staleAfterMs) {
+        alerts.push({
+          severity: 'warning',
+          kind: 'stale_connection',
+          message: `Queue ${q.id} (${q.emailAddress}) has not connected within 10 minutes.`,
+        });
+      }
+      if (q.lastConnectionErrorAt && (!q.lastConnectedAt || q.lastConnectionErrorAt > q.lastConnectedAt)) {
+        alerts.push({
+          severity: 'warning',
+          kind: 'connection_error',
+          message: `Queue ${q.id} (${q.emailAddress}) has a newer IMAP connection error.`,
+        });
+      }
+      if (q.lastPollStartedAt && (!q.lastPollCompletedAt || q.lastPollStartedAt > q.lastPollCompletedAt)) {
+        alerts.push({
+          severity: 'warning',
+          kind: 'poll_running',
+          message: `Queue ${q.id} (${q.emailAddress}) has a poll cycle still in progress.`,
+        });
+      } else if (q.lastPollCompletedAt && now.getTime() - q.lastPollCompletedAt.getTime() > staleAfterMs) {
+        alerts.push({
+          severity: 'warning',
+          kind: 'stale_poll',
+          message: `Queue ${q.id} (${q.emailAddress}) has not completed a poll within 10 minutes.`,
+        });
+      }
+      const bootstrapStartedAt = q.reconcileRequestedAt ?? q.lastPollStartedAt;
+      if (
+        q.syncState === 'BOOTSTRAPPING' &&
+        bootstrapStartedAt &&
+        now.getTime() - bootstrapStartedAt.getTime() > staleAfterMs
+      ) {
+        alerts.push({
+          severity: 'warning',
+          kind: 'bootstrap_stalled',
+          message: `Queue ${q.id} (${q.emailAddress}) has been bootstrapping for over 10 minutes.`,
+        });
+      }
+    }
     if (halted.length) {
       alerts.push({
         severity: 'critical',
@@ -865,6 +1077,15 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         message: `${stalledProcessing} delivery(ies) are PROCESSING past their lease — awaiting drain reclaim.`,
       });
     }
+    if (recentCollisions > 0) {
+      alerts.push({
+        severity: 'critical',
+        kind: 'inbound_collision',
+        message:
+          `${recentCollisions} transport or Message-ID semantic collision audit event(s) occurred in the last 24 hours; ` +
+          'review quarantine and the inbound audit trail before resuming normal operations.',
+      });
+    }
     // Aged backlog: a still-pending delivery older than 15 min signals a stuck drain.
     if (oldestPending && now.getTime() - oldestPending.createdAt.getTime() > 15 * 60_000) {
       alerts.push({
@@ -874,15 +1095,52 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
+    // Large raw MIME lives under the existing uploads volume.  Its write path refuses an
+    // incoming message that would cross the configured reserve; surface the same boundary to
+    // operators before the next large delivery is rejected.  Capacity telemetry itself is
+    // deliberately best-effort here: an unavailable probe is an alert, not a health-endpoint
+    // outage that hides the rest of the ledger state.
+    let storage: { availableBytes: string; reserveBytes: string; nearReserve: boolean } | null = null;
+    if (this.rawStorage) {
+      try {
+        const capacity = await this.rawStorage.capacity();
+        const nextInboundBytes = BigInt(this.config?.TELECOM_HD_INBOUND_MAX_SIZE_MB ?? 0) * 1024n * 1024n;
+        const nearReserve = capacity.availableBytes < capacity.reserveBytes + nextInboundBytes;
+        storage = {
+          availableBytes: capacity.availableBytes.toString(),
+          reserveBytes: capacity.reserveBytes.toString(),
+          nearReserve,
+        };
+        if (nearReserve) {
+          alerts.push({
+            severity: 'warning',
+            kind: 'raw_storage_near_reserve',
+            message:
+              'Inbound raw MIME storage is within one maximum inbound message of its configured reserve; ' +
+              'new oversized deliveries will fail closed until capacity is restored.',
+          });
+        }
+      } catch (err) {
+        alerts.push({
+          severity: 'warning',
+          kind: 'raw_storage_capacity_unknown',
+          message: 'Inbound raw MIME storage capacity cannot be verified.',
+        });
+        this.logger.warn(`Inbound raw MIME storage capacity probe failed (${this.errorKind(err)})`);
+      }
+    }
+
     return {
       queues,
       ledger: {
         backlog: byState.accepted + byState.retry,
         byState,
+        quarantineBytes: quarantineSize._sum.sizeBytes ?? 0,
         stalledProcessing,
         oldestPendingAt: oldestPending?.createdAt ?? null,
         lastProcessedAt: lastProcessed?.processedAt ?? null,
       },
+      rawStorage: storage,
       alerts,
       checkedAt: now,
     };

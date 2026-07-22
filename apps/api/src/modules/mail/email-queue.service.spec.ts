@@ -6,7 +6,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { EmailQueueService } from './email-queue.service';
-import { ReconcileEmailQueueSchema } from './dto';
+import { ReconcileEmailQueueSchema, ReplayQuarantinedInboundSchema } from './dto';
 import type { PrismaService } from '../../prisma/prisma.service';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -35,6 +35,14 @@ function makeSafeQueue(overrides: Partial<SafeQueue> = {}): SafeQueue {
     reconcileRequestedAt: null,
     bootstrapPolicy: null,
     bootstrapBackfillLimit: null,
+    lastConnectedAt: null,
+    lastConnectionAttemptAt: null,
+    lastDisconnectedAt: null,
+    lastConnectionErrorAt: null,
+    lastPollStartedAt: null,
+    lastPollAt: null,
+    lastPollCompletedAt: null,
+    lastAcceptedAt: null,
     ...overrides,
   };
 }
@@ -68,6 +76,14 @@ type SafeQueue = {
   reconcileRequestedAt: Date | null;
   bootstrapPolicy: 'FROM_NOW' | 'BACKFILL' | null;
   bootstrapBackfillLimit: number | null;
+  lastConnectedAt: Date | null;
+  lastConnectionAttemptAt: Date | null;
+  lastDisconnectedAt: Date | null;
+  lastConnectionErrorAt: Date | null;
+  lastPollStartedAt: Date | null;
+  lastPollAt: Date | null;
+  lastPollCompletedAt: Date | null;
+  lastAcceptedAt: Date | null;
 };
 
 function makePrismaMock() {
@@ -82,18 +98,26 @@ function makePrismaMock() {
     },
     inboundDelivery: {
       findMany: vi.fn().mockResolvedValue([]),
+      findUnique: vi.fn(),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       groupBy: vi.fn().mockResolvedValue([]),
+      aggregate: vi.fn().mockResolvedValue({ _sum: { sizeBytes: null } }),
       findFirst: vi.fn().mockResolvedValue(null),
       count: vi.fn().mockResolvedValue(0),
     },
     setting: {
       findUnique: vi.fn().mockResolvedValue(null),
     },
-    inboundAuditLog: { create: vi.fn().mockResolvedValue({ id: 1 }) },
+    inboundAuditLog: {
+      create: vi.fn().mockResolvedValue({ id: 1 }),
+      findMany: vi.fn().mockResolvedValue([]),
+      count: vi.fn().mockResolvedValue(0),
+    },
   } as unknown as Record<string, unknown>;
   (prisma as { $transaction: ReturnType<typeof vi.fn> }).$transaction = vi.fn(async (arg: unknown) =>
-    typeof arg === 'function' ? (arg as (tx: unknown) => Promise<unknown>)(prisma) : arg,
+    typeof arg === 'function'
+      ? (arg as (tx: unknown) => Promise<unknown>)(prisma)
+      : Promise.all(arg as Promise<unknown>[]),
   );
   return prisma as unknown as PrismaService;
 }
@@ -628,29 +652,152 @@ describe('EmailQueueService', () => {
     });
   });
 
+  describe('quarantine observability', () => {
+    it('paginates metadata without exposing raw storage keys and returns server replay capability', async () => {
+      const row = {
+        id: 91,
+        transport: 'IMAP',
+        queueId: 2,
+        messageId: '<message@example.test>',
+        envelopeFrom: 'sender@example.test',
+        envelopeTo: 'support@example.test',
+        subject: 'Cannot connect',
+        sizeBytes: 2048,
+        attempts: 5,
+        lastError: 'parse failed',
+        truncated: true,
+        rawStorageKey: 'inbound-raw/00000000-0000-4000-8000-000000000001.eml',
+        createdAt: new Date('2026-07-22T12:00:00.000Z'),
+        updatedAt: new Date('2026-07-22T12:01:00.000Z'),
+      };
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([row]);
+      (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+
+      const out = await service.listQuarantined({ page: 1, limit: 25 });
+
+      expect(out).toMatchObject({ total: 1, page: 1, limit: 25 });
+      expect(out.items[0]).toMatchObject({ id: 91, replayAllowed: false });
+      expect(out.items[0]).not.toHaveProperty('rawStorageKey');
+      const args = (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        select: Record<string, boolean>;
+      };
+      expect(args.select).not.toHaveProperty('rawStorageKey');
+    });
+
+    it('searches both legacy and observed Message-ID values', async () => {
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+
+      await service.listQuarantined({ page: 1, limit: 25, messageId: '<thread@example.test>' });
+
+      const args = (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        where: { OR?: unknown[] };
+      };
+      expect(args.where.OR).toEqual([
+        { messageId: { contains: '<thread@example.test>', mode: 'insensitive' } },
+        { observedMessageId: { contains: '<thread@example.test>', mode: 'insensitive' } },
+      ]);
+    });
+
+    it('returns detail/audit metadata but never a raw storage key', async () => {
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 92,
+        state: 'QUARANTINED',
+        transport: 'PIPE',
+        queueId: 3,
+        messageId: null,
+        envelopeFrom: null,
+        envelopeTo: 'pipe@example.test',
+        subject: '',
+        sizeBytes: 1024,
+        attempts: 1,
+        lastError: 'bad MIME',
+        truncated: false,
+        rawStorageKey: 'inbound-raw/00000000-0000-4000-8000-000000000001.eml',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      (prisma.inboundAuditLog.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const out = await service.getQuarantined(92);
+
+      expect(out.delivery).toMatchObject({ id: 92, replayAllowed: true, replayBlockReason: null });
+      expect(out.delivery).not.toHaveProperty('rawStorageKey');
+      const args = (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        select: Record<string, boolean>;
+      };
+      expect(args.select).not.toHaveProperty('rawStorageKey');
+    });
+  });
+
   describe('replayQuarantined', () => {
-    it('resets a QUARANTINED delivery back to ACCEPTED', async () => {
+    const replayDto = {
+      reason: 'fixed mailbox rule',
+      expectedUpdatedAt: new Date('2026-07-22T12:00:00.000Z'),
+    };
+    const actor = { staffId: 7, email: 'ops@example.test' };
+
+    it('resets a QUARANTINED delivery back to ACCEPTED with a durable reason audit', async () => {
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        state: 'QUARANTINED',
+        truncated: false,
+        updatedAt: replayDto.expectedUpdatedAt,
+      });
       (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
-      await expect(service.replayQuarantined(9)).resolves.toEqual({ replayed: true });
+      await expect(service.replayQuarantined(9, replayDto, actor)).resolves.toEqual({ replayed: true });
       expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 9, state: 'QUARANTINED' },
+          where: { id: 9, state: 'QUARANTINED', updatedAt: replayDto.expectedUpdatedAt },
           data: expect.objectContaining({ state: 'ACCEPTED', attempts: 0 }),
+        }),
+      );
+      expect(prisma.inboundAuditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: 'mail.quarantine_replay',
+            deliveryId: 9,
+            reason: 'fixed mailbox rule',
+            actorStaffId: 7,
+          }),
         }),
       );
     });
 
     it('throws NotFoundException when the delivery is not quarantined', async () => {
-      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
-      await expect(service.replayQuarantined(9)).rejects.toBeInstanceOf(NotFoundException);
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await expect(service.replayQuarantined(9, replayDto, actor)).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('rejects stale/concurrent replay with 409 and does not create a false audit row', async () => {
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        state: 'QUARANTINED',
+        truncated: false,
+        updatedAt: new Date('2026-07-22T12:00:01.000Z'),
+      });
+      await expect(service.replayQuarantined(9, replayDto, actor)).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.inboundAuditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('never replays truncated raw MIME as a partial ticket', async () => {
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        state: 'QUARANTINED',
+        truncated: true,
+        updatedAt: replayDto.expectedUpdatedAt,
+      });
+      await expect(service.replayQuarantined(9, replayDto, actor)).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.inboundAuditLog.create).not.toHaveBeenCalled();
     });
   });
 
   describe('health', () => {
     it('reports backlog + byState and raises halt / quarantine / stalled alerts', async () => {
       (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-        makeSafeQueue({ id: 1, syncState: 'NEEDS_RECONCILIATION' }),
-        makeSafeQueue({ id: 2, syncState: 'OK' }),
+        makeSafeQueue({ id: 1, isEnabled: true, syncState: 'NEEDS_RECONCILIATION' }),
+        makeSafeQueue({ id: 2, isEnabled: true, syncState: 'OK' }),
       ]);
       (prisma.inboundDelivery.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([
         { state: 'ACCEPTED', _count: { _all: 3 } },
@@ -660,6 +807,7 @@ describe('EmailQueueService', () => {
       ]);
       (prisma.inboundDelivery.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>).mockResolvedValue(4); // stalled PROCESSING
+      (prisma.inboundAuditLog.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
 
       const out = await service.health(new Date('2026-07-18T12:00:00.000Z'));
 
@@ -670,6 +818,7 @@ describe('EmailQueueService', () => {
       expect(kinds).toContain('queue_halted');
       expect(kinds).toContain('quarantine');
       expect(kinds).toContain('stalled_processing');
+      expect(kinds).toContain('inbound_collision');
       expect(out.alerts.find((a) => a.kind === 'queue_halted')?.severity).toBe('critical');
     });
 
@@ -700,6 +849,73 @@ describe('EmailQueueService', () => {
       const out = await service.health(new Date('2026-07-18T12:00:00.000Z'));
       expect(out.alerts).toEqual([]);
       expect(out.ledger.backlog).toBe(0);
+    });
+
+    it('surfaces enabled IMAP that is disabled globally, never connected and stale', async () => {
+      const ops = new EmailQueueService(prisma as unknown as PrismaService, undefined, undefined, {
+        TELECOM_HD_IMAP_ENABLED: false,
+      } as never);
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeSafeQueue({
+          id: 4,
+          isEnabled: true,
+          lastConnectedAt: null,
+          lastConnectionErrorAt: new Date('2026-07-22T11:00:00.000Z'),
+          lastPollStartedAt: new Date('2026-07-22T11:00:00.000Z'),
+          lastPollCompletedAt: null,
+        } as never),
+      ]);
+      const out = await ops.health(new Date('2026-07-22T12:00:00.000Z'));
+      const kinds = out.alerts.map((alert) => alert.kind);
+      expect(kinds).toEqual(
+        expect.arrayContaining(['imap_disabled', 'never_connected', 'connection_error', 'poll_running']),
+      );
+    });
+
+    it('alerts when a reconcile request remains BOOTSTRAPPING even before a poll timestamp exists', async () => {
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeSafeQueue({
+          id: 7,
+          isEnabled: true,
+          syncState: 'BOOTSTRAPPING',
+          reconcileRequestedAt: new Date('2026-07-22T11:40:00.000Z'),
+          lastPollStartedAt: null,
+        }),
+      ]);
+
+      const out = await service.health(new Date('2026-07-22T12:00:00.000Z'));
+
+      expect(out.alerts.map((alert) => alert.kind)).toContain('bootstrap_stalled');
+    });
+
+    it('reports quarantine bytes and warns before raw storage reaches its write reserve', async () => {
+      const rawStorage = {
+        capacity: vi.fn().mockResolvedValue({
+          reserveBytes: 100n * 1024n * 1024n,
+          availableBytes: 101n * 1024n * 1024n,
+        }),
+      };
+      const ops = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        undefined,
+        { TELECOM_HD_IMAP_ENABLED: true, TELECOM_HD_INBOUND_MAX_SIZE_MB: 35 } as never,
+        rawStorage as never,
+      );
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.inboundDelivery.aggregate as ReturnType<typeof vi.fn>).mockResolvedValue({
+        _sum: { sizeBytes: 4096 },
+      });
+
+      const out = await ops.health(new Date('2026-07-22T12:00:00.000Z'));
+
+      expect(out.ledger.quarantineBytes).toBe(4096);
+      expect(out.rawStorage).toEqual({
+        availableBytes: String(101n * 1024n * 1024n),
+        reserveBytes: String(100n * 1024n * 1024n),
+        nearReserve: true,
+      });
+      expect(out.alerts.map((alert) => alert.kind)).toContain('raw_storage_near_reserve');
     });
   });
 
@@ -733,6 +949,19 @@ describe('EmailQueueService', () => {
           mode: 'BACKFILL',
           expectedCursorGeneration: 0,
           backfillLimit: 500,
+        }).success,
+      ).toBe(true);
+    });
+  });
+
+  describe('ReplayQuarantinedInboundSchema', () => {
+    it('requires an explicit reason and an inspected row version', () => {
+      expect(ReplayQuarantinedInboundSchema.safeParse({}).success).toBe(false);
+      expect(ReplayQuarantinedInboundSchema.safeParse({ reason: 'why' }).success).toBe(false);
+      expect(
+        ReplayQuarantinedInboundSchema.safeParse({
+          reason: 'verified the root cause',
+          expectedUpdatedAt: '2026-07-22T12:00:00.000Z',
         }).success,
       ).toBe(true);
     });

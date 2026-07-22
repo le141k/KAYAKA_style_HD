@@ -1,83 +1,90 @@
 # ADR 0007 — Durable inbound-delivery ledger (fail-closed IMAP/PIPE ingestion)
 
 - Status: Accepted
-- Date: 2026-07-17
+- Date: 2026-07-17; amended 2026-07-22
 
 ## Context
 
-Inbound mail (IMAP poll and the `POST /api/inbound/pipe` webhook) previously threaded/created
-tickets directly from a parsed message, with the only durability being an IMAP UID watermark in
-`Setting`. A production review found several ways this loses or duplicates mail:
+Direct IMAP parsing plus a mutable `Setting` watermark could silently skip mail after a fetch,
+storage or DB error, UIDVALIDITY reset, mailbox replacement, out-of-order response, stale poller
+or retry. It also made a received copy, a true logical message and a ticket/post the same mutable
+thing: two poller processes could disagree on routing or double-post.
 
-- The UID cursor advanced on a moving counter and on any processing outcome, so a poison message,
-  an infrastructure error (Prisma/DB/storage), an out-of-order UID, or a crash between the reply
-  and the watermark write could **silently drop or double-process** mail.
-- First-connect bootstrap could import the whole historical mailbox, or (with no `UIDNEXT`) fail
-  open to `1:*`. A `UIDVALIDITY` change auto-advanced into the new UID space, skipping mail.
-- Message-ID de-dup missed retries because the id was written in a follow-up `UPDATE`, and mail
-  with no Message-ID had no idempotency at all.
-- No raw MIME was retained, so a failed message could not be replayed; multiple pollers raced.
+The public PIPE ingress has distinct risks: a large body must not be read before authentication,
+a caller-controlled queue/department is not a safe routing source, and byte-identical independent
+headerless messages must not be collapsed by a content hash.
 
 ## Decision
 
-Introduce a durable **`InboundDelivery` ledger** and split ingestion into **accept** and **drain**.
+Use a durable **`InboundDelivery` ledger** and split inbound work into acceptance and drain.
 
-- **Accept** records every message (raw MIME retained) under a UNIQUE `transportKey`
-  (`imap:<queueId>:<uidValidity>:<uid>` or `pipe:-:<externalId|sha256:hash>`). The IMAP
-  `EmailQueue.lastSeenUid` cursor advances via a **monotonic CAS** ONLY after durable acceptance;
-  any fetch/DB error stops the poll without advancing (**fail-closed** — no silent loss). A
-  duplicate key is an idempotent no-op (multi-poller / re-poll safe).
-- **Bootstrap** captures the baseline **synchronously at connect** (not the first poll) via an
-  explicit `FROM_NOW` / `BACKFILL` policy; it never fails open to `1:*`.
-- **`UIDVALIDITY`** changes are **fail-closed**: the queue halts (`syncState =
-NEEDS_RECONCILIATION`) for an explicit operator `FROM_NOW` / bounded `BACKFILL` decision.
-- **Drain** processes `ACCEPTED`/`RETRY` deliveries with a **leased** CAS claim (`leaseOwner` +
-  `leaseExpiresAt`); an expired lease is reclaimed, and terminal writes are lease-gated, so a
-  crash mid-processing never strands a delivery in `PROCESSING`. Success → `PROCESSED`, transient
-  error → `RETRY` (backoff), attempts exhausted → `QUARANTINED`. A quarantine **never discards** —
-  the raw MIME stays for replay.
-- **Upgrade/cutover** is safe: the ledger migration halts every already-enabled IMAP queue
-  (`NEEDS_RECONCILIATION`) so the deploy can't FROM_NOW over an in-flight cursor; the later
-  `20260721010000_inbound_hardening` migration extends the same halt to already-**disabled** IMAP
-  queues (a disabled queue re-enabled after upgrade would otherwise FROM_NOW over its legacy cursor).
-  An operator reconciles explicitly (RESUME_MIGRATED, FROM_NOW, or bounded BACKFILL).
-- **Idempotency** is primarily the transport key; processing additionally de-dups by an _effective_
-  Message-ID (the RFC id, else a deterministic `<inbound-<sha256>@23telecom.local>` from the
-  content hash), written **atomically** with the ticket/post create — so retries never double-post
-  even without a Message-ID.
+### Acceptance and cursor
+
+- Every received transport copy is stored before ticket work. IMAP transport identity is
+  `imap:<queueId>:<mailboxEpoch>:<uidValidity>:<uid>`; PIPE uses an enabled queue plus SHA-256 of
+  the normalised, mandatory MTA delivery id. Transport retry is idempotent only when its complete
+  transport identity and raw content hash match.
+- `mailboxEpoch` increments atomically for IMAP identity changes and IMAP ↔ non-IMAP transitions.
+  A stale UID from a different mailbox can therefore never be mistaken for a duplicate.
+- An IMAP acceptance transaction fences queue id, enabled/type, sync state, epoch, generation and
+  UIDVALIDITY. Cursor CAS uses the same fixed snapshot and safe frontier; a stale poller creates no
+  delivery after a reconcile/identity boundary.
+- `FROM_NOW`/`BACKFILL` are synchronous IMAP operations: under a mailbox lock they snapshot
+  `UIDNEXT - 1`, persist the generation/epoch baseline, and return success only then. BACKFILL uses
+  actual existing UIDs, not `boundary - N`. Missing IMAP state is fail-closed.
+
+### Logical message identity and routing
+
+- A delivery preserves non-unique `observedMessageId`, raw `contentHash`, semantic hash and its
+  receiving queue. A real Message-ID is claimed through a separate `InboundMessageClaim`, not a
+  unique field on `InboundDelivery`; every transport copy remains forensic evidence.
+- Same normalized Message-ID plus semantic hash is a duplicate (`SKIPPED`). Same Message-ID plus
+  different semantic hash is `QUARANTINED`, audited and alerted. Semantic hash excludes per-hop
+  trace headers such as Received/Delivered-To.
+- Headerless IMAP mail is identified only by its transport identity. Two different UIDs with equal
+  bytes remain two deliveries/tickets; a visible duplicate after a UID-space reset is safer than a
+  silent loss. PIPE cannot be headerless at the transport layer because delivery id is required.
+- Route ownership is deterministic: matching enabled queue recipients, `routingPriority` (lower
+  first), then queue id. The decision is persisted before ticket work; trusted PIPE queue address
+  is snapshotted as envelope recipient for BCC cases.
+
+### Drain, raw evidence and operations
+
+- Drain claims `ACCEPTED`/due `RETRY`/expired `PROCESSING` rows with a lease token and heartbeat.
+  Terminal/retry settle is lease-gated; crash recovery reclaims an expired lease. Ticket create and
+  reply keep post, recipients, counters and audit in the same transaction (LIFE-03).
+- Failed delivery is retried then quarantined; it is never discarded. Truncated IMAP MIME is
+  fast-quarantined and cannot be replayed without safe original refetch.
+- Small raw MIME stays inline. Large MIME uses the existing uploads volume with a pending marker,
+  fsync/atomic rename, ledger pointer and bounded marker reaper. Quarantined evidence is excluded
+  from retention. Capacity is checked against the existing storage reserve and fails closed.
+- `/api/inbound/pipe` authenticates before its route-specific parser, preserves raw bytes and
+  validates queue/type/id before acceptance. JSON and raw MIME use bounded parsers.
+- Poll and drain supervisors are single-flight, expose durable liveness and emit health alerts.
+  `mail.view`, `mail.replay`, `mail.reconcile`, and `mail.configure` are separate permissions;
+  reconcile/replay state transitions and their reason/audit are transactional.
 
 ## Consequences
 
-- Mail is durable (replayable), idempotent, and the cursor is provably fail-closed; both transports
-  share the ledger.
-- New table + `EmailQueue` cursor columns (migration `20260718000000_inbound_delivery_ledger`); the
-  legacy `Setting` `imap/lastSeenUid:<id>` watermark is superseded.
-- Raw MIME is stored inline (bounded); very large messages should later externalise to object
-  storage via `rawStorageKey`. Full single-transaction atomicity of ticket counters/audit with the
-  post (LIFE-03) remains a separate follow-up; the ledger already guarantees no loss and no
-  duplicate posts. Per-queue advisory locking is best-effort — correctness rests on the unique
-  transport-key claim, not the lock.
-- A live-IMAP (GreenMail/Dovecot) rehearsal covering EXPUNGE, reconnect and `UIDVALIDITY` remains a
-  required pre-cutover manual gate; the unit suite models the same invariants with a fake ImapFlow.
+- `InboundDelivery` is a transport ledger, not the global logical-message uniqueness table.
+  Operations must investigate its quarantine/audit rows rather than deleting them to unblock mail.
+- Existing cursor/ledger migrations are forward-only. Claim cutover follows expand → dual-write →
+  verified PostgreSQL backfill → constraint removal; it is not safe to delete a legacy unique
+  constraint before the claim migration has been rehearsed.
+- `RESUME_MIGRATED` is valid only for the legacy migration cause. UIDVALIDITY/identity events require
+  explicit FROM_NOW or bounded BACKFILL with server-provided allowed modes and a generation CAS.
+- A live PostgreSQL + GreenMail/Dovecot matrix remains mandatory before cutover; mocked tests prove
+  local invariants but do not prove migration, pooling or IMAP server behaviour.
 
 ## Rollback / cutover-back
 
-Rollback is **forward-only, not reversible in place.** The new poller writes its cursor **only** to
-`EmailQueue.lastSeenUid` (+ `uidValidity` / `cursorGeneration`) and **never** writes back the legacy
-`Setting` `imap/lastSeenUid:<id>` / `imap/state:<id>` watermark. **There is no dual-write.** Once the
-ledger cursor has advanced past the legacy watermark, rolling the API binary back to the pre-ledger
-build is **unsafe**: the old build would resume from the stale `Setting` watermark and re-fetch —
-worse, if `Setting` was never carried forward it could FROM_NOW/`1:*` — silently skipping or
-double-handling everything ingested since cutover.
+Rollback is **forward-only**. A code rollback is distinct from a data rollback: an old binary may
+not understand new epoch/claim/reconcile fields and must not be started against a ledger-advanced
+database. Before deploy, quiesce inbound workers and take/verify one recovery set containing
+PostgreSQL, uploads (including `inbound-raw`) and Redis.
 
-The supported strategy is therefore:
-
-1. **Take a full PostgreSQL backup immediately before the deploy** (schema + data).
-2. Deploy forward. Do not expect to downgrade the binary against a ledger-advanced database.
-3. If a rollback is genuinely required, **restore the pre-deploy backup** and accept re-processing
-   from that point. Re-fetching already-handled mail is safe: **Message-ID idempotency** (the unique
-   `InboundDelivery.messageId` / `TicketPost.messageId` claim, plus the effective/synthetic id) makes
-   a re-fetch of an already-ticketed message a no-op rather than a duplicate.
-
-This restore-and-reprocess path **MUST be rehearsed against a real PostgreSQL instance before
-cutover** — do not treat rollback as a theoretical option validated only in unit tests.
+If deployment fails after schema/data transition, prefer roll-forward with the corrected binary. A
+true data rollback requires restoring the matched pre-deploy recovery set while workers are stopped,
+then re-running the controlled mail canary. Do not recreate legacy `Setting` cursors manually, do
+not delete ledger evidence, and do not rely on Message-ID dedup alone to justify an unsafe old
+binary. The restore path must be rehearsed on real PostgreSQL before production cutover.
