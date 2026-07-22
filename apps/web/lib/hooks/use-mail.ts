@@ -16,6 +16,10 @@ export interface AdminEmailQueue {
   username: string;
   useTls: boolean;
   departmentId: number | null;
+  /** Queue policy is versioned so an old browser tab cannot restore stale settings. */
+  configGeneration: number;
+  routingPriority: number;
+  sendAutoresponder: boolean;
   isEnabled: boolean;
   syncState: EmailQueueSyncState;
   lastError: string | null;
@@ -28,7 +32,6 @@ export interface AdminEmailQueue {
   reconcileCause?: string | null;
   reconcileRequestedAt?: string | null;
   allowedModes?: ReconcileMode[];
-  routingPriority?: number;
   lastConnectionAttemptAt?: string | null;
   lastConnectedAt: string | null;
   lastDisconnectedAt?: string | null;
@@ -37,6 +40,35 @@ export interface AdminEmailQueue {
   lastPollAt: string | null;
   lastPollCompletedAt?: string | null;
   lastAcceptedAt: string | null;
+}
+
+/**
+ * Password is write-only.  Neither the list nor the edit form receives a stored
+ * value, and omitting it on update deliberately preserves the existing secret.
+ */
+export interface EmailQueueConfigInput {
+  type: 'IMAP' | 'POP3' | 'PIPE';
+  emailAddress: string;
+  host: string;
+  port: number;
+  username: string;
+  password?: string;
+  useTls: boolean;
+  departmentId: number | null;
+  routingPriority: number;
+  sendAutoresponder: boolean;
+  isEnabled: boolean;
+}
+
+export interface UpdateEmailQueueInput extends Partial<EmailQueueConfigInput> {
+  id: number;
+  /** Required by the API for an optimistic, full-form configuration write. */
+  expectedConfigGeneration: number;
+}
+
+export interface DeleteEmailQueueInput {
+  id: number;
+  expectedConfigGeneration: number;
 }
 
 export interface InboundAlert {
@@ -93,6 +125,80 @@ export interface InboundHealth {
   } | null;
   alerts: InboundAlert[];
   checkedAt: string;
+}
+
+// ─── Durable workflow customer-email events ─────────────────────────────────
+
+export type WorkflowEmailEventState = 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'RETRY' | 'QUARANTINED';
+
+export interface WorkflowEmailEventAlert {
+  severity: 'warning' | 'critical';
+  kind: string;
+  message: string;
+}
+
+export interface WorkflowEmailEventHealth {
+  backlog: number;
+  byState: {
+    pending: number;
+    processing: number;
+    retry: number;
+    quarantined: number;
+    processed: number;
+  };
+  stalledProcessing: number;
+  oldestPendingAt: string | null;
+  lastProcessedAt: string | null;
+  alerts: WorkflowEmailEventAlert[];
+  checkedAt: string;
+}
+
+/** List deliberately contains only event metadata, never recipient or body. */
+export interface WorkflowEmailEventListItem {
+  id: string;
+  ticketId: number;
+  eventType: string;
+  state: WorkflowEmailEventState;
+  attempts: number;
+  nextAttemptAt: string | null;
+  leaseExpiresAt: string | null;
+  lastError: string | null;
+  processedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  ticket: { id: number; mask: string };
+}
+
+export interface WorkflowEmailEventDetail {
+  event: WorkflowEmailEventListItem & {
+    sourceKey: string;
+    ticket: { id: number; mask: string; subject: string };
+    actions: Array<{
+      workflowId: number;
+      workflowVersionMs: number;
+      actionIndex: number;
+      to: string;
+      subject: string;
+      text: string;
+    }>;
+    snapshotValid: boolean;
+    replayAllowed: boolean;
+    replayBlockReason: string | null;
+  };
+}
+
+export interface WorkflowEmailEventFilters {
+  page?: number;
+  limit?: number;
+  state?: WorkflowEmailEventState;
+  ticketId?: number;
+}
+
+export interface WorkflowEmailEventPage {
+  items: WorkflowEmailEventListItem[];
+  total: number;
+  page: number;
+  limit: number;
 }
 
 export interface QuarantinedDelivery {
@@ -160,6 +266,10 @@ const mailKeys = {
   health: ['admin', 'inbound-health'] as const,
   quarantine: (filters: QuarantineFilters) => ['admin', 'inbound-quarantine', filters] as const,
   quarantineDetail: (id: number) => ['admin', 'inbound-quarantine', id] as const,
+  workflowEmailHealth: ['admin', 'workflow-email-health'] as const,
+  workflowEmailEvents: (filters: WorkflowEmailEventFilters) =>
+    ['admin', 'workflow-email-events', filters] as const,
+  workflowEmailEventDetail: (id: string) => ['admin', 'workflow-email-event', id] as const,
 };
 
 export function useEmailQueues() {
@@ -169,12 +279,98 @@ export function useEmailQueues() {
   });
 }
 
+export function useCreateEmailQueue() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: EmailQueueConfigInput) => api.post<AdminEmailQueue>('/admin/email-queues', body),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: mailKeys.queues });
+      void qc.invalidateQueries({ queryKey: mailKeys.health });
+    },
+  });
+}
+
+export function useUpdateEmailQueue() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: UpdateEmailQueueInput) =>
+      api.put<AdminEmailQueue>(`/admin/email-queues/${id}`, body),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: mailKeys.queues });
+      void qc.invalidateQueries({ queryKey: mailKeys.health });
+    },
+  });
+}
+
+export function useDeleteEmailQueue() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, expectedConfigGeneration }: DeleteEmailQueueInput) =>
+      api.delete<void>(`/admin/email-queues/${id}`, { expectedConfigGeneration }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: mailKeys.queues });
+      void qc.invalidateQueries({ queryKey: mailKeys.health });
+    },
+  });
+}
+
 export function useInboundHealth() {
   return useQuery({
     queryKey: mailKeys.health,
     queryFn: () => api.get<InboundHealth>('/admin/email-queues/inbound/health'),
     // Health is a live operational view — refresh periodically.
     refetchInterval: 30_000,
+  });
+}
+
+export function useWorkflowEmailHealth() {
+  return useQuery({
+    queryKey: mailKeys.workflowEmailHealth,
+    queryFn: () => api.get<WorkflowEmailEventHealth>('/admin/workflow-email-events/health'),
+    refetchInterval: 30_000,
+  });
+}
+
+export function useWorkflowEmailEvents(filters: WorkflowEmailEventFilters = {}) {
+  const normalized = { page: 1, limit: 25, ...filters };
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(normalized)) {
+    if (value !== undefined) params.set(key, String(value));
+  }
+  return useQuery({
+    queryKey: mailKeys.workflowEmailEvents(normalized),
+    queryFn: () => api.get<WorkflowEmailEventPage>(`/admin/workflow-email-events?${params.toString()}`),
+  });
+}
+
+export function useWorkflowEmailEventDetail(eventId: string | null) {
+  return useQuery({
+    queryKey: mailKeys.workflowEmailEventDetail(eventId ?? ''),
+    queryFn: () => api.get<WorkflowEmailEventDetail>(`/admin/workflow-email-events/${eventId}`),
+    enabled: eventId !== null,
+  });
+}
+
+export function useReplayWorkflowEmailEvent() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      eventId,
+      reason,
+      expectedUpdatedAt,
+    }: {
+      eventId: string;
+      reason: string;
+      expectedUpdatedAt: string;
+    }) =>
+      api.post<{ replayed: true }>(`/admin/workflow-email-events/${eventId}/replay`, {
+        reason,
+        expectedUpdatedAt,
+      }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['admin', 'workflow-email-events'] });
+      void qc.invalidateQueries({ queryKey: mailKeys.workflowEmailHealth });
+    },
   });
 }
 

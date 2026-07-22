@@ -10,7 +10,7 @@
  *  - 4 TicketPriorities
  *  - 4 TicketTypes
  *  - 1 SlaPlan + SlaSchedule (Mon–Fri 09:00–18:00)
- *  - 8 EmailTemplate rows: ticket_user_reply + autoresponder (en + ru),
+ *  - EmailTemplate rows including ticket_user_reply, autoresponder and auto-close,
  *    sla_breach_internal, notify_staff_assigned, notify_staff_user_replied,
  *    password_reset (en only)
  *  - 2 Organizations + 4 Users
@@ -327,13 +327,22 @@ async function main(): Promise<void> {
         'Здравствуйте, {{name}},\n\nВаш запрос зарегистрирован ({{mask}}). Ответим в течение 4 рабочих часов.\n\nСлужба поддержки 23 Telecom',
     },
     {
+      key: 'ticket_auto_closed',
+      locale: 'en',
+      subject: '[{{mask}}] Your ticket has been closed',
+      htmlBody:
+        '<p>Hello {{name}},</p><p>Your ticket <strong>{{mask}}</strong> has been closed due to inactivity.</p><p>If you still need help, reply to this email to reopen it.</p><p>Best regards,<br>23 Telecom Support</p>',
+      textBody:
+        'Hello {{name}},\n\nYour ticket {{mask}} has been closed due to inactivity. If you still need help, reply to this email to reopen it.\n\n23 Telecom Support',
+    },
+    {
       key: 'sla_breach_internal',
       locale: 'en',
       subject: '[SLA BREACH] {{breachType}} — {{mask}} — {{minutesOverdue}}m overdue',
       htmlBody:
-        '<p><strong>SLA Breach Alert</strong></p><p>Ticket <strong>{{mask}}</strong> has breached the {{breachType}} SLA target by {{minutesOverdue}} minutes.</p><p>Subject: {{subject}}</p><p>Please take immediate action.</p>',
+        '<p><strong>SLA Breach Alert</strong></p><p>Ticket <strong>{{mask}}</strong> has breached the {{breachType}} SLA target by {{minutesOverdue}} minutes.</p><p>Subject: {{subject}}</p><p>Rule: {{rule}}</p><p>Please take immediate action.</p>',
       textBody:
-        'SLA BREACH\nTicket: {{mask}}\nType: {{breachType}}\nOverdue: {{minutesOverdue}}m\nSubject: {{subject}}\n\nPlease take immediate action.',
+        'SLA BREACH\nTicket: {{mask}}\nType: {{breachType}}\nOverdue: {{minutesOverdue}}m\nSubject: {{subject}}\nRule: {{rule}}\n\nPlease take immediate action.',
     },
     {
       key: 'notify_staff_assigned',

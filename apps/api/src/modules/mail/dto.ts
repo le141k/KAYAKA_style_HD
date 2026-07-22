@@ -15,16 +15,32 @@ export const CreateEmailQueueSchema = z.object({
   // Lower values win deterministic routing when one logical message is delivered to
   // multiple enabled queue addresses; queue id is the stable tie-breaker.
   routingPriority: z.number().int().min(0).max(1_000_000).default(100),
+  sendAutoresponder: z.boolean().default(false),
   isEnabled: z.boolean().default(false),
 });
 // Zod supplies routingPriority=100 at the HTTP boundary. Keep it optional in the service
 // input too, so internal callers/older seeds remain backward-compatible during rollout.
-export type CreateEmailQueueDto = Omit<z.infer<typeof CreateEmailQueueSchema>, 'routingPriority'> & {
+export type CreateEmailQueueDto = Omit<
+  z.infer<typeof CreateEmailQueueSchema>,
+  'routingPriority' | 'sendAutoresponder'
+> & {
   routingPriority?: number;
+  sendAutoresponder?: boolean;
 };
 
-export const UpdateEmailQueueSchema = CreateEmailQueueSchema.partial();
+export const UpdateEmailQueueSchema = CreateEmailQueueSchema.partial().extend({
+  // Reject stale queue forms rather than letting a last write silently restore
+  // an old address, department or autoresponder policy.
+  expectedConfigGeneration: z.number().int().nonnegative(),
+});
 export type UpdateEmailQueueDto = z.infer<typeof UpdateEmailQueueSchema>;
+
+/** Queue deletion is versioned for the same reason as config writes: a stale tab must not
+ * remove a queue that was just repointed/reconciled by another operator. */
+export const DeleteEmailQueueSchema = z.object({
+  expectedConfigGeneration: z.number().int().nonnegative(),
+});
+export type DeleteEmailQueueDto = z.infer<typeof DeleteEmailQueueSchema>;
 
 // ─────────────────── Cutover / reconcile ───────────────────
 //

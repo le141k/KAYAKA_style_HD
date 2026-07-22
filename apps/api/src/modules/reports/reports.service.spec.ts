@@ -135,6 +135,22 @@ describe('ReportsService', () => {
     });
   });
 
+  describe('configuration generations', () => {
+    it('increments the report generation on every semantic report update', async () => {
+      (prisma.report.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 8, title: 'Renamed' });
+
+      await service.update(8, { title: 'Renamed' });
+
+      expect(prisma.report.update).toHaveBeenCalledWith({
+        where: { id: 8 },
+        data: {
+          title: 'Renamed',
+          configGeneration: { increment: 1 },
+        },
+      });
+    });
+  });
+
   // ─── run ─────────────────────────────────────────────────────────────────────
 
   describe('run', () => {
@@ -206,6 +222,20 @@ describe('ReportsService', () => {
 
       expect(prisma.reportRun.findMany).toHaveBeenCalledWith({
         where: { reportId: 4, staffId: REPORT_RUNNER.staffId },
+        include: {
+          outboundEmail: {
+            select: {
+              id: true,
+              kind: true,
+              state: true,
+              attempts: true,
+              nextAttemptAt: true,
+              lastError: true,
+              acceptedAt: true,
+              sentAt: true,
+            },
+          },
+        },
         orderBy: { createdAt: 'desc' },
         take: 50,
       });
@@ -216,6 +246,20 @@ describe('ReportsService', () => {
 
       expect(prisma.reportRun.findMany).toHaveBeenCalledWith({
         where: { reportId: 4 },
+        include: {
+          outboundEmail: {
+            select: {
+              id: true,
+              kind: true,
+              state: true,
+              attempts: true,
+              nextAttemptAt: true,
+              lastError: true,
+              acceptedAt: true,
+              sentAt: true,
+            },
+          },
+        },
         orderBy: { createdAt: 'desc' },
         take: 50,
       });
@@ -391,9 +435,27 @@ describe('ReportsService', () => {
       });
       expect(prisma.reportSchedule.updateMany).toHaveBeenCalledWith({
         where: { id: 44, ownerStaffId: REPORT_MANAGER.staffId },
-        data: { isEnabled: false },
+        data: { isEnabled: false, configGeneration: { increment: 1 } },
       });
       expect(prisma.reportSchedule.update).not.toHaveBeenCalled();
+    });
+
+    it('increments the schedule generation for an administrator configuration edit', async () => {
+      (prisma.reportSchedule.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 44 });
+
+      await service.updateSchedule(
+        44,
+        { recipients: ['new-recipient@example.test'] },
+        { ...REPORT_MANAGER, isAdmin: true },
+      );
+
+      expect(prisma.reportSchedule.update).toHaveBeenCalledWith({
+        where: { id: 44 },
+        data: {
+          recipients: ['new-recipient@example.test'],
+          configGeneration: { increment: 1 },
+        },
+      });
     });
 
     it('uses an owner-qualified DELETE predicate instead of a check-then-unscoped delete', async () => {

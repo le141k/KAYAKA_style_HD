@@ -6,7 +6,7 @@
  */
 import { createHash } from 'node:crypto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, ServiceUnavailableException } from '@nestjs/common';
 import { InboundMailService } from './inbound.service';
 import type { PrismaService } from '../../prisma/prisma.service';
 import type { TicketsService } from '../tickets/tickets.service';
@@ -68,6 +68,9 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_CLAMAV_PORT: 3310,
   TELECOM_HD_CLAMAV_TIMEOUT_MS: 15000,
   TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
+  // Most service tests exercise the accepted delivery pipeline. The production default
+  // is closed; fixtures opt in explicitly so a missing config field can never hide it.
+  TELECOM_HD_INBOUND_DELIVERY_ENABLED: true,
   TELECOM_HD_IMAP_ENABLED: false,
   TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'FROM_NOW',
   TELECOM_HD_IMAP_BACKFILL_LIMIT: 0,
@@ -83,7 +86,17 @@ function makePrismaMock() {
   const claims = new Map<string, Record<string, unknown>>();
   const prisma = {
     emailQueue: {
-      findMany: vi.fn().mockResolvedValue([]),
+      // Acceptance snapshots must contain the same enabled queue row that the SQL acceptance
+      // fence locked. Individual routing/supervisor tests replace this fixture as needed.
+      findMany: vi.fn().mockResolvedValue([
+        {
+          id: 1,
+          emailAddress: 'support@example.com',
+          departmentId: null,
+          routingPriority: 100,
+          sendAutoresponder: false,
+        },
+      ]),
       findUnique: vi.fn(),
       findFirst: vi.fn(),
       update: vi.fn().mockResolvedValue({}),
@@ -139,7 +152,15 @@ function makePrismaMock() {
       upsert: vi.fn().mockResolvedValue({}),
     },
     // Acceptance fence raw query — default to the matching queue row.
-    $queryRaw: vi.fn().mockResolvedValue([{ id: 1, locked: true }]),
+    $queryRaw: vi.fn().mockResolvedValue([
+      {
+        id: 1,
+        emailAddress: 'support@example.com',
+        departmentId: null,
+        sendAutoresponder: false,
+        configGeneration: 0,
+      },
+    ]),
   };
   // Interactive transactions execute against the same mock delegates. This keeps tests close
   // to the real atomic logical-claim path rather than falsely bypassing it.
@@ -399,6 +420,14 @@ describe('InboundMailService — parser rule helpers', () => {
           envelopeTo?: string;
           routedQueueId?: number;
           routedDepartmentId?: number;
+          sendAutoresponder?: boolean | null;
+          routingSnapshot?: Array<{
+            id: number;
+            emailAddress: string;
+            departmentId: number | null;
+            routingPriority: number;
+            sendAutoresponder: boolean;
+          }>;
         };
       },
     ) => Promise<{ state: string; ticketId?: number; postId?: number }>;
@@ -648,44 +677,91 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(svc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
     });
 
-    it('P1-E: deterministic route uses priority then queue id, independent of receiving queue order', async () => {
-      const queues = [
-        { id: 1, emailAddress: 'priority-100@example.test', departmentId: 11, routingPriority: 100 },
-        { id: 2, emailAddress: 'priority-5@example.test', departmentId: 22, routingPriority: 5 },
-        { id: 3, emailAddress: 'tie@example.test', departmentId: 33, routingPriority: 5 },
-      ];
-      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue(queues);
-      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      const svc = svcOf();
-      const twoRecipients = rawEmail.replace(
-        'To: support@test.example',
-        'To: priority-100@example.test, priority-5@example.test, tie@example.test',
-      );
-      await svc.processRawMessage(Buffer.from(twoRecipients.replace('dup-123', 'route-1')), 11, {
-        deliveryId: 101,
-        deliveryContext: { queueId: 1, transportKey: 'imap:1:1:7:101' },
-      });
-      await svc.processRawMessage(Buffer.from(twoRecipients.replace('dup-123', 'route-2')), 22, {
-        deliveryId: 102,
-        deliveryContext: { queueId: 2, transportKey: 'imap:2:1:7:102' },
-      });
-      const claimData = (prisma.inboundMessageClaim.createMany as ReturnType<typeof vi.fn>).mock.calls.map(
-        (call) => (call[0] as { data: { routedQueueId: number; departmentId: number } }).data,
-      );
-      expect(claimData).toHaveLength(2);
-      expect(claimData).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ routedQueueId: 2, departmentId: 22 }),
-          expect.objectContaining({ routedQueueId: 2, departmentId: 22 }),
-        ]),
-      );
-    });
+    it.each([
+      ['IMAP high-priority copy drains first', 'imap', ['q1', 'q2']],
+      ['IMAP low-priority copy drains first', 'imap', ['q2', 'q1']],
+      ['PIPE high-priority copy drains first', 'pipe', ['q1', 'q2']],
+      ['PIPE low-priority copy drains first', 'pipe', ['q2', 'q1']],
+    ] as const)(
+      'P1-E: immutable routing snapshot chooses the same owner when %s',
+      async (_scenario, transport, order) => {
+        // q1 and q2 are two accepted transport copies of ONE RFC Message-ID. The visible
+        // recipients match both, but q2 wins by lower routingPriority. This must hold even
+        // when q1's drain claims the durable Message-ID first.
+        const localPrisma = makePrismaMock();
+        (localPrisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+        const localSvc = makeInboundService(localPrisma as unknown as PrismaService) as unknown as RoutingSvc;
+        const snapshot = [
+          {
+            id: 1,
+            emailAddress: 'priority-100@example.test',
+            departmentId: 11,
+            routingPriority: 100,
+            sendAutoresponder: false,
+          },
+          {
+            id: 2,
+            emailAddress: 'priority-5@example.test',
+            departmentId: 22,
+            routingPriority: 5,
+            sendAutoresponder: true,
+          },
+        ];
+        const mail = Buffer.from(
+          rawEmail
+            .replace('To: support@test.example', 'To: priority-100@example.test, priority-5@example.test')
+            .replace('dup-123', 'cc-priority-race'),
+        );
+        const copies = {
+          q1: {
+            deliveryId: 101,
+            departmentId: 11,
+            context: {
+              queueId: 1,
+              envelopeTo: 'priority-100@example.test',
+              transportKey: `${transport}:1:1:7:101`,
+              routingSnapshot: snapshot,
+            },
+          },
+          q2: {
+            deliveryId: 102,
+            departmentId: 22,
+            context: {
+              queueId: 2,
+              envelopeTo: 'priority-5@example.test',
+              transportKey: `${transport}:2:1:7:102`,
+              routingSnapshot: snapshot,
+            },
+          },
+        };
 
-    it('P1-E: routes a BCC-style delivery by the persisted trusted envelope recipient', async () => {
-      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { id: 8, emailAddress: 'visible@example.test', departmentId: 8, routingPriority: 100 },
-        { id: 2, emailAddress: 'bcc@example.test', departmentId: 22, routingPriority: 5 },
-      ]);
+        for (const copyName of order) {
+          const copy = copies[copyName];
+          await localSvc.processRawMessage(mail, copy.departmentId, {
+            deliveryId: copy.deliveryId,
+            deliveryContext: copy.context,
+          });
+        }
+
+        const claimRows = (localPrisma.inboundMessageClaim.createMany as ReturnType<typeof vi.fn>).mock.calls;
+        expect(claimRows).toHaveLength(2);
+        expect((claimRows[0]?.[0] as { data: unknown }).data).toEqual(
+          expect.objectContaining({ routedQueueId: 2, departmentId: 22 }),
+        );
+        expect(localSvc.ticketsService.createTicket).toHaveBeenCalledTimes(1);
+        expect(localSvc.ticketsService.createTicket).toHaveBeenCalledWith(
+          expect.objectContaining({
+            departmentId: 22,
+            inboundQueueId: 2,
+            inboundSendAutoresponder: true,
+          }),
+        );
+        // The drain must not look at today's live queue configuration after acceptance.
+        expect(localPrisma.emailQueue.findMany).not.toHaveBeenCalled();
+      },
+    );
+
+    it('uses the trusted envelope recipient from the snapshot for a headerless BCC copy', async () => {
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       const svc = svcOf();
       const bccCopy = rawEmail.replace('To: support@test.example\r\n', '').replace('dup-123', 'bcc-route-1');
@@ -695,6 +771,22 @@ describe('InboundMailService — parser rule helpers', () => {
           queueId: 8,
           envelopeTo: 'bcc@example.test',
           transportKey: 'imap:8:1:7:103',
+          routingSnapshot: [
+            {
+              id: 8,
+              emailAddress: 'visible@example.test',
+              departmentId: 8,
+              routingPriority: 100,
+              sendAutoresponder: false,
+            },
+            {
+              id: 2,
+              emailAddress: 'bcc@example.test',
+              departmentId: 22,
+              routingPriority: 5,
+              sendAutoresponder: true,
+            },
+          ],
         },
       });
 
@@ -703,10 +795,61 @@ describe('InboundMailService — parser rule helpers', () => {
           data: expect.objectContaining({ routedQueueId: 2, departmentId: 22 }),
         }),
       );
-      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
+      expect(svc.ticketsService.createTicket).toHaveBeenCalledWith(
+        expect.objectContaining({ departmentId: 22, inboundQueueId: 2, inboundSendAutoresponder: true }),
+      );
+      expect(prisma.emailQueue.findMany).not.toHaveBeenCalled();
+    });
+
+    it('keeps a queued ledger delivery on its persisted route after the accepting queue was deleted', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = svcOf();
+      await svc.processRawMessage(Buffer.from(rawEmail.replace('dup-123', 'deleted-queue-route')), 9, {
+        deliveryId: 105,
+        // Queue foreign keys are nullable by design after operator deletion. The immutable
+        // transport key + snapshot must still prove this is a ledger row, never a direct
+        // caller permitted to read today's enabled queues.
+        deliveryContext: {
+          transportKey: 'imap:deleted-queue:1:7:105',
+          envelopeTo: 'persisted@example.test',
+          routingSnapshot: [
+            {
+              id: 9,
+              emailAddress: 'support@test.example',
+              departmentId: 9,
+              routingPriority: 10,
+              sendAutoresponder: false,
+            },
+          ],
+        },
+      });
+
+      expect(svc.ticketsService.createTicket).toHaveBeenCalledWith(
+        expect.objectContaining({ departmentId: 9, inboundQueueId: 9, inboundSendAutoresponder: false }),
+      );
+      expect(prisma.emailQueue.findMany).not.toHaveBeenCalled();
+    });
+
+    it('passes the acceptance-time autoresponder policy to new-ticket creation', async () => {
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const svc = svcOf();
+
+      await svc.processRawMessage(Buffer.from(rawEmail.replace('dup-123', 'auto-policy-1')), 12, {
+        deliveryId: 104,
+        deliveryContext: {
+          queueId: 7,
+          routedQueueId: 7,
+          routedDepartmentId: 12,
+          sendAutoresponder: true,
+          transportKey: 'imap:7:1:7:104',
+        },
+      });
+
+      expect(svc.ticketsService.createTicket).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 103 },
-          data: expect.objectContaining({ envelopeTo: 'bcc@example.test' }),
+          departmentId: 12,
+          inboundQueueId: 7,
+          inboundSendAutoresponder: true,
         }),
       );
     });
@@ -857,12 +1000,14 @@ describe('InboundMailService — parser rule helpers', () => {
         isEnabled: true,
         emailAddress: 'support@example.com',
         departmentId: null,
+        sendAutoresponder: false,
         lastSeenUid: 100n,
         uidValidity: 7n,
         syncState: 'OK',
         lastError: null,
         cursorGeneration: 0,
         mailboxEpoch: 1,
+        configGeneration: 0,
         reconcileCause: null,
         ...over,
       };
@@ -917,11 +1062,68 @@ describe('InboundMailService — parser rule helpers', () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
         queue({ departmentId: 4 }),
       );
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: 1,
+          emailAddress: 'support@example.com',
+          departmentId: 4,
+          sendAutoresponder: false,
+          configGeneration: 0,
+        },
+      ]);
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: 1,
+          emailAddress: 'support@example.com',
+          departmentId: 4,
+          routingPriority: 100,
+          sendAutoresponder: false,
+        },
+      ]);
       await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
       expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ departmentId: 4, envelopeTo: 'support@example.com' }),
+          data: expect.objectContaining({
+            departmentId: 4,
+            envelopeTo: 'support@example.com',
+            routedQueueId: 1,
+            routedDepartmentId: 4,
+            sendAutoresponder: false,
+            routingSnapshot: expect.arrayContaining([
+              expect.objectContaining({
+                id: 1,
+                emailAddress: 'support@example.com',
+                departmentId: 4,
+                routingPriority: 100,
+                sendAutoresponder: false,
+              }),
+            ]),
+          }),
         }),
+      );
+    });
+
+    it('P1-D: a queue config change after fetch rejects acceptance and leaves the cursor behind the UID', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        queue({ departmentId: 4, sendAutoresponder: true, configGeneration: 0 }),
+      );
+      // The operator moved the queue after fetch. Even if an unsafe direct SQL
+      // edit forgot to bump the generation, the locked value comparison rejects it.
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: 1,
+          emailAddress: 'support@example.com',
+          departmentId: 9,
+          sendAutoresponder: false,
+          configGeneration: 0,
+        },
+      ]);
+
+      await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
+
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: { lastSeenUid: 101n } }),
       );
     });
 
@@ -943,9 +1145,11 @@ describe('InboundMailService — parser rule helpers', () => {
               isEnabled: boolean;
               emailAddress: string;
               departmentId: number | null;
+              sendAutoresponder: boolean;
               syncState: 'OK';
               mailboxEpoch: number;
               cursorGeneration: number;
+              configGeneration: number;
               uidValidity: bigint;
             },
             uv: bigint,
@@ -955,6 +1159,24 @@ describe('InboundMailService — parser rule helpers', () => {
         }
       ).acceptImapMessage;
       const large = Buffer.alloc(1024 * 1024 + 1, 0x61);
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: 1,
+          emailAddress: 'support@example.test',
+          departmentId: 4,
+          sendAutoresponder: false,
+          configGeneration: 0,
+        },
+      ]);
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: 1,
+          emailAddress: 'support@example.test',
+          departmentId: 4,
+          routingPriority: 100,
+          sendAutoresponder: false,
+        },
+      ]);
       await accept.call(
         svc,
         {
@@ -963,9 +1185,11 @@ describe('InboundMailService — parser rule helpers', () => {
           isEnabled: true,
           emailAddress: 'support@example.test',
           departmentId: 4,
+          sendAutoresponder: false,
           syncState: 'OK',
           mailboxEpoch: 1,
           cursorGeneration: 0,
+          configGeneration: 0,
           uidValidity: 7n,
         },
         7n,
@@ -1076,9 +1300,11 @@ describe('InboundMailService — parser rule helpers', () => {
               isEnabled: boolean;
               emailAddress: string;
               departmentId: number | null;
+              sendAutoresponder: boolean;
               syncState: 'OK';
               mailboxEpoch: number;
               cursorGeneration: number;
+              configGeneration: number;
               uidValidity: bigint;
             },
             uv: bigint,
@@ -1087,6 +1313,24 @@ describe('InboundMailService — parser rule helpers', () => {
           ) => Promise<'accepted' | 'duplicate'>;
         }
       ).acceptImapMessage;
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: 1,
+          emailAddress: 'support@example.test',
+          departmentId: null,
+          sendAutoresponder: false,
+          configGeneration: 0,
+        },
+      ]);
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: 1,
+          emailAddress: 'support@example.test',
+          departmentId: null,
+          routingPriority: 100,
+          sendAutoresponder: false,
+        },
+      ]);
 
       await expect(
         accept.call(
@@ -1097,9 +1341,11 @@ describe('InboundMailService — parser rule helpers', () => {
             isEnabled: true,
             emailAddress: 'support@example.test',
             departmentId: null,
+            sendAutoresponder: false,
             syncState: 'OK',
             mailboxEpoch: 1,
             cursorGeneration: 0,
+            configGeneration: 0,
             uidValidity: 7n,
           },
           7n,
@@ -1245,7 +1491,7 @@ describe('InboundMailService — parser rule helpers', () => {
         undefined,
         new MailAccessPolicy(prisma as unknown as PrismaService),
       );
-      await queueService.update(1, { host: 'new-imap.example' });
+      await queueService.update(1, { host: 'new-imap.example', expectedConfigGeneration: 0 });
       releaseFence?.([]);
       await running;
 
@@ -1357,6 +1603,7 @@ describe('InboundMailService — parser rule helpers', () => {
       useTls: true,
       mailboxEpoch: 2,
       cursorGeneration: 5,
+      configGeneration: 0,
     };
 
     function attachLiveClient(client: unknown) {
@@ -1414,12 +1661,14 @@ describe('InboundMailService — parser rule helpers', () => {
         isEnabled: true,
         emailAddress: 'support@example.com',
         departmentId: null,
+        sendAutoresponder: false,
         lastSeenUid: 100n,
         uidValidity: 7n,
         syncState: 'OK',
         lastError: null,
         cursorGeneration: 5,
         mailboxEpoch: 2,
+        configGeneration: 0,
         reconcileCause: null,
       });
       await (service as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
@@ -1498,6 +1747,44 @@ describe('InboundMailService — parser rule helpers', () => {
             syncState: 'OK',
           }),
           data: expect.objectContaining({ lastSeenUid: 500n, uidValidity: 7n, syncState: 'OK' }),
+        }),
+      );
+    });
+
+    it('BACKFILL uses the last N existing sparse UIDs, never UIDNEXT minus N', async () => {
+      const backfillService = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'BACKFILL',
+        TELECOM_HD_IMAP_BACKFILL_LIMIT: 2,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        type: 'IMAP',
+        isEnabled: true,
+        uidValidity: null,
+        syncState: 'OK',
+        reconcileCause: null,
+        mailboxEpoch: 1,
+        cursorGeneration: 0,
+        configGeneration: 0,
+        bootstrapPolicy: null,
+        bootstrapBackfillLimit: null,
+      });
+      const client = {
+        mailbox: { uidValidity: 7n, uidNext: 101 },
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        search: vi.fn().mockResolvedValue([2, 90, 95, 100]),
+      };
+
+      await (
+        backfillService as unknown as { bootstrapQueue: (q: number, c: unknown) => Promise<void> }
+      ).bootstrapQueue(1, client);
+
+      expect(client.search).toHaveBeenCalledWith({ uid: '1:100' }, { uid: true });
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ configGeneration: 0 }),
+          data: expect.objectContaining({ lastSeenUid: 94n, uidValidity: 7n }),
         }),
       );
     });
@@ -1679,6 +1966,32 @@ describe('InboundMailService — parser rule helpers', () => {
       }
     });
 
+    it('cutover gate: disabled startup starts neither drain nor IMAP supervisor', async () => {
+      vi.useFakeTimers();
+      try {
+        const svc = makeInboundService(prisma as unknown as PrismaService, {
+          ...TEST_CONFIG,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_IMAP_ENABLED: true,
+        });
+        const drain = vi.spyOn(svc as unknown as { drainDeliveries: () => Promise<void> }, 'drainDeliveries');
+        const refresh = vi.spyOn(
+          svc as unknown as { refreshOwnAddresses: () => Promise<void> },
+          'refreshOwnAddresses',
+        );
+
+        await svc.onModuleInit();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(drain).not.toHaveBeenCalled();
+        expect(refresh).not.toHaveBeenCalled();
+        expect((svc as unknown as { connections: Map<number, unknown> }).connections.size).toBe(0);
+        await svc.onModuleDestroy();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('P1-F: stamps poll start and completion separately for honest operator liveness', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 1,
@@ -1727,6 +2040,20 @@ describe('InboundMailService — parser rule helpers', () => {
         ...over,
       });
     }
+
+    it('cutover gate: leaves ACCEPTED/RETRY work untouched while delivery is disabled', async () => {
+      stageDelivery();
+      const disabled = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+      });
+
+      await (disabled as unknown as { drainDeliveries: () => Promise<void> }).drainDeliveries();
+
+      expect(prisma.inboundDelivery.findMany).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.ticketPost.findFirst).not.toHaveBeenCalled();
+    });
 
     it('marks a delivery PROCESSED after successful routing (lease-gated settle)', async () => {
       stageDelivery();
@@ -2042,8 +2369,33 @@ describe('InboundMailService — parser rule helpers', () => {
         isEnabled: true,
       });
       (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { id: 7, emailAddress: 'pipe-support@example.test', departmentId: 3 },
+        { id: 7, emailAddress: 'pipe-support@example.test', departmentId: 3, sendAutoresponder: false },
       ]);
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: 7,
+          emailAddress: 'pipe-support@example.test',
+          departmentId: 3,
+          routingPriority: 100,
+          sendAutoresponder: false,
+        },
+      ]);
+    });
+
+    it('cutover gate: direct PIPE service invocation cannot create a ledger row while disabled', async () => {
+      const disabled = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+      });
+      await expect(
+        (
+          disabled as unknown as {
+            ingestRawMessage: (s: string, d: number | undefined, e: string, q: number) => Promise<void>;
+          }
+        ).ingestRawMessage('message', undefined, 'mta-77', 7),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(prisma.emailQueue.findUnique).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
     });
 
     it('#8: a reused delivery-id with DIFFERENT content is rejected (409), not silently lost', async () => {
@@ -2091,6 +2443,50 @@ describe('InboundMailService — parser rule helpers', () => {
         .transportKey as string;
       expect(key).toMatch(/^pipe:7:id-sha256:[a-f0-9]{64}$/);
       expect(key).not.toContain('mta-88');
+    });
+
+    it('P1-E: PIPE acceptance persists the immutable enabled-queue routing snapshot', async () => {
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: 7,
+          emailAddress: 'pipe-support@example.test',
+          departmentId: 3,
+          routingPriority: 100,
+          sendAutoresponder: false,
+        },
+        {
+          id: 8,
+          emailAddress: 'priority@example.test',
+          departmentId: 4,
+          routingPriority: 5,
+          sendAutoresponder: true,
+        },
+      ]);
+
+      await ingest('From: sender@example.test\r\nTo: pipe-support@example.test\r\n\r\nbody');
+
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            routingSnapshot: [
+              {
+                id: 8,
+                emailAddress: 'priority@example.test',
+                departmentId: 4,
+                routingPriority: 5,
+                sendAutoresponder: true,
+              },
+              {
+                id: 7,
+                emailAddress: 'pipe-support@example.test',
+                departmentId: 3,
+                routingPriority: 100,
+                sendAutoresponder: false,
+              },
+            ],
+          }),
+        }),
+      );
     });
 
     it('rejects disabled and non-PIPE queues before attempting a ledger insert', async () => {

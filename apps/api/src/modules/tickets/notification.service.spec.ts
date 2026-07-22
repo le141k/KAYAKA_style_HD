@@ -1,18 +1,26 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { NotificationService } from './notification.service';
-import type { PrismaService } from '../../prisma/prisma.service';
 import type { MailService } from '../mail/mail.service';
 
-function makePrismaMock() {
+function makeTransactionMock() {
   return {
-    ticket: { findUnique: vi.fn() },
     staff: { findUnique: vi.fn() },
     ticketWatcher: { findMany: vi.fn() },
-  } as unknown as PrismaService;
+  };
 }
 
 function makeMailMock(): MailService {
-  return { sendTemplate: vi.fn().mockResolvedValue(undefined) } as unknown as MailService;
+  return {
+    createInternalNotificationEmail: vi
+      .fn()
+      .mockImplementation(async (_tx: unknown, input: { idempotencyKey: string }) => ({
+        id: `command:${input.idempotencyKey}`,
+      })),
+    enqueueOutbound: vi.fn().mockResolvedValue(undefined),
+    // This is intentionally present as a tripwire: NotificationService must
+    // never use the legacy inline SMTP/template path.
+    sendTemplate: vi.fn(),
+  } as unknown as MailService;
 }
 
 const MOCK_TICKET = {
@@ -34,133 +42,100 @@ const MOCK_STAFF = {
 
 describe('NotificationService', () => {
   let service: NotificationService;
-  let prisma: ReturnType<typeof makePrismaMock>;
+  let tx: ReturnType<typeof makeTransactionMock>;
   let mail: MailService;
 
   beforeEach(() => {
-    prisma = makePrismaMock();
+    tx = makeTransactionMock();
     mail = makeMailMock();
-    service = new NotificationService(prisma as unknown as PrismaService, mail);
+    service = new NotificationService(mail);
   });
 
-  // ─── notifyOnAssign ──────────────────────────────────────────────────────────
+  describe('queueAssignmentNotification', () => {
+    it('creates an immutable durable command from the assignment audit source', async () => {
+      tx.staff.findUnique.mockResolvedValue(MOCK_STAFF);
 
-  describe('notifyOnAssign', () => {
-    it('sends notify_staff_assigned email to the assignee', async () => {
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TICKET);
-      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
+      const id = await service.queueAssignmentNotification(tx as never, MOCK_TICKET as never, 5, 'audit:42');
 
-      await service.notifyOnAssign(1, 5);
-
-      expect(mail.sendTemplate).toHaveBeenCalledWith(
-        MOCK_STAFF.email,
-        'notify_staff_assigned',
-        'en',
-        expect.objectContaining({ mask: 'TT-000001', subject: 'Network issue' }),
+      expect(id).toBe('command:internal:assignment:audit:42:staff:5');
+      expect(mail.createInternalNotificationEmail).toHaveBeenCalledWith(
+        tx,
+        expect.objectContaining({
+          ticketId: 1,
+          templateKey: 'notify_staff_assigned',
+          to: 'staff@example.com',
+          idempotencyKey: 'internal:assignment:audit:42:staff:5',
+          vars: expect.objectContaining({
+            mask: 'TT-000001',
+            subject: 'Network issue',
+            staffName: 'Alex Smith',
+          }),
+        }),
       );
-    });
-
-    it('does nothing when ticket not found', async () => {
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
-
-      await service.notifyOnAssign(999, 5);
       expect(mail.sendTemplate).not.toHaveBeenCalled();
     });
 
-    it('does nothing when staff not found', async () => {
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TICKET);
-      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+    it('does not disclose an assignment to a staff member outside the current department', async () => {
+      tx.staff.findUnique.mockResolvedValue({ ...MOCK_STAFF, departments: [{ departmentId: 2 }] });
 
-      await service.notifyOnAssign(1, 999);
-      expect(mail.sendTemplate).not.toHaveBeenCalled();
+      await expect(
+        service.queueAssignmentNotification(tx as never, MOCK_TICKET as never, 5, 'audit:42'),
+      ).resolves.toBeUndefined();
+      expect(mail.createInternalNotificationEmail).not.toHaveBeenCalled();
     });
 
-    it('does not disclose a ticket through an out-of-scope assignment notification', async () => {
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        ...MOCK_TICKET,
-        departmentId: 2,
-      });
-      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
+    it('does not queue an alert for a disabled/missing assignee', async () => {
+      tx.staff.findUnique.mockResolvedValue({ ...MOCK_STAFF, isEnabled: false });
 
-      await service.notifyOnAssign(1, 5);
-
-      expect(mail.sendTemplate).not.toHaveBeenCalled();
-    });
-
-    it('does nothing when mailService is not injected', async () => {
-      const serviceNoMail = new NotificationService(prisma as unknown as PrismaService, undefined);
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TICKET);
-      await expect(serviceNoMail.notifyOnAssign(1, 5)).resolves.toBeUndefined();
-      expect(mail.sendTemplate).not.toHaveBeenCalled();
-    });
-
-    it('swallows errors from sendTemplate without throwing', async () => {
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TICKET);
-      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_STAFF);
-      (mail.sendTemplate as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('SMTP down'));
-
-      await expect(service.notifyOnAssign(1, 5)).resolves.toBeUndefined();
+      await expect(
+        service.queueAssignmentNotification(tx as never, MOCK_TICKET as never, 5, 'audit:42'),
+      ).resolves.toBeUndefined();
+      expect(mail.createInternalNotificationEmail).not.toHaveBeenCalled();
     });
   });
 
-  // ─── notifyWatchersOnUserReply ───────────────────────────────────────────────
-
-  describe('notifyWatchersOnUserReply', () => {
-    it('sends notify_staff_user_replied to all enabled watchers', async () => {
-      const watchers = [
+  describe('queueWatcherNotificationsForUserReply', () => {
+    it('creates one command per eligible watcher with TicketPost-based idempotency keys', async () => {
+      tx.ticketWatcher.findMany.mockResolvedValue([
         { staffId: 5, staff: { ...MOCK_STAFF, id: 5 } },
         {
           staffId: 6,
           staff: { id: 6, email: 'agent2@example.com', firstName: 'Bob', lastName: 'Jones', isEnabled: true },
         },
-      ];
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TICKET);
-      (prisma.ticketWatcher.findMany as ReturnType<typeof vi.fn>).mockResolvedValue(watchers);
+      ]);
 
-      await service.notifyWatchersOnUserReply(1);
+      const ids = await service.queueWatcherNotificationsForUserReply(tx as never, MOCK_TICKET as never, 77);
 
-      expect(mail.sendTemplate).toHaveBeenCalledTimes(2);
-      expect(mail.sendTemplate).toHaveBeenCalledWith(
-        'staff@example.com',
-        'notify_staff_user_replied',
-        'en',
-        expect.objectContaining({ mask: 'TT-000001' }),
+      expect(ids).toEqual([
+        'command:internal:watcher-reply:post:77:staff:5',
+        'command:internal:watcher-reply:post:77:staff:6',
+      ]);
+      expect(mail.createInternalNotificationEmail).toHaveBeenNthCalledWith(
+        1,
+        tx,
+        expect.objectContaining({
+          templateKey: 'notify_staff_user_replied',
+          idempotencyKey: 'internal:watcher-reply:post:77:staff:5',
+        }),
       );
+      expect(mail.createInternalNotificationEmail).toHaveBeenNthCalledWith(
+        2,
+        tx,
+        expect.objectContaining({ idempotencyKey: 'internal:watcher-reply:post:77:staff:6' }),
+      );
+      expect(mail.sendTemplate).not.toHaveBeenCalled();
     });
 
-    it('does not email disabled watchers', async () => {
-      const watchers = [
-        { staffId: 5, staff: { ...MOCK_STAFF, id: 5 } },
-        {
-          staffId: 7,
-          staff: { id: 7, email: 'disabled@example.com', firstName: 'X', lastName: 'Y', isEnabled: false },
-        },
-      ];
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(MOCK_TICKET);
-      (prisma.ticketWatcher.findMany as ReturnType<typeof vi.fn>).mockResolvedValue(watchers);
+    it('checks watcher scope against the ticket department inside the caller transaction', async () => {
+      tx.ticketWatcher.findMany.mockResolvedValue([]);
 
-      await service.notifyWatchersOnUserReply(1);
-
-      expect(mail.sendTemplate).toHaveBeenCalledTimes(1);
-      expect(mail.sendTemplate).toHaveBeenCalledWith(
-        'staff@example.com',
-        expect.any(String),
-        expect.any(String),
-        expect.any(Object),
+      await service.queueWatcherNotificationsForUserReply(
+        tx as never,
+        { ...MOCK_TICKET, departmentId: 2 } as never,
+        77,
       );
-    });
 
-    it('queries watcher membership against the ticket department at send time', async () => {
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        ...MOCK_TICKET,
-        departmentId: 2,
-      });
-      (prisma.ticketWatcher.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-
-      await service.notifyWatchersOnUserReply(1);
-
-      expect(prisma.ticketWatcher.findMany).toHaveBeenCalledWith(
+      expect(tx.ticketWatcher.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
             ticketId: 1,
@@ -176,21 +151,20 @@ describe('NotificationService', () => {
       );
     });
 
-    it('does nothing when ticket not found', async () => {
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-
-      await service.notifyWatchersOnUserReply(999);
-      expect(mail.sendTemplate).not.toHaveBeenCalled();
+    it('rejects an invalid post id rather than manufacturing an idempotency key', async () => {
+      await expect(
+        service.queueWatcherNotificationsForUserReply(tx as never, MOCK_TICKET as never, 0),
+      ).rejects.toThrow('source post id is invalid');
     });
+  });
 
-    it('does nothing when mailService is not injected', async () => {
-      const serviceNoMail = new NotificationService(prisma as unknown as PrismaService, undefined);
-      await expect(serviceNoMail.notifyWatchersOnUserReply(1)).resolves.toBeUndefined();
-    });
+  it('wakes committed commands through the durable outbox only', async () => {
+    service.wakeCommittedNotifications(['one', 'one', 'two']);
+    await Promise.resolve();
 
-    it('swallows errors without throwing', async () => {
-      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('DB error'));
-      await expect(service.notifyWatchersOnUserReply(1)).resolves.toBeUndefined();
-    });
+    expect(mail.enqueueOutbound).toHaveBeenCalledTimes(2);
+    expect(mail.enqueueOutbound).toHaveBeenCalledWith('one');
+    expect(mail.enqueueOutbound).toHaveBeenCalledWith('two');
+    expect(mail.sendTemplate).not.toHaveBeenCalled();
   });
 });

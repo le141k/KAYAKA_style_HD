@@ -1,14 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, ServiceUnavailableException } from '@nestjs/common';
 import { InboundController } from './inbound.controller';
 import type { InboundMailService } from './inbound.service';
 import type { AppConfig } from '../../config/configuration';
 
 const SECRET = 'inbound-webhook-secret-32chars-min!!';
 
-function makeController() {
+function makeController(deliveryEnabled = true) {
   const inbound = { ingestRawMessage: vi.fn().mockResolvedValue(undefined) } as unknown as InboundMailService;
-  const config = { TELECOM_HD_INBOUND_WEBHOOK_SECRET: SECRET } as AppConfig;
+  const config = {
+    TELECOM_HD_INBOUND_WEBHOOK_SECRET: SECRET,
+    TELECOM_HD_INBOUND_DELIVERY_ENABLED: deliveryEnabled,
+  } as AppConfig;
   return { controller: new InboundController(inbound, config), inbound };
 }
 
@@ -29,6 +32,14 @@ describe('InboundController (A1 webhook)', () => {
   it('rejects an empty raw body with 400', async () => {
     await expect(ctx.controller.pipe(SECRET, 'mta-1', { raw: '' }, '1')).rejects.toThrow(BadRequestException);
     await expect(ctx.controller.pipe(SECRET, 'mta-1', {}, '1')).rejects.toThrow(BadRequestException);
+  });
+
+  it('cutover gate: rejects an authenticated PIPE delivery with 503 before service acceptance', async () => {
+    const disabled = makeController(false);
+    await expect(disabled.controller.pipe(SECRET, 'mta-1', { raw: RAW }, '1')).rejects.toThrow(
+      ServiceUnavailableException,
+    );
+    expect(disabled.inbound.ingestRawMessage).not.toHaveBeenCalled();
   });
 
   it('requires both a trusted delivery id and a PIPE queue id', async () => {

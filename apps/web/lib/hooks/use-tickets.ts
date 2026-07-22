@@ -2,7 +2,15 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
-import type { Ticket, Reply, PaginatedResponse, DashboardStats, User, Department } from '@/lib/types';
+import type {
+  Ticket,
+  Reply,
+  PaginatedResponse,
+  DashboardStats,
+  User,
+  Department,
+  AutomatedOutboundEmail,
+} from '@/lib/types';
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '') + '/api';
 
@@ -89,6 +97,17 @@ interface ApiTicket {
   posts?: ApiPost[];
   notes?: ApiNote[];
   tags?: { name: string }[];
+  outboundEmails?: Array<{
+    id: string;
+    kind: 'AUTORESPONDER' | 'AUTO_CLOSE' | 'WORKFLOW' | 'INTERNAL_NOTIFICATION';
+    state: AutomatedOutboundEmail['state'];
+    attempts: number;
+    nextAttemptAt?: string | null;
+    lastError?: string | null;
+    acceptedAt?: string | null;
+    sentAt?: string | null;
+    createdAt: string;
+  }>;
 }
 
 function staffName(s?: ApiStaffRel | null): string | undefined {
@@ -208,6 +227,17 @@ function mapTicket(t: ApiTicket): Ticket {
     updated_at: t.updatedAt,
     reply_count: t.totalReplies ?? 0,
     tags: t.tags?.map((tag) => tag.name),
+    automated_outbound_emails: t.outboundEmails?.map((email) => ({
+      id: email.id,
+      kind: email.kind,
+      state: email.state,
+      attempts: email.attempts,
+      next_attempt_at: email.nextAttemptAt,
+      last_error: email.lastError,
+      accepted_at: email.acceptedAt,
+      sent_at: email.sentAt,
+      created_at: email.createdAt,
+    })),
     // posts[0] is rendered separately as the original message (ticket.body); skip it
     // here so it isn't duplicated in the conversation thread.
     replies: [...(t.posts?.slice(1).map(mapPostToReply) ?? []), ...(t.notes?.map(mapNoteToReply) ?? [])].sort(

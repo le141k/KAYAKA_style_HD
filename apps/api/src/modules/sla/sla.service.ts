@@ -1,6 +1,7 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
+import { Prisma } from '@prisma/client';
 import type { SlaPlan, SlaSchedule, SlaHoliday, EscalationRule, Ticket } from '@prisma/client';
 import type {
   CreateSlaPlanDto,
@@ -30,6 +31,9 @@ type WorkHours = Record<string, Array<[string, string]>>;
 const SLA_BREACH_SCAN_CAP = 1000;
 
 const DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const;
+
+/** A scan result became stale before its transaction could claim the breach. */
+class StaleSlaBreachError extends Error {}
 
 /**
  * Parse a time string "HH:MM" into minutes-since-midnight.
@@ -226,60 +230,119 @@ export class SlaService {
   async runPeriodicCheck(): Promise<void> {
     const breaches = await this.checkBreaches();
 
-    // C4 — batch-load all escalation rules for the breached plans ONCE (was a
-    // per-ticket query inside the loop = N+1 over up to 1000 tickets).
-    const planIds = [...new Set(breaches.map((b) => b.ticket.slaPlanId).filter((id): id is number => !!id))];
-    const allRules = planIds.length
-      ? await this.prisma.escalationRule.findMany({
-          where: { slaPlanId: { in: planIds }, isEnabled: true },
-          orderBy: { thresholdSeconds: 'asc' },
-        })
-      : [];
-    const rulesByPlan = new Map<number, EscalationRule[]>();
-    for (const r of allRules) {
-      const list = rulesByPlan.get(r.slaPlanId) ?? [];
-      list.push(r);
-      rulesByPlan.set(r.slaPlanId, list);
-    }
-
     for (const { ticket, breachType, minutesOverdue } of breaches) {
       this.logger.warn(`SLA ${breachType} breach on ${ticket.mask}: ${minutesOverdue}m overdue`);
-
-      // Mark as escalated. A ticket that breaches BOTH first-response and
-      // resolution in the same scan appears twice in `breaches` sharing one
-      // in-memory object; flip the local flag after the update so the second
-      // entry doesn't increment escalationLevel a second time (D8 dual-breach).
-      if (!ticket.isEscalated) {
-        await this.prisma.ticket.update({
-          where: { id: ticket.id },
-          data: { isEscalated: true, escalationLevel: { increment: 1 } },
-        });
-        ticket.isEscalated = true;
-      }
-
-      // Execute EscalationRule.actions for this ticket's SLA plan
-      if (ticket.slaPlanId) {
-        await this.executeEscalationRules(
-          ticket,
-          breachType,
-          minutesOverdue,
-          rulesByPlan.get(ticket.slaPlanId) ?? [],
-        );
-      }
+      await this.processBreach(ticket, breachType, minutesOverdue);
     }
   }
 
   /**
-   * Execute EscalationRule.actions for a ticket that has breached its SLA.
-   * `planRules` is the pre-loaded, enabled rule set for the ticket's SLA plan.
+   * Claim, mutate and materialize one SLA breach as a single transaction. The
+   * durable event is the scheduler fence: concurrent scanners race on its
+   * unique sourceKey, and a transaction failure rolls back the ticket mutation,
+   * action side effects and every notification command together.
    */
-  private async executeEscalationRules(
+  private async processBreach(
+    ticket: Ticket,
+    breachType: 'FIRST_RESPONSE' | 'RESOLUTION',
+    minutesOverdue: number,
+  ): Promise<void> {
+    const sourceKey = `sla:ticket:${ticket.id}:breach:${breachType}`;
+    let committed: { commandIds: string[] } | undefined;
+    try {
+      committed = await this.prisma.$transaction(
+        async (tx) => {
+          const now = new Date();
+          const current = await tx.ticket.findFirst({
+            where: this.activeBreachWhere(ticket.id, breachType, now),
+          });
+          // The scan is advisory. A reply/resolve after it ran makes this breach
+          // stale; do not create a permanent event or send a late alert.
+          if (!current) return { commandIds: [] };
+
+          // Do not execute a rule snapshot read before the transaction: an
+          // administrator may disable/edit it between the periodic scan and
+          // this breach claim. Serializable isolation makes a concurrent rule
+          // update conflict/retry rather than allowing an obsolete notify body
+          // to commit after the edit.
+          const planRules = current.slaPlanId
+            ? await tx.escalationRule.findMany({
+                where: { slaPlanId: current.slaPlanId, isEnabled: true },
+                orderBy: { thresholdSeconds: 'asc' },
+              })
+            : [];
+
+          const event = await tx.slaEscalationEvent.create({
+            data: { ticketId: current.id, breachType, sourceKey },
+            select: { id: true },
+          });
+
+          // A ticket may breach both target types.  The first successful event
+          // increments escalationLevel; the second sees count=0 yet still runs
+          // its own target-specific rules exactly once.
+          await tx.ticket.updateMany({
+            where: { ...this.activeBreachWhere(current.id, breachType, now), isEscalated: false },
+            data: { isEscalated: true, escalationLevel: { increment: 1 } },
+          });
+
+          // Re-read after the conditional write. A concurrent reply/resolve can
+          // make the scanner's earlier snapshot stale; throwing rolls back the
+          // just-created event instead of permanently suppressing a future SLA
+          // cycle or sending an alert for a now-healthy ticket.
+          const currentAfterFence = await tx.ticket.findFirst({
+            where: this.activeBreachWhere(current.id, breachType, new Date()),
+          });
+          if (!currentAfterFence) throw new StaleSlaBreachError();
+
+          const commandIds = await this.executeEscalationRulesInTransaction(
+            tx,
+            currentAfterFence,
+            breachType,
+            minutesOverdue,
+            planRules,
+            event.id,
+          );
+          return { commandIds };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+    } catch (err) {
+      if (err instanceof StaleSlaBreachError) {
+        this.logger.debug(`SLA breach ${sourceKey} became stale before it was claimed`);
+        return;
+      }
+      if ((err as { code?: string } | undefined)?.code === 'P2002') {
+        // Only a committed event with *this exact source key* proves another
+        // worker won. Any other uniqueness failure remains loud/fail-closed.
+        const winner = await this.prisma.slaEscalationEvent.findUnique({
+          where: { sourceKey },
+          select: { id: true },
+        });
+        if (winner) {
+          this.logger.debug(`SLA breach ${sourceKey} was already claimed by ${winner.id}`);
+          return;
+        }
+      }
+      // Serializable conflicts and transient template/DB errors intentionally
+      // leave no event behind. The next periodic scan retries from the durable
+      // ticket state instead of accepting a partial escalation.
+      this.logger.error(`SLA breach ${sourceKey} could not be materialized: ${String(err)}`);
+      return;
+    }
+
+    this.wakeCommittedCommands(committed?.commandIds ?? []);
+  }
+
+  /** Execute EscalationRule actions inside the already-claimed breach transaction. */
+  private async executeEscalationRulesInTransaction(
+    tx: Prisma.TransactionClient,
     ticket: Ticket,
     breachType: 'FIRST_RESPONSE' | 'RESOLUTION',
     minutesOverdue: number,
     planRules: EscalationRule[],
-  ): Promise<void> {
-    if (!ticket.slaPlanId) return;
+    escalationEventId: string,
+  ): Promise<string[]> {
+    if (!ticket.slaPlanId) return [];
 
     const slaTargetType = breachType === 'FIRST_RESPONSE' ? 'FIRST_RESPONSE' : 'RESOLUTION';
     const thresholdSeconds = minutesOverdue * 60;
@@ -288,77 +351,144 @@ export class SlaService {
       (r) => r.targetType === slaTargetType && r.thresholdSeconds <= thresholdSeconds,
     );
 
+    const commandIds: string[] = [];
     for (const rule of rules) {
       const actions = rule.actions as unknown as EscalationAction[];
-      for (const action of actions) {
-        await this.executeAction(ticket, action, rule);
+      for (const [actionIndex, action] of actions.entries()) {
+        const commandId = await this.executeActionInTransaction(
+          tx,
+          ticket,
+          action,
+          rule,
+          breachType,
+          minutesOverdue,
+          escalationEventId,
+          actionIndex,
+        );
+        if (commandId) commandIds.push(commandId);
       }
+    }
+    return commandIds;
+  }
+
+  /** Returns a durable notification id only for the notify action. */
+  private async executeActionInTransaction(
+    tx: Prisma.TransactionClient,
+    ticket: Ticket,
+    action: EscalationAction,
+    rule: EscalationRule,
+    breachType: 'FIRST_RESPONSE' | 'RESOLUTION',
+    minutesOverdue: number,
+    escalationEventId: string,
+    actionIndex: number,
+  ): Promise<string | undefined> {
+    switch (action.type) {
+      case 'notify': {
+        const staffId = action.staffId ?? ticket.ownerStaffId;
+        if (!staffId) return undefined;
+        const staff = await tx.staff.findUnique({
+          where: { id: staffId },
+          include: {
+            staffGroup: { select: { isAdmin: true } },
+            departments: { select: { departmentId: true } },
+          },
+        });
+        if (!staff?.email || staff.isEnabled === false) return undefined;
+        // An SLA rule is administrator-authored, but it must not turn into an
+        // email disclosure bypass: only an enabled admin or a current member of
+        // this ticket's department may receive the subject/body snapshot.
+        if (
+          !staff.staffGroup.isAdmin &&
+          !staff.departments.some((membership) => membership.departmentId === ticket.departmentId)
+        ) {
+          this.logger.warn(
+            `Skipped out-of-scope SLA notification for ticket ${ticket.id} and staff ${staff.id}`,
+          );
+          return undefined;
+        }
+        const command = await this.mailService.createInternalNotificationEmail(tx, {
+          ticketId: ticket.id,
+          templateKey: 'sla_breach_internal',
+          locale: 'en',
+          to: staff.email,
+          vars: {
+            mask: ticket.mask,
+            subject: ticket.subject,
+            rule: rule.name,
+            staff: staff.firstName,
+            breachType,
+            minutesOverdue: String(minutesOverdue),
+          },
+          idempotencyKey:
+            `internal:sla:event:${escalationEventId}:rule:${rule.id}:` +
+            `action:${actionIndex}:staff:${staff.id}`,
+          slaEscalationEventId: escalationEventId,
+        });
+        return command.id;
+      }
+      case 'change_priority':
+        if (action.priorityId) {
+          await tx.ticket.update({ where: { id: ticket.id }, data: { priorityId: action.priorityId } });
+        }
+        return undefined;
+      case 'assign':
+        if (action.staffId) {
+          // Escalation rules may intentionally assign an enabled staff member
+          // across departments (an explicit administrator policy), but never a
+          // deleted/disabled account.  Fail the whole event so the operator can
+          // repair the unsafe rule; partial rule effects would be misleading.
+          const assignee = await tx.staff.findUnique({
+            where: { id: action.staffId },
+            select: { id: true, isEnabled: true },
+          });
+          if (!assignee?.isEnabled) {
+            throw new Error(`SLA assignment target ${action.staffId} is unavailable`);
+          }
+          await tx.ticket.update({ where: { id: ticket.id }, data: { ownerStaffId: action.staffId } });
+        }
+        return undefined;
+      case 'add_note':
+        if (action.note) {
+          await tx.ticketNote.create({
+            data: { ticketId: ticket.id, contents: `[SLA Escalation: ${rule.name}] ${action.note}` },
+          });
+        }
+        return undefined;
+      case 'mark_escalated':
+        // The guarded update in processBreach owns the one-and-only level bump.
+        await tx.ticket.update({ where: { id: ticket.id }, data: { isEscalated: true } });
+        return undefined;
     }
   }
 
-  private async executeAction(ticket: Ticket, action: EscalationAction, rule: EscalationRule): Promise<void> {
-    try {
-      switch (action.type) {
-        case 'notify': {
-          // Send email notification to a specific staff member
-          const staffId = action.staffId ?? ticket.ownerStaffId;
-          if (staffId) {
-            const staff = await this.prisma.staff.findUnique({
-              where: { id: staffId },
-              select: { email: true, firstName: true },
-            });
-            if (staff) {
-              await this.mailService.sendTemplate(staff.email, 'sla_breach_internal', 'en', {
-                mask: ticket.mask,
-                subject: ticket.subject,
-                rule: rule.name,
-                staff: staff.firstName,
-              });
-            }
-          }
-          break;
-        }
-        case 'change_priority': {
-          if (action.priorityId) {
-            await this.prisma.ticket.update({
-              where: { id: ticket.id },
-              data: { priorityId: action.priorityId },
-            });
-          }
-          break;
-        }
-        case 'assign': {
-          if (action.staffId) {
-            await this.prisma.ticket.update({
-              where: { id: ticket.id },
-              data: { ownerStaffId: action.staffId },
-            });
-          }
-          break;
-        }
-        case 'add_note': {
-          if (action.note) {
-            await this.prisma.ticketNote.create({
-              data: {
-                ticketId: ticket.id,
-                contents: `[SLA Escalation: ${rule.name}] ${action.note}`,
-              },
-            });
-          }
-          break;
-        }
-        case 'mark_escalated': {
-          // D8: do NOT increment escalationLevel here — runPeriodicCheck already
-          // bumped it once when it flagged the breach (double-increment otherwise).
-          await this.prisma.ticket.update({
-            where: { id: ticket.id },
-            data: { isEscalated: true },
-          });
-          break;
-        }
-      }
-    } catch (err) {
-      this.logger.error(`Error executing escalation action ${action.type} on ${ticket.mask}: ${String(err)}`);
+  private activeBreachWhere(
+    ticketId: number,
+    breachType: 'FIRST_RESPONSE' | 'RESOLUTION',
+    now: Date,
+  ): Prisma.TicketWhereInput {
+    return {
+      id: ticketId,
+      isResolved: false,
+      mergedIntoId: null,
+      ...(breachType === 'FIRST_RESPONSE'
+        ? { dueAt: { lt: now }, firstResponseAt: null }
+        : { resolutionDueAt: { lt: now } }),
+    };
+  }
+
+  private wakeCommittedCommands(ids: Iterable<string>): void {
+    const enqueue = (this.mailService as unknown as { enqueueOutbound?: (id: string) => Promise<void> })
+      .enqueueOutbound;
+    if (!enqueue) return;
+    for (const id of new Set(ids)) {
+      void enqueue
+        .call(this.mailService, id)
+        .catch((err: unknown) =>
+          this.logger.error(
+            `SLA notification outbox wake-up failed for ${id}: ` +
+              `${err instanceof Error && err.name ? err.name.slice(0, 80) : 'UnknownError'}`,
+          ),
+        );
     }
   }
 

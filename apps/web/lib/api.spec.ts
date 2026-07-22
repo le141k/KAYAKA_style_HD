@@ -64,4 +64,25 @@ describe('CSRF bootstrap and recovery', () => {
       }),
     );
   });
+
+  it('sends a versioned DELETE body for optimistic server-side delete fences', async () => {
+    vi.stubGlobal('document', { cookie: '' });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ csrfToken: 'csrf-delete' }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await import('./api');
+
+    await expect(
+      api.delete('/admin/email-queues/7', { expectedConfigGeneration: 4 }),
+    ).resolves.toBeUndefined();
+    expect(fetchMock.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({
+        method: 'DELETE',
+        body: JSON.stringify({ expectedConfigGeneration: 4 }),
+        headers: expect.objectContaining({ 'X-CSRF-Token': 'csrf-delete' }),
+      }),
+    );
+  });
 });

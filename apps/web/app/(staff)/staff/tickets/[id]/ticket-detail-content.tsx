@@ -22,7 +22,7 @@ import {
   usePriorityOptions,
   useTypeOptions,
 } from '@/lib/hooks/use-tickets';
-import type { Ticket, Attachment } from '@/lib/types';
+import type { Ticket, Attachment, AutomatedOutboundEmail } from '@/lib/types';
 import { StatusBadge } from '@/components/premium/StatusBadge';
 import { PriorityChip } from '@/components/premium/PriorityChip';
 import { SlaPill } from '@/components/premium/SlaPill';
@@ -87,6 +87,13 @@ const DELIVERY_COLORS = {
   AMBIGUOUS: 'bg-status-pending/10 text-status-pending',
 } as const;
 
+const AUTOMATED_EMAIL_LABELS: Record<AutomatedOutboundEmail['kind'], string> = {
+  AUTORESPONDER: 'Автоответ о приёме заявки',
+  AUTO_CLOSE: 'Автоматическое уведомление о закрытии',
+  WORKFLOW: 'Автоматическое уведомление workflow',
+  INTERNAL_NOTIFICATION: 'Внутреннее уведомление сотруднику',
+};
+
 export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const { t } = useI18n();
   const ta = t.ticketActions;
@@ -119,10 +126,14 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   // A post is committed before SMTP accepts it, so refresh an open ticket while
   // its durable outbox command is still changing state. This avoids leaving an
   // operator looking at a stale "queued" badge after the worker settles it.
-  const fastOutboundRefresh = ticket?.replies?.some(
-    (reply) => reply.delivery?.state === 'QUEUED' || reply.delivery?.state === 'PROCESSING',
+  const postOutboundDeliveries =
+    ticket?.replies?.flatMap((reply) => (reply.delivery ? [reply.delivery] : [])) ?? [];
+  const automatedOutboundDeliveries = ticket?.automated_outbound_emails ?? [];
+  const allOutboundDeliveries = [...postOutboundDeliveries, ...automatedOutboundDeliveries];
+  const fastOutboundRefresh = allOutboundDeliveries.some(
+    (delivery) => delivery.state === 'QUEUED' || delivery.state === 'PROCESSING',
   );
-  const retryOutboundRefresh = ticket?.replies?.some((reply) => reply.delivery?.state === 'RETRY');
+  const retryOutboundRefresh = allOutboundDeliveries.some((delivery) => delivery.state === 'RETRY');
   useEffect(() => {
     const intervalMs = fastOutboundRefresh ? 5_000 : retryOutboundRefresh ? 30_000 : null;
     if (!intervalMs) return;
@@ -350,6 +361,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   }
 
   const allReplies = ticket.replies ?? [];
+  const automatedOutboundEmails = ticket.automated_outbound_emails ?? [];
 
   // Build status/priority options for the combobox (need value:string, label:string)
   const statusComboOptions = statusOptions.map((s) => ({ value: s.value, label: s.label }));
@@ -395,6 +407,65 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
               </div>
               <p className="text-sm leading-relaxed whitespace-pre-line">{ticket.body}</p>
             </motion.div>
+
+            {automatedOutboundEmails.length > 0 && (
+              <section
+                className="rounded-xl border border-border bg-card p-5"
+                aria-label="Автоматические письма"
+              >
+                <div className="mb-3">
+                  <h2 className="text-sm font-semibold">Автоматические письма</h2>
+                  <p className="text-xs text-muted-foreground">
+                    Только статус доставки — содержание и адреса получателей здесь не показываются.
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  {automatedOutboundEmails.map((email) => (
+                    <div
+                      key={email.id}
+                      className="flex flex-wrap items-center gap-2 rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm"
+                    >
+                      <span className="font-medium">{AUTOMATED_EMAIL_LABELS[email.kind]}</span>
+                      <span
+                        title={email.last_error ?? undefined}
+                        className={cn(
+                          'inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold',
+                          DELIVERY_COLORS[email.state],
+                        )}
+                      >
+                        {DELIVERY_LABELS[email.state]}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        создано <RelativeTime date={email.created_at} />
+                      </span>
+                      {email.attempts > 0 && (
+                        <span className="text-xs text-muted-foreground">попыток: {email.attempts}</span>
+                      )}
+                      {can(PERMISSIONS.MAIL_CONFIGURE) &&
+                        (email.state === 'FAILED' || email.state === 'AMBIGUOUS') && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="ml-auto"
+                            disabled={retryOutbound.isPending}
+                            onClick={() => {
+                              if (email.state === 'AMBIGUOUS') {
+                                setAmbiguousRetryId(email.id);
+                              } else {
+                                void submitOutboundRetry(email.id);
+                              }
+                            }}
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" />
+                            Повторить
+                          </Button>
+                        )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
 
             {/* Replies */}
             {allReplies.map((reply, i) => (

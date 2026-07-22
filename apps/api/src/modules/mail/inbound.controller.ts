@@ -8,6 +8,7 @@ import {
   HttpStatus,
   Inject,
   Post,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { InboundMailService } from './inbound.service';
@@ -59,6 +60,12 @@ export class InboundController {
     const expected = this.config.TELECOM_HD_INBOUND_WEBHOOK_SECRET;
     if (!inboundSecretMatches(secret, expected)) {
       throw new ForbiddenException('Invalid inbound webhook secret');
+    }
+    // The Express middleware normally rejects this before parsing the body. Keep the
+    // controller guard too: unit/direct Nest invocation and any future transport adapter
+    // must not bypass the same cutover fence.
+    if (!this.config.TELECOM_HD_INBOUND_DELIVERY_ENABLED) {
+      throw new ServiceUnavailableException('Inbound delivery is temporarily disabled');
     }
 
     // Accept EITHER raw bytes (Content-Type: message/rfc822 or application/octet-stream —

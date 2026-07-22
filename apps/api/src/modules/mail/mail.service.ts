@@ -12,11 +12,12 @@ import type { Queue } from 'bullmq';
 import * as nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
 import { randomUUID } from 'node:crypto';
-import type { OutboundEmail, OutboundEmailState, Prisma } from '@prisma/client';
+import type { OutboundEmail, OutboundEmailKind, OutboundEmailState, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AppConfig, APP_CONFIG } from '../../config/configuration';
 import { StorageService } from '../attachments/storage.service';
 import { MailAccessPolicy, type MailAccessActor } from './mail-access-policy.service';
+import { normalizeEmail } from '../../common/email.util';
 
 export interface SendMailOptions {
   to: string | string[];
@@ -54,7 +55,8 @@ export interface OutboundEmailJobData {
 
 export interface OutboundDeliveryStatus {
   id: string;
-  postId: number;
+  postId: number | null;
+  kind: OutboundEmailKind;
   state: OutboundEmailState;
   attempts: number;
   nextAttemptAt: Date | null;
@@ -69,10 +71,27 @@ const OUTBOX_RECOVERY_MS = 30_000;
 const OUTBOX_RECOVERY_BATCH = 100;
 const OUTBOX_MAX_ATTEMPTS = 5;
 
+/**
+ * Immutable fields that define a workflow-email command.  A matching
+ * idempotency key alone is not enough: returning a row for another command
+ * would mark the workflow event handled and silently mail the wrong payload.
+ */
+const WORKFLOW_OUTBOUND_IDENTITY_SELECT = {
+  id: true,
+  ticketId: true,
+  postId: true,
+  kind: true,
+  subject: true,
+  htmlBody: true,
+  textBody: true,
+  recipients: { select: { email: true, role: true } },
+} satisfies Prisma.OutboundEmailSelect;
+
 /** Safe projection for a staff ticket timeline — intentionally no recipients/BCC/body. */
 export const OUTBOUND_STATUS_SELECT = {
   id: true,
   postId: true,
+  kind: true,
   state: true,
   attempts: true,
   nextAttemptAt: true,
@@ -92,6 +111,59 @@ export interface RenderedTemplate {
   subject: string;
   html: string;
   text: string;
+}
+
+/** Immutable customer-facing command to create inside a ticket transaction. */
+export interface AutomatedTicketEmailInput {
+  ticketId: number;
+  emailQueueId?: number | null;
+  kind: 'AUTORESPONDER' | 'AUTO_CLOSE';
+  templateKey: string;
+  locale: string;
+  to: string;
+  vars: Record<string, string>;
+}
+
+/**
+ * Immutable staff-facing alert created in the same transaction as its business
+ * event.  Unlike the legacy `sendTemplate()` path, this persists the rendered
+ * template and recipient before any SMTP work begins.
+ */
+export interface InternalNotificationEmailInput {
+  ticketId: number;
+  templateKey: string;
+  locale: string;
+  to: string;
+  vars: Record<string, string>;
+  /** Server-derived business-event identity; never supplied by HTTP clients. */
+  idempotencyKey: string;
+  /** Present only for a command created by a durable SLA breach event. */
+  slaEscalationEventId?: string;
+}
+
+/**
+ * A workflow's customer notification has no staff TicketPost, but it must still
+ * be an immutable, retryable PostgreSQL command.  The workflow body is admin
+ * authored rather than template authored, so storing the exact text snapshot is
+ * intentional: a later workflow edit cannot rewrite a queued email.
+ */
+export interface WorkflowTicketEmailInput {
+  ticketId: number;
+  to: string;
+  subject: string;
+  text: string;
+  /** Server-computed workflow rule/version/ticket/action identity; never user supplied. */
+  idempotencyKey: string;
+}
+
+/** Immutable scheduled-report result command, created with its ReportRun transaction. */
+export interface ReportEmailInput {
+  reportRunId: number;
+  to: string[];
+  subject: string;
+  text: string;
+  /** Stable schedule/fire identity so a duplicate scanner cannot mail twice. */
+  idempotencyKey: string;
 }
 
 @Injectable()
@@ -146,6 +218,233 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
   /** Exact configured sender snapshot used by transactional ticket replies. */
   getDefaultFromAddress(): string {
     return this.config.TELECOM_HD_MAIL_FROM;
+  }
+
+  /** Stable identity generated before the durable command is committed. */
+  createOutboundMessageId(): string {
+    return `<${randomUUID()}@23telecom.local>`;
+  }
+
+  /**
+   * Create an automated customer-facing command in the caller's transaction.
+   * Rendering against the same transaction prevents a ticket being committed
+   * with an unrenderable/JSON-fallback acknowledgement.
+   */
+  async createAutomatedTicketEmail(
+    tx: Prisma.TransactionClient,
+    input: AutomatedTicketEmailInput,
+  ): Promise<{ id: string }> {
+    const rendered = await this.renderTemplateRequiredInTransaction(
+      tx,
+      input.templateKey,
+      input.locale,
+      input.vars,
+    );
+    return tx.outboundEmail.create({
+      data: {
+        ticketId: input.ticketId,
+        postId: null,
+        emailQueueId: input.emailQueueId ?? null,
+        kind: input.kind,
+        state: 'QUEUED',
+        messageId: this.createOutboundMessageId(),
+        fromAddress: this.getDefaultFromAddress(),
+        replyToAddress: null,
+        subject: rendered.subject,
+        htmlBody: rendered.html,
+        textBody: rendered.text,
+        recipients: { create: [{ email: input.to, role: 'TO' }] },
+      },
+      select: { id: true },
+    });
+  }
+
+  /**
+   * Persist a staff notification command in the caller's existing transaction.
+   * The unique business key is the concurrency fence: two deliveries of the
+   * same post/audit/SLA event return the exact same command instead of creating
+   * two SMTP attempts.  The body, subject and recipient are rendered/snapshotted
+   * on the first insert and never re-rendered from a later template edit.
+   */
+  async createInternalNotificationEmail(
+    tx: Prisma.TransactionClient,
+    input: InternalNotificationEmailInput,
+  ): Promise<{ id: string }> {
+    const to = normalizeEmail(input.to);
+    if (!Number.isInteger(input.ticketId) || input.ticketId <= 0) {
+      throw new Error('Internal notification ticket id is invalid');
+    }
+    if (!to) throw new Error('Internal notification recipient is empty');
+    if (!input.templateKey.trim()) throw new Error('Internal notification template key is empty');
+    if (!input.idempotencyKey || input.idempotencyKey.length > 255) {
+      throw new Error('Internal notification idempotency key is invalid');
+    }
+
+    const existing = await tx.outboundEmail.findUnique({
+      where: { idempotencyKey: input.idempotencyKey },
+      select: {
+        id: true,
+        ticketId: true,
+        kind: true,
+        slaEscalationEventId: true,
+        recipients: { select: { email: true, role: true } },
+      },
+    });
+    if (existing) {
+      this.assertInternalNotificationIdentity(existing, input, to);
+      return { id: existing.id };
+    }
+
+    // Required rendering intentionally happens before the business transaction
+    // can commit.  A broken/empty configured template therefore fails closed
+    // instead of committing a ticket update with a silently missing alert.
+    const rendered = await this.renderTemplateRequiredInTransaction(
+      tx,
+      input.templateKey,
+      input.locale,
+      input.vars,
+    );
+    const command = await tx.outboundEmail.upsert({
+      where: { idempotencyKey: input.idempotencyKey },
+      update: {},
+      create: {
+        ticketId: input.ticketId,
+        postId: null,
+        kind: 'INTERNAL_NOTIFICATION',
+        idempotencyKey: input.idempotencyKey,
+        ...(input.slaEscalationEventId ? { slaEscalationEventId: input.slaEscalationEventId } : {}),
+        state: 'QUEUED',
+        messageId: this.createOutboundMessageId(),
+        fromAddress: this.getDefaultFromAddress(),
+        replyToAddress: null,
+        subject: rendered.subject,
+        htmlBody: rendered.html,
+        textBody: rendered.text,
+        recipients: { create: [{ email: to, role: 'TO' }] },
+      },
+      select: {
+        id: true,
+        ticketId: true,
+        kind: true,
+        slaEscalationEventId: true,
+        recipients: { select: { email: true, role: true } },
+      },
+    });
+    this.assertInternalNotificationIdentity(command, input, to);
+    return { id: command.id };
+  }
+
+  /**
+   * Persist a workflow-generated customer message before asking Redis to wake a
+   * worker.  Unlike the legacy `send()` path, Redis/SMPP outages cannot make a
+   * workflow email disappear or be reported as sent.  Re-read the requester in
+   * the transaction so an event based on a stale ticket snapshot cannot mail a
+   * previous requester after their address changed.
+   */
+  async createWorkflowTicketEmail(input: WorkflowTicketEmailInput): Promise<{ id: string }> {
+    const to = normalizeEmail(input.to);
+    const text = input.text.trim();
+    if (!to) throw new Error('Workflow email recipient is empty');
+    if (!text) throw new Error('Workflow email body is empty');
+    if (text.length > 50_000) throw new Error('Workflow email body exceeds 50000 characters');
+    if (!input.idempotencyKey || input.idempotencyKey.length > 255) {
+      throw new Error('Workflow email idempotency key is invalid');
+    }
+
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const ticket = await tx.ticket.findUnique({
+          where: { id: input.ticketId },
+          select: { id: true, requesterEmail: true },
+        });
+        if (!ticket || !ticket.requesterEmail || normalizeEmail(ticket.requesterEmail) !== to) {
+          throw new Error('Workflow email requester changed or is unavailable');
+        }
+
+        // The unique key is the real concurrency fence.  The preliminary read
+        // avoids a needless failed insert on ordinary repeated event delivery.
+        const existing = await tx.outboundEmail.findUnique({
+          where: { idempotencyKey: input.idempotencyKey },
+          select: WORKFLOW_OUTBOUND_IDENTITY_SELECT,
+        });
+        if (existing) return this.assertWorkflowTicketEmailIdentity(existing, input, to, text);
+
+        return tx.outboundEmail.create({
+          data: {
+            ticketId: ticket.id,
+            postId: null,
+            // Added by the accompanying expand migration.  A separate kind keeps
+            // workflow mail visible to operators and prevents it from affecting
+            // first-response or staff-reply projections.
+            kind: 'WORKFLOW',
+            idempotencyKey: input.idempotencyKey,
+            state: 'QUEUED',
+            messageId: this.createOutboundMessageId(),
+            fromAddress: this.getDefaultFromAddress(),
+            replyToAddress: null,
+            subject: input.subject,
+            htmlBody: this.textToSafeHtml(text),
+            textBody: text,
+            recipients: { create: [{ email: to, role: 'TO' }] },
+          },
+          select: { id: true },
+        });
+      });
+    } catch (err) {
+      // PostgreSQL marks an interactive transaction failed after a uniqueness
+      // violation, so the winner lookup MUST run after that transaction has
+      // rolled back.  Only a row with our exact server-computed key converts a
+      // P2002 into a successful replay; a Message-ID/other conflict still fails.
+      if ((err as { code?: string } | undefined)?.code !== 'P2002') throw err;
+      const winner = await this.prisma.outboundEmail.findUnique({
+        where: { idempotencyKey: input.idempotencyKey },
+        select: WORKFLOW_OUTBOUND_IDENTITY_SELECT,
+      });
+      if (!winner) throw err;
+      return this.assertWorkflowTicketEmailIdentity(winner, input, to, text);
+    }
+  }
+
+  /**
+   * Add a scheduled report result to the durable outbox in the caller's
+   * transaction.  ReportRun is deliberately linked to the command instead of
+   * being marked as SMTP-successful: `OutboundEmail.state` remains the honest
+   * live delivery status (QUEUED/RETRY/SENT/AMBIGUOUS).
+   */
+  async createReportEmail(tx: Prisma.TransactionClient, input: ReportEmailInput): Promise<{ id: string }> {
+    const recipients = [...new Set(input.to.map(normalizeEmail).filter(Boolean))];
+    const text = input.text.trim();
+    if (!Number.isInteger(input.reportRunId) || input.reportRunId <= 0) {
+      throw new Error('Report email run id is invalid');
+    }
+    if (recipients.length === 0) throw new Error('Report email has no recipients');
+    if (!text) throw new Error('Report email body is empty');
+    // Report definitions cap rows at 1,000, but individual fields may still be
+    // large.  Bound the durable DB/SMTP command rather than allocating an
+    // unbounded JSON/CSV payload in a repeating worker.
+    if (text.length > 5_000_000) throw new Error('Report email body exceeds 5000000 characters');
+    if (!input.idempotencyKey || input.idempotencyKey.length > 255) {
+      throw new Error('Report email idempotency key is invalid');
+    }
+
+    return tx.outboundEmail.create({
+      data: {
+        ticketId: null,
+        postId: null,
+        reportRunId: input.reportRunId,
+        kind: 'REPORT',
+        idempotencyKey: input.idempotencyKey,
+        state: 'QUEUED',
+        messageId: this.createOutboundMessageId(),
+        fromAddress: this.getDefaultFromAddress(),
+        replyToAddress: null,
+        subject: input.subject,
+        htmlBody: this.textToSafeHtml(text),
+        textBody: text,
+        recipients: { create: recipients.map((email) => ({ email, role: 'TO' as const })) },
+      },
+      select: { id: true },
+    });
   }
 
   /**
@@ -304,16 +603,20 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
         },
       });
       if (changed.count !== 1) return null;
-      await tx.ticketAuditLog.create({
-        data: {
-          ticketId: row.ticketId,
-          staffId: actor.staffId,
-          actorType: 'STAFF',
-          action: 'OUTBOUND_RETRY',
-          field: 'outboundEmailId',
-          newValue: row.id,
-        },
-      });
+      // Scheduled reports are ticketless.  They remain retryable by an admin,
+      // but must not fabricate a TicketAuditLog with a null/foreign ticket id.
+      if (row.ticketId != null) {
+        await tx.ticketAuditLog.create({
+          data: {
+            ticketId: row.ticketId,
+            staffId: actor.staffId,
+            actorType: 'STAFF',
+            action: 'OUTBOUND_RETRY',
+            field: 'outboundEmailId',
+            newValue: row.id,
+          },
+        });
+      }
       return tx.outboundEmail.findFirst({
         where: scopedWhere,
         select: OUTBOUND_STATUS_SELECT,
@@ -479,7 +782,48 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
     if (!tpl) throw new Error(`Required email template "${key}" (${locale}) is not configured`);
     const replace = (str: string): string =>
       str.replace(/\{\{(\w+)\}\}/g, (_m, name: string) => vars[name] ?? '');
-    return { subject: replace(tpl.subject), html: replace(tpl.htmlBody), text: replace(tpl.textBody) };
+    const rendered = {
+      subject: replace(tpl.subject),
+      html: replace(tpl.htmlBody),
+      text: replace(tpl.textBody),
+    };
+    this.assertRequiredTemplateContent(key, locale, rendered);
+    return rendered;
+  }
+
+  private async renderTemplateRequiredInTransaction(
+    tx: Prisma.TransactionClient,
+    key: string,
+    locale: string,
+    vars: Record<string, string>,
+  ): Promise<RenderedTemplate> {
+    let tpl = await tx.emailTemplate.findUnique({ where: { key_locale: { key, locale } } });
+    if (!tpl && locale !== 'en') {
+      tpl = await tx.emailTemplate.findUnique({ where: { key_locale: { key, locale: 'en' } } });
+    }
+    if (!tpl) throw new Error(`Required email template "${key}" (${locale}) is not configured`);
+    const replace = (str: string): string =>
+      str.replace(/\{\{(\w+)\}\}/g, (_m, name: string) => vars[name] ?? '');
+    const rendered = {
+      subject: replace(tpl.subject),
+      html: replace(tpl.htmlBody),
+      text: replace(tpl.textBody),
+    };
+    this.assertRequiredTemplateContent(key, locale, rendered);
+    return rendered;
+  }
+
+  /**
+   * Required templates are a release invariant, not a best-effort convenience.
+   * An existing but whitespace-only row is just as unsafe as a missing row: it
+   * would otherwise snapshot and send a blank automated/customer or internal
+   * notification.  Validate the rendered result too, because a template made
+   * solely of an absent placeholder is effectively blank at send time.
+   */
+  private assertRequiredTemplateContent(key: string, locale: string, rendered: RenderedTemplate): void {
+    if (!rendered.subject.trim() || !rendered.html.trim() || !rendered.text.trim()) {
+      throw new Error(`Required email template "${key}" (${locale}) is empty`);
+    }
   }
 
   /**
@@ -524,6 +868,11 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
       }>;
     },
   ): SendMailOptions {
+    if (outbound.kind === 'STAFF_REPLY' && outbound.ticketId == null) {
+      // REPORT is intentionally ticketless; a human reply never is.  Stop before
+      // SMTP so a corrupt row cannot be sent without its ticket/SLA projection.
+      throw new Error('Staff reply outbox row has no ticket');
+    }
     if (!this.storageService && outbound.attachments.length > 0) {
       // This is a deployment wiring error, not a reason to send an incomplete
       // email. recordDeliveryFailure() will expose a retryable safe diagnostic.
@@ -543,6 +892,11 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
       html: outbound.htmlBody,
       text: outbound.textBody,
       messageId: outbound.messageId,
+      ...(outbound.kind === 'AUTORESPONDER'
+        ? { autoSubmitted: 'auto-replied' as const }
+        : outbound.kind === 'STAFF_REPLY'
+          ? {}
+          : { autoSubmitted: 'auto-generated' as const }),
       ...(outbound.inReplyTo ? { inReplyTo: outbound.inReplyTo } : {}),
       ...(outbound.references.length ? { references: outbound.references } : {}),
       ...(cc.length ? { cc } : {}),
@@ -557,6 +911,79 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
           }
         : {}),
     };
+  }
+
+  /** Reject a server-side idempotency-key collision rather than mailing a row
+   * that belongs to another ticket/event or a different staff recipient. */
+  private assertInternalNotificationIdentity(
+    command: {
+      ticketId: number | null;
+      kind: OutboundEmailKind;
+      slaEscalationEventId: string | null;
+      recipients: Array<{ email: string; role: string }>;
+    },
+    input: InternalNotificationEmailInput,
+    to: string,
+  ): void {
+    const hasExactlyOneRecipient =
+      command.recipients.length === 1 &&
+      command.recipients[0]?.role === 'TO' &&
+      normalizeEmail(command.recipients[0]?.email ?? '') === to;
+    if (
+      command.ticketId !== input.ticketId ||
+      command.kind !== 'INTERNAL_NOTIFICATION' ||
+      command.slaEscalationEventId !== (input.slaEscalationEventId ?? null) ||
+      !hasExactlyOneRecipient
+    ) {
+      throw new Error('Internal notification idempotency key conflicts with another command');
+    }
+  }
+
+  /**
+   * The unique idempotency key is a concurrency fence, not proof that a prior
+   * row represents this exact workflow command.  Validate its immutable
+   * snapshot in both the normal replay and P2002 winner paths; otherwise fail
+   * closed so the workflow event remains retryable/quarantinable.
+   */
+  private assertWorkflowTicketEmailIdentity(
+    command: {
+      id: string;
+      ticketId: number | null;
+      postId: number | null;
+      kind: OutboundEmailKind;
+      subject: string;
+      htmlBody: string;
+      textBody: string;
+      recipients: Array<{ email: string; role: string }>;
+    },
+    input: WorkflowTicketEmailInput,
+    to: string,
+    text: string,
+  ): { id: string } {
+    const hasExactlyOneRecipient =
+      command.recipients.length === 1 &&
+      command.recipients[0]?.role === 'TO' &&
+      normalizeEmail(command.recipients[0]?.email ?? '') === to;
+    if (
+      command.ticketId !== input.ticketId ||
+      command.postId !== null ||
+      command.kind !== 'WORKFLOW' ||
+      command.subject !== input.subject ||
+      command.htmlBody !== this.textToSafeHtml(text) ||
+      command.textBody !== text ||
+      !hasExactlyOneRecipient
+    ) {
+      throw new Error('Workflow email idempotency key conflicts with another command');
+    }
+    return { id: command.id };
+  }
+
+  /** Render untrusted/admin-configured plain text without turning it into email HTML. */
+  private textToSafeHtml(text: string): string {
+    return `<pre style="font-family:inherit;white-space:pre-wrap">${text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')}</pre>`;
   }
 
   private async extendLease(id: string, leaseOwner: string, leaseVersion: number): Promise<void> {
@@ -638,14 +1065,21 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
       if (changed.count !== 1) return false;
       // The timeline's legacy boolean is a server-owned projection of SMTP
       // acceptance. Never set it when the post was merely queued.
-      await tx.ticketPost.updateMany({ where: { id: outbound.postId }, data: { isEmailed: true } });
+      if (outbound.postId != null) {
+        await tx.ticketPost.updateMany({ where: { id: outbound.postId }, data: { isEmailed: true } });
+      }
       // First-response SLA is also a delivery fact, not a compose/queue fact.
       // Conditional update avoids overwriting the first successful staff reply
       // when multiple queued replies complete out of order.
-      await tx.ticket.updateMany({
-        where: { id: outbound.ticketId, firstResponseAt: null },
-        data: { firstResponseAt: now },
-      });
+      if (outbound.kind === 'STAFF_REPLY' && outbound.ticketId != null) {
+        // A ticketless row is valid only for REPORT.  Reject a corrupt staff
+        // command rather than silently losing the SLA projection.
+        if (outbound.ticketId == null) throw new Error('Staff reply outbox row has no ticket');
+        await tx.ticket.updateMany({
+          where: { id: outbound.ticketId, firstResponseAt: null },
+          data: { firstResponseAt: now },
+        });
+      }
       return true;
     });
     if (!settled) {

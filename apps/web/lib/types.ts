@@ -73,6 +73,24 @@ export interface Reply {
   };
 }
 
+/**
+ * Delivery state for an automated email which deliberately has no ticket post
+ * (for example an inbound receipt or a staff assignment alert). The API omits
+ * recipient, subject, body and SMTP identifiers from this view.
+ */
+export interface AutomatedOutboundEmail {
+  /** Opaque durable outbox id; only used for the permission-gated retry action. */
+  id: string;
+  kind: 'AUTORESPONDER' | 'AUTO_CLOSE' | 'WORKFLOW' | 'INTERNAL_NOTIFICATION';
+  state: 'QUEUED' | 'PROCESSING' | 'SENT' | 'RETRY' | 'FAILED' | 'AMBIGUOUS';
+  attempts: number;
+  next_attempt_at?: string | null;
+  last_error?: string | null;
+  accepted_at?: string | null;
+  sent_at?: string | null;
+  created_at: string;
+}
+
 export interface Ticket {
   id: number;
   mask: string;
@@ -94,6 +112,8 @@ export interface Ticket {
   reply_count: number;
   tags?: string[];
   replies?: Reply[];
+  /** Safe staff-only status handles for postless automated customer emails. */
+  automated_outbound_emails?: AutomatedOutboundEmail[];
 }
 
 export interface KBCategory {

@@ -36,6 +36,7 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
   let users: Record<string, any>;
   let emitter: Record<string, any>;
   let mail: Record<string, any>;
+  let notifications: Record<string, any>;
   let service: TicketsService;
 
   beforeEach(() => {
@@ -46,6 +47,8 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
       attachment: { findMany: vi.fn().mockResolvedValue([]) },
       outboundEmail: { create: vi.fn().mockResolvedValue({ id: 'outbox-1' }) },
       ticketAuditLog: { create: vi.fn().mockResolvedValue({}) },
+      workflow: { findMany: vi.fn().mockResolvedValue([]) },
+      workflowEmailEvent: { upsert: vi.fn() },
     };
     prisma = {
       ticket: { findUnique: vi.fn(), update: vi.fn() },
@@ -69,6 +72,12 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     mail = {
       sendTemplate: vi.fn().mockResolvedValue(undefined),
       enqueueOutbound: vi.fn().mockResolvedValue(undefined),
+      createAutomatedTicketEmail: vi.fn().mockResolvedValue({ id: 'auto-outbox-1' }),
+    };
+    notifications = {
+      queueWatcherNotificationsForUserReply: vi.fn().mockResolvedValue([]),
+      queueAssignmentNotification: vi.fn().mockResolvedValue(undefined),
+      wakeCommittedNotifications: vi.fn(),
     };
     const sla = {
       resolvePlanForTicket: vi.fn().mockResolvedValue(null),
@@ -85,6 +94,7 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
       emitter as never,
       mail as never,
       admin as never,
+      notifications as never,
       attachments as never,
     );
   });
@@ -135,6 +145,165 @@ describe('TicketsService reply/note atomicity and inbound idempotency', () => {
     );
     expect(prisma.ticketAuditLog.create).not.toHaveBeenCalled();
     expect(emitter.emit).toHaveBeenCalledWith('ticket.replied', { ticketId: 1 });
+  });
+
+  it('creates watcher notification commands inside the customer-reply transaction and wakes only after commit', async () => {
+    const existingTicket = ticket({ requesterEmail: 'customer@example.test', mask: 'TT-000001' });
+    const createdPost = post({ id: 55 });
+    const updatedTicket = ticket({ requesterEmail: 'customer@example.test', mask: 'TT-000001' });
+    prisma.ticket.findUnique.mockResolvedValue(existingTicket);
+    tx.ticketPost.create.mockResolvedValue(createdPost);
+    tx.ticket.update.mockResolvedValue(updatedTicket);
+    notifications.queueWatcherNotificationsForUserReply.mockResolvedValue(['watcher-outbox-1']);
+
+    await service.reply(1, {
+      contents: 'Customer update',
+      isHtml: false,
+      isNote: false,
+      isEmailed: true,
+      isThirdParty: false,
+      creationMode: 'EMAIL',
+    });
+
+    expect(notifications.queueWatcherNotificationsForUserReply).toHaveBeenCalledWith(tx, updatedTicket, 55);
+    expect(notifications.wakeCommittedNotifications).toHaveBeenCalledWith(['watcher-outbox-1']);
+  });
+
+  it('creates the assignment audit and notification command in one transaction', async () => {
+    const existingTicket = ticket({ ownerStaffId: null, departmentId: 2 });
+    const updatedTicket = ticket({ ownerStaffId: 5, departmentId: 2 });
+    prisma.ticket.findUnique.mockResolvedValue(existingTicket);
+    prisma.staff.findUnique.mockResolvedValue({ id: 5, isEnabled: true });
+    tx.ticket.update.mockResolvedValue(updatedTicket);
+    tx.ticketAuditLog.create.mockResolvedValue({ id: 91 });
+    notifications.queueAssignmentNotification.mockResolvedValue('assignment-outbox-1');
+
+    await service.assign(1, { ownerStaffId: 5 }, 10);
+
+    expect(tx.ticketAuditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ action: 'ASSIGN', newValue: '5' }) }),
+    );
+    expect(notifications.queueAssignmentNotification).toHaveBeenCalledWith(tx, updatedTicket, 5, 'audit:91');
+    expect(notifications.wakeCommittedNotifications).toHaveBeenCalledWith(['assignment-outbox-1']);
+  });
+
+  it('queues an inbound autoresponder only from the accepting queue snapshot, inside ticket creation', async () => {
+    prisma.ticketStatus.findFirst.mockResolvedValue({ id: 1 });
+    prisma.ticketPriority.findFirst.mockResolvedValue({ id: 2 });
+    tx.ticket.create.mockResolvedValue({ id: 44, posts: [{ id: 99 }] });
+    tx.ticket.update.mockResolvedValue(ticket({ id: 44, mask: 'TT-000044' }));
+
+    await service.createTicket({
+      subject: 'Inbound',
+      contents: 'body',
+      isHtml: false,
+      departmentId: 2,
+      requesterEmail: 'customer@example.test',
+      requesterName: 'Customer',
+      tags: [],
+      customFields: {},
+      creationMode: 'EMAIL',
+      inboundQueueId: 7,
+      inboundSendAutoresponder: true,
+    });
+
+    expect(mail.createAutomatedTicketEmail).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        ticketId: 44,
+        emailQueueId: 7,
+        kind: 'AUTORESPONDER',
+        templateKey: 'autoresponder',
+        to: 'customer@example.test',
+      }),
+    );
+    expect(mail.enqueueOutbound).toHaveBeenCalledWith('auto-outbox-1');
+    expect(mail.sendTemplate).not.toHaveBeenCalled();
+  });
+
+  it('fails closed for an EMAIL delivery with no accepting-queue autoresponder snapshot', async () => {
+    prisma.ticketStatus.findFirst.mockResolvedValue({ id: 1 });
+    prisma.ticketPriority.findFirst.mockResolvedValue({ id: 2 });
+    tx.ticket.create.mockResolvedValue({ id: 45, posts: [{ id: 100 }] });
+    tx.ticket.update.mockResolvedValue(ticket({ id: 45, mask: 'TT-000045' }));
+
+    await service.createTicket({
+      subject: 'Legacy inbound',
+      contents: 'body',
+      isHtml: false,
+      departmentId: 2,
+      requesterEmail: 'customer@example.test',
+      requesterName: 'Customer',
+      tags: [],
+      customFields: {},
+      creationMode: 'EMAIL',
+    });
+
+    expect(mail.createAutomatedTicketEmail).not.toHaveBeenCalled();
+    expect(mail.enqueueOutbound).not.toHaveBeenCalled();
+  });
+
+  it('rolls back the ticket mutation, workflow event and outbox when durable workflow-event insertion fails', async () => {
+    prisma.ticketStatus.findFirst.mockResolvedValue({ id: 1 });
+    prisma.ticketPriority.findFirst.mockResolvedValue({ id: 2 });
+    tx.ticket.create.mockResolvedValue({ id: 46, posts: [{ id: 101 }] });
+    tx.ticket.update.mockResolvedValue(
+      ticket({ id: 46, mask: 'TT-000046', requesterEmail: 'customer@example.test' }),
+    );
+    tx.workflow.findMany.mockResolvedValue([
+      {
+        id: 9,
+        criteria: [],
+        actions: [{ type: 'send_email', value: 'A durable update' }],
+        isEnabled: true,
+        sortOrder: 0,
+        updatedAt: new Date('2026-07-22T10:00:00.000Z'),
+      },
+    ]);
+
+    // A small transactional fake makes the assertion meaningful: mutators stage
+    // effects, and only a successful callback publishes them.  The production
+    // interactive transaction has the same all-or-nothing contract.
+    const committed = { ticket: 0, workflowEvent: 0, outbox: 0 };
+    let staged = { ticket: 0, workflowEvent: 0, outbox: 0 };
+    tx.ticket.create.mockImplementation(async () => {
+      staged.ticket += 1;
+      return { id: 46, posts: [{ id: 101 }] };
+    });
+    tx.workflowEmailEvent.upsert.mockImplementation(async () => {
+      staged.workflowEvent += 1;
+      throw new Error('workflow event database outage');
+    });
+    tx.outboundEmail.create.mockImplementation(async () => {
+      staged.outbox += 1;
+      return { id: 'unexpected-outbox' };
+    });
+    prisma.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) => {
+      staged = { ticket: 0, workflowEvent: 0, outbox: 0 };
+      const result = await callback(tx);
+      Object.assign(committed, staged);
+      return result;
+    });
+
+    await expect(
+      service.createTicket({
+        subject: 'Workflow rollback',
+        contents: 'body',
+        isHtml: false,
+        departmentId: 2,
+        requesterEmail: 'customer@example.test',
+        requesterName: 'Customer',
+        tags: [],
+        customFields: {},
+        // Avoid the unrelated autoresponder path: this test isolates workflow
+        // customer mail, whose outbox is created only by the durable processor.
+        creationMode: 'ALARIS',
+      }),
+    ).rejects.toThrow('workflow event database outage');
+
+    expect(committed).toEqual({ ticket: 0, workflowEvent: 0, outbox: 0 });
+    expect(emitter.emit).not.toHaveBeenCalled();
+    expect(mail.enqueueOutbound).not.toHaveBeenCalled();
   });
 
   it('does not update counters, audit or emit when attachment adoption fails', async () => {

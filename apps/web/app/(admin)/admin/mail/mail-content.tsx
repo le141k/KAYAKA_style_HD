@@ -1,7 +1,7 @@
 'use client';
 
-import { useState } from 'react';
-import { AlertTriangle, Mail, RefreshCw, RotateCcw } from 'lucide-react';
+import { useState, type FormEvent } from 'react';
+import { AlertTriangle, Mail, Pencil, Plus, RefreshCw, RotateCcw, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -13,15 +13,25 @@ import { RelativeTime } from '@/components/RelativeTime';
 import { QueryError } from '@/components/QueryError';
 import {
   useEmailQueues,
+  useCreateEmailQueue,
+  useDeleteEmailQueue,
   useInboundHealth,
+  useWorkflowEmailEventDetail,
+  useWorkflowEmailEvents,
+  useWorkflowEmailHealth,
   useQuarantine,
   useQuarantineDetail,
   useReconcileQueue,
+  useReplayWorkflowEmailEvent,
   useReplayQuarantined,
+  useUpdateEmailQueue,
   type AdminEmailQueue,
+  type EmailQueueConfigInput,
   type EmailQueueSyncState,
   type QuarantinedDelivery,
   type ReconcileMode,
+  type WorkflowEmailEventListItem,
+  type WorkflowEmailEventState,
 } from '@/lib/hooks/use-mail';
 import { useMe } from '@/lib/hooks/use-auth';
 import { hasPermission, PERMISSIONS } from '@/lib/auth/permissions';
@@ -59,9 +69,67 @@ function formatStoredBytes(value: string): string {
   }
 }
 
+type QueueForm = {
+  type: EmailQueueConfigInput['type'];
+  emailAddress: string;
+  host: string;
+  port: string;
+  username: string;
+  /** Write-only: it is intentionally always blank when opening an existing queue. */
+  password: string;
+  useTls: boolean;
+  departmentId: string;
+  routingPriority: string;
+  sendAutoresponder: boolean;
+  isEnabled: boolean;
+};
+
+const EMPTY_QUEUE_FORM: QueueForm = {
+  type: 'IMAP',
+  emailAddress: '',
+  host: '',
+  port: '993',
+  username: '',
+  password: '',
+  useTls: true,
+  departmentId: '',
+  routingPriority: '100',
+  sendAutoresponder: false,
+  isEnabled: false,
+};
+
+function queueFormFromQueue(queue: AdminEmailQueue): QueueForm {
+  return {
+    type: queue.type,
+    emailAddress: queue.emailAddress,
+    host: queue.host,
+    port: String(queue.port),
+    username: queue.username,
+    password: '',
+    useTls: queue.useTls,
+    departmentId: queue.departmentId === null ? '' : String(queue.departmentId),
+    routingPriority: String(queue.routingPriority),
+    sendAutoresponder: queue.sendAutoresponder,
+    isEnabled: queue.isEnabled,
+  };
+}
+
+function errorStatus(error: unknown): number | undefined {
+  return typeof error === 'object' && error !== null && 'status' in error
+    ? (error as { status?: number }).status
+    : undefined;
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  if (typeof error !== 'object' || error === null || !('data' in error)) return fallback;
+  const message = (error as { data?: { message?: unknown } }).data?.message;
+  return typeof message === 'string' && message.trim() ? message : fallback;
+}
+
 export function MailContent() {
   const queues = useEmailQueues();
   const health = useInboundHealth();
+  const workflowEmailHealth = useWorkflowEmailHealth();
   const [quarantinePage, setQuarantinePage] = useState(1);
   const [quarantineQueueId, setQuarantineQueueId] = useState('');
   const [quarantineReason, setQuarantineReason] = useState('');
@@ -72,22 +140,210 @@ export function MailContent() {
     reason: quarantineReason || undefined,
     messageId: quarantineMessageId || undefined,
   });
+  const [workflowEventPage, setWorkflowEventPage] = useState(1);
+  const [workflowEventState, setWorkflowEventState] = useState<WorkflowEmailEventState | ''>('');
+  const workflowEvents = useWorkflowEmailEvents({
+    page: workflowEventPage,
+    state: workflowEventState || undefined,
+  });
   const reconcile = useReconcileQueue();
   const replay = useReplayQuarantined();
+  const replayWorkflowEmail = useReplayWorkflowEmailEvent();
   const { data: me } = useMe();
+  const createQueue = useCreateEmailQueue();
+  const updateQueue = useUpdateEmailQueue();
+  const deleteQueue = useDeleteEmailQueue();
 
   const [reconcileFor, setReconcileFor] = useState<AdminEmailQueue | null>(null);
   const [detailFor, setDetailFor] = useState<QuarantinedDelivery | null>(null);
   const detail = useQuarantineDetail(detailFor?.id ?? null);
   const [replayFor, setReplayFor] = useState<QuarantinedDelivery | null>(null);
   const [replayReason, setReplayReason] = useState('');
+  const [workflowDetailFor, setWorkflowDetailFor] = useState<WorkflowEmailEventListItem | null>(null);
+  const workflowDetail = useWorkflowEmailEventDetail(workflowDetailFor?.id ?? null);
+  const [workflowReplayFor, setWorkflowReplayFor] = useState<WorkflowEmailEventListItem | null>(null);
+  const [workflowReplayReason, setWorkflowReplayReason] = useState('');
   const [mode, setMode] = useState<ReconcileMode>('RESUME_MIGRATED');
   const [reason, setReason] = useState('');
   const [confirm, setConfirm] = useState(false);
   const [confirmationText, setConfirmationText] = useState('');
   const [backfillLimit, setBackfillLimit] = useState<number>(100);
+  const [queueDialogOpen, setQueueDialogOpen] = useState(false);
+  const [editingQueue, setEditingQueue] = useState<AdminEmailQueue | null>(null);
+  const [queueForm, setQueueForm] = useState<QueueForm>(EMPTY_QUEUE_FORM);
   const canReconcile = hasPermission(me, PERMISSIONS.MAIL_RECONCILE);
   const canReplay = hasPermission(me, PERMISSIONS.MAIL_REPLAY);
+  const canConfigure = hasPermission(me, PERMISSIONS.MAIL_CONFIGURE);
+  const configMutationPending = createQueue.isPending || updateQueue.isPending || deleteQueue.isPending;
+
+  function reloadQueueData() {
+    void queues.refetch();
+    void health.refetch();
+    void workflowEmailHealth.refetch();
+    void workflowEvents.refetch();
+  }
+
+  function openCreateQueue() {
+    setEditingQueue(null);
+    setQueueForm(EMPTY_QUEUE_FORM);
+    setQueueDialogOpen(true);
+  }
+
+  function openEditQueue(queue: AdminEmailQueue) {
+    if (queue.syncState === 'BOOTSTRAPPING') {
+      toast({
+        title: 'Очередь сейчас реконсилируется',
+        description: 'Дождитесь завершения IMAP-baseline и обновите список перед изменением настроек.',
+        variant: 'destructive',
+      });
+      return;
+    }
+    setEditingQueue(queue);
+    setQueueForm(queueFormFromQueue(queue));
+    setQueueDialogOpen(true);
+  }
+
+  function closeQueueDialog() {
+    if (configMutationPending) return;
+    setQueueDialogOpen(false);
+    setEditingQueue(null);
+    setQueueForm(EMPTY_QUEUE_FORM);
+  }
+
+  function handleQueueError(error: unknown, fallback: string) {
+    if (errorStatus(error) === 409) {
+      closeQueueDialog();
+      reloadQueueData();
+      toast({
+        title: 'Настройки очереди уже изменились',
+        description: 'Список обновлён. Откройте форму снова и повторите действие.',
+        variant: 'destructive',
+      });
+      return;
+    }
+    toast({
+      title: 'Не удалось сохранить очередь',
+      description: errorMessage(error, fallback),
+      variant: 'destructive',
+    });
+  }
+
+  async function submitQueue(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const emailAddress = queueForm.emailAddress.trim();
+    const host = queueForm.host.trim();
+    const username = queueForm.username.trim();
+    const port = Number(queueForm.port);
+    const routingPriority = Number(queueForm.routingPriority);
+    const departmentId = queueForm.departmentId.trim() === '' ? null : Number(queueForm.departmentId);
+
+    if (!/^\S+@\S+\.\S+$/.test(emailAddress)) {
+      toast({ title: 'Укажите корректный адрес очереди', variant: 'destructive' });
+      return;
+    }
+    if (!Number.isInteger(port) || port < 1) {
+      toast({ title: 'Порт должен быть положительным целым числом', variant: 'destructive' });
+      return;
+    }
+    if (!Number.isInteger(routingPriority) || routingPriority < 0 || routingPriority > 1_000_000) {
+      toast({ title: 'Приоритет должен быть целым числом от 0 до 1 000 000', variant: 'destructive' });
+      return;
+    }
+    if (departmentId !== null && (!Number.isInteger(departmentId) || departmentId < 1)) {
+      toast({ title: 'ID отдела должен быть положительным целым числом или пустым', variant: 'destructive' });
+      return;
+    }
+    if (queueForm.type !== 'PIPE' && (!host || !username)) {
+      toast({ title: 'Для IMAP/POP3 укажите хост и имя пользователя', variant: 'destructive' });
+      return;
+    }
+
+    const payload: EmailQueueConfigInput = {
+      type: queueForm.type,
+      emailAddress,
+      host,
+      port,
+      username,
+      useTls: queueForm.useTls,
+      departmentId,
+      routingPriority,
+      sendAutoresponder: queueForm.sendAutoresponder,
+      isEnabled: queueForm.isEnabled,
+      ...(queueForm.password === '' ? {} : { password: queueForm.password }),
+    };
+
+    try {
+      if (editingQueue) {
+        if (!Number.isInteger(editingQueue.configGeneration)) {
+          reloadQueueData();
+          toast({
+            title: 'Нужны свежие данные очереди',
+            description: 'Сервер не вернул версию конфигурации. Список обновлён.',
+            variant: 'destructive',
+          });
+          return;
+        }
+        await updateQueue.mutateAsync({
+          id: editingQueue.id,
+          expectedConfigGeneration: editingQueue.configGeneration,
+          ...payload,
+        });
+        toast({ title: 'Очередь обновлена' });
+      } else {
+        await createQueue.mutateAsync(payload);
+        toast({ title: 'Очередь создана' });
+      }
+      closeQueueDialog();
+    } catch (error) {
+      handleQueueError(error, 'Проверьте параметры очереди и права доступа.');
+    }
+  }
+
+  async function toggleQueue(queue: AdminEmailQueue) {
+    if (queue.syncState === 'BOOTSTRAPPING') return;
+    if (!Number.isInteger(queue.configGeneration)) {
+      reloadQueueData();
+      toast({
+        title: 'Нужны свежие данные очереди',
+        description: 'Список обновлён.',
+        variant: 'destructive',
+      });
+      return;
+    }
+    try {
+      await updateQueue.mutateAsync({
+        id: queue.id,
+        expectedConfigGeneration: queue.configGeneration,
+        isEnabled: !queue.isEnabled,
+      });
+      toast({ title: queue.isEnabled ? 'Очередь выключена' : 'Очередь включена' });
+    } catch (error) {
+      handleQueueError(error, 'Не удалось изменить состояние очереди.');
+    }
+  }
+
+  async function deleteQueueById(queue: AdminEmailQueue) {
+    if (queue.syncState === 'BOOTSTRAPPING') return;
+    if (!Number.isInteger(queue.configGeneration)) {
+      reloadQueueData();
+      toast({
+        title: 'Нужны свежие данные очереди',
+        description: 'Список обновлён.',
+        variant: 'destructive',
+      });
+      return;
+    }
+    if (!window.confirm(`Удалить очередь «${queue.emailAddress}»? Это действие нельзя отменить.`)) return;
+    try {
+      await deleteQueue.mutateAsync({
+        id: queue.id,
+        expectedConfigGeneration: queue.configGeneration,
+      });
+      toast({ title: 'Очередь удалена' });
+    } catch (error) {
+      handleQueueError(error, 'Не удалось удалить очередь.');
+    }
+  }
 
   function openReconcile(q: AdminEmailQueue) {
     // The server is the sole authority for allowed reconciliation modes. Never recreate a
@@ -154,7 +410,38 @@ export function MailContent() {
     );
   }
 
+  function submitWorkflowEmailReplay() {
+    if (!workflowReplayFor) return;
+    replayWorkflowEmail.mutate(
+      {
+        eventId: workflowReplayFor.id,
+        reason: workflowReplayReason.trim(),
+        expectedUpdatedAt: workflowReplayFor.updatedAt,
+      },
+      {
+        onSuccess: () => {
+          toast({
+            title: 'Workflow-email событие возвращено в обработку',
+            description: workflowReplayFor.ticket.mask,
+          });
+          setWorkflowReplayFor(null);
+          setWorkflowReplayReason('');
+        },
+        onError: (error: unknown) =>
+          toast({
+            title: 'Не удалось повторить workflow-email',
+            description: errorMessage(
+              error,
+              'Обновите детали события и проверьте, что адрес заявителя не изменился.',
+            ),
+            variant: 'destructive',
+          }),
+      },
+    );
+  }
+
   const h = health.data;
+  const workflowH = workflowEmailHealth.data;
 
   return (
     <div className="space-y-8">
@@ -168,18 +455,28 @@ export function MailContent() {
             Входящая почта → заявки: состояние синхронизации, здоровье, карантин.
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
-            void queues.refetch();
-            void health.refetch();
-            void quarantine.refetch();
-          }}
-        >
-          <RefreshCw className="mr-2 h-4 w-4" />
-          Обновить
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              void queues.refetch();
+              void health.refetch();
+              void quarantine.refetch();
+              void workflowEmailHealth.refetch();
+              void workflowEvents.refetch();
+            }}
+          >
+            <RefreshCw className="mr-2 h-4 w-4" />
+            Обновить
+          </Button>
+          {canConfigure && (
+            <Button size="sm" onClick={openCreateQueue} disabled={configMutationPending}>
+              <Plus className="mr-2 h-4 w-4" />
+              Добавить очередь
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* ── Health summary + alerts ─────────────────────────────────────────── */}
@@ -234,6 +531,50 @@ export function MailContent() {
         )}
       </section>
 
+      {/* ── Durable workflow customer-email event health ─────────────────── */}
+      <section className="space-y-3">
+        <h2 className="text-sm font-semibold text-muted-foreground">Workflow customer-email</h2>
+        {workflowEmailHealth.isError ? (
+          <QueryError onRetry={() => void workflowEmailHealth.refetch()} />
+        ) : (
+          <>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+              {[
+                { label: 'Бэклог', value: workflowH ? workflowH.backlog : '—' },
+                { label: 'В обработке', value: workflowH ? workflowH.byState.processing : '—' },
+                { label: 'Повтор', value: workflowH ? workflowH.byState.retry : '—' },
+                { label: 'Карантин', value: workflowH ? workflowH.byState.quarantined : '—' },
+                { label: 'Lease истёк', value: workflowH ? workflowH.stalledProcessing : '—' },
+                { label: 'Обработано', value: workflowH ? workflowH.byState.processed : '—' },
+              ].map((item) => (
+                <div key={item.label} className="rounded-xl border border-border bg-card p-3">
+                  <div className="text-2xl font-bold tabular-nums">{item.value}</div>
+                  <div className="text-xs text-muted-foreground">{item.label}</div>
+                </div>
+              ))}
+            </div>
+            {workflowH && workflowH.alerts.length > 0 && (
+              <div className="space-y-2">
+                {workflowH.alerts.map((alert) => (
+                  <div
+                    key={alert.kind}
+                    className={
+                      'flex items-start gap-2 rounded-lg border p-3 text-sm ' +
+                      (alert.severity === 'critical'
+                        ? 'border-destructive/40 bg-destructive/5 text-destructive'
+                        : 'border-amber-500/40 bg-amber-500/5 text-amber-600 dark:text-amber-400')
+                    }
+                  >
+                    <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+                    <span>{alert.message}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </section>
+
       {/* ── Queues ──────────────────────────────────────────────────────────── */}
       <section className="space-y-3">
         <h2 className="text-sm font-semibold text-muted-foreground">Очереди</h2>
@@ -268,6 +609,9 @@ export function MailContent() {
                           {q.lastError}
                         </div>
                       )}
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        отдел: {q.departmentId ?? '—'} · автоответ: {q.sendAutoresponder ? 'вкл' : 'выкл'}
+                      </div>
                     </TableCell>
                     <TableCell className="text-muted-foreground">{q.type}</TableCell>
                     <TableCell>{syncStateBadge(q.syncState)}</TableCell>
@@ -282,6 +626,7 @@ export function MailContent() {
                       {q.routingPriority !== undefined && (
                         <div className="text-xs text-muted-foreground">prio {q.routingPriority}</div>
                       )}
+                      <div className="text-xs text-muted-foreground">cfg {q.configGeneration}</div>
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground">
                       <div>
@@ -305,16 +650,64 @@ export function MailContent() {
                       <div>принято: {q.lastAcceptedAt ? <RelativeTime date={q.lastAcceptedAt} /> : '—'}</div>
                     </TableCell>
                     <TableCell className="text-right">
-                      {q.type === 'IMAP' && canReconcile && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={!q.allowedModes?.length || reconcile.isPending}
-                          onClick={() => openReconcile(q)}
-                        >
-                          Реконсиляция
-                        </Button>
-                      )}
+                      <div className="flex flex-wrap justify-end gap-2">
+                        {q.type === 'IMAP' && canReconcile && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={!q.allowedModes?.length || reconcile.isPending}
+                            onClick={() => openReconcile(q)}
+                          >
+                            Реконсиляция
+                          </Button>
+                        )}
+                        {canConfigure && (
+                          <>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={configMutationPending || q.syncState === 'BOOTSTRAPPING'}
+                              title={
+                                q.syncState === 'BOOTSTRAPPING'
+                                  ? 'Настройки нельзя менять во время IMAP-baseline'
+                                  : undefined
+                              }
+                              onClick={() => openEditQueue(q)}
+                            >
+                              <Pencil className="mr-1 h-3.5 w-3.5" />
+                              Изменить
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={configMutationPending || q.syncState === 'BOOTSTRAPPING'}
+                              title={
+                                q.syncState === 'BOOTSTRAPPING'
+                                  ? 'Настройки нельзя менять во время IMAP-baseline'
+                                  : undefined
+                              }
+                              onClick={() => void toggleQueue(q)}
+                            >
+                              {q.isEnabled ? 'Выключить' : 'Включить'}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="text-destructive hover:text-destructive"
+                              disabled={configMutationPending || q.syncState === 'BOOTSTRAPPING'}
+                              title={
+                                q.syncState === 'BOOTSTRAPPING'
+                                  ? 'Очередь нельзя удалять во время IMAP-baseline'
+                                  : undefined
+                              }
+                              onClick={() => void deleteQueueById(q)}
+                            >
+                              <Trash2 className="mr-1 h-3.5 w-3.5" />
+                              Удалить
+                            </Button>
+                          </>
+                        )}
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}
@@ -453,6 +846,134 @@ export function MailContent() {
                     size="sm"
                     disabled={quarantine.data.page * quarantine.data.limit >= quarantine.data.total}
                     onClick={() => setQuarantinePage((page) => page + 1)}
+                  >
+                    Дальше
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* ── Workflow email event quarantine / recovery ───────────────────── */}
+      <section className="space-y-3">
+        <h2 className="text-sm font-semibold text-muted-foreground">
+          Workflow-email события {workflowEvents.data ? `(${workflowEvents.data.total})` : ''}
+        </h2>
+        {workflowEvents.isError ? (
+          <QueryError onRetry={() => void workflowEvents.refetch()} />
+        ) : (
+          <div className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              <select
+                aria-label="Фильтр workflow-email по состоянию"
+                className="flex h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm"
+                value={workflowEventState}
+                onChange={(event) => {
+                  setWorkflowEventState(event.target.value as WorkflowEmailEventState | '');
+                  setWorkflowEventPage(1);
+                }}
+              >
+                <option value="">Все состояния</option>
+                <option value="QUARANTINED">Карантин</option>
+                <option value="RETRY">Повтор</option>
+                <option value="PROCESSING">В обработке</option>
+                <option value="PENDING">Ожидает</option>
+                <option value="PROCESSED">Обработано</option>
+              </select>
+            </div>
+            <div className="overflow-x-auto rounded-xl border border-border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Тикет</TableHead>
+                    <TableHead>Событие</TableHead>
+                    <TableHead>Состояние</TableHead>
+                    <TableHead>Попыток</TableHead>
+                    <TableHead>Ошибка</TableHead>
+                    <TableHead>Когда</TableHead>
+                    <TableHead className="text-right">Действия</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {(workflowEvents.data?.items ?? []).map((event) => (
+                    <TableRow key={event.id}>
+                      <TableCell className="font-medium">{event.ticket.mask}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">{event.eventType}</TableCell>
+                      <TableCell>
+                        <Badge variant={event.state === 'QUARANTINED' ? 'destructive' : 'secondary'}>
+                          {event.state}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="tabular-nums">{event.attempts}</TableCell>
+                      <TableCell
+                        className="max-w-[18rem] truncate text-xs text-muted-foreground"
+                        title={event.lastError ?? ''}
+                      >
+                        {event.lastError ?? '—'}
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground">
+                        <RelativeTime date={event.updatedAt} />
+                      </TableCell>
+                      <TableCell className="space-x-2 text-right">
+                        <Button variant="ghost" size="sm" onClick={() => setWorkflowDetailFor(event)}>
+                          Детали
+                        </Button>
+                        {canReplay && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={replayWorkflowEmail.isPending || event.state !== 'QUARANTINED'}
+                            title={
+                              event.state !== 'QUARANTINED'
+                                ? 'Повтор доступен только из карантина'
+                                : undefined
+                            }
+                            onClick={() => {
+                              setWorkflowReplayFor(event);
+                              setWorkflowReplayReason('');
+                            }}
+                          >
+                            <RotateCcw className="mr-1 h-3.5 w-3.5" />
+                            Повторить
+                          </Button>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {(workflowEvents.data?.items ?? []).length === 0 && !workflowEvents.isLoading && (
+                    <TableRow>
+                      <TableCell colSpan={7} className="py-6 text-center text-sm text-muted-foreground">
+                        Workflow-email событий в выбранной области нет.
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+            {workflowEvents.data && (
+              <div className="flex items-center justify-between text-sm text-muted-foreground">
+                <span>
+                  Страница {workflowEvents.data.page} из{' '}
+                  {Math.max(1, Math.ceil(workflowEvents.data.total / workflowEvents.data.limit))}
+                </span>
+                <div className="space-x-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={workflowEvents.data.page <= 1}
+                    onClick={() => setWorkflowEventPage((page) => Math.max(1, page - 1))}
+                  >
+                    Назад
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={
+                      workflowEvents.data.page * workflowEvents.data.limit >= workflowEvents.data.total
+                    }
+                    onClick={() => setWorkflowEventPage((page) => page + 1)}
                   >
                     Дальше
                   </Button>
@@ -674,6 +1195,350 @@ export function MailContent() {
               Подтвердить повтор
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── Workflow email event detail (body is detail-only) ─────────────── */}
+      <Dialog open={workflowDetailFor !== null} onOpenChange={(open) => !open && setWorkflowDetailFor(null)}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>
+              Workflow-email: {workflowDetail.data?.event.ticket.mask ?? workflowDetailFor?.ticket.mask}
+            </DialogTitle>
+          </DialogHeader>
+          {workflowDetail.isError ? (
+            <QueryError onRetry={() => void workflowDetail.refetch()} />
+          ) : workflowDetail.data ? (
+            <div className="space-y-4 text-sm">
+              <dl className="grid grid-cols-3 gap-2">
+                <dt className="text-muted-foreground">Событие</dt>
+                <dd className="col-span-2">{workflowDetail.data.event.eventType}</dd>
+                <dt className="text-muted-foreground">Состояние</dt>
+                <dd className="col-span-2">{workflowDetail.data.event.state}</dd>
+                <dt className="text-muted-foreground">Попыток</dt>
+                <dd className="col-span-2">{workflowDetail.data.event.attempts}</dd>
+                <dt className="text-muted-foreground">Ошибка</dt>
+                <dd className="col-span-2 break-words text-destructive">
+                  {workflowDetail.data.event.lastError ?? '—'}
+                </dd>
+              </dl>
+              {!workflowDetail.data.event.snapshotValid && (
+                <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-destructive">
+                  Снимок действия повреждён. Повтор заблокирован, чтобы не отправить непроверенное письмо.
+                </div>
+              )}
+              {workflowDetail.data.event.replayBlockReason && (
+                <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-amber-700 dark:text-amber-300">
+                  {workflowDetail.data.event.replayBlockReason}
+                </div>
+              )}
+              <div className="space-y-3 border-t pt-3">
+                <p className="font-medium">Неизменяемый снимок письма</p>
+                {workflowDetail.data.event.actions.length === 0 ? (
+                  <p className="text-muted-foreground">Нет валидного действия для отправки.</p>
+                ) : (
+                  workflowDetail.data.event.actions.map((action) => (
+                    <div
+                      key={`${action.workflowId}-${action.workflowVersionMs}-${action.actionIndex}`}
+                      className="space-y-1 rounded-md border p-3"
+                    >
+                      <div className="text-xs text-muted-foreground">
+                        Workflow #{action.workflowId}, action #{action.actionIndex}
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Кому:</span> {action.to}
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Тема:</span> {action.subject}
+                      </div>
+                      <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded bg-muted p-2 text-xs">
+                        {action.text}
+                      </pre>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">Загрузка…</p>
+          )}
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setWorkflowDetailFor(null)}>
+              Закрыть
+            </Button>
+            {workflowDetail.data && canReplay && (
+              <Button
+                variant="outline"
+                disabled={
+                  replayWorkflowEmail.isPending ||
+                  !workflowDetail.data.event.replayAllowed ||
+                  workflowDetail.data.event.state !== 'QUARANTINED'
+                }
+                onClick={() => {
+                  setWorkflowDetailFor(null);
+                  setWorkflowReplayFor(workflowDetail.data!.event);
+                  setWorkflowReplayReason('');
+                }}
+              >
+                <RotateCcw className="mr-1 h-3.5 w-3.5" />
+                Повторить
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── Workflow email replay: deliberate, version-fenced, audited ───── */}
+      <Dialog open={workflowReplayFor !== null} onOpenChange={(open) => !open && setWorkflowReplayFor(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Повторить workflow-email: {workflowReplayFor?.ticket.mask}</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            Снимок письма и его idempotency key не меняются. Сервер повторно проверит адрес заявителя и версию
+            события.
+          </p>
+          <Textarea
+            id="workflow-email-replay-reason"
+            aria-label="Причина повтора workflow-email"
+            value={workflowReplayReason}
+            onChange={(event) => setWorkflowReplayReason(event.target.value)}
+            placeholder="Что исправлено и почему повтор безопасен"
+            rows={3}
+          />
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setWorkflowReplayFor(null)}>
+              Отмена
+            </Button>
+            <Button
+              disabled={replayWorkflowEmail.isPending || workflowReplayReason.trim().length === 0}
+              onClick={submitWorkflowEmailReplay}
+            >
+              Подтвердить повтор
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Password is deliberately write-only: editing never reads or renders the stored secret. */}
+      <Dialog
+        open={queueDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) closeQueueDialog();
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{editingQueue ? 'Изменить почтовую очередь' : 'Новая почтовая очередь'}</DialogTitle>
+          </DialogHeader>
+          <form onSubmit={(event) => void submitQueue(event)} className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium" htmlFor="mail-queue-type">
+                  Тип
+                </label>
+                <select
+                  id="mail-queue-type"
+                  className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm"
+                  value={queueForm.type}
+                  onChange={(event) =>
+                    setQueueForm((current) => ({
+                      ...current,
+                      type: event.target.value as QueueForm['type'],
+                    }))
+                  }
+                  disabled={configMutationPending}
+                >
+                  <option value="IMAP">IMAP</option>
+                  <option value="POP3">POP3</option>
+                  <option value="PIPE">PIPE</option>
+                </select>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium" htmlFor="mail-queue-address">
+                  Адрес очереди
+                </label>
+                <Input
+                  id="mail-queue-address"
+                  type="email"
+                  value={queueForm.emailAddress}
+                  onChange={(event) =>
+                    setQueueForm((current) => ({ ...current, emailAddress: event.target.value }))
+                  }
+                  autoComplete="off"
+                  required
+                  disabled={configMutationPending}
+                />
+              </div>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-[1fr_8rem]">
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium" htmlFor="mail-queue-host">
+                  Хост
+                </label>
+                <Input
+                  id="mail-queue-host"
+                  value={queueForm.host}
+                  onChange={(event) => setQueueForm((current) => ({ ...current, host: event.target.value }))}
+                  placeholder={queueForm.type === 'PIPE' ? 'Не обязателен для PIPE' : 'imap.example.com'}
+                  required={queueForm.type !== 'PIPE'}
+                  autoComplete="off"
+                  disabled={configMutationPending}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium" htmlFor="mail-queue-port">
+                  Порт
+                </label>
+                <Input
+                  id="mail-queue-port"
+                  type="number"
+                  min={1}
+                  value={queueForm.port}
+                  onChange={(event) => setQueueForm((current) => ({ ...current, port: event.target.value }))}
+                  disabled={configMutationPending}
+                />
+              </div>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium" htmlFor="mail-queue-username">
+                  Имя пользователя
+                </label>
+                <Input
+                  id="mail-queue-username"
+                  value={queueForm.username}
+                  onChange={(event) =>
+                    setQueueForm((current) => ({ ...current, username: event.target.value }))
+                  }
+                  required={queueForm.type !== 'PIPE'}
+                  autoComplete="off"
+                  disabled={configMutationPending}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium" htmlFor="mail-queue-password">
+                  Пароль
+                </label>
+                <Input
+                  id="mail-queue-password"
+                  type="password"
+                  value={queueForm.password}
+                  onChange={(event) =>
+                    setQueueForm((current) => ({ ...current, password: event.target.value }))
+                  }
+                  placeholder={editingQueue ? 'Оставьте пустым, чтобы сохранить' : 'Необязательно'}
+                  autoComplete="new-password"
+                  disabled={configMutationPending}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {editingQueue
+                    ? 'Текущий пароль не показывается и сохранится, если поле оставить пустым.'
+                    : 'Пароль не сохраняется в браузере.'}
+                </p>
+              </div>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium" htmlFor="mail-queue-department">
+                  ID отдела
+                </label>
+                <Input
+                  id="mail-queue-department"
+                  type="number"
+                  min={1}
+                  value={queueForm.departmentId}
+                  onChange={(event) =>
+                    setQueueForm((current) => ({ ...current, departmentId: event.target.value }))
+                  }
+                  placeholder="Пусто — без отдела"
+                  inputMode="numeric"
+                  disabled={configMutationPending}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium" htmlFor="mail-queue-priority">
+                  Приоритет маршрутизации
+                </label>
+                <Input
+                  id="mail-queue-priority"
+                  type="number"
+                  min={0}
+                  max={1_000_000}
+                  value={queueForm.routingPriority}
+                  onChange={(event) =>
+                    setQueueForm((current) => ({ ...current, routingPriority: event.target.value }))
+                  }
+                  inputMode="numeric"
+                  disabled={configMutationPending}
+                />
+                <p className="text-xs text-muted-foreground">Меньшее число имеет больший приоритет.</p>
+              </div>
+            </div>
+
+            <div className="space-y-2 rounded-md border border-border p-3">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  id="mail-queue-tls"
+                  type="checkbox"
+                  checked={queueForm.useTls}
+                  onChange={(event) =>
+                    setQueueForm((current) => ({ ...current, useTls: event.target.checked }))
+                  }
+                  disabled={configMutationPending}
+                />
+                Использовать TLS
+              </label>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  id="mail-queue-autoresponder"
+                  type="checkbox"
+                  checked={queueForm.sendAutoresponder}
+                  onChange={(event) =>
+                    setQueueForm((current) => ({ ...current, sendAutoresponder: event.target.checked }))
+                  }
+                  disabled={configMutationPending}
+                />
+                Отправлять автоответ при создании заявки
+              </label>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  id="mail-queue-enabled"
+                  type="checkbox"
+                  checked={queueForm.isEnabled}
+                  onChange={(event) =>
+                    setQueueForm((current) => ({ ...current, isEnabled: event.target.checked }))
+                  }
+                  disabled={configMutationPending}
+                />
+                Включить очередь после сохранения
+              </label>
+            </div>
+
+            {editingQueue?.syncState === 'NEEDS_RECONCILIATION' && (
+              <p className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-300">
+                После изменения идентичности IMAP-почтового ящика очередь останется остановленной, пока
+                оператор не выполнит реконсиляцию.
+              </p>
+            )}
+
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={closeQueueDialog}
+                disabled={configMutationPending}
+              >
+                Отмена
+              </Button>
+              <Button type="submit" disabled={configMutationPending}>
+                {configMutationPending ? 'Сохранение…' : 'Сохранить'}
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
     </div>

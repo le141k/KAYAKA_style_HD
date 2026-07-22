@@ -104,6 +104,12 @@ function makePrismaMock() {
     ticketAuditLog: {
       create: vi.fn(),
     },
+    workflow: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    workflowEmailEvent: {
+      upsert: vi.fn(),
+    },
     staff: {
       // E3: assign/bulkAction validate the assignee exists + is enabled.
       findUnique: vi.fn().mockResolvedValue({ id: 5, isEnabled: true }),
@@ -154,6 +160,8 @@ describe('TicketsService', () => {
     const eventEmitterMock = { emit: vi.fn() } as unknown as EventEmitter2;
     const mailMock = {
       sendTemplate: vi.fn().mockResolvedValue(undefined),
+      createAutomatedTicketEmail: vi.fn().mockResolvedValue({ id: 'auto-outbox-1' }),
+      enqueueOutbound: vi.fn().mockResolvedValue(undefined),
     } as unknown as MailService;
     const adminMock = {
       validateCustomFields: vi.fn().mockResolvedValue(undefined),
@@ -163,6 +171,11 @@ describe('TicketsService', () => {
         .fn()
         .mockImplementation((_s: unknown, rows: unknown) => Promise.resolve(rows)),
     } as unknown as AdminService;
+    const notificationMock = {
+      queueWatcherNotificationsForUserReply: vi.fn().mockResolvedValue([]),
+      queueAssignmentNotification: vi.fn().mockResolvedValue(undefined),
+      wakeCommittedNotifications: vi.fn(),
+    };
     attachments = { linkToPost: vi.fn().mockResolvedValue(undefined) };
     service = new TicketsService(
       prisma as unknown as PrismaService,
@@ -171,6 +184,7 @@ describe('TicketsService', () => {
       eventEmitterMock,
       mailMock,
       adminMock,
+      notificationMock as never,
       attachments as unknown as AttachmentsService,
     );
   });
@@ -183,7 +197,10 @@ describe('TicketsService', () => {
 
       (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
       (prisma.ticketPriority.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 2 });
-      (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue(mockTicket);
+      (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...mockTicket,
+        posts: [{ id: 100 }],
+      });
       (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...mockTicket,
         mask: 'TT-000042',
@@ -217,7 +234,10 @@ describe('TicketsService', () => {
 
       (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
       (prisma.ticketPriority.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 2 });
-      (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue(mockTicket);
+      (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...mockTicket,
+        posts: [{ id: 101 }],
+      });
       (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...mockTicket,
         mask: 'TT-000042',
@@ -335,7 +355,10 @@ describe('TicketsService', () => {
 
       (prisma.ticketStatus.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
       (prisma.ticketPriority.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 2 });
-      (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue(mockTicket);
+      (prisma.ticket.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...mockTicket,
+        posts: [{ id: 102 }],
+      });
       (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...mockTicket,
         mask: 'TT-000042',

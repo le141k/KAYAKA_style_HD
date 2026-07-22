@@ -76,10 +76,14 @@ Required invariants:
   the verified forward-only migration boundary, with compare-and-swap updates and aggregate-only logs.
 - `TELECOM_HD_UPLOAD_DIR` is exactly `/app/uploads`. This is the sole durable Compose volume mount for
   attachments and inbound raw MIME; another path is rejected by preflight and API production startup.
-- Keep global IMAP polling explicitly safe until the inbound canary gate: `TELECOM_HD_IMAP_ENABLED=false`.
-  `scripts/deploy-prod.sh` now rejects a release env with it enabled, so a stale production
-  file cannot consume a mailbox before the live canary proof. Enable it only after the
-  documented queue-by-queue canary gate has completed successfully.
+- Keep the shared delivery gate explicitly safe until the inbound canary gate:
+  `TELECOM_HD_INBOUND_DELIVERY_ENABLED=false` and `TELECOM_HD_IMAP_ENABLED=false`.
+  `scripts/deploy-prod.sh` rejects a release env with either enabled, so a stale production
+  file cannot consume an IMAP mailbox, accept PIPE mail, or drain an existing ledger before
+  the live canary proof. Every code or migration deployment must therefore start with both
+  false. After the live canary is green, use the separate configuration-only API restart in
+  [the inbound cutover runbook](INBOUND_PRODUCTION_CUTOVER.md) to enable the shared gate and,
+  only for an IMAP canary, polling; turn both false again before the next normal deployment.
   `TELECOM_HD_IMAP_BOOTSTRAP_POLICY=FROM_NOW`, `TELECOM_HD_IMAP_BACKFILL_LIMIT=0`,
   `TELECOM_HD_INBOUND_MAX_ATTEMPTS=5`, and `TELECOM_HD_INBOUND_RAW_RETENTION_DAYS=30`. Queue connection
   settings are stored in the database; `BACKFILL` requires a deliberate non-zero bounded limit.
@@ -192,14 +196,20 @@ Before enabling production queues after an inbound-ledger migration:
    `inbound-raw`) + Redis recovery triplet is backed up and restore-rehearsed.
 2. Apply migrations forward only. Do not start an old API binary against an epoch/claim/reconcile
    schema, and do not invent a down migration.
-3. Run the real PostgreSQL migration/upgrade rehearsal and the GreenMail/Dovecot matrix from
-   `docs/INBOUND_LEDGER_VERIFICATION_RU.md`. A missing/red gate blocks queue enablement.
+3. Run the real PostgreSQL migration/upgrade rehearsal and the GreenMail/Dovecot/PIPE matrix from
+   [INBOUND_PRODUCTION_CUTOVER.md](INBOUND_PRODUCTION_CUTOVER.md). A missing/red gate blocks
+   queue enablement and production cutover.
 4. Configure exactly one non-customer-impacting canary mailbox/PIPE queue. Verify `/admin/mail`
    health: connection/poll/accepted stamps, epoch/generation, no unexplained alert, and raw-storage
    reserve. Deliver a controlled message, retry it, and inspect its ledger/audit outcome.
 5. Only then enable the remaining queues one at a time. Stop immediately on a halted queue,
    transport/semantic collision, stale poll, quarantine growth, storage-reserve alert or unexpected
    ticket/post count. Preserve ledger/raw evidence; do not delete rows as a recovery shortcut.
+
+For the current inbound acceptance and automated-customer-email migration, the exact PostgreSQL,
+GreenMail/Dovecot, PIPE, configuration-only IMAP restart and recovery procedure is
+[INBOUND_PRODUCTION_CUTOVER.md](INBOUND_PRODUCTION_CUTOVER.md). It is a mandatory gate, not
+an optional troubleshooting guide.
 
 ## 5. HTTPS edge gate
 

@@ -9,7 +9,7 @@ import type { PrismaService } from '../../prisma/prisma.service';
 import type { MailService } from '../mail/mail.service';
 
 function makePrismaMock() {
-  return {
+  const mock = {
     slaPlan: {
       findUnique: vi.fn(),
       findFirst: vi.fn(),
@@ -52,7 +52,26 @@ function makePrismaMock() {
     staff: {
       findUnique: vi.fn(),
     },
-  } as unknown as PrismaService;
+    slaEscalationEvent: {
+      findUnique: vi.fn(),
+    },
+  };
+  const tx = {
+    ticket: {
+      findFirst: vi.fn(),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      update: mock.ticket.update,
+    },
+    ticketNote: mock.ticketNote,
+    staff: mock.staff,
+    escalationRule: { findMany: vi.fn().mockResolvedValue([]) },
+    slaEscalationEvent: { create: vi.fn().mockResolvedValue({ id: 'sla-event-1' }) },
+  };
+  return {
+    ...mock,
+    $transaction: vi.fn(async (callback: (client: typeof tx) => unknown) => callback(tx)),
+    __tx: tx,
+  } as unknown as PrismaService & { __tx: typeof tx };
 }
 
 function makeMailMock() {
@@ -60,6 +79,8 @@ function makeMailMock() {
     send: vi.fn(),
     sendTemplate: vi.fn(),
     renderTemplate: vi.fn(),
+    createInternalNotificationEmail: vi.fn().mockResolvedValue({ id: 'internal-outbox-1' }),
+    enqueueOutbound: vi.fn().mockResolvedValue(undefined),
   } as unknown as MailService;
 }
 
@@ -464,13 +485,13 @@ describe('SlaService (extra coverage)', () => {
       };
 
       (prisma.ticket.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([breachedTicket]);
-      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
-      (prisma.escalationRule.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      prisma.__tx.ticket.findFirst.mockResolvedValue(breachedTicket);
+      prisma.__tx.escalationRule.findMany.mockResolvedValue([]);
 
       await service.runPeriodicCheck();
 
       // Should mark as escalated
-      expect(prisma.ticket.update).toHaveBeenCalledWith(
+      expect(prisma.__tx.ticket.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({ isEscalated: true }),
         }),

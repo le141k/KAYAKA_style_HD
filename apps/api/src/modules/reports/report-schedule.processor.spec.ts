@@ -7,24 +7,44 @@ import type { ReportCompiler } from './report-compiler';
 // ─── Mock factories ───────────────────────────────────────────────────────────
 
 function makePrismaMock() {
-  // reportRun and reportSchedule.update with new fields are from our migration;
+  // reportRun and reportSchedule fields are migration-backed in production;
   // cast as any since generated PrismaClient types may not reflect local migration yet.
-  return {
-    reportSchedule: {
-      findMany: vi.fn().mockResolvedValue([]),
-      update: vi.fn().mockResolvedValue({}),
-    },
-    // New model added by migration
-    reportRun: {
-      create: vi.fn().mockResolvedValue({ id: 1 }),
-    },
+  const reportSchedule = {
+    findMany: vi.fn().mockResolvedValue([]),
+    updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+  };
+  const reportRun = {
+    create: vi.fn().mockResolvedValue({ id: 1 }),
+  };
+  const staff = {
+    findUnique: vi.fn().mockResolvedValue({
+      id: 7,
+      isEnabled: true,
+      staffGroup: { isAdmin: false, permissions: ['report.run'] },
+      departments: [{ departmentId: 2 }, { departmentId: 1 }],
+    }),
+  };
+  const tx = {
+    reportSchedule,
+    reportRun,
+    // Separate mock lets a barrier test change authorization after compilation
+    // but before the persistence transaction re-reads it.
     staff: {
       findUnique: vi.fn().mockResolvedValue({
         id: 7,
         isEnabled: true,
         staffGroup: { isAdmin: false, permissions: ['report.run'] },
+        departments: [{ departmentId: 1 }, { departmentId: 2 }],
       }),
     },
+  };
+  return {
+    reportSchedule,
+    // New model added by migration
+    reportRun,
+    staff,
+    $transaction: vi.fn(async (callback: (client: typeof tx) => unknown) => callback(tx)),
+    __tx: tx,
   } as unknown as PrismaService;
 }
 
@@ -36,6 +56,8 @@ function makeCompilerMock() {
 
 function makeMailMock() {
   return {
+    createReportEmail: vi.fn().mockResolvedValue({ id: 'report-outbox-1' }),
+    enqueueOutbound: vi.fn().mockResolvedValue(undefined),
     send: vi.fn().mockResolvedValue(undefined),
   } as unknown as MailService;
 }
@@ -145,9 +167,9 @@ describe('ReportScheduleProcessor', () => {
 
     await processor.process(makeJob());
 
-    expect(prisma.reportSchedule.update).toHaveBeenCalledWith(
+    expect(prisma.reportSchedule.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 7 },
+        where: expect.objectContaining({ id: 7, isEnabled: true }),
         data: expect.objectContaining({
           lastRunAt: expect.any(Date),
           nextRunAt: expect.any(Date),
@@ -158,7 +180,7 @@ describe('ReportScheduleProcessor', () => {
 
   // ─── Sends email when recipients present ─────────────────────────────────
 
-  it('sends email via MailService when recipients are set', async () => {
+  it('creates a durable REPORT outbox command when recipients are set', async () => {
     (compiler.compile as ReturnType<typeof vi.fn>).mockResolvedValue([{ statusId: 1, count: 10 }]);
     (prisma.reportSchedule.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
       {
@@ -175,12 +197,161 @@ describe('ReportScheduleProcessor', () => {
 
     await processor.process(makeJob());
 
-    expect(mail.send).toHaveBeenCalledWith(
+    expect(mail.createReportEmail).toHaveBeenCalledWith(
+      (prisma as unknown as { __tx: unknown }).__tx,
       expect.objectContaining({
         to: ['admin@example.com', 'manager@example.com'],
         subject: expect.stringContaining('CSV Report'),
+        text: expect.stringContaining('statusId,count'),
       }),
     );
+    expect(mail.enqueueOutbound).toHaveBeenCalledWith('report-outbox-1');
+    expect(mail.send).not.toHaveBeenCalled();
+  });
+
+  it('keeps a committed report command durable when the Redis wake-up fails', async () => {
+    (compiler.compile as ReturnType<typeof vi.fn>).mockResolvedValue([{ statusId: 1, count: 10 }]);
+    (mail.enqueueOutbound as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('redis unavailable'));
+    (prisma.reportSchedule.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 22,
+        reportId: 5,
+        ownerStaffId: 7,
+        cron: '*/5 * * * *',
+        recipients: ['admin@example.com'],
+        isEnabled: true,
+        format: 'json',
+        report: { id: 5, title: 'JSON Report', definition: VALID_DEFINITION },
+      },
+    ]);
+
+    await expect(processor.process(makeJob())).resolves.toBeUndefined();
+    await Promise.resolve(); // detached durable-wake-up diagnostic
+
+    expect(prisma.reportRun.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ error: null }) }),
+    );
+    expect(prisma.reportSchedule.updateMany).toHaveBeenCalledTimes(1);
+    expect(mail.createReportEmail).toHaveBeenCalledTimes(1);
+    expect(mail.send).not.toHaveBeenCalled();
+  });
+
+  it('does not create a second ReportRun or email when another scanner wins the due CAS', async () => {
+    (compiler.compile as ReturnType<typeof vi.fn>).mockResolvedValue([{ statusId: 1, count: 10 }]);
+    (prisma.reportSchedule.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+    (prisma.reportSchedule.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 23,
+        reportId: 5,
+        ownerStaffId: 7,
+        cron: '*/5 * * * *',
+        recipients: ['admin@example.com'],
+        isEnabled: true,
+        format: 'json',
+        report: { id: 5, title: 'Contended Report', definition: VALID_DEFINITION },
+      },
+    ]);
+
+    await processor.process(makeJob());
+
+    expect(prisma.reportRun.create).not.toHaveBeenCalled();
+    expect(mail.createReportEmail).not.toHaveBeenCalled();
+    expect(mail.enqueueOutbound).not.toHaveBeenCalled();
+  });
+
+  it('rejects a compiled snapshot when schedule/report generations or the exact fire changed', async () => {
+    const dueAt = new Date('2026-07-22T09:55:00.000Z');
+    (compiler.compile as ReturnType<typeof vi.fn>).mockResolvedValue([{ statusId: 1, count: 10 }]);
+    // Simulates an operator editing recipients/owner/definition while the report
+    // was compiling: their config write advances a generation before our tx CAS.
+    (prisma.reportSchedule.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+    (prisma.reportSchedule.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 24,
+        reportId: 5,
+        ownerStaffId: 7,
+        cron: '*/5 * * * *',
+        recipients: ['old-recipient@example.com'],
+        isEnabled: true,
+        format: 'json',
+        configGeneration: 12,
+        nextRunAt: dueAt,
+        report: { id: 5, title: 'Edited Report', definition: VALID_DEFINITION, configGeneration: 34 },
+      },
+    ]);
+
+    await processor.process(makeJob());
+
+    expect(prisma.reportSchedule.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 24,
+          reportId: 5,
+          ownerStaffId: 7,
+          isEnabled: true,
+          nextRunAt: dueAt,
+          configGeneration: 12,
+          report: { is: { id: 5, configGeneration: 34 } },
+        },
+      }),
+    );
+    expect(prisma.reportRun.create).not.toHaveBeenCalled();
+    expect(mail.createReportEmail).not.toHaveBeenCalled();
+    expect(mail.enqueueOutbound).not.toHaveBeenCalled();
+  });
+
+  it('revalidates owner authorization after compilation and commits nothing after a revocation', async () => {
+    const dueAt = new Date('2026-07-22T09:55:00.000Z');
+    let releaseCompile!: (rows: Array<Record<string, unknown>>) => void;
+    (compiler.compile as ReturnType<typeof vi.fn>).mockImplementation(
+      () =>
+        new Promise<Array<Record<string, unknown>>>((resolve) => {
+          releaseCompile = resolve;
+        }),
+    );
+    (prisma.reportSchedule.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 25,
+        reportId: 5,
+        ownerStaffId: 7,
+        cron: '*/5 * * * *',
+        recipients: ['recipient@example.com'],
+        isEnabled: true,
+        format: 'json',
+        configGeneration: 3,
+        nextRunAt: dueAt,
+        report: { id: 5, title: 'Authorization barrier', definition: VALID_DEFINITION, configGeneration: 4 },
+      },
+    ]);
+
+    const processing = processor.process(makeJob());
+    await vi.waitFor(() => expect(compiler.compile).toHaveBeenCalledTimes(1));
+
+    // Barrier: report compilation has already consumed the former department
+    // scope; revoke the owner before the short persistence transaction starts.
+    const tx = (
+      prisma as unknown as {
+        __tx: { staff: { findUnique: ReturnType<typeof vi.fn> } };
+      }
+    ).__tx;
+    tx.staff.findUnique.mockResolvedValue({
+      id: 7,
+      isEnabled: false,
+      staffGroup: { isAdmin: false, permissions: ['report.run'] },
+      departments: [{ departmentId: 1 }],
+    });
+    releaseCompile([{ count: 10 }]);
+
+    await processing;
+
+    expect(tx.staff.findUnique).toHaveBeenCalledTimes(1);
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: 'Serializable',
+    });
+    expect(prisma.reportSchedule.updateMany).not.toHaveBeenCalled();
+    expect(prisma.reportRun.create).not.toHaveBeenCalled();
+    expect(mail.createReportEmail).not.toHaveBeenCalled();
+    expect(mail.enqueueOutbound).not.toHaveBeenCalled();
   });
 
   // ─── Stores error in ReportRun on failure ─────────────────────────────────
@@ -211,8 +382,8 @@ describe('ReportScheduleProcessor', () => {
       }),
     );
 
-    // Schedule should still be advanced despite error
-    expect(prisma.reportSchedule.update).toHaveBeenCalled();
+    // The error row and the next scheduled fire are committed atomically.
+    expect(prisma.reportSchedule.updateMany).toHaveBeenCalled();
   });
 
   it('fails closed, does not send mail, and disables a legacy ownerless schedule', async () => {
@@ -232,14 +403,17 @@ describe('ReportScheduleProcessor', () => {
     await processor.process(makeJob());
 
     expect(compiler.compile).not.toHaveBeenCalled();
-    expect(mail.send).not.toHaveBeenCalled();
+    expect(mail.createReportEmail).not.toHaveBeenCalled();
     expect(prisma.reportRun.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ error: expect.stringContaining('no owner'), rowCount: 0 }),
       }),
     );
-    expect(prisma.reportSchedule.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: 30 }, data: expect.objectContaining({ isEnabled: false }) }),
+    expect(prisma.reportSchedule.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 30 }),
+        data: expect.objectContaining({ isEnabled: false }),
+      }),
     );
   });
 
@@ -265,9 +439,12 @@ describe('ReportScheduleProcessor', () => {
     await processor.process(makeJob());
 
     expect(compiler.compile).not.toHaveBeenCalled();
-    expect(mail.send).not.toHaveBeenCalled();
-    expect(prisma.reportSchedule.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: 31 }, data: expect.objectContaining({ isEnabled: false }) }),
+    expect(mail.createReportEmail).not.toHaveBeenCalled();
+    expect(prisma.reportSchedule.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 31 }),
+        data: expect.objectContaining({ isEnabled: false }),
+      }),
     );
   });
 

@@ -16,6 +16,7 @@ import { MailService } from '../mail/mail.service';
 import { AdminService } from '../admin/admin.service';
 import { AttachmentsService } from '../attachments/attachments.service';
 import { NotificationService } from './notification.service';
+import { enqueueWorkflowEmailEvent } from '../workflow/workflow-email-event.service';
 import { formatTicketMask } from './ticket-mask.util';
 import { normalizeEmail } from '../../common/email.util';
 import type { AuthStaff } from '../../auth/auth.decorators';
@@ -49,6 +50,21 @@ export interface TicketDetail extends Ticket {
   notes: TicketNote[];
   watchers: Array<{ staffId: number }>;
   tags: Array<{ name: string }>;
+  // Automated commands have no TicketPost, but staff need a safe status/retry
+  // handle rather than an invisible fire-and-forget email. This intentionally
+  // includes staff-facing INTERNAL_NOTIFICATION rows while omitting recipients,
+  // bodies and SMTP identifiers from the ticket projection.
+  outboundEmails?: Array<{
+    id: string;
+    kind: 'AUTORESPONDER' | 'AUTO_CLOSE' | 'WORKFLOW' | 'INTERNAL_NOTIFICATION';
+    state: string;
+    attempts: number;
+    nextAttemptAt: Date | null;
+    lastError: string | null;
+    acceptedAt: Date | null;
+    sentAt: Date | null;
+    createdAt: Date;
+  }>;
 }
 
 /**
@@ -91,6 +107,10 @@ export type InternalCreateTicketInput = CreateTicketDto & {
   creationMode?: CreationMode;
   ipAddress?: string;
   incomingMessageId?: string;
+  /** Immutable receiving-queue snapshot from the inbound ledger; never HTTP input. */
+  inboundQueueId?: number;
+  /** NULL/undefined legacy delivery is deliberately fail-closed for EMAIL auto replies. */
+  inboundSendAutoresponder?: boolean;
 };
 
 /** Trusted service-to-service reply input; not accepted by ReplyTicketSchema. */
@@ -164,8 +184,11 @@ export class TicketsService {
     private readonly eventEmitter: EventEmitter2,
     private readonly mailService: MailService,
     private readonly adminService: AdminService,
+    // Required: a customer reply/assignment must fail its transaction if the
+    // durable internal-notification planner is not wired.  Silently omitting it
+    // would recreate the exact crash/loss window the outbox closes.
+    private readonly notificationService: NotificationService,
     @Optional() private readonly attachmentsService?: AttachmentsService,
-    @Optional() private readonly notificationService?: NotificationService,
     @Optional() private readonly ticketAccess?: TicketAccessPolicy,
   ) {}
 
@@ -225,6 +248,13 @@ export class TicketsService {
 
     const creationMode: CreationMode = dto.creationMode ?? 'STAFF';
     const ipAddress = dto.ipAddress ?? '0.0.0.0';
+    // EMAIL can only auto-reply when the accepting delivery snapshotted an
+    // explicit queue opt-in. Historical/unknown ledger rows fail closed rather
+    // than consulting a live queue that may now belong to another department.
+    const shouldQueueAutoresponder =
+      Boolean(dto.requesterEmail) &&
+      creationMode !== 'ALARIS' &&
+      (creationMode !== 'EMAIL' || dto.inboundSendAutoresponder === true);
     // Validate custom fields against TICKET scope definitions, then encrypt any
     // fields flagged isEncrypted before they are persisted to the JSONB column.
     let customFields = dto.customFields as Record<string, unknown> | undefined;
@@ -276,8 +306,9 @@ export class TicketsService {
     // auto-increment id, so we create first (temp mask) then update within a
     // single $transaction to avoid a window where a TT-PENDING mask is visible.
     let updated: Ticket;
+    let autoresponderOutboundEmailId: string | undefined;
     try {
-      const [, transactionTicket] = await this.prisma.$transaction(async (tx) => {
+      const committed = await this.prisma.$transaction(async (tx) => {
         if (actor) {
           await this.requireTicketAccess(actor).assertCanAccessDepartmentInTransaction(
             actor,
@@ -334,10 +365,10 @@ export class TicketsService {
           },
           include: { posts: { select: { id: true } } },
         });
+        const firstPost = created.posts[0];
+        if (!firstPost) throw new BadRequestException('Initial ticket post was not created');
 
         if (dto.attachmentIds?.length && this.attachmentsService) {
-          const firstPost = created.posts[0];
-          if (!firstPost) throw new BadRequestException('Initial ticket post was not created');
           await this.attachmentsService.linkToPost(
             dto.attachmentIds,
             firstPost.id,
@@ -379,9 +410,33 @@ export class TicketsService {
           tx,
         );
 
-        return [created, updatedTicket] as const;
+        let outboxId: string | undefined;
+        if (shouldQueueAutoresponder) {
+          const requesterName = dto.requesterName || dto.requesterEmail;
+          const outbox = await this.mailService.createAutomatedTicketEmail(tx, {
+            ticketId: created.id,
+            emailQueueId: dto.inboundQueueId ?? null,
+            kind: 'AUTORESPONDER',
+            templateKey: 'autoresponder',
+            locale: 'en',
+            to: dto.requesterEmail,
+            vars: {
+              mask: updatedTicket.mask,
+              subject: dto.subject,
+              contents: dto.contents,
+              name: requesterName,
+              requesterName,
+            },
+          });
+          outboxId = outbox.id;
+        }
+
+        await enqueueWorkflowEmailEvent(tx, updatedTicket, 'ticket.created', `ticket-post:${firstPost.id}`);
+
+        return { ticket: updatedTicket, autoresponderOutboundEmailId: outboxId };
       });
-      updated = transactionTicket;
+      updated = committed.ticket;
+      autoresponderOutboundEmailId = committed.autoresponderOutboundEmailId;
     } catch (err) {
       // Concurrent delivery: the inbound-only unique index is the final arbiter. The
       // losing transaction is fully rolled back; return the winning ticket and
@@ -402,33 +457,17 @@ export class TicketsService {
     // Emit domain event
     this.emitDomainEvent('ticket.created', updated.id);
 
-    // Send autoresponder email to requester (non-blocking).
-    // Skip for system-generated tickets (e.g. Alaris) — their requesterEmail is a
-    // non-deliverable internal address and should not receive an autoresponder.
-    const isSystemTicket = creationMode === 'ALARIS';
-    // Per-queue autoresponder (Kayako): for inbound EMAIL tickets, only send the
-    // autoresponder when the receiving queue opts in (noc@/rates@ are OFF). Web/
-    // staff/API tickets keep the previous always-send behaviour.
-    let suppressAutoresponder = false;
-    if (creationMode === 'EMAIL') {
-      const queue = await this.prisma.emailQueue.findFirst({
-        where: { departmentId: dto.departmentId },
-        select: { sendAutoresponder: true },
-      });
-      suppressAutoresponder = !queue?.sendAutoresponder;
-    }
-    if (dto.requesterEmail && !isSystemTicket && !suppressAutoresponder) {
-      const requesterName = dto.requesterName || dto.requesterEmail;
+    if (autoresponderOutboundEmailId) {
+      // Redis is only a wake-up accelerator. The customer-facing command already
+      // committed with the ticket; periodic DB recovery delivers it after a crash.
       this.mailService
-        .sendTemplate(dto.requesterEmail, 'autoresponder', 'en', {
-          mask,
-          subject: dto.subject,
-          contents: dto.contents,
-          // Templates reference {{name}}; keep requesterName too for forward-compat.
-          name: requesterName,
-          requesterName,
-        })
-        .catch((err: unknown) => this.logger.error(`Autoresponder email failed for ${mask}: ${String(err)}`));
+        .enqueueOutbound(autoresponderOutboundEmailId)
+        .catch((err: unknown) =>
+          this.logger.error(
+            `Autoresponder outbox wake-up failed for ${mask} ` +
+              `(${err instanceof Error && err.name ? err.name.slice(0, 80) : 'UnknownError'})`,
+          ),
+        );
     }
 
     return updated;
@@ -618,7 +657,7 @@ export class TicketsService {
         }
       : {};
 
-    const post = await this.prisma.$transaction(async (tx) => {
+    const committed = await this.prisma.$transaction(async (tx) => {
       const createdPost = await tx.ticketPost.create({
         data: {
           ticketId,
@@ -644,7 +683,7 @@ export class TicketsService {
           tx,
         );
       }
-      await tx.ticket.update({
+      const updatedTicket = await tx.ticket.update({
         where: { id: ticketId },
         data: {
           totalReplies: { increment: 1 },
@@ -654,10 +693,31 @@ export class TicketsService {
           ...reopenData,
         },
       });
-      return createdPost;
+      await enqueueWorkflowEmailEvent(tx, updatedTicket, 'ticket.replied', `ticket-post:${createdPost.id}`);
+      // Portal replies are customer replies too. Persist watcher commands in this
+      // same source transaction as the post, attachment claim and ticket update;
+      // a crash must not leave staff without the durable notification that an
+      // inbound/API customer reply receives.
+      const watcherNotificationIds = await this.notificationService.queueWatcherNotificationsForUserReply(
+        tx,
+        updatedTicket,
+        createdPost.id,
+      );
+      // The user-reply audit is part of the same business event as its post,
+      // workflow trigger and watcher commands. Keeping it in this transaction
+      // prevents a committed portal reply from losing its audit trail if the
+      // process fails before the former post-commit write.
+      await this.writeAudit(ticketId, 'REPLY', undefined, 'USER', {}, tx);
+      return { post: createdPost, watcherNotificationIds };
     });
 
-    await this.writeAudit(ticketId, 'REPLY', undefined, 'USER', {});
+    const post = committed.post;
+
+    // Redis only accelerates delivery; the notification commands are already
+    // committed and MailService's recovery scan remains the durable backstop.
+    if (committed.watcherNotificationIds.length > 0) {
+      this.notificationService.wakeCommittedNotifications(committed.watcherNotificationIds);
+    }
     this.emitDomainEvent('ticket.replied', ticketId);
 
     return post;
@@ -767,6 +827,7 @@ export class TicketsService {
             outboundEmail: {
               select: {
                 id: true,
+                kind: true,
                 state: true,
                 attempts: true,
                 nextAttemptAt: true,
@@ -789,6 +850,24 @@ export class TicketsService {
         tags: { select: { name: true } },
         auditLogs: { orderBy: { createdAt: 'desc' }, take: 50 },
         recipients: { orderBy: { addedAt: 'asc' } },
+        outboundEmails: {
+          // Only postless automated commands belong in this staff-safe projection.
+          // A corrupt legacy STAFF_REPLY row with postId=NULL must not violate the
+          // API/UI discriminator contract below.
+          where: { postId: null, kind: { not: 'STAFF_REPLY' } },
+          orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            kind: true,
+            state: true,
+            attempts: true,
+            nextAttemptAt: true,
+            lastError: true,
+            acceptedAt: true,
+            sentAt: true,
+            createdAt: true,
+          },
+        },
       },
     } as const;
     const ticket = actor
@@ -823,6 +902,7 @@ export class TicketsService {
             outboundEmail: {
               select: {
                 id: true,
+                kind: true,
                 state: true,
                 attempts: true,
                 nextAttemptAt: true,
@@ -838,6 +918,21 @@ export class TicketsService {
         watchers: { select: { staffId: true } },
         tags: { select: { name: true } },
         auditLogs: { orderBy: { createdAt: 'desc' }, take: 50 },
+        outboundEmails: {
+          where: { postId: null, kind: { not: 'STAFF_REPLY' } },
+          orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            kind: true,
+            state: true,
+            attempts: true,
+            nextAttemptAt: true,
+            lastError: true,
+            acceptedAt: true,
+            sentAt: true,
+            createdAt: true,
+          },
+        },
       },
     } as const;
     const ticket = actor
@@ -957,6 +1052,7 @@ export class TicketsService {
 
     let post: TicketPost;
     let outboundEmailId: string | undefined;
+    let watcherNotificationIds: string[] = [];
     try {
       const committed = await this.prisma.$transaction(async (tx) => {
         await this.fenceTicketMutation(tx, ticketId, actor, now);
@@ -1026,7 +1122,7 @@ export class TicketsService {
           }));
         }
 
-        await tx.ticket.update({
+        const updatedTicket = await tx.ticket.update({
           where: { id: ticketId },
           data: {
             totalReplies: { increment: 1 },
@@ -1039,6 +1135,7 @@ export class TicketsService {
         });
 
         await this.writeAudit(ticketId, 'REPLY', staffId, isStaffReply ? 'STAFF' : 'USER', {}, tx);
+        await enqueueWorkflowEmailEvent(tx, updatedTicket, 'ticket.replied', `ticket-post:${createdPost.id}`);
 
         const outbox = outboundDraft
           ? await tx.outboundEmail.create({
@@ -1046,6 +1143,7 @@ export class TicketsService {
                 ticketId,
                 postId: createdPost.id,
                 emailQueueId: outboundDraft.emailQueueId,
+                kind: 'STAFF_REPLY',
                 state: 'QUEUED',
                 messageId: outboundDraft.messageId,
                 fromAddress: outboundDraft.fromAddress,
@@ -1061,10 +1159,22 @@ export class TicketsService {
               select: { id: true },
             })
           : undefined;
-        return { post: createdPost, outboundEmailId: outbox?.id };
+        // A customer reply and each watcher notification share this transaction.
+        // The TicketPost id is the durable business-event key, so a retry cannot
+        // produce a second alert and a crash cannot commit the post without its
+        // notification commands.
+        const notificationIds = !isStaffReply
+          ? await this.notificationService.queueWatcherNotificationsForUserReply(
+              tx,
+              updatedTicket,
+              createdPost.id,
+            )
+          : [];
+        return { post: createdPost, outboundEmailId: outbox?.id, watcherNotificationIds: notificationIds };
       });
       post = committed.post;
       outboundEmailId = committed.outboundEmailId;
+      watcherNotificationIds = committed.watcherNotificationIds;
     } catch (err) {
       if (incomingMessageId && this.isUniqueConstraintViolation(err)) {
         const existing = await this.findPostByInboundMessageId(incomingMessageId);
@@ -1097,13 +1207,10 @@ export class TicketsService {
       }
     }
 
-    // Notify watchers when a user (customer) replies
-    if (!isStaffReply && this.notificationService) {
-      this.notificationService
-        .notifyWatchersOnUserReply(ticketId)
-        .catch((err: unknown) =>
-          this.logger.error(`Watcher notification failed for ticket ${ticket.mask}: ${String(err)}`),
-        );
+    if (watcherNotificationIds.length > 0) {
+      // Redis only accelerates delivery; the commands are already committed and
+      // MailService's durable recovery scan will pick them up after an outage.
+      this.notificationService.wakeCommittedNotifications(watcherNotificationIds);
     }
 
     // Emit domain event
@@ -1157,9 +1264,11 @@ export class TicketsService {
 
   /**
    * Apply one action (status change or (re)assignment) to many tickets at once.
-   * Reuses the per-ticket changeStatus/assign paths so audit logs, SLA side
-   * effects and events fire exactly as for a single update. Returns the count
-   * of tickets updated; ids that fail (e.g. already gone) are skipped.
+   * Keeps the same business guarantees as the single-ticket paths: each
+   * mutation's audit is the source for its durable side effect, while all
+   * external wake-ups/domain events happen only after the batch commits.
+   * Returns the count of tickets updated; ids that fail (e.g. already gone)
+   * are skipped.
    */
   async bulkAction(
     dto: BulkTicketActionDto,
@@ -1167,9 +1276,9 @@ export class TicketsService {
     actor?: TicketAccessActor,
   ): Promise<{ updated: number; failed: number[] }> {
     // Pre-validate: ids that don't exist (or were merged away) are reported in
-    // `failed[]` and never touched. Bulk ops apply a direct field update + audit
-    // atomically (no per-ticket notification/event spam — that's by design for a
-    // batch); the resolved-status side effect is preserved inline.
+    // `failed[]` and never touched. The batch remains all-or-nothing, including
+    // durable notification/workflow commands; a failed member must not leave a
+    // committed ticket mutation with its command silently missing.
     const uniqueIds = [...new Set(dto.ids)];
     const policyWhere = actor ? await this.requireTicketAccess(actor).ticketWhere(actor) : undefined;
     const existing = await this.prisma.ticket.findMany({
@@ -1210,7 +1319,10 @@ export class TicketsService {
     }
 
     const now = new Date();
-    await this.prisma.$transaction(async (tx) => {
+    const committed = await this.prisma.$transaction(async (tx) => {
+      const notificationIds: string[] = [];
+      const statusChangedTicketIds: number[] = [];
+
       for (const t of existing) {
         await this.fenceTicketMutation(tx, t.id, actor, now);
         const data: Record<string, unknown> = { lastActivityAt: now };
@@ -1239,19 +1351,53 @@ export class TicketsService {
           newValue = ownerStaffId?.toString() ?? null;
         }
 
-        await tx.ticket.update({ where: { id: t.id }, data });
-        await tx.ticketAuditLog.create({
-          data: {
-            ticketId: t.id,
-            staffId,
-            actorType: 'STAFF',
-            action,
+        const updatedTicket = await tx.ticket.update({ where: { id: t.id }, data });
+        const audit = await this.writeAudit(
+          t.id,
+          action,
+          staffId,
+          'STAFF',
+          {
             field: action === 'STATUS' ? 'statusId' : 'ownerStaffId',
             newValue,
           },
-        });
+          tx,
+        );
+
+        if (dto.action === 'assignee' && dto.ownerStaffId != null) {
+          const notificationId = await this.notificationService.queueAssignmentNotification(
+            tx,
+            updatedTicket,
+            dto.ownerStaffId,
+            `audit:${audit.id}`,
+          );
+          if (notificationId) notificationIds.push(notificationId);
+        }
+
+        if (dto.action === 'status') {
+          await enqueueWorkflowEmailEvent(
+            tx,
+            updatedTicket,
+            'ticket.status_changed',
+            `ticket-audit:${audit.id}`,
+          );
+          statusChangedTicketIds.push(updatedTicket.id);
+        }
       }
+
+      return { notificationIds, statusChangedTicketIds };
     });
+
+    // Both helpers below are wake-up accelerators/listener dispatch, never the
+    // source of truth.  The durable rows above must commit first, otherwise a
+    // failed batch could notify an assignee or execute a workflow for a ticket
+    // whose mutation was rolled back.
+    if (committed.notificationIds.length > 0) {
+      this.notificationService.wakeCommittedNotifications(committed.notificationIds);
+    }
+    for (const ticketId of committed.statusChangedTicketIds) {
+      this.emitDomainEvent('ticket.status_changed', ticketId);
+    }
 
     return { updated: existing.length, failed };
   }
@@ -1282,32 +1428,29 @@ export class TicketsService {
       oldValue: ticket.ownerStaffId?.toString() ?? null,
       newValue: dto.ownerStaffId?.toString() ?? null,
     };
-    const updated = actor
-      ? await this.prisma.$transaction(async (tx) => {
-          await this.fenceTicketMutation(tx, ticketId, actor, now);
-          const result = await tx.ticket.update({
-            where: { id: ticketId },
-            data: { ownerStaffId: dto.ownerStaffId, lastActivityAt: now },
-          });
-          await this.writeAudit(ticketId, 'ASSIGN', staffId, 'STAFF', audit, tx);
-          return result;
-        })
-      : await this.prisma.ticket.update({
-          where: { id: ticketId },
-          data: { ownerStaffId: dto.ownerStaffId, lastActivityAt: now },
-        });
-    if (!actor) await this.writeAudit(ticketId, 'ASSIGN', staffId, 'STAFF', audit);
+    const committed = await this.prisma.$transaction(async (tx) => {
+      if (actor) await this.fenceTicketMutation(tx, ticketId, actor, now);
+      const result = await tx.ticket.update({
+        where: { id: ticketId },
+        data: { ownerStaffId: dto.ownerStaffId, lastActivityAt: now },
+      });
+      const auditLog = await this.writeAudit(ticketId, 'ASSIGN', staffId, 'STAFF', audit, tx);
+      const notificationId = dto.ownerStaffId
+        ? await this.notificationService.queueAssignmentNotification(
+            tx,
+            result,
+            dto.ownerStaffId,
+            `audit:${auditLog.id}`,
+          )
+        : undefined;
+      return { ticket: result, notificationId };
+    });
 
-    // Notify the newly assigned staff member (non-blocking)
-    if (dto.ownerStaffId && this.notificationService) {
-      this.notificationService
-        .notifyOnAssign(ticketId, dto.ownerStaffId)
-        .catch((err: unknown) =>
-          this.logger.error(`Assignment notification failed for ticket ${ticketId}: ${String(err)}`),
-        );
+    if (committed.notificationId) {
+      this.notificationService.wakeCommittedNotifications([committed.notificationId]);
     }
 
-    return updated;
+    return committed.ticket;
   }
 
   // ─────────────────────────── Status / Priority / Type ───────────────────────────
@@ -1362,15 +1505,16 @@ export class TicketsService {
       oldValue: ticket.statusId.toString(),
       newValue: dto.statusId.toString(),
     };
-    const updated = actor
-      ? await this.prisma.$transaction(async (tx) => {
-          await this.fenceTicketMutation(tx, ticketId, actor, now);
-          const result = await tx.ticket.update({ where: { id: ticketId }, data });
-          await this.writeAudit(ticketId, 'STATUS_CHANGE', staffId, 'STAFF', audit, tx);
-          return result;
-        })
-      : await this.prisma.ticket.update({ where: { id: ticketId }, data });
-    if (!actor) await this.writeAudit(ticketId, 'STATUS_CHANGE', staffId, 'STAFF', audit);
+    // The status audit is the immutable business source for a workflow-email
+    // event.  Keep all three writes in one transaction so a crash cannot leave
+    // an updated ticket with no durable customer-notification trigger.
+    const updated = await this.prisma.$transaction(async (tx) => {
+      if (actor) await this.fenceTicketMutation(tx, ticketId, actor, now);
+      const result = await tx.ticket.update({ where: { id: ticketId }, data });
+      const statusAudit = await this.writeAudit(ticketId, 'STATUS_CHANGE', staffId, 'STAFF', audit, tx);
+      await enqueueWorkflowEmailEvent(tx, result, 'ticket.status_changed', `ticket-audit:${statusAudit.id}`);
+      return result;
+    });
 
     // Emit domain event
     this.emitDomainEvent('ticket.status_changed', ticketId);
@@ -1624,7 +1768,7 @@ export class TicketsService {
         },
       });
       const mask = formatTicketMask(created.id);
-      await tx.ticket.update({ where: { id: created.id }, data: { mask } });
+      const newTicket = await tx.ticket.update({ where: { id: created.id }, data: { mask } });
       const moved = await tx.ticketPost.updateMany({
         where: { id: { in: dto.postIds }, ticketId: sourceTicketId },
         data: { ticketId: created.id },
@@ -1638,7 +1782,8 @@ export class TicketsService {
         where: { id: sourceTicketId },
         data: { totalReplies: { decrement: posts.length }, lastActivityAt: now },
       });
-      return { newTicket: created, newMask: mask };
+      await enqueueWorkflowEmailEvent(tx, newTicket, 'ticket.created', `ticket-split:${newTicket.id}`);
+      return { newTicket, newMask: mask };
     });
 
     // Audit on both
@@ -2534,9 +2679,9 @@ export class TicketsService {
     actorType: ActorType,
     opts: { field?: string; oldValue?: string | null; newValue?: string | null },
     transaction?: Prisma.TransactionClient,
-  ): Promise<void> {
+  ): Promise<{ id: number }> {
     const client = transaction ?? this.prisma;
-    await client.ticketAuditLog.create({
+    return client.ticketAuditLog.create({
       data: {
         ticketId,
         staffId: staffId ?? null,
@@ -2546,6 +2691,7 @@ export class TicketsService {
         oldValue: opts.oldValue ?? null,
         newValue: opts.newValue ?? null,
       },
+      select: { id: true },
     });
   }
 }

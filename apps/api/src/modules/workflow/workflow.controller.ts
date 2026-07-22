@@ -13,7 +13,12 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { WorkflowService } from './workflow.service';
-import { RequireGlobalAdmin, RequirePermissions } from '../../auth/auth.decorators';
+import {
+  CurrentStaff,
+  RequireGlobalAdmin,
+  RequirePermissions,
+  type AuthStaff,
+} from '../../auth/auth.decorators';
 import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
@@ -29,7 +34,12 @@ import {
   type UpdateMacroCategoryDto,
   type CreateMacroDto,
   type UpdateMacroDto,
+  ListWorkflowEmailEventsSchema,
+  ReplayWorkflowEmailEventSchema,
+  type ListWorkflowEmailEventsDto,
+  type ReplayWorkflowEmailEventDto,
 } from './dto';
+import { WorkflowEmailEventService } from './workflow-email-event.service';
 
 // ─────────────────── Workflow ───────────────────
 
@@ -181,5 +191,58 @@ export class MacroController {
   @ApiOperation({ summary: 'Delete a macro' })
   delete(@Param('id', ParseIntPipe) id: number) {
     return this.workflowService.deleteMacro(id);
+  }
+}
+
+// ─────────────────── Workflow email event operations ───────────────────
+
+/**
+ * Workflow customer-mail is operationally part of the mail console, even
+ * though its durable event table lives in the workflow module. The service
+ * applies TicketAccessPolicy to every row; these route guards retain the
+ * existing split between observing and manually replaying mail work.
+ */
+@ApiTags('admin/workflow-email-events')
+// This intentionally does not live below /admin/email-queues/:id: Express
+// resolves parameter routes in registration order, and MailModule is loaded
+// before WorkflowModule. A dedicated prefix keeps the operational route
+// reachable regardless of module/controller registration order.
+@Controller('admin/workflow-email-events')
+export class WorkflowEmailEventController {
+  constructor(private readonly workflowEmailEvents: WorkflowEmailEventService) {}
+
+  @Get('health')
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
+  @ApiOperation({ summary: 'Workflow customer-email event health and alerts (ticket scoped)' })
+  health(@CurrentStaff() staff: AuthStaff) {
+    return this.workflowEmailEvents.operatorHealth(staff);
+  }
+
+  @Get()
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
+  @ApiOperation({ summary: 'List workflow email events (metadata only; ticket scoped)' })
+  list(
+    @Query(new ZodValidationPipe(ListWorkflowEmailEventsSchema)) query: ListWorkflowEmailEventsDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.workflowEmailEvents.listOperatorEvents(query, staff);
+  }
+
+  @Get(':eventId')
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
+  @ApiOperation({ summary: 'Get a workflow email event detail (ticket scoped)' })
+  get(@Param('eventId') eventId: string, @CurrentStaff() staff: AuthStaff) {
+    return this.workflowEmailEvents.getOperatorEvent(eventId, staff);
+  }
+
+  @Post(':eventId/replay')
+  @RequirePermissions(PERMISSIONS.MAIL_REPLAY)
+  @ApiOperation({ summary: 'Replay a quarantined workflow email event with a CAS fence and audit trail' })
+  replay(
+    @Param('eventId') eventId: string,
+    @Body(new ZodValidationPipe(ReplayWorkflowEmailEventSchema)) dto: ReplayWorkflowEmailEventDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.workflowEmailEvents.replayOperatorEvent(eventId, dto, staff);
   }
 }

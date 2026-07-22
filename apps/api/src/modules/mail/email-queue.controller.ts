@@ -17,11 +17,13 @@ import { PERMISSIONS } from '../../auth/permissions';
 import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
   CreateEmailQueueSchema,
+  DeleteEmailQueueSchema,
   ListQuarantinedInboundSchema,
   ReconcileEmailQueueSchema,
   ReplayQuarantinedInboundSchema,
   UpdateEmailQueueSchema,
   type CreateEmailQueueDto,
+  type DeleteEmailQueueDto,
   type ListQuarantinedInboundDto,
   type ReconcileEmailQueueDto,
   type ReplayQuarantinedInboundDto,
@@ -39,6 +41,45 @@ export class EmailQueueController {
   @ApiOperation({ summary: 'List all email queues (password excluded)' })
   list(@CurrentStaff() staff: AuthStaff) {
     return this.emailQueueService.list(staff);
+  }
+
+  // Keep every literal inbound route before `:id`. Nest registers controller
+  // methods in declaration order and the underlying Express router otherwise
+  // treats "inbound" as an id, causing ParseIntPipe to return 400 before the
+  // operational endpoint is reached.
+  @Get('inbound/health')
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
+  @ApiOperation({ summary: 'Inbound health: per-queue sync state, ledger backlog + staleness, alerts' })
+  health(@CurrentStaff() staff: AuthStaff) {
+    return this.emailQueueService.health(staff);
+  }
+
+  @Get('inbound/quarantine')
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
+  @ApiOperation({ summary: 'Paginated inbound quarantine metadata, filters and totals' })
+  listQuarantined(
+    @Query(new ZodValidationPipe(ListQuarantinedInboundSchema)) query: ListQuarantinedInboundDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.emailQueueService.listQuarantined(query, staff);
+  }
+
+  @Get('inbound/quarantine/:deliveryId')
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
+  @ApiOperation({ summary: 'Inbound quarantine metadata and audit history (never raw MIME)' })
+  getQuarantined(@Param('deliveryId', ParseIntPipe) deliveryId: number, @CurrentStaff() staff: AuthStaff) {
+    return this.emailQueueService.getQuarantined(deliveryId, staff);
+  }
+
+  @Post('inbound/quarantine/:deliveryId/replay')
+  @RequirePermissions(PERMISSIONS.MAIL_REPLAY)
+  @ApiOperation({ summary: 'Replay a quarantined inbound delivery (reset to ACCEPTED)' })
+  replayQuarantined(
+    @Param('deliveryId', ParseIntPipe) deliveryId: number,
+    @Body(new ZodValidationPipe(ReplayQuarantinedInboundSchema)) dto: ReplayQuarantinedInboundDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.emailQueueService.replayQuarantined(deliveryId, dto, staff);
   }
 
   @Get(':id')
@@ -73,8 +114,12 @@ export class EmailQueueController {
   @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Delete an email queue' })
-  delete(@Param('id', ParseIntPipe) id: number, @CurrentStaff() staff: AuthStaff) {
-    return this.emailQueueService.delete(id, staff);
+  delete(
+    @Param('id', ParseIntPipe) id: number,
+    @Body(new ZodValidationPipe(DeleteEmailQueueSchema)) dto: DeleteEmailQueueDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.emailQueueService.delete(id, dto, staff);
   }
 
   @Post(':id/reconcile')
@@ -88,40 +133,5 @@ export class EmailQueueController {
     @CurrentStaff() staff: AuthStaff,
   ) {
     return this.emailQueueService.reconcile(id, dto, staff);
-  }
-
-  @Get('inbound/health')
-  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
-  @ApiOperation({ summary: 'Inbound health: per-queue sync state, ledger backlog + staleness, alerts' })
-  health(@CurrentStaff() staff: AuthStaff) {
-    return this.emailQueueService.health(staff);
-  }
-
-  @Get('inbound/quarantine')
-  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
-  @ApiOperation({ summary: 'Paginated inbound quarantine metadata, filters and totals' })
-  listQuarantined(
-    @Query(new ZodValidationPipe(ListQuarantinedInboundSchema)) query: ListQuarantinedInboundDto,
-    @CurrentStaff() staff: AuthStaff,
-  ) {
-    return this.emailQueueService.listQuarantined(query, staff);
-  }
-
-  @Get('inbound/quarantine/:deliveryId')
-  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
-  @ApiOperation({ summary: 'Inbound quarantine metadata and audit history (never raw MIME)' })
-  getQuarantined(@Param('deliveryId', ParseIntPipe) deliveryId: number, @CurrentStaff() staff: AuthStaff) {
-    return this.emailQueueService.getQuarantined(deliveryId, staff);
-  }
-
-  @Post('inbound/quarantine/:deliveryId/replay')
-  @RequirePermissions(PERMISSIONS.MAIL_REPLAY)
-  @ApiOperation({ summary: 'Replay a quarantined inbound delivery (reset to ACCEPTED)' })
-  replayQuarantined(
-    @Param('deliveryId', ParseIntPipe) deliveryId: number,
-    @Body(new ZodValidationPipe(ReplayQuarantinedInboundSchema)) dto: ReplayQuarantinedInboundDto,
-    @CurrentStaff() staff: AuthStaff,
-  ) {
-    return this.emailQueueService.replayQuarantined(deliveryId, dto, staff);
   }
 }

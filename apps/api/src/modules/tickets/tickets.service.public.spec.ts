@@ -114,6 +114,8 @@ function makePrismaMock() {
     ticketStatus: { findFirst: vi.fn(), findUnique: vi.fn() },
     ticketPriority: { findFirst: vi.fn() },
     ticketAuditLog: { create: vi.fn() },
+    workflow: { findMany: vi.fn().mockResolvedValue([]) },
+    workflowEmailEvent: { upsert: vi.fn() },
     ticketWatcher: { upsert: vi.fn(), deleteMany: vi.fn() },
     ticketTag: { findUnique: vi.fn() },
     ticketRecipient: {
@@ -133,6 +135,11 @@ describe('TicketsService — client-session endpoints', () => {
   let service: TicketsService;
   let prisma: ReturnType<typeof makePrismaMock>;
   let attachments: { linkToPost: ReturnType<typeof vi.fn> };
+  let notifications: {
+    queueWatcherNotificationsForUserReply: ReturnType<typeof vi.fn>;
+    queueAssignmentNotification: ReturnType<typeof vi.fn>;
+    wakeCommittedNotifications: ReturnType<typeof vi.fn>;
+  };
 
   beforeEach(() => {
     prisma = makePrismaMock();
@@ -151,6 +158,11 @@ describe('TicketsService — client-session endpoints', () => {
         .fn()
         .mockImplementation((_s: unknown, rows: unknown) => Promise.resolve(rows)),
     } as unknown as AdminService;
+    notifications = {
+      queueWatcherNotificationsForUserReply: vi.fn().mockResolvedValue([]),
+      queueAssignmentNotification: vi.fn().mockResolvedValue(undefined),
+      wakeCommittedNotifications: vi.fn(),
+    };
     attachments = { linkToPost: vi.fn().mockResolvedValue(undefined) };
 
     service = new TicketsService(
@@ -160,6 +172,7 @@ describe('TicketsService — client-session endpoints', () => {
       eventEmitter,
       mail,
       admin,
+      notifications as never,
       attachments as unknown as AttachmentsService,
     );
   });
@@ -295,6 +308,47 @@ describe('TicketsService — client-session endpoints', () => {
       expect(prisma.ticket.update).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ totalReplies: { increment: 1 } }) }),
       );
+    });
+
+    it('queues watcher notifications in the portal-reply transaction and wakes them only after commit', async () => {
+      const ticket = makeTicket();
+      armReplyMocks(ticket);
+      const lifecycle: string[] = [];
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation(async (callback: unknown) => {
+        lifecycle.push('begin');
+        const result = await (callback as (tx: PrismaService) => unknown)(prisma);
+        lifecycle.push('commit');
+        return result;
+      });
+      notifications.queueWatcherNotificationsForUserReply.mockImplementation(async () => {
+        lifecycle.push('queue-watcher');
+        return ['watcher-outbox-1'];
+      });
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        lifecycle.push('audit');
+        return {};
+      });
+      notifications.wakeCommittedNotifications.mockImplementation(() => lifecycle.push('wake'));
+
+      await service.publicReply(1, { contents: 'Reply' }, OWNER);
+
+      expect(notifications.queueWatcherNotificationsForUserReply).toHaveBeenCalledWith(prisma, ticket, 10);
+      expect(notifications.wakeCommittedNotifications).toHaveBeenCalledWith(['watcher-outbox-1']);
+      expect(lifecycle).toEqual(['begin', 'queue-watcher', 'audit', 'commit', 'wake']);
+    });
+
+    it('does not wake or audit a portal reply when its transactional watcher command fails', async () => {
+      armReplyMocks(makeTicket());
+      notifications.queueWatcherNotificationsForUserReply.mockRejectedValueOnce(
+        new Error('required notification template is unavailable'),
+      );
+
+      await expect(service.publicReply(1, { contents: 'Reply' }, OWNER)).rejects.toThrow(
+        'required notification template is unavailable',
+      );
+
+      expect(notifications.wakeCommittedNotifications).not.toHaveBeenCalled();
+      expect(prisma.ticketAuditLog.create).not.toHaveBeenCalled();
     });
 
     it('claims client attachments in the same transaction as the reply post', async () => {

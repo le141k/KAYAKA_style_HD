@@ -149,6 +149,29 @@ enum OutboundEmailState {
   AMBIGUOUS
 }
 
+// The persisted command kind determines both its delivery semantics and the
+// safe projections we update after SMTP acceptance.  Automated customer mail
+// must not masquerade as a human first response.
+enum OutboundEmailKind {
+  STAFF_REPLY
+  AUTORESPONDER
+  AUTO_CLOSE
+  WORKFLOW
+  REPORT
+  // Staff-facing, machine-generated alerts (assignment, watcher reply, SLA).
+  // They remain durable commands rather than an inline SMTP side effect.
+  INTERNAL_NOTIFICATION
+}
+
+/** Durable, ticket-transactional trigger for customer-facing workflow email actions. */
+enum WorkflowEmailEventState {
+  PENDING
+  PROCESSING
+  PROCESSED
+  RETRY
+  QUARANTINED
+}
+
 // Kept separate from TicketRecipient's CC/BCC roles because every immutable
 // outbox snapshot also owns its visible To recipients.
 enum OutboundRecipientRole {
@@ -534,6 +557,8 @@ model Ticket {
   recipients      TicketRecipient[]
   timeEntries     TimeEntry[]
   followUps       FollowUp[]
+  workflowEmailEvents WorkflowEmailEvent[]
+  slaEscalationEvents SlaEscalationEvent[]
   inboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimTicket")
   outboundEmails  OutboundEmail[]
 
@@ -754,6 +779,25 @@ model EscalationRule {
   @@index([slaPlanId])
 }
 
+/**
+ * One durable, idempotent SLA breach event per ticket/target pair.  The event
+ * is claimed in the same transaction as the escalation mutation and any
+ * internal-notification outbox commands, so a second scheduler cannot repeat
+ * rule effects or silently lose the notification after a process crash.
+ */
+model SlaEscalationEvent {
+  id             String          @id @default(cuid())
+  ticket         Ticket          @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId       Int
+  breachType     SlaTargetType
+  sourceKey      String          @unique
+  outboundEmails OutboundEmail[]
+  createdAt      DateTime        @default(now())
+
+  @@unique([ticketId, breachType])
+  @@index([ticketId])
+}
+
 // ───────────────────────────── workflows / macros ─────────────────────────────
 
 model MacroCategory {
@@ -815,6 +859,10 @@ model EmailQueue {
   // Kayako `ticketautoresponder`: only send the autoresponder for EMAIL tickets
   // when the receiving queue opts in (noc@/rates@ are OFF in the source system).
   sendAutoresponder Boolean      @default(false)
+  // Optimistic configuration version. Every operator edit increments it, so a
+  // poller which fetched MIME under an older address/department/policy snapshot
+  // cannot accept that mail after the queue has been repointed.
+  configGeneration Int           @default(0)
   isEnabled      Boolean        @default(false)
   createdAt      DateTime       @default(now())
 
@@ -868,12 +916,25 @@ model EmailQueue {
  */
 model OutboundEmail {
   id            String             @id @default(cuid())
-  ticket        Ticket             @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-  ticketId      Int
-  post          TicketPost         @relation(fields: [postId], references: [id], onDelete: Cascade)
-  postId        Int                @unique
+  // Staff/ticket automation rows belong to a ticket; scheduled report commands do not.
+  ticket        Ticket?            @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId      Int?
+  // Automated ticket mail has no TicketPost, but is still a first-class durable
+  // command tied to the ticket and visible to operators.
+  post          TicketPost?        @relation(fields: [postId], references: [id], onDelete: Cascade)
+  postId        Int?               @unique
   emailQueue    EmailQueue?        @relation(fields: [emailQueueId], references: [id], onDelete: SetNull)
   emailQueueId  Int?
+  reportRun     ReportRun?         @relation("ReportRunOutboundEmail", fields: [reportRunId], references: [id], onDelete: Cascade)
+  reportRunId   Int?               @unique
+  // SLA notifications are linked to their durable breach event.  This is a
+  // many-command relation because one rule/event may notify several staff.
+  slaEscalationEvent SlaEscalationEvent? @relation(fields: [slaEscalationEventId], references: [id], onDelete: Cascade)
+  slaEscalationEventId String?
+  // Command-level idempotency fence for non-post commands (workflow/report). PostgreSQL
+  // permits many NULL values, so existing ticket-mail behavior is unchanged.
+  idempotencyKey String?           @unique
+  kind          OutboundEmailKind  @default(STAFF_REPLY)
 
   state         OutboundEmailState @default(QUEUED)
   // Generated before the ticket transaction commits. It is reused by every
@@ -906,6 +967,7 @@ model OutboundEmail {
   updatedAt     DateTime           @updatedAt
 
   @@index([ticketId])
+  @@index([slaEscalationEventId])
   @@index([state, nextAttemptAt])
   @@index([leaseExpiresAt])
 }
@@ -991,6 +1053,12 @@ model InboundDelivery {
   // Department resolved AT acceptance (snapshot) — a later queue change must not
   // re-route an already-accepted message.
   departmentId  Int?
+  // Receiving queue policy as it was when the bytes became durable. NULL is a
+  // legacy/unknown delivery and fails closed for EMAIL autoresponses.
+  sendAutoresponder Boolean?
+  // Every enabled recipient queue/policy at acceptance. It is used only to resolve a
+  // ledger delivery's owner deterministically; drains never re-read mutable queues.
+  routingSnapshot Json?
   // Receiving queue/department above are transport snapshots. These fields hold the immutable
   // deterministic business owner selected for this delivery/claim before ticket creation.
   routedQueue   EmailQueue?      @relation("InboundDeliveryRoutedQueue", fields: [routedQueueId], references: [id], onDelete: SetNull)
@@ -1072,6 +1140,9 @@ model InboundMessageClaim {
   routedQueueId       Int?
   department          Department?     @relation("InboundMessageClaimDepartment", fields: [departmentId], references: [id], onDelete: SetNull)
   departmentId        Int?
+  // Frozen alongside the selected owning queue, so a winner retry cannot consult a queue that
+  // was edited after acceptance to decide whether to send a customer autoresponder.
+  sendAutoresponder   Boolean?
   ticket              Ticket?         @relation("InboundMessageClaimTicket", fields: [ticketId], references: [id], onDelete: SetNull)
   ticketId            Int?
   post                TicketPost?     @relation("InboundMessageClaimPost", fields: [postId], references: [id], onDelete: SetNull)
@@ -1290,6 +1361,9 @@ model Report {
   kind       ReportKind       @default(SUMMARY)
   // declarative definition: { source, filters, groupBy, aggregates, orderBy, limit }
   definition Json             @default("{}")
+  // Every semantic edit advances this fence. A scanner that compiled an older
+  // definition/title must not create a ReportRun or SMTP command after the edit.
+  configGeneration Int        @default(0)
   schedules  ReportSchedule[]
   runs       ReportRun[]
   createdAt  DateTime         @default(now())
@@ -1309,6 +1383,9 @@ model ReportSchedule {
   recipients  Json      @default("[]")
   isEnabled   Boolean   @default(true)
   format      String    @default("json")
+  // Changes to recipients, owner, cron, format or enabled state invalidate an
+  // in-flight schedule scan before it can persist a report/outbox command.
+  configGeneration Int @default(0)
   lastRunAt   DateTime?
   nextRunAt   DateTime?
 
@@ -1328,9 +1405,41 @@ model ReportRun {
   durationMs  Int      @default(0)
   error       String?
   resultKey   String?  // storage key for large results (future)
+  outboundEmail OutboundEmail? @relation("ReportRunOutboundEmail")
   createdAt   DateTime @default(now())
 
   @@index([reportId])
+}
+
+/**
+ * Immutable snapshot of customer `send_email` workflow actions selected in the same ticket
+ * transaction as the event that triggered them. Redis/EventEmitter can wake this work, but
+ * never owns its correctness: the processor recovers PENDING/RETRY rows from PostgreSQL.
+ */
+model WorkflowEmailEvent {
+  id             String                  @id @default(cuid())
+  ticket         Ticket                  @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticketId       Int
+  eventType      String
+  // Immutable business mutation identity (post/audit/split), not a generated process id.
+  // This is the event-level retry/replay fence; action-level keys derive from it.
+  sourceKey      String                  @unique
+  // Validated action snapshots: workflow identity/version, index, recipient, subject, body.
+  actions        Json
+  state          WorkflowEmailEventState @default(PENDING)
+  attempts       Int                     @default(0)
+  nextAttemptAt  DateTime?
+  leaseOwner     String?
+  leaseExpiresAt DateTime?
+  leaseVersion   Int                     @default(0)
+  lastError      String?
+  processedAt    DateTime?
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  @@index([ticketId])
+  @@index([state, nextAttemptAt])
+  @@index([leaseExpiresAt])
 }
 
 // ───────────────────────────── agent productivity (P3) ─────────────────────────────

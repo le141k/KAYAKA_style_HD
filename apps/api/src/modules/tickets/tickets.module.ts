@@ -25,6 +25,9 @@ import { TicketAccessModule } from './ticket-access.module';
   ],
   controllers: [TicketsController, ReferenceController, RecipientsController],
   providers: [TicketsService, ReferenceService, NotificationService],
-  exports: [TicketsService],
+  // Workflow rules consume the same transactional notification planner as
+  // manual ticket actions. Exporting the singleton prevents a second provider
+  // from silently diverging in configuration or outbox behavior.
+  exports: [TicketsService, NotificationService],
 })
 export class TicketsModule {}

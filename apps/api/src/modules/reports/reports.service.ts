@@ -63,6 +63,10 @@ export class ReportsService {
         ...(dto.title !== undefined ? { title: dto.title } : {}),
         ...(dto.kind !== undefined ? { kind: dto.kind } : {}),
         ...(definition !== undefined ? { definition } : {}),
+        // A scheduled scanner may have compiled the previous title/definition
+        // outside its short persistence transaction.  Advance a durable fence
+        // on every write so that stale snapshot cannot later queue an email.
+        configGeneration: { increment: 1 },
       },
     });
   }
@@ -124,6 +128,23 @@ export class ReportsService {
       where: {
         reportId,
         ...(actor.isAdmin ? {} : { staffId: actor.staffId }),
+      },
+      // A null relation means the report had no recipients.  For scheduled
+      // reports with recipients, this is the authoritative live delivery state;
+      // do not infer SMTP success from ReportRun.error alone.
+      include: {
+        outboundEmail: {
+          select: {
+            id: true,
+            kind: true,
+            state: true,
+            attempts: true,
+            nextAttemptAt: true,
+            lastError: true,
+            acceptedAt: true,
+            sentAt: true,
+          },
+        },
       },
       orderBy: { createdAt: 'desc' },
       take: 50,
@@ -245,6 +266,10 @@ export class ReportsService {
     // Recompute the next fire time when the cron expression changes.
     const data: Record<string, unknown> = { ...dto };
     if (dto.cron) data['nextRunAt'] = nextRunFromCron(dto.cron, new Date());
+    // This is a server-owned optimistic fence, not client input.  It covers
+    // recipients, enabled state, format and cron (including its next fire)
+    // before a scanner can commit a stale ReportRun/outbox transaction.
+    data['configGeneration'] = { increment: 1 };
     if (actor.isAdmin) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return (this.prisma.reportSchedule as any).update({ where: { id: scheduleId }, data });

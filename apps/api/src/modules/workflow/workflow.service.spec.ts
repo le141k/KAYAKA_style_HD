@@ -109,6 +109,20 @@ describe('WorkflowService', () => {
         }),
       );
     });
+
+    it('rejects a malformed customer send_email action before it can be persisted', async () => {
+      await expect(
+        service.createWorkflow({
+          title: 'Broken legacy-style mail rule',
+          criteria: [],
+          actions: [{ type: 'send_email', value: '   ' }],
+          isEnabled: true,
+          sortOrder: 0,
+        }),
+      ).rejects.toThrow('send_email requires a non-empty string value or note');
+
+      expect(prisma.workflow.create).not.toHaveBeenCalled();
+    });
   });
 
   describe('updateWorkflow', () => {

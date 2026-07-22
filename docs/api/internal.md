@@ -250,11 +250,11 @@ checkBreaches(): Promise<BreachEntry[]>
 // Finds open, unmerged tickets past dueAt (no firstResponseAt) or resolutionDueAt.
 
 runPeriodicCheck(): Promise<void>
-// Calls checkBreaches(), marks breaching tickets isEscalated=true (escalationLevel++).
-// Then calls executeEscalationRules() which fetches EscalationRule rows for the ticket's
-// slaPlanId where thresholdSeconds ≤ minutesOverdue and isEnabled=true, then executes each
-// action: notify (sends 'sla_breach_internal' mail template), change_priority, assign,
-// add_note, mark_escalated.
+// Calls checkBreaches(), then claims one SlaEscalationEvent under a SERIALIZABLE
+// transaction before updating escalation state and re-reading enabled rules. `notify`
+// creates a durable INTERNAL_NOTIFICATION command (not direct SMTP); stale/disabled
+// rules and out-of-scope recipients fail closed. Other actions are priority/assign/note/
+// mark_escalated and roll back together if the event cannot be materialized.
 
 resolvePlanForTicket(organizationId: number | null | undefined): Promise<number | null>
 // Returns the SLA plan ID to assign to a new ticket.
@@ -350,6 +350,12 @@ Durable, idempotent, fail-closed inbound pipeline backed by the **`InboundDelive
 Both transports (IMAP poll, `POST /api/inbound/pipe`) record every message in the ledger under a
 UNIQUE `transportKey` before it is processed.
 
+- **Cutover master gate:** `TELECOM_HD_INBOUND_DELIVERY_ENABLED` defaults to `false`. While it is
+  false, the API does not start the IMAP supervisor or ledger drain, `pollNow()` is a no-op, and
+  PIPE returns retryable 503 before its body parser. Existing `ACCEPTED`/`RETRY` ledger rows and
+  all operator health/reconcile/quarantine/replay endpoints remain available; an attended
+  configuration-only restart with the gate true is required before any ticket can be created.
+
 - **Public:** `ingestRawMessage(source, departmentId?, externalId?, queueId?)` — PIPE ingress:
   records a ledger delivery (idempotent by `externalId` or content hash) and processes it inline.
   An optional `queueId` (from the `x-inbound-queue-id` header) binds the delivery to an
@@ -378,7 +384,8 @@ UNIQUE `transportKey` before it is processed.
   queue to `BOOTSTRAPPING`, captures UIDVALIDITY plus exact `UIDNEXT - 1` under the mailbox lock,
   and writes the baseline in a second epoch/generation CAS before returning success. BACKFILL
   enumerates actual existing UIDs under that same lock; it never uses `boundary - N`.
-- **Drain phase:** a `setInterval` (30 s, plus one **startup drain** for crash recovery) processes
+- **Drain phase (only while the master gate is enabled):** a `setInterval` (30 s, plus one
+  **startup drain** for crash recovery) processes
   `ACCEPTED`/`RETRY` deliveries in id order; claims each with a **lease** (CAS: `ACCEPTED`, a
   `RETRY` whose `nextAttemptAt` is due, or a `PROCESSING` whose `leaseExpiresAt` passed →
   `PROCESSING` + a fresh per-claim `leaseOwner` token/`leaseExpiresAt`). The **claim CAS increments
@@ -579,12 +586,19 @@ workflows against the mutated ticket.
 @OnEvent('ticket.status_changed') → evaluate(ticketId, 'ticket.status_changed')
 ```
 
-`evaluate()` loads all enabled `Workflow` rows (ordered by `sortOrder`), runs `matchesCriteria()`
-against the ticket, and calls `applyActions()` for each matching workflow.
+`evaluate()` loads all enabled `Workflow` rows (ordered by `sortOrder`), runs the shared ordered
+rule-chain projection against the ticket, and calls `applyActions()` for each matching workflow.
+Scalar mutations made by an earlier matching rule are visible to later criteria. `send_email` is
+never sent by this listener: `TicketsService` stores an immutable `WorkflowEmailEvent` snapshot in
+the source ticket transaction, and `WorkflowEmailEventService` materializes idempotent durable
+outbox rows with a lease/retry/quarantine state machine. Workflow assignment writes its ticket
+update, audit and internal-notification command atomically.
 
 **Criteria operators:** `eq | neq | contains | gt | lt` on any scalar ticket field.
 
-**Action types:** `change_department | change_owner | change_status | change_priority | change_type | add_tag | add_note`
+**Action types:** `change_department | change_owner | change_status | change_priority | change_type | add_tag | add_note | send_email`.
+New `send_email` bodies are validated; malformed legacy data is preserved as operator-visible
+quarantine evidence rather than rolling back a customer mutation or sending partial rule output.
 
 ---
 
@@ -677,11 +691,11 @@ update(id: number, dto: Partial<NewsDto>): Promise<NewsItem>
 `BullModule.forRoot()` is registered in `AppModule` with the Redis connection from `REDIS_URL`.
 Each feature module that needs a queue calls `BullModule.registerQueue({ name })`.
 
-| Queue      | Job                       | Producer                 | Consumer             | Purpose                                                                                                             |
-| ---------- | ------------------------- | ------------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `sla`      | `scan` (repeatable, 60 s) | `SlaModule` on init      | `SlaProcessor`       | Periodic SLA breach scan → `SlaService.runPeriodicCheck()`                                                          |
-| `workflow` | `auto-close` (repeatable) | `WorkflowModule` on init | `AutoCloseProcessor` | Close idle pending tickets after `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); sends `autoresponder` mail template |
-| `mail`     | per-message send job      | `MailService`            | `MailProcessor`      | Async outbound mail delivery via nodemailer                                                                         |
+| Queue      | Job                       | Producer                 | Consumer             | Purpose                                                                                                                         |
+| ---------- | ------------------------- | ------------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `sla`      | `scan` (repeatable, 60 s) | `SlaModule` on init      | `SlaProcessor`       | Periodic SLA breach scan → `SlaService.runPeriodicCheck()`                                                                      |
+| `workflow` | `auto-close` (repeatable) | `WorkflowModule` on init | `AutoCloseProcessor` | Close idle pending tickets after `TELECOM_HD_AUTO_CLOSE_DAYS` days (default 7); queues one durable `ticket_auto_closed` command |
+| `mail`     | per-message send job      | `MailService`            | `MailProcessor`      | Durable outbox wake-up; PostgreSQL scan/recovery remains authoritative for SMTP delivery                                        |
 
 Inbound mail is NOT on a BullMQ queue — it runs on in-process `setInterval` timers:
 `InboundMailService` polls IMAP (60 s) and drains the ledger (30 s, + a startup drain for crash

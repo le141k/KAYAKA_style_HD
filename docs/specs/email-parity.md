@@ -28,11 +28,17 @@
 - `seed/reencrypt-email-queue-passwords.ts` is the idempotent deployment gate (CAS updates plus a final
   aggregate-only verification); it is run by `scripts/deploy-prod.sh` before new API startup.
 
-## D [P1] Staff notifications (no notify-on-assign; prod swnotificationrules has assignment rule)
+## D [P1] Staff notifications
 
-- notification.service.ts: notifyOnAssign(ticketId,staffId) emails assignee (template notify_staff_assigned); notifyWatchersOnUserReply(ticketId) emails enabled watchers (notify_staff_user_replied).
-- TicketsService.assign → notifyOnAssign; reply USER path → notifyWatchersOnUserReply.
-- seed 2 templates. workflow.executor: add `notify_staff` action (P2). NotificationRule model = P2 stub (TICKET_ASSIGNED/REPLIED/STATUS_CHANGED/CREATED).
+- Assignment, customer-reply watcher alerts and SLA alerts are immutable
+  `INTERNAL_NOTIFICATION` outbox commands, never direct `sendTemplate()` calls.
+- `TicketsService.assign` creates its assignment audit and command in one transaction;
+  a customer reply uses its `TicketPost` id as the watcher-command source. Workflow
+  assignment uses the same transactional helper. SLA uses a unique
+  `SlaEscalationEvent` under a serializable fence.
+- Five mandatory production templates (`autoresponder`, `ticket_auto_closed`,
+  `notify_staff_assigned`, `notify_staff_user_replied`, `sla_breach_internal`) are
+  seeded by migration and verified non-empty by `scripts/deploy-prod.sh`.
 
 ## Tests
 

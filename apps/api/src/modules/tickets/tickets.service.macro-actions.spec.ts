@@ -40,7 +40,7 @@ function makeService(prisma: PrismaService, access?: Record<string, unknown>): T
     { emit: vi.fn() } as unknown as EventEmitter2,
     {} as unknown as MailService,
     {} as unknown as AdminService,
-    undefined,
+    {} as never,
     undefined,
     access as never,
   );

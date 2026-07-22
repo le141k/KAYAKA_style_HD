@@ -6,7 +6,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { EmailQueueService } from './email-queue.service';
-import { ReconcileEmailQueueSchema, ReplayQuarantinedInboundSchema } from './dto';
+import { ReconcileEmailQueueSchema, ReplayQuarantinedInboundSchema, UpdateEmailQueueSchema } from './dto';
 import type { PrismaService } from '../../prisma/prisma.service';
 import { MailAccessPolicy } from './mail-access-policy.service';
 
@@ -24,6 +24,8 @@ function makeSafeQueue(overrides: Partial<SafeQueue> = {}): SafeQueue {
     useTls: true,
     departmentId: null,
     signature: '',
+    routingPriority: 100,
+    sendAutoresponder: false,
     isEnabled: false,
     createdAt: new Date('2024-01-01T00:00:00.000Z'),
     syncState: 'OK',
@@ -32,6 +34,7 @@ function makeSafeQueue(overrides: Partial<SafeQueue> = {}): SafeQueue {
     uidValidity: null,
     cursorGeneration: 0,
     mailboxEpoch: 1,
+    configGeneration: 0,
     reconcileCause: null,
     reconcileRequestedAt: null,
     bootstrapPolicy: null,
@@ -58,6 +61,8 @@ type SafeQueue = {
   useTls: boolean;
   departmentId: number | null;
   signature: string;
+  routingPriority: number;
+  sendAutoresponder: boolean;
   isEnabled: boolean;
   createdAt: Date;
   syncState: 'OK' | 'BOOTSTRAPPING' | 'NEEDS_RECONCILIATION';
@@ -66,6 +71,7 @@ type SafeQueue = {
   uidValidity: bigint | null;
   cursorGeneration: number;
   mailboxEpoch: number;
+  configGeneration: number;
   reconcileCause:
     | 'LEGACY_MIGRATION'
     | 'UIDVALIDITY_CHANGED'
@@ -323,11 +329,18 @@ describe('EmailQueueService', () => {
   // ── update ────────────────────────────────────────────────────────────────
 
   describe('update', () => {
+    it('rejects a queue mutation without the configuration version at the HTTP boundary', () => {
+      expect(UpdateEmailQueueSchema.safeParse({ isEnabled: true }).success).toBe(false);
+      expect(UpdateEmailQueueSchema.safeParse({ isEnabled: true, expectedConfigGeneration: 0 }).success).toBe(
+        true,
+      );
+    });
+
     it('maps password → passwordEnc when provided', async () => {
       const existing = makeSafeQueue({ id: 3 });
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(existing);
 
-      await service.update(3, { password: 'newPass' });
+      await service.update(3, { password: 'newPass', expectedConfigGeneration: 0 });
 
       const updateCall = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls[0] as [
         { where: Record<string, unknown>; data: Record<string, unknown> },
@@ -337,15 +350,16 @@ describe('EmailQueueService', () => {
       expect(typeof updateCall[0].data['passwordEnc']).toBe('string');
       expect(updateCall[0].data).not.toHaveProperty('password');
       expect(updateCall[0].where).toMatchObject({
-        AND: expect.arrayContaining([expect.objectContaining({ mailboxEpoch: 1, cursorGeneration: 0 })]),
+        AND: expect.arrayContaining([expect.objectContaining({ configGeneration: 0 })]),
       });
+      expect(updateCall[0].data).toMatchObject({ configGeneration: { increment: 1 } });
     });
 
     it('does not touch passwordEnc when password not in dto', async () => {
       const existing = makeSafeQueue({ id: 3 });
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(existing);
 
-      await service.update(3, { isEnabled: true });
+      await service.update(3, { isEnabled: true, expectedConfigGeneration: 0 });
 
       const updateCall = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls[0] as [
         { data: Record<string, unknown> },
@@ -354,10 +368,23 @@ describe('EmailQueueService', () => {
       expect(updateCall[0].data).not.toHaveProperty('password');
     });
 
+    it('refuses an edit while the queue owns a synchronous IMAP reconcile baseline', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSafeQueue({ id: 3, syncState: 'BOOTSTRAPPING' }),
+      );
+
+      await expect(
+        service.update(3, { isEnabled: true, expectedConfigGeneration: 0 }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+    });
+
     it('throws NotFoundException when queue does not exist', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
-      await expect(service.update(999, { isEnabled: true })).rejects.toBeInstanceOf(NotFoundException);
+      await expect(
+        service.update(999, { isEnabled: true, expectedConfigGeneration: 0 }),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
 
     it('identity guard: a host change on a bootstrapped IMAP queue resets the cursor + halts', async () => {
@@ -365,7 +392,7 @@ describe('EmailQueueService', () => {
         makeSafeQueue({ id: 3, type: 'IMAP', host: 'old.example.com', uidValidity: 42n }),
       );
 
-      await service.update(3, { host: 'new.example.com' });
+      await service.update(3, { host: 'new.example.com', expectedConfigGeneration: 0 });
 
       const call = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls[0] as [
         { data: Record<string, unknown> },
@@ -386,7 +413,7 @@ describe('EmailQueueService', () => {
         makeSafeQueue({ id: 3, type: 'IMAP', uidValidity: 42n }),
       );
 
-      await service.update(3, { password: 'rotated' });
+      await service.update(3, { password: 'rotated', expectedConfigGeneration: 0 });
 
       const call = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls[0] as [
         { data: Record<string, unknown> },
@@ -401,7 +428,7 @@ describe('EmailQueueService', () => {
         makeSafeQueue({ id: 3, type: 'IMAP', host: 'old.example.com', uidValidity: null }),
       );
 
-      await service.update(3, { host: 'new.example.com' });
+      await service.update(3, { host: 'new.example.com', expectedConfigGeneration: 0 });
 
       const call = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls[0] as [
         { data: Record<string, unknown> },
@@ -413,41 +440,19 @@ describe('EmailQueueService', () => {
       });
     });
 
-    it('identity CAS retry prevents a stale full-form update from reverting host without a new epoch', async () => {
+    it('rejects a stale full-form update instead of reverting a newer mailbox configuration', async () => {
       const old = makeSafeQueue({ id: 3, host: 'imap-a.example', mailboxEpoch: 1, cursorGeneration: 4 });
-      const concurrent = makeSafeQueue({
-        id: 3,
-        host: 'imap-b.example',
-        mailboxEpoch: 2,
-        cursorGeneration: 5,
-      });
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>)
-        .mockResolvedValueOnce(old)
-        .mockResolvedValueOnce(concurrent)
-        .mockResolvedValueOnce(concurrent);
-      (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>)
-        .mockResolvedValueOnce({ count: 0 }) // another operator committed A→B first
-        .mockResolvedValueOnce({ count: 1 });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValueOnce(old);
+      (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ count: 0 }); // another operator committed A→B first
 
-      await service.update(3, { host: 'imap-a.example' });
+      await expect(
+        service.update(3, { host: 'imap-a.example', expectedConfigGeneration: 0 }),
+      ).rejects.toBeInstanceOf(ConflictException);
 
       const calls = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls;
+      expect(calls).toHaveLength(1);
       expect(calls[0]?.[0]).toMatchObject({
-        where: {
-          AND: expect.arrayContaining([expect.objectContaining({ host: 'imap-a.example', mailboxEpoch: 1 })]),
-        },
-      });
-      expect(calls[1]?.[0]).toMatchObject({
-        where: {
-          AND: expect.arrayContaining([
-            expect.objectContaining({ host: 'imap-b.example', mailboxEpoch: 2, cursorGeneration: 5 }),
-          ]),
-        },
-        data: expect.objectContaining({
-          host: 'imap-a.example',
-          mailboxEpoch: { increment: 1 },
-          cursorGeneration: { increment: 1 },
-        }),
+        where: { AND: expect.arrayContaining([expect.objectContaining({ configGeneration: 0 })]) },
       });
     });
 
@@ -464,6 +469,7 @@ describe('EmailQueueService', () => {
         type: 'PIPE',
         mailboxEpoch: 2,
         cursorGeneration: 3,
+        configGeneration: 1,
         uidValidity: null,
       });
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>)
@@ -471,8 +477,8 @@ describe('EmailQueueService', () => {
         .mockResolvedValueOnce(pipe)
         .mockResolvedValueOnce(pipe)
         .mockResolvedValueOnce(imap);
-      await service.update(3, { type: 'PIPE' });
-      await service.update(3, { type: 'IMAP' });
+      await service.update(3, { type: 'PIPE', expectedConfigGeneration: 0 });
+      await service.update(3, { type: 'IMAP', expectedConfigGeneration: 1 });
       const calls = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls;
       expect(calls).toHaveLength(2);
       for (const [call] of calls) {
@@ -494,15 +500,44 @@ describe('EmailQueueService', () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeSafeQueue());
       (prisma.emailQueue.delete as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 
-      await expect(service.delete(1)).resolves.toBeUndefined();
-      expect(prisma.emailQueue.delete).toHaveBeenCalledWith({ where: { id: 1 } });
+      await expect(service.delete(1, { expectedConfigGeneration: 0 })).resolves.toBeUndefined();
+      expect(prisma.emailQueue.delete).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            AND: expect.arrayContaining([
+              expect.objectContaining({ configGeneration: 0 }),
+              expect.objectContaining({ syncState: { not: 'BOOTSTRAPPING' } }),
+            ]),
+          },
+        }),
+      );
     });
 
     it('throws NotFoundException when queue does not exist', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
-      await expect(service.delete(404)).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.delete(404, { expectedConfigGeneration: 0 })).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
       expect(prisma.emailQueue.delete).not.toHaveBeenCalled();
+    });
+
+    it('rejects a stale delete and never lets the UI be the only BOOTSTRAPPING guard', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSafeQueue({ configGeneration: 3, syncState: 'BOOTSTRAPPING' }),
+      );
+      await expect(service.delete(1, { expectedConfigGeneration: 3 })).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      expect(prisma.emailQueue.deleteMany).not.toHaveBeenCalled();
+
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSafeQueue({ configGeneration: 3 }),
+      );
+      await expect(service.delete(1, { expectedConfigGeneration: 2 })).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      expect(prisma.emailQueue.deleteMany).not.toHaveBeenCalled();
     });
   });
 
@@ -909,6 +944,30 @@ describe('EmailQueueService', () => {
       expect(kinds).toEqual(
         expect.arrayContaining(['imap_disabled', 'never_connected', 'connection_error', 'poll_running']),
       );
+    });
+
+    it('keeps the operator health/recovery surface available while the shared delivery gate is closed', async () => {
+      const ops = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        undefined,
+        {
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_IMAP_ENABLED: false,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const out = await ops.health(new Date('2026-07-22T12:00:00.000Z'));
+
+      expect(out.alerts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: 'inbound_delivery_disabled', severity: 'critical' }),
+        ]),
+      );
+      expect(out.ledger.byState).toEqual(expect.objectContaining({ accepted: 0, retry: 0 }));
     });
 
     it('alerts when a reconcile request remains BOOTSTRAPPING even before a poll timestamp exists', async () => {

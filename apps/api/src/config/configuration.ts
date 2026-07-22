@@ -95,6 +95,19 @@ const schema = z.object({
       z.boolean(),
     )
     .default(false),
+  // Master inbound-delivery gate. Unlike TELECOM_HD_IMAP_ENABLED this closes BOTH
+  // delivery transports: background IMAP connection/poll/accept is stopped, PIPE is
+  // rejected before its body parser, and already-accepted ledger rows are left untouched
+  // for a later, explicitly enabled drain. An operator may still take an explicit IMAP
+  // reconcile baseline while closed; that read-only mailbox step never accepts or routes
+  // a message and prepares a canary safely. Keep the gate false for every code/migration
+  // deploy; turn it on only for an attended inbound canary after the cutover runbook gates.
+  TELECOM_HD_INBOUND_DELIVERY_ENABLED: z
+    .preprocess(
+      (v) => (typeof v === 'string' ? ['true', '1', 'yes'].includes(v.toLowerCase()) : Boolean(v)),
+      z.boolean(),
+    )
+    .default(false),
   // IMAP first-connect baseline policy. FROM_NOW (default) records the current
   // high-water UID and imports nothing; BACKFILL additionally ingests up to
   // TELECOM_HD_IMAP_BACKFILL_LIMIT most-recent existing messages. Chosen explicitly

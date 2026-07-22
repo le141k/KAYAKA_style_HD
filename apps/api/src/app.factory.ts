@@ -16,7 +16,12 @@ import { inboundSecretMatches } from './common/inbound-secret.util';
  */
 export function configureInboundPipeMiddleware(
   app: Pick<express.Application, 'use'>,
-  config: Pick<AppConfig, 'TELECOM_HD_INBOUND_WEBHOOK_SECRET' | 'TELECOM_HD_INBOUND_MAX_SIZE_MB'>,
+  config: Pick<
+    AppConfig,
+    | 'TELECOM_HD_INBOUND_WEBHOOK_SECRET'
+    | 'TELECOM_HD_INBOUND_MAX_SIZE_MB'
+    | 'TELECOM_HD_INBOUND_DELIVERY_ENABLED'
+  >,
 ): void {
   const inboundLimit = `${config.TELECOM_HD_INBOUND_MAX_SIZE_MB}mb`;
   app.use('/api/inbound/pipe', (req: Request, res: Response, next: NextFunction) => {
@@ -24,6 +29,13 @@ export function configureInboundPipeMiddleware(
     const provided = Array.isArray(headerVal) ? headerVal[0] : headerVal;
     if (!inboundSecretMatches(provided, config.TELECOM_HD_INBOUND_WEBHOOK_SECRET)) {
       res.status(403).json({ statusCode: 403, message: 'Invalid inbound webhook secret' });
+      return;
+    }
+    // This is deliberately before the route-specific raw/JSON body parsers. During a
+    // code/migration cutover an authenticated MTA must receive a retryable failure,
+    // while the API must neither allocate/parse the MIME nor create an InboundDelivery.
+    if (!config.TELECOM_HD_INBOUND_DELIVERY_ENABLED) {
+      res.status(503).json({ statusCode: 503, message: 'Inbound delivery is temporarily disabled' });
       return;
     }
     next();

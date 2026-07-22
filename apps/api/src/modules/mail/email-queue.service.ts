@@ -17,6 +17,7 @@ import { encryptField } from '../../common/field-encrypt.util';
 import { APP_CONFIG, type AppConfig } from '../../config/configuration';
 import type {
   CreateEmailQueueDto,
+  DeleteEmailQueueDto,
   ListQuarantinedInboundDto,
   ReconcileEmailQueueDto,
   ReplayQuarantinedInboundDto,
@@ -50,6 +51,8 @@ const SAFE_SELECT = {
   departmentId: true,
   signature: true,
   routingPriority: true,
+  sendAutoresponder: true,
+  configGeneration: true,
   isEnabled: true,
   createdAt: true,
   // Inbound sync health (operator visibility).
@@ -112,7 +115,10 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     @Optional() private readonly inboundMail?: InboundMailService,
     @Optional()
     @Inject(APP_CONFIG)
-    private readonly config?: Pick<AppConfig, 'TELECOM_HD_IMAP_ENABLED' | 'TELECOM_HD_INBOUND_MAX_SIZE_MB'>,
+    private readonly config?: Pick<
+      AppConfig,
+      'TELECOM_HD_IMAP_ENABLED' | 'TELECOM_HD_INBOUND_DELIVERY_ENABLED' | 'TELECOM_HD_INBOUND_MAX_SIZE_MB'
+    >,
     @Optional() private readonly rawStorage?: InboundRawStorageService,
     @Optional() private readonly mailAccess?: MailAccessPolicy,
   ) {}
@@ -243,95 +249,117 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     const scope = await this.resolveMailScope(actor);
     const scopedWhere = access.queueByIdWhereForScope(id, scope);
     if (dto.departmentId !== undefined) access.assertCanTargetQueueDepartment(scope, dto.departmentId);
-    // The comparison and write intentionally use a CAS loop.  A stale full-form request
-    // which still says host=A must not overwrite a concurrent A→B change without an epoch
-    // bump; after a CAS miss it re-reads B, recognises B→A as an identity transition and
-    // consumes another mailbox epoch.  This is the fence for two operators editing a queue.
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const current = await this.prisma.emailQueue.findFirst({
-        where: scopedWhere,
-        select: {
-          type: true,
-          host: true,
-          port: true,
-          username: true,
-          useTls: true,
-          mailboxEpoch: true,
-          cursorGeneration: true,
-        },
-      });
-      if (!current) throw new NotFoundException(`EmailQueue #${id} not found`);
-
-      const { password, ...rest } = dto;
-      const data: Record<string, unknown> = { ...rest };
-      if (password !== undefined) {
-        const encKey = process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
-        data.passwordEnc = encryptField(password, encKey);
-      }
-
-      const nextType = rest.type ?? current.type;
-      const touchesImap = current.type === 'IMAP' || nextType === 'IMAP';
-      const identityChanged =
-        touchesImap &&
-        (nextType !== current.type ||
-          (rest.host !== undefined && rest.host !== current.host) ||
-          (rest.port !== undefined && rest.port !== current.port) ||
-          (rest.username !== undefined && rest.username !== current.username) ||
-          (rest.useTls !== undefined && rest.useTls !== current.useTls));
-
-      if (identityChanged) {
-        data.uidValidity = null;
-        data.lastSeenUid = BigInt(0);
-        data.syncState = 'NEEDS_RECONCILIATION';
-        data.reconcileCause = 'MAILBOX_IDENTITY_CHANGED';
-        data.reconcileRequestedAt = null;
-        data.lastError =
-          'Mailbox identity changed (host/username/port/TLS/type) — cursor reset; run FROM_NOW or bounded BACKFILL';
-        data.cursorGeneration = { increment: 1 };
-        data.mailboxEpoch = { increment: 1 };
-        data.bootstrapPolicy = null;
-        data.bootstrapBackfillLimit = null;
-      }
-
-      const updated = await this.prisma.emailQueue.updateMany({
-        where: {
-          AND: [
-            scopedWhere,
-            {
-              type: current.type,
-              host: current.host,
-              port: current.port,
-              username: current.username,
-              useTls: current.useTls,
-              mailboxEpoch: current.mailboxEpoch,
-              cursorGeneration: current.cursorGeneration,
-            },
-          ],
-        },
-        data,
-      });
-      if (updated.count !== 1) continue;
-
-      const result = await this.prisma.emailQueue.findFirst({ where: scopedWhere, select: SAFE_SELECT });
-      if (!result) throw new NotFoundException(`EmailQueue #${id} not found`);
-      if (identityChanged) {
-        this.logger.warn(
-          `EmailQueue ${id}: mailbox identity changed — epoch ${current.mailboxEpoch} → ${current.mailboxEpoch + 1}; reconciliation required`,
-        );
-      }
-      return this.withAllowedModes(result);
+    const current = await this.prisma.emailQueue.findFirst({
+      where: scopedWhere,
+      select: {
+        type: true,
+        host: true,
+        port: true,
+        username: true,
+        useTls: true,
+        mailboxEpoch: true,
+        cursorGeneration: true,
+        configGeneration: true,
+        syncState: true,
+      },
+    });
+    if (!current) throw new NotFoundException(`EmailQueue #${id} not found`);
+    if (current.syncState === 'BOOTSTRAPPING') {
+      throw new ConflictException('Queue is reconciling; reload after the IMAP baseline completes');
     }
-    throw new ConflictException(`EmailQueue #${id} changed concurrently; reload and retry`);
+    if (dto.expectedConfigGeneration !== current.configGeneration) {
+      throw new ConflictException(
+        `Queue configuration changed (expected ${dto.expectedConfigGeneration}, current ${current.configGeneration}); reload and retry`,
+      );
+    }
+
+    // A queue form carries every editable field. It must be a single optimistic
+    // write: re-reading and retrying after a CAS miss would let a stale form put
+    // back a previous mailbox identity/address/department.
+    const { password, expectedConfigGeneration: _expectedConfigGeneration, ...rest } = dto;
+    void _expectedConfigGeneration;
+    const data: Record<string, unknown> = { ...rest, configGeneration: { increment: 1 } };
+    if (password !== undefined) {
+      const encKey = process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
+      data.passwordEnc = encryptField(password, encKey);
+    }
+
+    const nextType = rest.type ?? current.type;
+    const touchesImap = current.type === 'IMAP' || nextType === 'IMAP';
+    const identityChanged =
+      touchesImap &&
+      (nextType !== current.type ||
+        (rest.host !== undefined && rest.host !== current.host) ||
+        (rest.port !== undefined && rest.port !== current.port) ||
+        (rest.username !== undefined && rest.username !== current.username) ||
+        (rest.useTls !== undefined && rest.useTls !== current.useTls));
+
+    if (identityChanged) {
+      data.uidValidity = null;
+      data.lastSeenUid = BigInt(0);
+      data.syncState = 'NEEDS_RECONCILIATION';
+      data.reconcileCause = 'MAILBOX_IDENTITY_CHANGED';
+      data.reconcileRequestedAt = null;
+      data.lastError =
+        'Mailbox identity changed (host/username/port/TLS/type) — cursor reset; run FROM_NOW or bounded BACKFILL';
+      data.cursorGeneration = { increment: 1 };
+      data.mailboxEpoch = { increment: 1 };
+      data.bootstrapPolicy = null;
+      data.bootstrapBackfillLimit = null;
+    }
+
+    const updated = await this.prisma.emailQueue.updateMany({
+      where: { AND: [scopedWhere, { configGeneration: current.configGeneration }] },
+      data,
+    });
+    if (updated.count !== 1) {
+      throw new ConflictException('Queue changed concurrently; reload and retry');
+    }
+
+    const result = await this.prisma.emailQueue.findFirst({ where: scopedWhere, select: SAFE_SELECT });
+    if (!result) throw new NotFoundException(`EmailQueue #${id} not found`);
+    if (identityChanged) {
+      this.logger.warn(
+        `EmailQueue ${id}: mailbox identity changed — epoch ${current.mailboxEpoch} → ${current.mailboxEpoch + 1}; reconciliation required`,
+      );
+    }
+    return this.withAllowedModes(result);
   }
 
-  /** Delete an email queue. */
-  async delete(id: number, actor?: InboundActor): Promise<void> {
+  /**
+   * Delete an email queue only from the version the operator inspected. BOOTSTRAPPING holds an
+   * IMAP mailbox lock and a two-phase baseline, so deleting it mid-cutover is always rejected
+   * server-side (the admin UI is only a convenience, never the safety boundary).
+   */
+  async delete(id: number, dto: DeleteEmailQueueDto, actor?: InboundActor): Promise<void> {
     const access = this.accessPolicy();
     const scope = await this.resolveMailScope(actor);
-    const deleted = await this.prisma.emailQueue.deleteMany({
-      where: access.queueByIdWhereForScope(id, scope),
+    const scopedWhere = access.queueByIdWhereForScope(id, scope);
+    const current = await this.prisma.emailQueue.findFirst({
+      where: scopedWhere,
+      select: { configGeneration: true, syncState: true },
     });
-    if (deleted.count !== 1) throw new NotFoundException(`EmailQueue #${id} not found`);
+    if (!current) throw new NotFoundException(`EmailQueue #${id} not found`);
+    if (current.syncState === 'BOOTSTRAPPING') {
+      throw new ConflictException(
+        'Queue is reconciling; it cannot be deleted until the IMAP baseline completes',
+      );
+    }
+    if (dto.expectedConfigGeneration !== current.configGeneration) {
+      throw new ConflictException(
+        `Queue configuration changed (expected ${dto.expectedConfigGeneration}, current ${current.configGeneration}); reload and retry`,
+      );
+    }
+    const deleted = await this.prisma.emailQueue.deleteMany({
+      where: {
+        AND: [
+          scopedWhere,
+          { configGeneration: current.configGeneration },
+          { syncState: { not: 'BOOTSTRAPPING' } },
+        ],
+      },
+    });
+    if (deleted.count !== 1) throw new ConflictException('Queue changed concurrently; reload and retry');
   }
 
   /**
@@ -357,6 +385,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         reconcileCause: true,
         cursorGeneration: true,
         mailboxEpoch: true,
+        configGeneration: true,
       },
     });
     if (!before) throw new NotFoundException(`EmailQueue #${id} not found`);
@@ -460,6 +489,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       reconcileCause: ReconcileCause;
       cursorGeneration: number;
       mailboxEpoch: number;
+      configGeneration: number;
     },
     dto: ReconcileEmailQueueDto,
     actor: InboundActor,
@@ -475,6 +505,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           reconcileCause: before.reconcileCause,
           cursorGeneration: before.cursorGeneration,
           mailboxEpoch: before.mailboxEpoch,
+          configGeneration: before.configGeneration,
         }),
         data: {
           syncState: 'BOOTSTRAPPING',
@@ -510,6 +541,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           useTls: true,
           mailboxEpoch: true,
           cursorGeneration: true,
+          configGeneration: true,
         },
       });
       if (!started) throw new ConflictException('Queue disappeared while reconcile was requested');
@@ -522,6 +554,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       id: number;
       mailboxEpoch: number;
       cursorGeneration: number;
+      configGeneration: number;
     },
     cause: ReconcileCause,
     dto: ReconcileEmailQueueDto,
@@ -538,6 +571,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           reconcileCause: cause,
           cursorGeneration: started.cursorGeneration,
           mailboxEpoch: started.mailboxEpoch,
+          configGeneration: started.configGeneration,
         }),
         data: {
           uidValidity: baseline.uidValidity,
@@ -578,7 +612,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async failMailboxReconcile(
-    started: { id: number; mailboxEpoch: number; cursorGeneration: number },
+    started: { id: number; mailboxEpoch: number; cursorGeneration: number; configGeneration: number },
     cause: ReconcileCause,
     dto: ReconcileEmailQueueDto,
     actor: InboundActor,
@@ -594,6 +628,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           reconcileCause: cause,
           cursorGeneration: started.cursorGeneration,
           mailboxEpoch: started.mailboxEpoch,
+          configGeneration: started.configGeneration,
         }),
         data: {
           syncState: 'NEEDS_RECONCILIATION',
@@ -632,6 +667,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       reconcileCause: ReconcileCause;
       cursorGeneration: number;
       mailboxEpoch: number;
+      configGeneration: number;
     },
     dto: ReconcileEmailQueueDto,
     actor: InboundActor,
@@ -664,6 +700,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           reconcileCause: 'LEGACY_MIGRATION',
           cursorGeneration: before.cursorGeneration,
           mailboxEpoch: before.mailboxEpoch,
+          configGeneration: before.configGeneration,
         }),
         data: {
           uidValidity: legacyUidValidity,
@@ -1113,6 +1150,14 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     const enabledQueues = queues.filter((q) => q.isEnabled);
     const halted = enabledQueues.filter((q) => q.syncState === 'NEEDS_RECONCILIATION').map((q) => q.id);
     const alerts: Array<{ severity: 'warning' | 'critical'; kind: string; message: string }> = [];
+    if (this.config?.TELECOM_HD_INBOUND_DELIVERY_ENABLED === false) {
+      alerts.push({
+        severity: 'critical',
+        kind: 'inbound_delivery_disabled',
+        message:
+          'Inbound delivery is disabled globally; IMAP and PIPE acceptance/drain are paused until an attended restart enables it.',
+      });
+    }
     if (enabledQueues.length > 0 && this.config?.TELECOM_HD_IMAP_ENABLED === false) {
       alerts.push({
         severity: 'critical',

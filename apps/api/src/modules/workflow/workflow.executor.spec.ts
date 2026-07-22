@@ -4,7 +4,7 @@ import type { PrismaService } from '../../prisma/prisma.service';
 import type { Ticket, Workflow } from '@prisma/client';
 
 function makePrismaMock() {
-  return {
+  const prisma = {
     ticket: {
       findUnique: vi.fn(),
       update: vi.fn(),
@@ -21,7 +21,19 @@ function makePrismaMock() {
     ticketAuditLog: {
       create: vi.fn().mockResolvedValue({}),
     },
-  } as unknown as PrismaService;
+    $transaction: vi.fn(),
+  };
+  prisma.$transaction.mockImplementation(async (callback: (tx: typeof prisma) => unknown) =>
+    callback(prisma),
+  );
+  return prisma as unknown as PrismaService;
+}
+
+function makeNotificationsMock() {
+  return {
+    queueAssignmentNotification: vi.fn().mockResolvedValue(undefined),
+    wakeCommittedNotifications: vi.fn(),
+  };
 }
 
 function makeTicket(overrides: Partial<Ticket> = {}): Ticket {
@@ -84,10 +96,12 @@ function makeWorkflow(overrides: Partial<Workflow> = {}): Workflow {
 describe('WorkflowExecutor', () => {
   let executor: WorkflowExecutor;
   let prisma: ReturnType<typeof makePrismaMock>;
+  let notifications: ReturnType<typeof makeNotificationsMock>;
 
   beforeEach(() => {
     prisma = makePrismaMock();
-    executor = new WorkflowExecutor(prisma as unknown as PrismaService);
+    notifications = makeNotificationsMock();
+    executor = new WorkflowExecutor(prisma as unknown as PrismaService, notifications as never);
   });
 
   // ─── matchesCriteria (via evaluate -> exposed indirectly through onTicketCreated) ─
@@ -218,11 +232,66 @@ describe('WorkflowExecutor', () => {
 
       expect(prisma.ticket.update).not.toHaveBeenCalled();
     });
+
+    it('applies later rules against the scalar state committed by earlier rules', async () => {
+      const initial = makeTicket({ statusId: 1, priorityId: 2 });
+      const afterStatus = makeTicket({ statusId: 2, priorityId: 2 });
+      const afterPriority = makeTicket({ statusId: 2, priorityId: 9 });
+      const statusRule = makeWorkflow({
+        id: 1,
+        sortOrder: 0,
+        criteria: [{ field: 'statusId', op: 'eq', value: 1 }] as any,
+        actions: [{ type: 'set_status', value: '2' }] as any,
+      });
+      const priorityRule = makeWorkflow({
+        id: 2,
+        sortOrder: 1,
+        criteria: [{ field: 'statusId', op: 'eq', value: 2 }] as any,
+        actions: [{ type: 'set_priority', value: '9' }] as any,
+      });
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(initial)
+        .mockResolvedValueOnce(afterStatus)
+        .mockResolvedValueOnce(afterPriority);
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([statusRule, priorityRule]);
+      (prisma.ticket.update as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(afterStatus)
+        .mockResolvedValueOnce(afterPriority);
+
+      await executor.onTicketCreated({ ticketId: initial.id });
+
+      expect(prisma.ticket.update).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ data: expect.objectContaining({ statusId: 2 }) }),
+      );
+      expect(prisma.ticket.update).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ data: expect.objectContaining({ priorityId: 9 }) }),
+      );
+    });
   });
 
   // ─── applyActions ────────────────────────────────────────────────────────────
 
   describe('applyActions', () => {
+    it('never sends customer email from the in-memory EventEmitter path', async () => {
+      const ticket = makeTicket();
+      const workflow = makeWorkflow({
+        actions: [{ type: 'send_email', value: 'Your case has been updated.' }] as any,
+      });
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([workflow]);
+
+      await executor.onTicketCreated({ ticketId: ticket.id });
+
+      // WorkflowEmailEvent is inserted with the ticket mutation, before this
+      // listener runs.  Calling the listener twice must not create mail or audit
+      // rows itself; its only job for send_email is to leave the durable worker
+      // alone.
+      await executor.onTicketCreated({ ticketId: ticket.id });
+      expect(prisma.ticketAuditLog.create).not.toHaveBeenCalled();
+    });
+
     it('applies change_owner action (setting ownerStaffId)', async () => {
       const ticket = makeTicket();
       const workflow = makeWorkflow({
@@ -360,10 +429,12 @@ describe('WorkflowExecutor', () => {
       });
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
       (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([workflow]);
-      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
+      // Prisma returns the post-update row. The assignment command must receive
+      // that snapshot, not the ticket loaded before the owner mutation.
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue({ ...ticket, ownerStaffId: 7 });
       (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 7 });
-      const notifications = { notifyOnAssign: vi.fn().mockResolvedValue(undefined) };
-      executor = new WorkflowExecutor(prisma as unknown as PrismaService, undefined, notifications as never);
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 71 });
+      notifications.queueAssignmentNotification.mockResolvedValue('assignment-outbox-7');
 
       await executor.onTicketCreated({ ticketId: 1 });
 
@@ -371,9 +442,91 @@ describe('WorkflowExecutor', () => {
         expect.objectContaining({ data: expect.objectContaining({ ownerStaffId: 7 }) }),
       );
       expect(prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(
-        expect.objectContaining({ data: expect.objectContaining({ action: 'ASSIGN', newValue: '7' }) }),
+        expect.objectContaining({
+          data: expect.objectContaining({ action: 'ASSIGN', newValue: '7' }),
+          select: { id: true },
+        }),
       );
-      expect(notifications.notifyOnAssign).toHaveBeenCalledWith(1, 7);
+      expect(notifications.queueAssignmentNotification).toHaveBeenCalledWith(
+        prisma,
+        expect.objectContaining({ id: 1, ownerStaffId: 7 }),
+        7,
+        'audit:71',
+      );
+      expect(notifications.wakeCommittedNotifications).toHaveBeenCalledWith(['assignment-outbox-7']);
+    });
+
+    it('keeps owner update, audit and assignment outbox inside one transaction and wakes only after commit', async () => {
+      const initial = makeTicket({ ownerStaffId: null, departmentId: 1 });
+      const updated = makeTicket({ ownerStaffId: 7, departmentId: 1 });
+      const tx = {
+        ticket: { update: vi.fn().mockResolvedValue(updated) },
+        ticketAuditLog: { create: vi.fn().mockResolvedValue({ id: 88 }) },
+      };
+      let commit!: () => void;
+      const commitGate = new Promise<void>((resolve) => {
+        commit = resolve;
+      });
+      let transactionWorkFinished!: () => void;
+      const transactionWorkFinishedGate = new Promise<void>((resolve) => {
+        transactionWorkFinished = resolve;
+      });
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(initial)
+        .mockResolvedValueOnce(updated);
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeWorkflow({ actions: [{ type: 'assign', value: '7' }] as any }),
+      ]);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 7 });
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation(
+        async (callback: (client: typeof tx) => unknown) => {
+          const result = await callback(tx);
+          transactionWorkFinished();
+          await commitGate;
+          return result;
+        },
+      );
+      notifications.queueAssignmentNotification.mockResolvedValue('assignment-command-88');
+
+      const evaluation = executor.onTicketCreated({ ticketId: initial.id });
+      // Wait for the transaction callback itself rather than assuming how many
+      // async boundaries workflow matching reaches before the assign action.
+      await transactionWorkFinishedGate;
+
+      expect(tx.ticket.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ ownerStaffId: 7 }) }),
+      );
+      expect(tx.ticketAuditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ action: 'ASSIGN' }) }),
+      );
+      expect(notifications.queueAssignmentNotification).toHaveBeenCalledWith(tx, updated, 7, 'audit:88');
+      expect(notifications.wakeCommittedNotifications).not.toHaveBeenCalled();
+
+      commit();
+      await evaluation;
+
+      expect(notifications.wakeCommittedNotifications).toHaveBeenCalledWith(['assignment-command-88']);
+      expect(prisma.ticket.update as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+      expect(prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+    });
+
+    it('does not swallow a durable assignment-notification failure or wake an uncommitted command', async () => {
+      const initial = makeTicket({ ownerStaffId: null });
+      const updated = makeTicket({ ownerStaffId: 7 });
+      (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(initial);
+      (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeWorkflow({ actions: [{ type: 'assign', value: '7' }] as any }),
+      ]);
+      (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 7 });
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(updated);
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 89 });
+      notifications.queueAssignmentNotification.mockRejectedValue(new Error('outbox template unavailable'));
+
+      await expect(executor.onTicketCreated({ ticketId: initial.id })).rejects.toThrow(
+        'outbox template unavailable',
+      );
+
+      expect(notifications.wakeCommittedNotifications).not.toHaveBeenCalled();
     });
 
     it('skips assign to a nonexistent staff (no owner update, no notify)', async () => {
@@ -385,14 +538,12 @@ describe('WorkflowExecutor', () => {
       (prisma.ticket.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(ticket);
       (prisma.workflow.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([workflow]);
       (prisma.staff.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      const notifications = { notifyOnAssign: vi.fn() };
-      executor = new WorkflowExecutor(prisma as unknown as PrismaService, undefined, notifications as never);
 
       await executor.onTicketCreated({ ticketId: 1 });
 
       // ownerStaffId never set → no ticket.update, no notification.
       expect(prisma.ticket.update as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
-      expect(notifications.notifyOnAssign).not.toHaveBeenCalled();
+      expect(notifications.queueAssignmentNotification).not.toHaveBeenCalled();
     });
   });
 

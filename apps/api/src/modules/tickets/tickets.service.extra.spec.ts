@@ -103,6 +103,12 @@ function makePrismaMock() {
     ticketAuditLog: {
       create: vi.fn(),
     },
+    workflow: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    workflowEmailEvent: {
+      upsert: vi.fn(),
+    },
     ticketWatcher: {
       upsert: vi.fn(),
       deleteMany: vi.fn(),
@@ -166,6 +172,11 @@ describe('TicketsService (extra coverage)', () => {
         .fn()
         .mockImplementation((_s: unknown, rows: unknown) => Promise.resolve(rows)),
     } as unknown as AdminService;
+    const notificationMock = {
+      queueWatcherNotificationsForUserReply: vi.fn().mockResolvedValue([]),
+      queueAssignmentNotification: vi.fn().mockResolvedValue(undefined),
+      wakeCommittedNotifications: vi.fn(),
+    };
     service = new TicketsService(
       prisma as unknown as PrismaService,
       users,
@@ -173,6 +184,7 @@ describe('TicketsService (extra coverage)', () => {
       eventEmitterMock,
       mailMock,
       adminMock,
+      notificationMock as never,
     );
   });
 
@@ -986,6 +998,14 @@ describe('TicketsService (extra coverage)', () => {
 
   describe('bulkAction', () => {
     const fm = () => prisma.ticket.findMany as ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      // bulkAction now uses the returned update row as the immutable snapshot
+      // for its in-transaction notification/workflow planners, and its audit id
+      // as the durable source key. Real Prisma always returns both values.
+      (prisma.ticket.update as ReturnType<typeof vi.fn>).mockResolvedValue(makeTicket());
+      (prisma.ticketAuditLog.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
+    });
 
     it('applies a status change atomically to every existing id', async () => {
       fm().mockResolvedValue([

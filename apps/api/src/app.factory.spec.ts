@@ -5,12 +5,16 @@ import { configureInboundPipeMiddleware } from './app.factory';
 
 const SECRET = 'inbound-webhook-secret-32chars-min!!';
 
-function makeApp(maxMb = 1) {
+function makeApp(maxMb = 1, inboundDeliveryEnabled = true) {
   const app = express();
   configureInboundPipeMiddleware(app, {
     TELECOM_HD_INBOUND_WEBHOOK_SECRET: SECRET,
     TELECOM_HD_INBOUND_MAX_SIZE_MB: maxMb,
+    TELECOM_HD_INBOUND_DELIVERY_ENABLED: inboundDeliveryEnabled,
   });
+  // Mirror createApiApp: PIPE's route-specific parser must consume JSON before the
+  // global parser gets a chance to steal the body.
+  app.use(express.json({ limit: '1mb' }));
   let reachedHandler = false;
   app.post('/api/inbound/pipe', (req, res) => {
     reachedHandler = true;
@@ -32,6 +36,20 @@ describe('production inbound PIPE middleware', () => {
       .set('x-inbound-secret', 'wrong')
       .send(Buffer.alloc(32))
       .expect(403);
+    expect(ctx.reachedHandler()).toBe(false);
+  });
+
+  it('cutover gate rejects a valid-secret PIPE request before body parsing or the route handler', async () => {
+    const ctx = makeApp(1, false);
+    await supertest(ctx.app)
+      .post('/api/inbound/pipe')
+      .set('content-type', 'message/rfc822')
+      .set('x-inbound-secret', SECRET)
+      // Keep the client write small: a server that intentionally returns 503 before
+      // reading an oversized request can close the socket while supertest is writing,
+      // producing EPIPE instead of the response we need to assert here.
+      .send(Buffer.from('From: sender@example.test\r\n\r\nbody'))
+      .expect(503);
     expect(ctx.reachedHandler()).toBe(false);
   });
 

@@ -85,7 +85,7 @@ function makeTicketService(prisma: Record<string, unknown>, access: Record<strin
       decryptCustomFields: vi.fn().mockImplementation(async (_scope: string, value: unknown) => value),
       decryptCustomFieldsMany: vi.fn().mockResolvedValue(undefined),
     } as unknown as AdminService,
-    undefined,
+    {} as never,
     undefined,
     access as unknown as TicketAccessPolicy,
   );

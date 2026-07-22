@@ -55,9 +55,25 @@ interface ProcessOutcome {
 interface InboundRoute {
   queueId?: number;
   departmentId?: number;
+  /** Customer-automation policy of the queue that actually owns this ticket. */
+  sendAutoresponder?: boolean;
   /** No configured recipient address matched; receiving queue/default was used explicitly. */
   fallback: boolean;
   fallbackReason?: 'RECEIVING_QUEUE' | 'DEFAULT_DEPARTMENT';
+}
+
+/**
+ * Immutable enabled-queue view captured in the same transaction as ledger acceptance.
+ * It lets every CC/BCC transport copy make the documented priority decision without
+ * consulting configuration that an operator may have changed while the delivery waited
+ * in the ledger.
+ */
+interface RoutingSnapshotEntry {
+  id: number;
+  emailAddress: string;
+  departmentId: number | null;
+  routingPriority: number;
+  sendAutoresponder: boolean;
 }
 
 /** Context snapshotted from the ledger row, never inferred from mutable queue state later. */
@@ -67,6 +83,8 @@ interface DeliveryRoutingContext {
   envelopeTo?: string;
   routedQueueId?: number;
   routedDepartmentId?: number;
+  sendAutoresponder?: boolean | null;
+  routingSnapshot?: RoutingSnapshotEntry[];
 }
 
 interface LogicalClaimWinner {
@@ -100,6 +118,7 @@ export interface ReconcileMailboxSnapshot {
   useTls: boolean;
   mailboxEpoch: number;
   cursorGeneration: number;
+  configGeneration: number;
 }
 
 /** Exact IMAP snapshot used to complete FROM_NOW/BACKFILL. */
@@ -137,9 +156,11 @@ interface ImapAcceptSnapshot {
   /** Configured receiving mailbox; persisted as the trusted envelope fallback for routing. */
   emailAddress: string;
   departmentId: number | null;
+  sendAutoresponder: boolean;
   syncState: 'OK' | 'BOOTSTRAPPING' | 'NEEDS_RECONCILIATION';
   mailboxEpoch: number;
   cursorGeneration: number;
+  configGeneration: number;
   uidValidity: bigint | null;
 }
 
@@ -234,6 +255,15 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     return this.config.TELECOM_HD_INBOUND_MAX_ATTEMPTS;
   }
 
+  /**
+   * The release/canary master gate must fail closed. `AppConfig` always supplies this
+   * boolean at runtime; treating an incomplete hand-built test/config object as disabled
+   * keeps a future bootstrap or direct service caller from accidentally accepting mail.
+   */
+  private get inboundDeliveryEnabled(): boolean {
+    return this.config.TELECOM_HD_INBOUND_DELIVERY_ENABLED === true;
+  }
+
   constructor(
     @Inject(APP_CONFIG) private readonly config: AppConfig,
     private readonly prisma: PrismaService,
@@ -244,6 +274,17 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async onModuleInit(): Promise<void> {
+    // Do not start supervisor, drain, or retention work when delivery is globally
+    // closed. ACCEPTED/RETRY ledger rows remain durable and operator endpoints remain
+    // available; an attended configuration-only restart is required before processing.
+    if (!this.inboundDeliveryEnabled) {
+      this.logger.warn(
+        'Inbound delivery disabled (TELECOM_HD_INBOUND_DELIVERY_ENABLED=false) — ' +
+          'IMAP, PIPE acceptance, and ledger drain are fail-closed',
+      );
+      return;
+    }
+
     // Seed loop-suppression addresses (our MAIL_FROM + every enabled queue) BEFORE the
     // TELECOM_HD_IMAP_ENABLED early-return, so a self-loop is suppressed even when the
     // poller is disabled and mail arrives only via the PIPE webhook. The set is rebuilt on
@@ -558,16 +599,19 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     if (queue.syncState !== 'OK' || queue.reconcileCause !== null) return;
     const lock = await client.getMailboxLock('INBOX');
     try {
-      const { uidValidity, uidNext, exists } = this.readMailboxState(client);
-      if (uidValidity === undefined) {
-        this.logger.warn(`IMAP queue ${queueId}: server did not advertise UIDVALIDITY — bootstrap deferred`);
+      const { uidValidity, uidNext } = this.readMailboxState(client);
+      if (
+        uidValidity === undefined ||
+        uidNext === undefined ||
+        !Number.isSafeInteger(uidNext) ||
+        uidNext < 1
+      ) {
+        this.logger.warn(
+          `IMAP queue ${queueId}: server did not advertise a valid UIDVALIDITY/UIDNEXT — bootstrap deferred`,
+        );
         return;
       }
-      const highWater = await this.resolveHighWaterUid(client, uidNext, exists);
-      if (highWater === null) {
-        this.logger.warn(`IMAP queue ${queueId}: cannot resolve high-water UID — bootstrap deferred`);
-        return;
-      }
+      const boundary = uidNext - 1;
       // A per-queue reconcile intent (bootstrapPolicy) overrides the global policy for
       // THIS bootstrap so the mode an operator chose at reconcile time is honoured.
       const policy = queue.bootstrapPolicy ?? this.config.TELECOM_HD_IMAP_BOOTSTRAP_POLICY;
@@ -575,7 +619,32 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         policy === 'BACKFILL'
           ? (queue.bootstrapBackfillLimit ?? this.config.TELECOM_HD_IMAP_BACKFILL_LIMIT)
           : 0;
-      const baseline = Math.max(highWater - backfill, 0);
+      let baseline = boundary;
+      let selectedUids: number[] = [];
+      if (policy === 'BACKFILL') {
+        if (!Number.isSafeInteger(backfill) || backfill < 1) {
+          this.logger.warn(`IMAP queue ${queueId}: BACKFILL requires a positive bounded UID count`);
+          return;
+        }
+        // UID values are sparse after EXPUNGE. Select the last N *existing* UIDs
+        // under the same lock rather than using `UIDNEXT - N`, which can skip mail.
+        const found = boundary === 0 ? [] : await client.search({ uid: `1:${boundary}` }, { uid: true });
+        if (found === false) {
+          this.logger.warn(`IMAP queue ${queueId}: bootstrap SEARCH did not return a UID set`);
+          return;
+        }
+        selectedUids = [
+          ...new Set(
+            found.filter(
+              (uid): uid is number =>
+                typeof uid === 'number' && Number.isSafeInteger(uid) && uid > 0 && uid <= boundary,
+            ),
+          ),
+        ]
+          .sort((a, b) => a - b)
+          .slice(-backfill);
+        baseline = selectedUids[0] === undefined ? boundary : selectedUids[0] - 1;
+      }
       // CAS on uidValidity IS NULL so two pods bootstrapping the same fresh queue can't
       // write different baselines — the first wins, the loser's updateMany matches 0 rows.
       // Also gate on `cursorGeneration` (read in the same snapshot): if an operator
@@ -594,6 +663,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           uidValidity: null,
           cursorGeneration: queue.cursorGeneration,
           mailboxEpoch: queue.mailboxEpoch,
+          configGeneration: queue.configGeneration,
           syncState: 'OK',
           reconcileCause: null,
         },
@@ -612,7 +682,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       }
       this.logger.log(
         `IMAP queue ${queueId}: bootstrap ${policy} at uid=${baseline} ` +
-          `(highWater=${highWater}, uidValidity=${uidValidity})`,
+          `(boundary=${boundary}, selected=${selectedUids.join(',') || 'none'}, uidValidity=${uidValidity})`,
       );
     } finally {
       lock.release();
@@ -627,6 +697,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    * the 60s interval calls the same path.
    */
   async pollNow(): Promise<void> {
+    if (!this.inboundDeliveryEnabled) return;
     await this.pollAll();
   }
 
@@ -642,6 +713,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async runPollAll(): Promise<void> {
+    if (!this.inboundDeliveryEnabled) return;
     await this.reconcileConnections();
     for (const [queueId, client] of this.connections) {
       try {
@@ -670,7 +742,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     // Rebuild loop-suppression addresses each cycle so a queue's emailAddress change (which
     // does not alter its connection fingerprint) is reflected without an API restart.
     await this.refreshOwnAddresses();
-    if (!this.config.TELECOM_HD_IMAP_ENABLED || this.stopping) return;
+    if (!this.inboundDeliveryEnabled || !this.config.TELECOM_HD_IMAP_ENABLED || this.stopping) return;
     let enabled: Array<{
       id: number;
       emailAddress: string;
@@ -768,7 +840,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async pollQueue(queueId: number, client: ImapFlow): Promise<void> {
-    if (this.stopping || this.pollingQueues.has(queueId)) return;
+    if (!this.inboundDeliveryEnabled || this.stopping || this.pollingQueues.has(queueId)) return;
     this.pollingQueues.add(queueId);
     await this.stampQueue(queueId, { lastPollStartedAt: new Date() });
     try {
@@ -896,6 +968,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
               lastSeenUid: queue.lastSeenUid,
               cursorGeneration: queue.cursorGeneration,
               mailboxEpoch: queue.mailboxEpoch,
+              configGeneration: queue.configGeneration,
               uidValidity: queue.uidValidity,
               syncState: 'OK',
               isEnabled: true,
@@ -1109,6 +1182,9 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     uid: number,
     source: Buffer,
   ): Promise<'accepted' | 'duplicate'> {
+    if (!this.inboundDeliveryEnabled) {
+      throw new ServiceUnavailableException('Inbound delivery is temporarily disabled');
+    }
     if (
       snapshot.type !== 'IMAP' ||
       !snapshot.isEnabled ||
@@ -1137,8 +1213,16 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         // conditional SELECT finds no row and no ledger delivery is inserted.  If acceptance
         // obtains the lock first, it is durably accepted before the new boundary — which is
         // safe; the concurrent identity/reconcile update waits and subsequently bumps epoch.
-        const current = await tx.$queryRaw<Array<{ id: number }>>(Prisma.sql`
-        SELECT "id"
+        const current = await tx.$queryRaw<
+          Array<{
+            id: number;
+            emailAddress: string;
+            departmentId: number | null;
+            sendAutoresponder: boolean;
+            configGeneration: number;
+          }>
+        >(Prisma.sql`
+        SELECT "id", "emailAddress", "departmentId", "sendAutoresponder", "configGeneration"
         FROM "EmailQueue"
         WHERE "id" = ${snapshot.id}
           AND "isEnabled" = true
@@ -1146,10 +1230,25 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           AND "syncState" = 'OK'
           AND "mailboxEpoch" = ${snapshot.mailboxEpoch}
           AND "cursorGeneration" = ${snapshot.cursorGeneration}
+          AND "configGeneration" = ${snapshot.configGeneration}
           AND "uidValidity" = ${snapshot.uidValidity}
         FOR UPDATE
         `);
-        if (current.length !== 1) throw new StaleImapAcceptSnapshotError(snapshot.id);
+        const lockedQueue = current[0];
+        if (
+          !lockedQueue ||
+          lockedQueue.emailAddress !== snapshot.emailAddress ||
+          lockedQueue.departmentId !== snapshot.departmentId ||
+          lockedQueue.sendAutoresponder !== snapshot.sendAutoresponder ||
+          lockedQueue.configGeneration !== snapshot.configGeneration
+        ) {
+          throw new StaleImapAcceptSnapshotError(snapshot.id);
+        }
+        // Freeze every enabled recipient queue (including its priority and customer-mail
+        // policy) in the same transaction as the ledger row.  A later drain must not make
+        // a CC-copy's owner depend on which poller happened to claim first or on a subsequent
+        // operator edit to the queue form.
+        const routingSnapshot = await this.captureRoutingSnapshot(tx, lockedQueue);
         await this.consumeRawStageForAcceptance(tx, raw.rawStorageKey);
 
         // `createMany(skipDuplicates)` maps to INSERT .. ON CONFLICT DO NOTHING.  It avoids
@@ -1160,11 +1259,17 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           data: {
             transport: 'IMAP',
             queueId: snapshot.id,
-            departmentId: snapshot.departmentId, // snapshot at acceptance
+            // Values come from the row locked by the acceptance fence, never a
+            // pre-fetch snapshot which a concurrent queue edit could have made stale.
+            departmentId: lockedQueue.departmentId,
+            sendAutoresponder: lockedQueue.sendAutoresponder,
+            routedQueueId: lockedQueue.id,
+            routedDepartmentId: lockedQueue.departmentId,
+            routingSnapshot: routingSnapshot as unknown as Prisma.InputJsonValue,
             // IMAP does not always expose the original SMTP envelope recipient in MIME.  The
             // configured queue address is the trusted receiving-mailbox fallback used by the
             // deterministic routing policy (not a header-derived guess).
-            envelopeTo: snapshot.emailAddress,
+            envelopeTo: lockedQueue.emailAddress,
             transportKey,
             mailboxEpoch: snapshot.mailboxEpoch,
             uidValidity,
@@ -1207,6 +1312,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
             syncState: 'OK',
             mailboxEpoch: snapshot.mailboxEpoch,
             cursorGeneration: snapshot.cursorGeneration,
+            configGeneration: snapshot.configGeneration,
             uidValidity: snapshot.uidValidity,
           },
           data: {
@@ -1265,6 +1371,56 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     return outcome;
   }
 
+  /**
+   * Read the enabled queues after the receiving queue has been locked by the acceptance
+   * fence. The returned JSON is deliberately small, deterministic and self-contained: it is
+   * the only queue configuration a later ledger drain is allowed to use for recipient routing.
+   */
+  private async captureRoutingSnapshot(
+    tx: Prisma.TransactionClient,
+    receivingQueue: {
+      id: number;
+      emailAddress: string;
+      departmentId: number | null;
+      sendAutoresponder: boolean;
+    },
+  ): Promise<RoutingSnapshotEntry[]> {
+    const queues = await tx.emailQueue.findMany({
+      where: { isEnabled: true },
+      select: {
+        id: true,
+        emailAddress: true,
+        departmentId: true,
+        routingPriority: true,
+        sendAutoresponder: true,
+      },
+    });
+    const snapshot = queues
+      .filter((queue) => normalizeEmail(queue.emailAddress) !== '')
+      .map((queue) => ({
+        id: queue.id,
+        emailAddress: queue.emailAddress,
+        departmentId: queue.departmentId,
+        routingPriority: queue.routingPriority,
+        sendAutoresponder: queue.sendAutoresponder,
+      }))
+      .sort((a, b) => a.routingPriority - b.routingPriority || a.id - b.id);
+
+    // The receiving row is SELECT ... FOR UPDATE and enabled, therefore it must be present in
+    // the same transaction's enabled-queue view. Treat an impossible/inconsistent view as a
+    // stale acceptance fence rather than silently writing a partial route snapshot.
+    const receiving = snapshot.find((queue) => queue.id === receivingQueue.id);
+    if (
+      !receiving ||
+      receiving.emailAddress !== receivingQueue.emailAddress ||
+      receiving.departmentId !== receivingQueue.departmentId ||
+      receiving.sendAutoresponder !== receivingQueue.sendAutoresponder
+    ) {
+      throw new StaleImapAcceptSnapshotError(receivingQueue.id);
+    }
+    return snapshot;
+  }
+
   /** Set a typed UIDVALIDITY halt plus its durable audit atomically. */
   private async haltImapSnapshot(
     snapshot: ImapAcceptSnapshot,
@@ -1280,6 +1436,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           syncState: 'OK',
           mailboxEpoch: snapshot.mailboxEpoch,
           cursorGeneration: snapshot.cursorGeneration,
+          configGeneration: snapshot.configGeneration,
           uidValidity: snapshot.uidValidity,
         },
         data: {
@@ -1321,6 +1478,9 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     externalId?: string,
     queueId?: number,
   ): Promise<void> {
+    if (!this.inboundDeliveryEnabled) {
+      throw new ServiceUnavailableException('Inbound delivery is temporarily disabled');
+    }
     const buf = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
     if (buf.length > this.config.TELECOM_HD_INBOUND_MAX_SIZE_MB * 1024 * 1024) {
       throw new PayloadTooLargeException('Inbound message exceeds the configured size limit');
@@ -1333,7 +1493,14 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const normalizedExternalId = normalizePipeDeliveryId(externalId);
     const q = await this.prisma.emailQueue.findUnique({
       where: { id: queueId },
-      select: { id: true, emailAddress: true, departmentId: true, type: true, isEnabled: true },
+      select: {
+        id: true,
+        emailAddress: true,
+        departmentId: true,
+        sendAutoresponder: true,
+        type: true,
+        isEnabled: true,
+      },
     });
     if (!q) throw new BadRequestException(`Unknown inbound queue id ${queueId}`);
     if (!q.isEnabled) throw new BadRequestException(`Inbound PIPE queue ${queueId} is disabled`);
@@ -1360,10 +1527,15 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         // Re-check and lock the queue in the same transaction as the ledger insert. A
         // concurrent disable or IMAP/PIPE type switch must not admit a late PIPE delivery.
         const locked = await tx.$queryRaw<
-          Array<{ id: number; emailAddress: string; departmentId: number | null }>
+          Array<{
+            id: number;
+            emailAddress: string;
+            departmentId: number | null;
+            sendAutoresponder: boolean;
+          }>
         >(
           Prisma.sql`
-            SELECT "id", "emailAddress", "departmentId"
+            SELECT "id", "emailAddress", "departmentId", "sendAutoresponder"
             FROM "EmailQueue"
             WHERE "id" = ${boundQueueId}
               AND "type" = 'PIPE'
@@ -1380,12 +1552,20 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         if (departmentId !== undefined && departmentId !== queue.departmentId) {
           throw new ConflictException('Inbound PIPE queue department changed while delivery was accepted');
         }
+        // PIPE uses the exact same immutable recipient/priorities snapshot as IMAP. Without
+        // this, two MTA copies bearing the same Message-ID could assign ownership to whichever
+        // PIPE drain happened to create the logical claim first.
+        const routingSnapshot = await this.captureRoutingSnapshot(tx, queue);
         await this.consumeRawStageForAcceptance(tx, raw.rawStorageKey);
         const created = await tx.inboundDelivery.create({
           data: {
             transport: 'PIPE',
             queueId: queue.id,
             departmentId: queue.departmentId,
+            sendAutoresponder: queue.sendAutoresponder,
+            routedQueueId: queue.id,
+            routedDepartmentId: queue.departmentId,
+            routingSnapshot: routingSnapshot as unknown as Prisma.InputJsonValue,
             transportKey,
             externalId: normalizedExternalId,
             contentHash,
@@ -1455,6 +1635,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    * delivery can never be stranded in `PROCESSING` forever.
    */
   drainDeliveries(): Promise<void> {
+    if (!this.inboundDeliveryEnabled) return Promise.resolve();
     if (this.stopping) return this.drainInFlight ?? Promise.resolve();
     if (this.drainInFlight) return this.drainInFlight;
 
@@ -1466,6 +1647,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async runDrainDeliveries(): Promise<void> {
+    if (!this.inboundDeliveryEnabled) return;
     const now = new Date();
     let due: Array<{ id: number; departmentId: number | null }>;
     try {
@@ -1504,6 +1686,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
    * retained, so a message is never lost, discarded, or stranded in PROCESSING.
    */
   private async processDelivery(deliveryId: number, departmentId: number | undefined): Promise<void> {
+    if (!this.inboundDeliveryEnabled) return;
     // In-process guard: never handle the same delivery twice concurrently in this process
     // (closes the "slow flow, lease expired, drain reclaims it" duplicate window).
     if (this.inFlight.has(deliveryId)) return;
@@ -1692,6 +1875,8 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           envelopeTo: delivery.envelopeTo ?? undefined,
           routedQueueId: delivery.routedQueueId ?? undefined,
           routedDepartmentId: delivery.routedDepartmentId ?? undefined,
+          sendAutoresponder: delivery.sendAutoresponder,
+          routingSnapshot: this.normalizeRoutingSnapshot(delivery.routingSnapshot),
         },
       });
       await settle({
@@ -2124,6 +2309,12 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       customFields: {},
       attachmentIds: await attachmentIds(),
       incomingMessageId: effectiveMessageId,
+      // The deterministic owner selected from the immutable acceptance snapshot controls
+      // both ticket attribution and the customer-autoresponder policy. A historical/unknown
+      // row deliberately leaves this undefined; TicketsService then fails closed rather than
+      // consulting a currently unrelated queue by department.
+      ...(route.queueId != null ? { inboundQueueId: route.queueId } : {}),
+      ...(route.sendAutoresponder !== undefined ? { inboundSendAutoresponder: route.sendAutoresponder } : {}),
       ...(ruleResult.priorityId !== undefined ? { priorityId: ruleResult.priorityId } : {}),
       ...(ruleResult.ownerStaffId !== undefined ? { ownerStaffId: ruleResult.ownerStaffId } : {}),
     });
@@ -2139,24 +2330,16 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
   // ─────────────────── logical Message-ID claim + deterministic route ───────────────────
 
   /**
-   * Select the one business owner deterministically. We only use trusted, normalized
-   * recipients (To/Cc plus the envelope recipient captured at accept) and rank matching
-   * enabled queues by routingPriority then id. On retry, an already-persisted route wins over
-   * any later queue configuration change.
+   * Select the business owner. Ledger-backed deliveries route only against their immutable
+   * acceptance-time queue snapshot, so equal RFC Message-ID copies resolve to the same
+   * `(routingPriority, id)` winner regardless of drain order. Direct (non-ledger) callers
+   * retain a current enabled-queue lookup for backwards compatibility.
    */
   private async resolveInboundRoute(
     parsed: ParsedMail,
     context: DeliveryRoutingContext | undefined,
     fallbackDepartmentId: number | undefined,
   ): Promise<InboundRoute> {
-    if (context?.routedQueueId != null || context?.routedDepartmentId != null) {
-      return {
-        queueId: context.routedQueueId,
-        departmentId: context.routedDepartmentId ?? fallbackDepartmentId,
-        fallback: false,
-      };
-    }
-
     const recipients = new Set<string>();
     for (const field of [parsed.to, parsed.cc]) {
       for (const entry of this.addressEntries(field)) {
@@ -2167,9 +2350,49 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
     const envelopeRecipient = normalizeEmail(context?.envelopeTo ?? '');
     if (envelopeRecipient) recipients.add(envelopeRecipient);
 
+    // No queue may be re-read while draining a ledger row.  The acceptance snapshot carries
+    // every enabled address/policy needed to make the documented deterministic choice even
+    // when two CC copies are claimed in the opposite order by separate workers.
+    // `queueId` can be nulled by an intentional queue deletion (the ledger retains the raw
+    // delivery for replay), whereas `transportKey` is immutable. Use the latter to recognize
+    // a ledger row so deletion can never make a queued delivery fall back to live routing.
+    if (context?.transportKey !== undefined) {
+      const matched = (context.routingSnapshot ?? [])
+        .filter((queue) => recipients.has(normalizeEmail(queue.emailAddress)))
+        .sort((a, b) => a.routingPriority - b.routingPriority || a.id - b.id);
+      const winner = matched[0];
+      if (winner) {
+        return {
+          queueId: winner.id,
+          departmentId: winner.departmentId ?? fallbackDepartmentId,
+          sendAutoresponder: winner.sendAutoresponder,
+          fallback: false,
+        };
+      }
+
+      // Old ledger rows predate `routingSnapshot`. Their accepting queue/department is the
+      // only immutable information available, so retain that conservative legacy fallback;
+      // never query today's queue configuration and accidentally reroute historical mail.
+      return {
+        queueId: context.routedQueueId ?? context.queueId,
+        departmentId: context.routedDepartmentId ?? fallbackDepartmentId,
+        ...(context.sendAutoresponder !== undefined && context.sendAutoresponder !== null
+          ? { sendAutoresponder: context.sendAutoresponder }
+          : {}),
+        fallback: true,
+        fallbackReason: 'RECEIVING_QUEUE',
+      };
+    }
+
     const queues = await this.prisma.emailQueue.findMany({
       where: { isEnabled: true },
-      select: { id: true, emailAddress: true, departmentId: true, routingPriority: true },
+      select: {
+        id: true,
+        emailAddress: true,
+        departmentId: true,
+        routingPriority: true,
+        sendAutoresponder: true,
+      },
     });
     const matched = queues
       .filter((queue) => recipients.has(normalizeEmail(queue.emailAddress)))
@@ -2179,27 +2402,54 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       return {
         queueId: winner.id,
         departmentId: winner.departmentId ?? fallbackDepartmentId,
+        sendAutoresponder: winner.sendAutoresponder,
         fallback: false,
       };
     }
 
-    // A message with no unambiguous configured recipient is never silently routed according
-    // to poller arrival order. The receiving queue is the explicit, durable fallback when it
-    // is known; otherwise only the already-snapshotted department remains available.
-    if (context?.queueId != null) {
-      const receiving = queues.find((queue) => queue.id === context.queueId);
-      return {
-        queueId: context.queueId,
-        departmentId: receiving?.departmentId ?? fallbackDepartmentId ?? (await this.defaultDeptId()),
-        fallback: true,
-        fallbackReason: 'RECEIVING_QUEUE',
-      };
-    }
     return {
       departmentId: fallbackDepartmentId ?? (await this.defaultDeptId()),
       fallback: true,
       fallbackReason: 'DEFAULT_DEPARTMENT',
     };
+  }
+
+  /** Validate the JSON persisted at acceptance before it participates in routing. */
+  private normalizeRoutingSnapshot(value: Prisma.JsonValue | null | undefined): RoutingSnapshotEntry[] {
+    if (!Array.isArray(value)) return [];
+    const ids = new Set<number>();
+    const result: RoutingSnapshotEntry[] = [];
+    for (const valueEntry of value) {
+      if (!valueEntry || typeof valueEntry !== 'object' || Array.isArray(valueEntry)) continue;
+      const entry = valueEntry as Record<string, unknown>;
+      const id = entry['id'];
+      const emailAddress = entry['emailAddress'];
+      const departmentId = entry['departmentId'];
+      const routingPriority = entry['routingPriority'];
+      const sendAutoresponder = entry['sendAutoresponder'];
+      if (
+        !Number.isSafeInteger(id) ||
+        (id as number) <= 0 ||
+        ids.has(id as number) ||
+        typeof emailAddress !== 'string' ||
+        normalizeEmail(emailAddress) === '' ||
+        !(departmentId === null || (Number.isSafeInteger(departmentId) && (departmentId as number) > 0)) ||
+        !Number.isSafeInteger(routingPriority) ||
+        (routingPriority as number) < 0 ||
+        typeof sendAutoresponder !== 'boolean'
+      ) {
+        continue;
+      }
+      ids.add(id as number);
+      result.push({
+        id: id as number,
+        emailAddress,
+        departmentId: departmentId as number | null,
+        routingPriority: routingPriority as number,
+        sendAutoresponder,
+      });
+    }
+    return result.sort((a, b) => a.routingPriority - b.routingPriority || a.id - b.id);
   }
 
   /**
@@ -2233,6 +2483,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           winnerDeliveryId: args.deliveryId,
           routedQueueId: args.route.queueId ?? null,
           departmentId: args.route.departmentId ?? null,
+          sendAutoresponder: args.route.sendAutoresponder ?? null,
         },
         skipDuplicates: true,
       });
@@ -2248,6 +2499,9 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
       const persistedRoute: InboundRoute = {
         queueId: claim.routedQueueId ?? undefined,
         departmentId: claim.departmentId ?? undefined,
+        ...(claim.sendAutoresponder !== null && claim.sendAutoresponder !== undefined
+          ? { sendAutoresponder: claim.sendAutoresponder }
+          : {}),
         fallback: false,
       };
       await this.recordDeliveryIdentity(tx, {

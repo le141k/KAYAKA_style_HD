@@ -60,6 +60,7 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_CLAMAV_PORT: 3310,
   TELECOM_HD_CLAMAV_TIMEOUT_MS: 15000,
   TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
+  TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
   TELECOM_HD_IMAP_ENABLED: false,
   TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'FROM_NOW',
   TELECOM_HD_IMAP_BACKFILL_LIMIT: 0,
@@ -160,6 +161,47 @@ describe('MailService', () => {
 
       expect(result.subject).toBe('some_key');
       expect(result.html).toContain('TT-001');
+    });
+  });
+
+  // ─── renderTemplateRequired ────────────────────────────────────────────────
+
+  describe('renderTemplateRequired', () => {
+    it('rejects every whitespace-only rendered required field', async () => {
+      const emptyFields: Array<keyof Pick<typeof MOCK_TEMPLATE, 'subject' | 'htmlBody' | 'textBody'>> = [
+        'subject',
+        'htmlBody',
+        'textBody',
+      ];
+
+      for (const field of emptyFields) {
+        (prisma.emailTemplate.findUnique as ReturnType<typeof vi.fn>).mockReset();
+        (prisma.emailTemplate.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+          ...MOCK_TEMPLATE,
+          [field]: ' \n\t ',
+        });
+
+        await expect(service.renderTemplateRequired('required_notice', 'en', {})).rejects.toThrow(
+          'Required email template "required_notice" (en) is empty',
+        );
+        expect(prisma.emailTemplate.findUnique).toHaveBeenCalledTimes(1);
+      }
+    });
+
+    it('validates the English fallback instead of accepting a blank fallback template', async () => {
+      (prisma.emailTemplate.findUnique as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ ...MOCK_TEMPLATE, textBody: '   ' });
+
+      await expect(service.renderTemplateRequired('required_notice', 'uk', {})).rejects.toThrow(
+        'Required email template "required_notice" (uk) is empty',
+      );
+      expect(prisma.emailTemplate.findUnique).toHaveBeenNthCalledWith(1, {
+        where: { key_locale: { key: 'required_notice', locale: 'uk' } },
+      });
+      expect(prisma.emailTemplate.findUnique).toHaveBeenNthCalledWith(2, {
+        where: { key_locale: { key: 'required_notice', locale: 'en' } },
+      });
     });
   });
 

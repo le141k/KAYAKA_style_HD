@@ -1,9 +1,9 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 import { PrismaService } from '../../prisma/prisma.service';
-import { MailService } from '../mail/mail.service';
 import { NotificationService } from '../tickets/notification.service';
 import type { Workflow, Ticket } from '@prisma/client';
+import { projectWorkflowRuleChain, type WorkflowActionPlan } from './workflow-matching';
 
 /** Domain event WorkflowService emits after any workflow write, to bust the cache below. */
 export const WORKFLOW_CHANGED_EVENT = 'workflow.changed';
@@ -18,36 +18,16 @@ interface TicketEvent {
   ticketId: number;
 }
 
-/** A single workflow criterion. Accepts both the admin-UI vocab (is/is_not/
- *  starts_with/ends_with/not_contains, value is a string) and the legacy vocab. */
-interface WorkflowCriterion {
-  field: string;
-  op: string;
-  value?: unknown;
-}
-
-/** A single workflow action. The admin UI emits { type, value } where value is a
- *  string; legacy/typed actions carry explicit id fields. Both are supported. */
-interface WorkflowAction {
-  type: string;
-  value?: string;
-  departmentId?: number;
-  ownerStaffId?: number;
-  statusId?: number;
-  priorityId?: number;
-  typeId?: number;
-  tag?: string;
-  note?: string;
-}
-
 @Injectable()
 export class WorkflowExecutor {
   private readonly logger = new Logger(WorkflowExecutor.name);
 
   constructor(
     private readonly prisma: PrismaService,
-    @Optional() private readonly mail?: MailService,
-    @Optional() private readonly notifications?: NotificationService,
+    // Required production dependency. Workflow assignment must not commit with
+    // a silent no-op notification path; its outbox command is part of the same
+    // transaction as the owner update and audit record below.
+    private readonly notifications: NotificationService,
   ) {}
 
   // C3: cache the enabled-workflows list — it was queried on EVERY ticket event.
@@ -104,17 +84,29 @@ export class WorkflowExecutor {
       if (!ticket) return;
 
       const workflows = await this.getEnabledWorkflows();
+      const ownerAvailability = new Map<number, boolean>();
+      const canAssignOwner = async (staffId: number): Promise<boolean> => {
+        const cached = ownerAvailability.get(staffId);
+        if (cached !== undefined) return cached;
+        const exists = Boolean(await this.prisma.staff.findUnique({ where: { id: staffId } }));
+        ownerAvailability.set(staffId, exists);
+        return exists;
+      };
 
       for (const workflow of workflows) {
-        if (this.matchesCriteria(ticket, workflow)) {
-          const changed = await this.applyActions(ticket, workflow);
-          // A5: re-fetch between evaluations so the next workflow matches against
-          // the UPDATED ticket, not the stale snapshot taken at the top.
-          if (changed) {
-            const fresh = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
-            if (!fresh) return;
-            ticket = fresh;
-          }
+        // Keep the same projection function as WorkflowEmailEventService.  Using
+        // the current persisted ticket for each one-rule projection preserves the
+        // existing re-fetch boundary while ensuring its scalar action vocabulary
+        // and later-rule criteria are identical to the durable email planner.
+        const [step] = await projectWorkflowRuleChain(ticket, [workflow], { canAssignOwner });
+        if (!step) continue;
+        const changed = await this.applyActions(ticket, workflow, step.actionPlan);
+        // A5: re-fetch between evaluations so the next workflow matches against
+        // the UPDATED ticket, not the stale snapshot taken at the top.
+        if (changed) {
+          const fresh = await this.prisma.ticket.findUnique({ where: { id: ticketId } });
+          if (!fresh) return;
+          ticket = fresh;
         }
       }
     } finally {
@@ -124,86 +116,38 @@ export class WorkflowExecutor {
     }
   }
 
-  private matchesCriteria(ticket: Ticket, workflow: Workflow): boolean {
-    const criteria = workflow.criteria as unknown as WorkflowCriterion[];
-    if (!Array.isArray(criteria) || criteria.length === 0) return true;
-
-    return criteria.every((c) => {
-      const raw = (ticket as Record<string, unknown>)[c.field];
-      const fv = String(raw ?? '').toLowerCase();
-      const cv = String(c.value ?? '').toLowerCase();
-      switch (c.op) {
-        case 'eq':
-        case 'is':
-          return fv === cv;
-        case 'neq':
-        case 'is_not':
-          return fv !== cv;
-        case 'contains':
-          return fv.includes(cv);
-        case 'not_contains':
-          return !fv.includes(cv);
-        case 'starts_with':
-          return fv.startsWith(cv);
-        case 'ends_with':
-          return fv.endsWith(cv);
-        case 'gt':
-          return typeof raw === 'number' && raw > Number(c.value);
-        case 'lt':
-          return typeof raw === 'number' && raw < Number(c.value);
-        default:
-          return false;
-      }
-    });
-  }
-
   /** Returns true if the ticket's matchable state changed (so the caller re-fetches). */
-  private async applyActions(ticket: Ticket, workflow: Workflow): Promise<boolean> {
-    const actions = workflow.actions as unknown as WorkflowAction[];
-    if (!Array.isArray(actions)) return false;
-
-    const ticketUpdate: Partial<Record<string, unknown>> = {};
-    // Track a real owner assignment so we can notify + audit after the update.
-    let assignedOwnerId: number | null = null;
+  private async applyActions(
+    ticket: Ticket,
+    workflow: Workflow,
+    actionPlan: WorkflowActionPlan,
+  ): Promise<boolean> {
+    const actions = actionPlan.actions;
     // Tag mutations also change matchable state even though they bypass ticketUpdate.
     let mutated = false;
 
+    for (const staffId of actionPlan.skippedOwnerIds) {
+      this.logger.warn(`Workflow ${workflow.id}: skipped assign — staff ${staffId} not found`);
+    }
+
     for (const action of actions) {
       try {
-        // Effective scalar value: legacy typed field OR the UI's string `value`.
-        const num = (legacy?: number) => legacy ?? (action.value != null ? Number(action.value) : undefined);
-        const str = (legacy?: string) => legacy ?? action.value;
+        const str = (legacy?: unknown): string | undefined =>
+          typeof legacy === 'string' ? legacy : typeof action.value === 'string' ? action.value : undefined;
         switch (action.type) {
+          // Scalar actions are applied once from the shared rule-chain plan
+          // below. Re-parsing them here would let legacy/UI representations
+          // diverge from the durable workflow-email snapshot.
           case 'change_department':
-          case 'assign_group': // UI label; ticket has no group → treat as department
-            if (num(action.departmentId)) ticketUpdate['departmentId'] = num(action.departmentId);
-            break;
-          // `assign` is the macro-builder vocab; `assign_staff`/`change_owner` the
-          // workflow vocab — unify so an "assign" action actually assigns.
+          case 'assign_group':
           case 'assign':
           case 'change_owner':
-          case 'assign_staff': {
-            const owner = num(action.ownerStaffId);
-            if (owner == null || Number.isNaN(owner)) {
-              ticketUpdate['ownerStaffId'] = null; // explicit unassign
-            } else if (await this.prisma.staff.findUnique({ where: { id: owner } })) {
-              ticketUpdate['ownerStaffId'] = owner;
-              assignedOwnerId = owner;
-            } else {
-              this.logger.warn(`Workflow ${workflow.id}: skipped assign — staff ${owner} not found`);
-            }
-            break;
-          }
+          case 'assign_staff':
           case 'change_status':
           case 'set_status':
-            if (num(action.statusId)) ticketUpdate['statusId'] = num(action.statusId);
-            break;
           case 'change_priority':
           case 'set_priority':
-            if (num(action.priorityId)) ticketUpdate['priorityId'] = num(action.priorityId);
-            break;
           case 'change_type':
-            ticketUpdate['typeId'] = num(action.typeId) ?? null;
             break;
           case 'add_tag': {
             const tag = str(action.tag);
@@ -235,20 +179,11 @@ export class WorkflowExecutor {
             }
             break;
           case 'send_email': {
-            const to = ticket.requesterEmail;
-            if (!this.mail || !to) {
-              this.logger.warn(
-                `Workflow ${workflow.id}: send_email skipped (no mail service or requester email)`,
-              );
-              break;
-            }
-            const body = str(action.note) || str(action.value) || `Обновление по обращению ${ticket.mask}.`;
-            await this.mail.send({
-              to,
-              subject: `[${ticket.mask}] ${ticket.subject}`,
-              text: body,
-              autoSubmitted: 'auto-generated', // A5(i): workflow mail is machine-generated
-            });
+            // Customer email is materialized solely by WorkflowEmailEventService.
+            // That event is inserted in the same ticket transaction as the
+            // triggering post/status change, so this in-memory listener must never
+            // send a second copy or become an availability dependency.
+            this.logger.debug(`Workflow ${workflow.id}: send_email delegated to durable event outbox`);
             break;
           }
           default:
@@ -261,32 +196,41 @@ export class WorkflowExecutor {
       }
     }
 
-    if (Object.keys(ticketUpdate).length > 0) {
-      await this.prisma.ticket.update({ where: { id: ticket.id }, data: ticketUpdate });
-      mutated = true;
-    }
-
-    // A workflow assignment must notify the assignee + leave an audit trail, just
-    // like a manual assign() (H8-1). The workflow has no staff actor → SYSTEM.
-    if (assignedOwnerId != null) {
-      await this.prisma.ticketAuditLog.create({
-        data: {
-          ticketId: ticket.id,
-          staffId: null,
-          actorType: 'SYSTEM',
-          action: 'ASSIGN',
-          field: 'ownerStaffId',
-          oldValue: ticket.ownerStaffId?.toString() ?? null,
-          newValue: assignedOwnerId.toString(),
-        },
-      });
-      if (this.notifications) {
-        await this.notifications
-          .notifyOnAssign(ticket.id, assignedOwnerId)
-          .catch((err: unknown) =>
-            this.logger.error(`Workflow ${workflow.id} assign notification failed: ${String(err)}`),
+    if (Object.keys(actionPlan.ticketMutation).length > 0) {
+      if (actionPlan.assignedOwnerId == null) {
+        await this.prisma.ticket.update({ where: { id: ticket.id }, data: actionPlan.ticketMutation });
+      } else {
+        // The owner update, audit row and durable internal-notification command
+        // form one business action. A crash/failure can therefore produce either
+        // all three persisted records or none — never an assigned ticket with a
+        // missing alert, and never an alert for a rolled-back assignment.
+        const notificationId = await this.prisma.$transaction(async (tx) => {
+          const updatedTicket = await tx.ticket.update({
+            where: { id: ticket.id },
+            data: actionPlan.ticketMutation,
+          });
+          const audit = await tx.ticketAuditLog.create({
+            data: {
+              ticketId: ticket.id,
+              staffId: null,
+              actorType: 'SYSTEM',
+              action: 'ASSIGN',
+              field: 'ownerStaffId',
+              oldValue: ticket.ownerStaffId?.toString() ?? null,
+              newValue: actionPlan.assignedOwnerId!.toString(),
+            },
+            select: { id: true },
+          });
+          return this.notifications.queueAssignmentNotification(
+            tx,
+            updatedTicket,
+            actionPlan.assignedOwnerId!,
+            `audit:${audit.id}`,
           );
+        });
+        if (notificationId) this.notifications.wakeCommittedNotifications([notificationId]);
       }
+      mutated = true;
     }
 
     return mutated;

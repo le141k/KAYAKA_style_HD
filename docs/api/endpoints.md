@@ -216,16 +216,18 @@ pre-disable links or sessions; the customer must request a new link.
 
 ## Inbound mail
 
-| Method | Path              | Auth                         | Body                                              | Returns              |
-| ------ | ----------------- | ---------------------------- | ------------------------------------------------- | -------------------- |
-| POST   | /api/inbound/pipe | 🔑 `x-inbound-secret` header | raw `message/rfc822`/octet-stream or JSON `{raw}` | `{ accepted: true }` |
+| Method | Path              | Auth                         | Body                                              | Returns                                                                                    |
+| ------ | ----------------- | ---------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| POST   | /api/inbound/pipe | 🔑 `x-inbound-secret` header | raw `message/rfc822`/octet-stream or JSON `{raw}` | `{ accepted: true }` (or retryable `503` while the global inbound-delivery gate is closed) |
 
 > Note: `@Public()` (bypasses JWT) but enforces `x-inbound-secret` against
 > `TELECOM_HD_INBOUND_WEBHOOK_SECRET` (constant-time). The secret is validated **twice**:
 > in a **pre-body-parser Express middleware** (`apps/api/src/app.factory.ts`) that rejects an
 > unauthenticated caller with **403 before the large raw body is buffered** (closing the
 > buffer-then-reject amplification window up to `TELECOM_HD_INBOUND_MAX_SIZE_MB`), and again in
-> the controller (defence in depth). The body may be raw `message/rfc822` /
+> the controller (defence in depth). With a valid secret but
+> `TELECOM_HD_INBOUND_DELIVERY_ENABLED=false`, that same pre-parser middleware returns a
+> retryable **503**: it creates no ledger row and reads no raw MIME. The body may be raw `message/rfc822` /
 > `application/octet-stream` bytes **or** JSON `{ raw }`. It feeds the same
 > parse→thread→dedup→ticket pipeline as the IMAP poller (`InboundMailService.ingestRawMessage`).
 > For MTA/PIPE delivery (Postfix/Exim pipe transport). Loop-guarded (Auto-Submitted / Precedence /
@@ -328,7 +330,7 @@ SLA plans, schedules, holidays, and escalation rules. All routes require `admin.
 | DELETE | /api/admin/workflows/{id} | 🔒 `admin.workflow` | —                                                    | 204 No Content                      |
 
 > `criteria` is a JSON array of `{ field, op: 'eq'|'neq'|'contains'|'gt'|'lt', value }`.
-> `actions` is a JSON array of `{ type: 'change_department'|'change_owner'|'change_status'|'change_priority'|'change_type'|'add_tag'|'add_note', ...params }`.
+> `actions` is a JSON array of `{ type: 'change_department'|'change_owner'|'change_status'|'change_priority'|'change_type'|'add_tag'|'add_note'|'send_email', ...params }`. New `send_email` actions require a bounded non-empty body. Matching actions are snapshotted with the ticket mutation and later materialized through the durable workflow-email outbox; an EventEmitter listener never sends a second copy.
 
 ### Macros
 
@@ -391,13 +393,18 @@ SLA plans, schedules, holidays, and escalation rules. All routes require `admin.
 | GET                 | /api/admin/email-queues/inbound/quarantine                     | 🔒 `mail.view`      | `?page&limit&queueId&reason&messageId&from&to`                       | `{items,total,page,limit}` metadata only; no raw MIME or storage key. Each row reports server replay capability.                                                                                                                                                                       |
 | GET                 | /api/admin/email-queues/inbound/quarantine/{deliveryId}        | 🔒 `mail.view`      | —                                                                    | Metadata, replay capability/block reason and delivery audit history; no raw MIME/storage key.                                                                                                                                                                                          |
 | POST                | /api/admin/email-queues/inbound/quarantine/{deliveryId}/replay | 🔒 `mail.replay`    | `{reason, expectedUpdatedAt}`                                        | Transactional CAS replay + durable audit. Stale/repeated action → 409; truncated MIME → 400/replay blocked.                                                                                                                                                                            |
+| GET                 | /api/admin/workflow-email-events/health                        | 🔒 `mail.view`      | —                                                                    | Ticket-scoped workflow customer-email backlog, lease/quarantine state and actionable alerts.                                                                                                                                                                                           |
+| GET                 | /api/admin/workflow-email-events                               | 🔒 `mail.view`      | `?page&limit&state&ticketId`                                         | Ticket-scoped metadata list only; no recipient or message body.                                                                                                                                                                                                                        |
+| GET                 | /api/admin/workflow-email-events/{eventId}                     | 🔒 `mail.view`      | —                                                                    | Ticket-scoped validated immutable action snapshot, status and replay block reason. Unauthorized callers receive the same 404 as an absent event.                                                                                                                                       |
+| POST                | /api/admin/workflow-email-events/{eventId}/replay              | 🔒 `mail.replay`    | `{reason, expectedUpdatedAt}`                                        | Requeues only safe quarantined events under a ticket-scope/version CAS and writes `TicketAuditLog`. Invalid snapshots or changed requester identity remain blocked.                                                                                                                    |
 
 ### Admin / Durable outbound email
 
 `GET /api/tickets/{id}` and `GET /api/tickets/by-mask/{mask}` expose a staff-only
 `post.outboundEmail` projection (`state`, attempts, retry/sent timestamps and
-sanitized error) for a public staff reply. It intentionally excludes body,
-recipient lists and BCC.
+sanitized error) for a public staff reply. Ticket detail also exposes the same
+safe status-only projection for postless automated customer and internal-staff
+commands. Both intentionally exclude body, recipient lists and BCC.
 
 | Method | Path                                  | Auth                | Body | Returns                                                                                                                                                               |
 | ------ | ------------------------------------- | ------------------- | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
