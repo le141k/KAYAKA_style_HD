@@ -721,9 +721,7 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
         // Cursor is a BigInt column (IMAP UIDs are unsigned 32-bit). UID values are well
         // within 2^53, so we compute in Number and store back as BigInt.
         const lastUid = Number(queue.lastSeenUid);
-        // Discover new UIDs first (uid-only).  Some servers can yield that stream out of
-        // order; acceptance records every durable result and the later safe-frontier logic
-        // accounts for both failed and still-unattempted lower UIDs.
+        // Discover new UIDs first (uid-only); sort the resulting set before accepting it.
         const uids: number[] = [];
         const seenUids = new Set<number>();
         for await (const m of client.fetch(`${lastUid + 1}:*`, { uid: true }, { uid: true })) {
@@ -735,18 +733,17 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
             uids.push(m.uid);
           }
         }
+        // IMAP may return the discovery stream out of order. Fetch/accept in UID order so
+        // the cursor remains a contiguous acknowledgement frontier and older messages are
+        // never ticketed after newer ones from the same mailbox batch.
+        uids.sort((a, b) => a - b);
 
         let processedMax = lastUid;
-        // A server is permitted to yield UID discovery results out of order.  This is the
-        // lowest UID that is either failed OR still unattempted after a failure stopped the
-        // batch.  Treating only the throwing UID as a failure would let `103` fail after
-        // `102` succeeded while an undispatched `101` sits later in the result stream, and
-        // a cursor=102 would silently skip 101 on the next poll.
-        let lowestUnresolvedUid: number | null = null;
+        // UIDs are processed in ascending order, so the first failure is the earliest
+        // non-durable message and defines the contiguous cursor frontier.
+        let lowestFailureUid: number | null = null;
         let acceptedCount = 0;
-        for (let index = 0; index < uids.length; index += 1) {
-          const uid = uids[index];
-          if (uid === undefined) continue;
+        for (const uid of uids) {
           try {
             const msg = await client.fetchOne(
               String(uid),
@@ -767,23 +764,15 @@ export class InboundMailService implements OnModuleInit, OnModuleDestroy {
           } catch (err) {
             // Fetch or DB failure → FAIL-CLOSED: stop without advancing past this UID.
             this.logger.error(`IMAP queue ${queueId}: accept failed at uid=${uid} — ${String(err)}`);
-            // Include every UID we have already discovered but will no longer attempt in
-            // this batch.  The cursor is a contiguous acknowledgement frontier, not merely
-            // the maximum successful UID.
-            const lowestRemaining = uids
-              .slice(index + 1)
-              .reduce((lowest, candidate) => Math.min(lowest, candidate), uid);
-            lowestUnresolvedUid =
-              lowestUnresolvedUid === null ? lowestRemaining : Math.min(lowestUnresolvedUid, lowestRemaining);
+            lowestFailureUid = lowestFailureUid === null ? uid : Math.min(lowestFailureUid, uid);
             break;
           }
         }
 
-        // Safe frontier.  In particular, if UID 103 was accepted first and UID 101 then
-        // fails, keep the cursor at 100; the durable 103 row will be an idempotent retry on
-        // the next poll, rather than silently skipping 101.
+        // Safe frontier: because the batch is UID-sorted, a failed UID cannot have an
+        // unattempted lower neighbour. The cursor remains immediately before it.
         const cursor =
-          lowestUnresolvedUid === null ? processedMax : Math.min(processedMax, lowestUnresolvedUid - 1);
+          lowestFailureUid === null ? processedMax : Math.min(processedMax, lowestFailureUid - 1);
 
         if (cursor > lastUid) {
           // Monotonic, generation-guarded CAS: advance only if nothing reconciled the

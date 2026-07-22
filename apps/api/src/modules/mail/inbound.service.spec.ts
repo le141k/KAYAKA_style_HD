@@ -800,35 +800,45 @@ describe('InboundMailService — parser rule helpers', () => {
       );
     });
 
-    it('P1-D out-of-order: high UID accepted first does not leapfrog a lower failed UID', async () => {
+    it('P1-D out-of-order discovery is accepted in ascending UID order; lower failure is never skipped', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
-      await poll(makeLedgerClient([103, 101], { uidValidity: 7n, uidNext: 104 }, { fetchOneThrowsAt: 101 }));
-
-      // UID 103 was already durable when lower UID 101 failed. It is safe to re-fetch 103
-      // later as an exact retry; it is NOT safe to write cursor=103 and skip 101.
-      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledTimes(1);
-      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
-        expect.objectContaining({ data: expect.objectContaining({ uid: 103n }) }),
+      const client = makeLedgerClient(
+        [103, 101],
+        { uidValidity: 7n, uidNext: 104 },
+        { fetchOneThrowsAt: 101 },
       );
+      await poll(client);
+
+      // A server returned 103 first, but we must fetch lower UID 101 before it; the failure
+      // leaves the cursor at 100 and 103 is retried only after 101 is durably accepted.
+      expect(client.fetchOne).toHaveBeenCalledTimes(1);
+      expect(client.fetchOne).toHaveBeenCalledWith('101', expect.anything(), { uid: true });
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
       expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: expect.anything() }) }),
       );
     });
 
-    it('P1-D out-of-order: a higher failure cannot skip a lower UID that the batch has not attempted yet', async () => {
+    it('P1-D out-of-order: sorted acceptance advances only through the contiguous successful prefix', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
-      // The server yielded 102, then a failing 103, and only then 101.  Polling stops at
-      // the error, so 101 is known but unattempted.  Advancing to 102 here would silently
-      // lose it on the next `lastSeenUid + 1` range.
-      await poll(
-        makeLedgerClient([102, 103, 101], { uidValidity: 7n, uidNext: 104 }, { fetchOneThrowsAt: 103 }),
+      // The server yielded 102, then a failing 103, and only then 101. Sorting means the
+      // contiguous prefix 101,102 is accepted before 103 fails, so cursor=102 is safe.
+      const client = makeLedgerClient(
+        [102, 103, 101],
+        { uidValidity: 7n, uidNext: 104 },
+        { fetchOneThrowsAt: 103 },
       );
+      await poll(client);
 
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ uid: 101n }) }),
+      );
       expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ uid: 102n }) }),
       );
-      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
-        expect.objectContaining({ data: expect.objectContaining({ lastSeenUid: expect.anything() }) }),
+      expect(client.fetchOne.mock.calls.map(([uid]) => uid)).toEqual(['101', '102', '103']);
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { lastSeenUid: 102n } }),
       );
     });
 
@@ -921,12 +931,10 @@ describe('InboundMailService — parser rule helpers', () => {
         fetch: vi.fn(function* () {
           yield { uid: 101 };
         }),
-        fetchOne: vi
-          .fn()
-          .mockResolvedValue({
-            uid: 101,
-            source: Buffer.from('From: sender@example.com\r\n\r\narrived after boundary'),
-          }),
+        fetchOne: vi.fn().mockResolvedValue({
+          uid: 101,
+          source: Buffer.from('From: sender@example.com\r\n\r\narrived after boundary'),
+        }),
       };
       attachLiveClient(client);
 
