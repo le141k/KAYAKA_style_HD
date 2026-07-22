@@ -13,6 +13,7 @@ import type { TicketsService } from '../tickets/tickets.service';
 import type { MailService } from './mail.service';
 import type { AppConfig } from '../../config/configuration';
 import type { InboundRawStorageService } from './inbound-raw-storage.service';
+import { MailAccessPolicy } from './mail-access-policy.service';
 
 // Fake ImapFlow so connectQueue() can be exercised without a real IMAP server. The
 // mailbox advertises UIDVALIDITY/UIDNEXT so the connect-time bootstrap barrier runs.
@@ -84,8 +85,12 @@ function makePrismaMock() {
     emailQueue: {
       findMany: vi.fn().mockResolvedValue([]),
       findUnique: vi.fn(),
+      findFirst: vi.fn(),
       update: vi.fn().mockResolvedValue({}),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    departmentStaff: {
+      findMany: vi.fn().mockResolvedValue([]),
     },
     emailParserRule: {
       findMany: vi.fn().mockResolvedValue([]),
@@ -146,6 +151,9 @@ function makePrismaMock() {
       return Promise.all(input as Promise<unknown>[]);
     }),
   });
+  (prisma.emailQueue.findFirst as ReturnType<typeof vi.fn>).mockImplementation((args: unknown) =>
+    (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>)(args),
+  );
   return prisma as unknown as PrismaService;
 }
 
@@ -1229,7 +1237,14 @@ describe('InboundMailService — parser rule helpers', () => {
       // no matching row. Releasing an old fetch must therefore NOT create a delivery.
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
       const queues = await import('./email-queue.service');
-      const queueService = new queues.EmailQueueService(prisma as unknown as PrismaService);
+      const queueService = new queues.EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
       await queueService.update(1, { host: 'new-imap.example' });
       releaseFence?.([]);
       await running;
