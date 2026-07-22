@@ -80,6 +80,25 @@ describe('reencryptEmailQueuePasswords', () => {
     expect(emailQueue.updateMany).not.toHaveBeenCalled();
   });
 
+  it('verify-only validates ciphertexts, observes plaintext, and never writes', async () => {
+    const encrypted = encryptField('already-encrypted', KEY);
+    const { db, rows, emailQueue } = fakeStore([
+      { id: 1, passwordEnc: encrypted },
+      { id: 2, passwordEnc: 'legacy-password' },
+    ]);
+
+    const report = await reencryptEmailQueuePasswords(db, KEY, { verifyOnly: true });
+
+    expect(report).toMatchObject({
+      existingCiphertextsValidated: 1,
+      legacyPlaintextObserved: 1,
+      legacyEncrypted: 0,
+      clean: true,
+    });
+    expect(rows.get(2)?.passwordEnc).toBe('legacy-password');
+    expect(emailQueue.updateMany).not.toHaveBeenCalled();
+  });
+
   it('fails closed if an existing ciphertext cannot be decrypted with the configured key', async () => {
     const { db, emailQueue } = fakeStore([{ id: 1, passwordEnc: encryptField('secret', OTHER_KEY) }]);
 
