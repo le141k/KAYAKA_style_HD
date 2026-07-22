@@ -20,10 +20,13 @@
 ## C [P0] IMAP password encryption (prod queues fail auth today; inbound.service.ts:57 TODO passes ciphertext)
 
 - common/field-encrypt.util.ts: AES-256-GCM, format `v1:<ivHex>:<tagHex>:<ctHex>`; legacy (no v1:) returns as-is (rolling migration).
-- config: `TELECOM_HD_FIELD_ENCRYPTION_KEY` (64 hex, optional+warn). .env.example with gen cmd.
+- config: `TELECOM_HD_FIELD_ENCRYPTION_KEY` (64 hex, required in production; dev/test may omit).
+  The deploy helper converts legacy plaintext `EmailQueue.passwordEnc` values while workers are paused,
+  validates existing `v1:` ciphertext with that key, and fails closed on a malformed value.
 - email-queue.service: encryptField on create/update password→passwordEnc.
 - inbound.service:57: `pass: decryptField(queue.passwordEnc, key)`.
-- scripts/encrypt-queues.ts one-off (idempotent via v1: check).
+- `seed/reencrypt-email-queue-passwords.ts` is the idempotent deployment gate (CAS updates plus a final
+  aggregate-only verification); it is run by `scripts/deploy-prod.sh` before new API startup.
 
 ## D [P1] Staff notifications (no notify-on-assign; prod swnotificationrules has assignment rule)
 

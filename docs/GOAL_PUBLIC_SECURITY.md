@@ -595,7 +595,7 @@ Implementation is complete; production scanner/load/storage evidence remains in 
       _(Done: `scripts/preflight.sh` (a) treats `NEXT_PUBLIC_API_URL` empty/unset as valid same-origin
       `/api` and requires `https://` only when set, and (b) fails when the env file is not owner-only
       `0600`/`0400`, never printing values. The TS boot guard `assertProductionSecrets` rejects
-      placeholder/default JWT, Alaris and field-encryption secrets AND now (S5-7) rejects a non-`https://`
+      placeholder/default JWT and Alaris secrets, plus a missing/malformed field-encryption key, AND now (S5-7) rejects a non-`https://`
       or localhost `TELECOM_HD_PUBLIC_URL` and a localhost/MailHog `TELECOM_HD_SMTP_HOST` in production —
       so a prod deploy cannot silently boot with the dev localhost origin (which would break the CSRF
       allowlist + magic-link/reset URLs) or a dev mail host (which would black-hole reset/login mail).
