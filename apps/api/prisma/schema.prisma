@@ -101,13 +101,25 @@ enum InboundDeliveryState {
 
 // Per-queue IMAP sync health. NEEDS_RECONCILIATION halts polling (fail-closed) after a
 // UIDVALIDITY change so an operator explicitly chooses FROM_NOW or a bounded BACKFILL.
-// BOOTSTRAPPING is transient: a queue an operator reconciled with FROM_NOW/BACKFILL sits
-// here until the poller fixes its high-water baseline and flips it to OK via the
-// generation-guarded CAS — so health never reports a queue OK before it has a cursor.
+// BOOTSTRAPPING is transient: an operator reconcile holds the queue here while it captures
+// UIDVALIDITY/UIDNEXT under the IMAP mailbox lock.  The same request durably commits that
+// exact baseline before it returns OK, so health never reports a cursor before it exists.
 enum EmailQueueSyncState {
   OK
   BOOTSTRAPPING
   NEEDS_RECONCILIATION
+}
+
+// Why an IMAP queue is halted/reconciling.  This is deliberately durable and
+// server-side: the UI must never infer that a dangerous resume is safe from a
+// free-form lastError string.
+enum EmailQueueReconcileCause {
+  LEGACY_MIGRATION
+  UIDVALIDITY_CHANGED
+  MAILBOX_IDENTITY_CHANGED
+  MANUAL_FORCE
+  TRANSPORT_COLLISION
+  UNKNOWN
 }
 
 enum FlagType {
@@ -779,6 +791,13 @@ model EmailQueue {
   // Bumped on every reconcile/rebootstrap. The cursor CAS is gated on this so a stale
   // poller (finishing after a reconcile) can't write a cursor from the old UID space.
   cursorGeneration Int               @default(0)
+  // Bumped whenever the IMAP mailbox identity changes (including IMAP <-> non-IMAP
+  // transitions). UIDVALIDITY/UID pairs are only meaningful within this epoch.
+  mailboxEpoch     Int               @default(1)
+  // A halted/reconciling mailbox carries a durable, typed reason. It determines the
+  // server-side allowed reconcile modes; never derive safety from lastError text.
+  reconcileCause       EmailQueueReconcileCause?
+  reconcileRequestedAt DateTime?
   // Per-queue re-bootstrap intent set by an explicit operator reconcile (overrides the
   // global TELECOM_HD_IMAP_BOOTSTRAP_POLICY for THIS queue's next bootstrap). NULL = use
   // the global config. Only consulted while `uidValidity IS NULL` (never bootstrapped).
@@ -810,12 +829,15 @@ model InboundDelivery {
   queueId       Int?
 
   // Canonical idempotency key — the atomic claim. Unique across all deliveries:
-  //   IMAP: `imap:<queueId>:<uidValidity>:<uid>`
+  //   IMAP: `imap:<queueId>:<mailboxEpoch>:<uidValidity>:<uid>`
   //   PIPE: `pipe:<queueId|->:<externalId or sha256:hash>`
   transportKey  String           @unique
 
   // IMAP transport identity (also stored structured for admin/observability). IMAP UIDs
   // are unsigned 32-bit, so BigInt (not signed 32-bit INTEGER) to avoid overflow.
+  // `mailboxEpoch` snapshots the queue's identity generation at acceptance, preventing a
+  // new mailbox reusing UIDVALIDITY/UID from colliding with an older mailbox's delivery.
+  mailboxEpoch  Int?
   uidValidity   BigInt?
   uid           BigInt?
   // PIPE/MTA transport identity (webhook idempotency id / MTA delivery id)
@@ -880,7 +902,7 @@ model InboundDelivery {
   processedAt   DateTime?
 
   @@index([state, nextAttemptAt])
-  @@index([queueId, uidValidity, uid])
+  @@index([queueId, mailboxEpoch, uidValidity, uid])
   @@index([messageIdHash])
   @@index([observedMessageId])
   @@index([routedQueueId])

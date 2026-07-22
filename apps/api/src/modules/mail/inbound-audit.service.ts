@@ -3,7 +3,13 @@ import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 
 /** One of the audited inbound operator actions. */
-export type InboundAuditAction = 'mail.reconcile' | 'mail.quarantine_replay';
+export type InboundAuditAction =
+  | 'mail.reconcile'
+  | 'mail.reconcile_requested'
+  | 'mail.reconcile_completed'
+  | 'mail.reconcile_failed'
+  | 'mail.transport_collision'
+  | 'mail.quarantine_replay';
 
 export interface InboundAuditEntry {
   actorStaffId?: number | null;
@@ -19,9 +25,9 @@ export interface InboundAuditEntry {
  * Append-only writer for the inbound operator-action audit trail (see `InboundAuditLog`).
  *
  * Kept separate from RbacAuditLog (staff/group RBAC) so mail-ops history is queryable on its
- * own with the queue/delivery it targeted. Writes are best-effort: an audit-insert failure is
- * logged, never propagated — the reconcile/replay it records is the source of truth and must
- * not roll back because the audit row failed.
+ * own with the queue/delivery it targeted. Writes through this convenience service are
+ * best-effort (e.g. replay); correctness-critical reconcile/collision transitions write their
+ * audit row directly through the same Prisma transaction as the state CAS.
  */
 @Injectable()
 export class InboundAuditService {
