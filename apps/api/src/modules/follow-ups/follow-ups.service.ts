@@ -18,18 +18,22 @@ export class FollowUpsService {
 
   /** Create a follow-up reminder on a ticket for the given staff member. */
   async create(ticketId: number, staffId: number, dto: CreateFollowUpDto, actor?: TicketAccessActor) {
-    if (actor) await this.requireTicketAccess(actor).assertCanAccessTicket(actor, ticketId);
+    const data = {
+      ticketId,
+      staffId,
+      dueAt: new Date(dto.dueAt),
+      note: dto.note ?? null,
+    };
+    if (actor) {
+      return this.prisma.$transaction(async (tx) => {
+        await this.requireTicketAccess(actor).fenceTicketMutation(tx, actor, ticketId, new Date());
+        return tx.followUp.create({ data });
+      });
+    }
     // E3: 404 on a non-existent ticket instead of an opaque FK 500.
     const ticket = await this.prisma.ticket.findUnique({ where: { id: ticketId }, select: { id: true } });
     if (!ticket) throw new NotFoundException(`Ticket ${ticketId} not found`);
-    return this.prisma.followUp.create({
-      data: {
-        ticketId,
-        staffId,
-        dueAt: new Date(dto.dueAt),
-        note: dto.note ?? null,
-      },
-    });
+    return this.prisma.followUp.create({ data });
   }
 
   /** List follow-ups for a ticket, ordered by due date ascending. */
@@ -52,20 +56,32 @@ export class FollowUpsService {
     canManageOthers = false,
     actor?: TicketAccessActor,
   ) {
-    if (actor) await this.requireTicketAccess(actor).assertCanAccessFollowUp(actor, id);
+    const data = { completed, completedAt: completed ? new Date() : null };
+    if (actor) {
+      return this.prisma.$transaction(async (tx) => {
+        const entry = await tx.followUp.findUnique({ where: { id } });
+        if (!entry) throw new NotFoundException(`Follow-up ${id} not found`);
+        await this.requireTicketAccess(actor).fenceTicketMutation(tx, actor, entry.ticketId, new Date());
+        this.assertEntryOwned(entry.staffId, staffId, canManageOthers);
+        return tx.followUp.update({ where: { id }, data });
+      });
+    }
     await this.assertOwned(id, staffId, canManageOthers);
-    return this.prisma.followUp.update({
-      where: { id },
-      data: {
-        completed,
-        completedAt: completed ? new Date() : null,
-      },
-    });
+    return this.prisma.followUp.update({ where: { id }, data });
   }
 
   /** Delete a follow-up. 404 if missing, 403 if not owner/manager. */
   async remove(id: number, staffId: number, canManageOthers = false, actor?: TicketAccessActor) {
-    if (actor) await this.requireTicketAccess(actor).assertCanAccessFollowUp(actor, id);
+    if (actor) {
+      await this.prisma.$transaction(async (tx) => {
+        const entry = await tx.followUp.findUnique({ where: { id } });
+        if (!entry) throw new NotFoundException(`Follow-up ${id} not found`);
+        await this.requireTicketAccess(actor).fenceTicketMutation(tx, actor, entry.ticketId, new Date());
+        this.assertEntryOwned(entry.staffId, staffId, canManageOthers);
+        await tx.followUp.delete({ where: { id } });
+      });
+      return { deleted: true };
+    }
     await this.assertOwned(id, staffId, canManageOthers);
     await this.prisma.followUp.delete({ where: { id } });
     return { deleted: true };
@@ -78,7 +94,11 @@ export class FollowUpsService {
   private async assertOwned(id: number, staffId: number, canManageOthers = false): Promise<void> {
     const existing = await this.prisma.followUp.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException(`Follow-up ${id} not found`);
-    if (existing.staffId !== staffId && !canManageOthers) {
+    this.assertEntryOwned(existing.staffId, staffId, canManageOthers);
+  }
+
+  private assertEntryOwned(entryStaffId: number, staffId: number, canManageOthers: boolean): void {
+    if (entryStaffId !== staffId && !canManageOthers) {
       throw new ForbiddenException('You can only modify your own follow-ups');
     }
   }

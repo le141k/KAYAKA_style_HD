@@ -198,7 +198,9 @@ model Staff {
   authVersion     Int       @default(0)
   staffGroup      StaffGroup @relation(fields: [staffGroupId], references: [id])
   staffGroupId    Int
-  // departments this agent can act in (empty = all, governed by group)
+  // Explicit allow-list of departments this non-admin agent can act in. An
+  // empty list grants no ticket-department access; only staffGroup.isAdmin is
+  // globally unrestricted.
   departments     DepartmentStaff[]
   ownedTickets    Ticket[]  @relation("TicketOwner")
   posts           TicketPost[]

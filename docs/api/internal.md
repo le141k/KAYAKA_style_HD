@@ -466,7 +466,13 @@ state = PROCESSING`): a **0-row settle** means the lease was lost mid-processing
 > reconcile audit transactions and split mail permissions. The current contract is below.
 
 Consumed by: `EmailQueueController`. Owns queue CRUD (password `passwordEnc` never returned) plus
-the inbound operator actions. Injects `InboundAuditService` (`@Optional()`).
+the inbound operator actions. Injects `MailAccessPolicy` and `InboundAuditService` (`@Optional()`).
+`MailAccessPolicy` makes only global administrators unrestricted. A non-admin gets an explicit
+`DepartmentStaff` allow-list (an empty list is deny-all, matching ticket ACL behavior):
+queue predicates require an allowed non-null `EmailQueue.departmentId`; delivery predicates require
+an allowed non-null acceptance-time `InboundDelivery.departmentId` and, when bound to a queue, an
+allowed current queue department too. ID mutations repeat their scoped SQL predicate at write time
+to prevent a read-then-write scope race.
 
 ```ts
 list() / get(id) / create(dto) / delete(id)

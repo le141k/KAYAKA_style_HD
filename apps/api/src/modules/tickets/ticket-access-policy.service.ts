@@ -11,7 +11,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 export type TicketAccessActor = Pick<AuthStaff, 'staffId' | 'isAdmin'>;
 
 export interface TicketDepartmentScope {
-  /** Administrators and staff without DepartmentStaff rows can see every department. */
+  /** Only global administrators are unrestricted. */
   unrestricted: boolean;
   departmentIds: number[];
 }
@@ -19,11 +19,11 @@ export interface TicketDepartmentScope {
 /**
  * One authoritative policy for every staff-facing ticket boundary.
  *
- * A DepartmentStaff row is an allow-list.  Its absence deliberately keeps the
- * historic "all departments" behaviour for unrestricted staff; it is not a
- * deny-all state.  Ticket lookups use a scoped SQL predicate instead of reading
- * a row first and filtering it in application code, so unauthorized callers do
- * not receive ticket/post/note data while the page is being assembled.
+ * A DepartmentStaff row is an explicit allow-list. A non-administrator without
+ * a row is deliberately denied every department; the only unrestricted role is
+ * a global administrator. Ticket lookups use a scoped SQL predicate instead of
+ * reading a row first and filtering it in application code, so unauthorized
+ * callers do not receive ticket/post/note data while the page is being assembled.
  */
 @Injectable()
 export class TicketAccessPolicy {
@@ -37,11 +37,25 @@ export class TicketAccessPolicy {
       select: { departmentId: true },
     });
     const departmentIds = [...new Set(rows.map((row) => row.departmentId))];
-    return { unrestricted: departmentIds.length === 0, departmentIds };
+    return { unrestricted: false, departmentIds };
   }
 
   async ticketWhere(actor: TicketAccessActor): Promise<Prisma.TicketWhereInput> {
-    return this.ticketWhereForScope(await this.resolveScope(actor));
+    if (actor.isAdmin) return {};
+    // Keep ordinary reads and conditional writes tied to DepartmentStaff in the
+    // same SQL statement. Resolving IDs first is fine for dashboards, but it
+    // leaves a window in which a just-revoked assignment can still be used by a
+    // following mutation. This relation predicate closes that window and is
+    // naturally deny-all when the staff member has no assignment rows.
+    return {
+      department: {
+        is: {
+          staff: {
+            some: { staffId: actor.staffId },
+          },
+        },
+      },
+    };
   }
 
   ticketWhereForScope(scope: TicketDepartmentScope): Prisma.TicketWhereInput {
@@ -57,6 +71,24 @@ export class TicketAccessPolicy {
     }
   }
 
+  /**
+   * Re-check a target department from inside the caller's write transaction.
+   * This is used for staff-created/moved tickets, where a stale preflight check
+   * must not survive a concurrent DepartmentStaff revocation.
+   */
+  async assertCanAccessDepartmentInTransaction(
+    actor: TicketAccessActor,
+    departmentId: number,
+    transaction: Prisma.TransactionClient,
+  ): Promise<void> {
+    if (actor.isAdmin) return;
+    const membership = await transaction.departmentStaff.findUnique({
+      where: { departmentId_staffId: { departmentId, staffId: actor.staffId } },
+      select: { departmentId: true },
+    });
+    if (!membership) throw new NotFoundException('Department not found');
+  }
+
   async assertCanAccessTicket(actor: TicketAccessActor, ticketId: number): Promise<void> {
     const where = await this.ticketWhere(actor);
     const ticket = await this.prisma.ticket.findFirst({
@@ -64,6 +96,27 @@ export class TicketAccessPolicy {
       select: { id: true },
     });
     if (!ticket) throw new NotFoundException('Ticket not found');
+  }
+
+  /**
+   * Atomically prove the actor can still mutate this ticket and retain a row
+   * lock until the enclosing transaction commits. The conditional write is the
+   * mutation fence for child rows (posts, notes, links, time and follow-ups),
+   * which otherwise cannot carry a ticket department predicate themselves.
+   */
+  async fenceTicketMutation(
+    transaction: Prisma.TransactionClient,
+    actor: TicketAccessActor,
+    ticketId: number,
+    now: Date,
+  ): Promise<void> {
+    const result = await transaction.ticket.updateMany({
+      where: {
+        AND: [{ id: ticketId }, await this.ticketWhere(actor)],
+      },
+      data: { lastActivityAt: now },
+    });
+    if (result.count !== 1) throw new NotFoundException('Ticket not found');
   }
 
   /**
@@ -135,7 +188,7 @@ export class TicketAccessPolicy {
     if (!staff.isEnabled) {
       throw new BadRequestException(`Staff ${assigneeStaffId} is disabled and cannot be assigned`);
     }
-    if (staff.staffGroup.isAdmin || staff.departments.length === 0) return;
+    if (staff.staffGroup.isAdmin) return;
 
     const allowed = new Set(staff.departments.map((row) => row.departmentId));
     if (departmentIds.some((departmentId) => !allowed.has(departmentId))) {

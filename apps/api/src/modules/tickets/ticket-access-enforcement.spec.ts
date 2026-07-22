@@ -63,8 +63,10 @@ function makeAccess(overrides: Record<string, unknown> = {}) {
   return {
     ticketWhere: vi.fn().mockResolvedValue({ departmentId: { in: [1] } }),
     assertCanAccessDepartment: vi.fn().mockResolvedValue(undefined),
+    assertCanAccessDepartmentInTransaction: vi.fn().mockResolvedValue(undefined),
     assertAssigneeCanHandleDepartments: vi.fn().mockResolvedValue(undefined),
     assertCanAccessTicket: vi.fn().mockResolvedValue(undefined),
+    fenceTicketMutation: vi.fn().mockResolvedValue(undefined),
     assertCanAccessAttachment: vi.fn().mockResolvedValue(undefined),
     assertCanAccessTimeEntry: vi.fn().mockResolvedValue(undefined),
     assertCanAccessFollowUp: vi.fn().mockResolvedValue(undefined),
@@ -144,6 +146,22 @@ describe('ACL-01 enforcement at staff-facing ticket boundaries', () => {
       NotFoundException,
     );
     expect(prisma.ticket.update).not.toHaveBeenCalled();
+  });
+
+  it('does not write after a scoped mutation fence loses a department-move race', async () => {
+    const access = makeAccess({ fenceTicketMutation: vi.fn().mockRejectedValue(new NotFoundException()) });
+    const tx = { ticket: { update: vi.fn() }, ticketAuditLog: { create: vi.fn() } };
+    const prisma = {
+      ticket: { findFirst: vi.fn().mockResolvedValue(makeTicket()) },
+      $transaction: vi.fn((callback: (client: typeof tx) => unknown) => callback(tx)),
+    };
+    const service = makeTicketService(prisma, access);
+
+    await expect(service.changePriority(101, { priorityId: 3 }, 10, DEPT_A_AGENT)).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+    expect(tx.ticket.update).not.toHaveBeenCalled();
+    expect(tx.ticketAuditLog.create).not.toHaveBeenCalled();
   });
 
   it('does not turn an inbound Message-ID into a cross-department staff read path', async () => {
@@ -317,9 +335,19 @@ describe('ACL-01 relation and attachment endpoints', () => {
   });
 
   it('blocks time and follow-up operations before their service writes or reads Department B data', async () => {
-    const access = makeAccess({ assertCanAccessTicket: vi.fn().mockRejectedValue(new NotFoundException()) });
-    const timePrisma = { ticket: { findUnique: vi.fn() }, timeEntry: { create: vi.fn() } };
-    const followPrisma = { followUp: { findMany: vi.fn() } };
+    const access = makeAccess({
+      assertCanAccessTicket: vi.fn().mockRejectedValue(new NotFoundException()),
+      fenceTicketMutation: vi.fn().mockRejectedValue(new NotFoundException()),
+    });
+    const timePrisma = {
+      ticket: { findUnique: vi.fn() },
+      timeEntry: { create: vi.fn() },
+      $transaction: vi.fn((callback: (tx: unknown) => unknown) => callback({})),
+    };
+    const followPrisma = {
+      followUp: { findMany: vi.fn() },
+      $transaction: vi.fn((callback: (tx: unknown) => unknown) => callback({})),
+    };
     const time = new TimeTrackingService(
       timePrisma as unknown as PrismaService,
       access as unknown as TicketAccessPolicy,

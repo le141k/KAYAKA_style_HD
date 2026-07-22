@@ -275,6 +275,13 @@ export class TicketsService {
     let updated: Ticket;
     try {
       const [, transactionTicket] = await this.prisma.$transaction(async (tx) => {
+        if (actor) {
+          await this.requireTicketAccess(actor).assertCanAccessDepartmentInTransaction(
+            actor,
+            dto.departmentId,
+            tx,
+          );
+        }
         const created = await tx.ticket.create({
           data: {
             mask: 'TT-PENDING', // temporary; replaced within this same transaction
@@ -949,6 +956,7 @@ export class TicketsService {
     let outboundEmailId: string | undefined;
     try {
       const committed = await this.prisma.$transaction(async (tx) => {
+        await this.fenceTicketMutation(tx, ticketId, actor, now);
         const createdPost = await tx.ticketPost.create({
           data: {
             ticketId,
@@ -1117,6 +1125,7 @@ export class TicketsService {
     const hasNoteAttachments = Boolean(attachmentIds?.length);
 
     return this.prisma.$transaction(async (tx) => {
+      await this.fenceTicketMutation(tx, ticketId, actor, new Date());
       const note = await tx.ticketNote.create({
         data: { ticketId, staffId, contents },
       });
@@ -1200,6 +1209,7 @@ export class TicketsService {
     const now = new Date();
     await this.prisma.$transaction(async (tx) => {
       for (const t of existing) {
+        await this.fenceTicketMutation(tx, t.id, actor, now);
         const data: Record<string, unknown> = { lastActivityAt: now };
         let action: string;
         let newValue: string | null;
@@ -1263,16 +1273,27 @@ export class TicketsService {
       }
     }
 
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { ownerStaffId: dto.ownerStaffId, lastActivityAt: new Date() },
-    });
-
-    await this.writeAudit(ticketId, 'ASSIGN', staffId, 'STAFF', {
+    const now = new Date();
+    const audit = {
       field: 'ownerStaffId',
       oldValue: ticket.ownerStaffId?.toString() ?? null,
       newValue: dto.ownerStaffId?.toString() ?? null,
-    });
+    };
+    const updated = actor
+      ? await this.prisma.$transaction(async (tx) => {
+          await this.fenceTicketMutation(tx, ticketId, actor, now);
+          const result = await tx.ticket.update({
+            where: { id: ticketId },
+            data: { ownerStaffId: dto.ownerStaffId, lastActivityAt: now },
+          });
+          await this.writeAudit(ticketId, 'ASSIGN', staffId, 'STAFF', audit, tx);
+          return result;
+        })
+      : await this.prisma.ticket.update({
+          where: { id: ticketId },
+          data: { ownerStaffId: dto.ownerStaffId, lastActivityAt: now },
+        });
+    if (!actor) await this.writeAudit(ticketId, 'ASSIGN', staffId, 'STAFF', audit);
 
     // Notify the newly assigned staff member (non-blocking)
     if (dto.ownerStaffId && this.notificationService) {
@@ -1326,22 +1347,27 @@ export class TicketsService {
       };
     }
 
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: {
-        statusId: dto.statusId,
-        isResolved: becomesResolved,
-        resolvedAt: becomesResolved ? now : null,
-        lastActivityAt: now,
-        ...slaUpdate,
-      },
-    });
-
-    await this.writeAudit(ticketId, 'STATUS_CHANGE', staffId, 'STAFF', {
+    const data = {
+      statusId: dto.statusId,
+      isResolved: becomesResolved,
+      resolvedAt: becomesResolved ? now : null,
+      lastActivityAt: now,
+      ...slaUpdate,
+    };
+    const audit = {
       field: 'statusId',
       oldValue: ticket.statusId.toString(),
       newValue: dto.statusId.toString(),
-    });
+    };
+    const updated = actor
+      ? await this.prisma.$transaction(async (tx) => {
+          await this.fenceTicketMutation(tx, ticketId, actor, now);
+          const result = await tx.ticket.update({ where: { id: ticketId }, data });
+          await this.writeAudit(ticketId, 'STATUS_CHANGE', staffId, 'STAFF', audit, tx);
+          return result;
+        })
+      : await this.prisma.ticket.update({ where: { id: ticketId }, data });
+    if (!actor) await this.writeAudit(ticketId, 'STATUS_CHANGE', staffId, 'STAFF', audit);
 
     // Emit domain event
     this.emitDomainEvent('ticket.status_changed', ticketId);
@@ -1356,17 +1382,22 @@ export class TicketsService {
     actor?: TicketAccessActor,
   ): Promise<Ticket> {
     const ticket = await this.findAccessibleOrThrow(ticketId, actor);
-
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { priorityId: dto.priorityId, lastActivityAt: new Date() },
-    });
-
-    await this.writeAudit(ticketId, 'PRIORITY_CHANGE', staffId, 'STAFF', {
+    const now = new Date();
+    const data = { priorityId: dto.priorityId, lastActivityAt: now };
+    const audit = {
       field: 'priorityId',
       oldValue: ticket.priorityId.toString(),
       newValue: dto.priorityId.toString(),
-    });
+    };
+    const updated = actor
+      ? await this.prisma.$transaction(async (tx) => {
+          await this.fenceTicketMutation(tx, ticketId, actor, now);
+          const result = await tx.ticket.update({ where: { id: ticketId }, data });
+          await this.writeAudit(ticketId, 'PRIORITY_CHANGE', staffId, 'STAFF', audit, tx);
+          return result;
+        })
+      : await this.prisma.ticket.update({ where: { id: ticketId }, data });
+    if (!actor) await this.writeAudit(ticketId, 'PRIORITY_CHANGE', staffId, 'STAFF', audit);
 
     return updated;
   }
@@ -1378,17 +1409,22 @@ export class TicketsService {
     actor?: TicketAccessActor,
   ): Promise<Ticket> {
     const ticket = await this.findAccessibleOrThrow(ticketId, actor);
-
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { typeId: dto.typeId, lastActivityAt: new Date() },
-    });
-
-    await this.writeAudit(ticketId, 'TYPE_CHANGE', staffId, 'STAFF', {
+    const now = new Date();
+    const data = { typeId: dto.typeId, lastActivityAt: now };
+    const audit = {
       field: 'typeId',
       oldValue: ticket.typeId?.toString() ?? null,
       newValue: dto.typeId?.toString() ?? null,
-    });
+    };
+    const updated = actor
+      ? await this.prisma.$transaction(async (tx) => {
+          await this.fenceTicketMutation(tx, ticketId, actor, now);
+          const result = await tx.ticket.update({ where: { id: ticketId }, data });
+          await this.writeAudit(ticketId, 'TYPE_CHANGE', staffId, 'STAFF', audit, tx);
+          return result;
+        })
+      : await this.prisma.ticket.update({ where: { id: ticketId }, data });
+    if (!actor) await this.writeAudit(ticketId, 'TYPE_CHANGE', staffId, 'STAFF', audit);
 
     return updated;
   }
@@ -1424,6 +1460,11 @@ export class TicketsService {
 
     await this.prisma.$transaction(async (tx) => {
       const now = new Date();
+      // Deterministic order prevents A→B and B→A merges from deadlocking while
+      // both transactions acquire their department-scope fences.
+      for (const ticketId of [sourceTicketId, target.id].sort((a, b) => a - b)) {
+        await this.fenceTicketMutation(tx, ticketId, actor, now);
+      }
 
       // Move all posts from source to target
       await tx.ticketPost.updateMany({
@@ -1547,6 +1588,10 @@ export class TicketsService {
     // concurrent split/merge can't let us yank posts that no longer belong to the
     // source (TOCTOU between the verify above and the move).
     const { newTicket, newMask } = await this.prisma.$transaction(async (tx) => {
+      if (actor) {
+        await this.requireTicketAccess(actor).assertCanAccessDepartmentInTransaction(actor, departmentId, tx);
+      }
+      await this.fenceTicketMutation(tx, sourceTicketId, actor, now);
       const created = await tx.ticket.create({
         data: {
           mask: 'TT-PENDING',
@@ -1614,16 +1659,34 @@ export class TicketsService {
         ticket.departmentId,
       ]);
     }
-    await this.prisma.ticketWatcher.upsert({
-      where: { ticketId_staffId: { ticketId, staffId: dto.staffId } },
-      create: { ticketId, staffId: dto.staffId },
-      update: {},
-    });
+    const upsert = (db: PrismaService | Prisma.TransactionClient) =>
+      db.ticketWatcher.upsert({
+        where: { ticketId_staffId: { ticketId, staffId: dto.staffId } },
+        create: { ticketId, staffId: dto.staffId },
+        update: {},
+      });
+    if (actor) {
+      await this.prisma.$transaction(async (tx) => {
+        await this.fenceTicketMutation(tx, ticketId, actor, new Date());
+        await upsert(tx);
+      });
+    } else {
+      await upsert(this.prisma);
+    }
   }
 
   async removeWatcher(ticketId: number, staffId: number, actor?: TicketAccessActor): Promise<void> {
     if (actor) await this.findAccessibleOrThrow(ticketId, actor);
-    await this.prisma.ticketWatcher.deleteMany({ where: { ticketId, staffId } });
+    const remove = (db: PrismaService | Prisma.TransactionClient) =>
+      db.ticketWatcher.deleteMany({ where: { ticketId, staffId } });
+    if (actor) {
+      await this.prisma.$transaction(async (tx) => {
+        await this.fenceTicketMutation(tx, ticketId, actor, new Date());
+        await remove(tx);
+      });
+    } else {
+      await remove(this.prisma);
+    }
   }
 
   // ─────────────────────────── Ticket links (client ↔ supplier) ─────────────
@@ -1696,36 +1759,55 @@ export class TicketsService {
     await this.findAccessibleOrThrow(ticketId, actor);
     await this.findAccessibleOrThrow(dto.targetId, actor);
 
-    // Reject a duplicate in either direction (the @@unique only covers one).
-    const existing = await this.prisma.ticketLink.findFirst({
-      where: {
-        OR: [
-          { sourceId: ticketId, targetId: dto.targetId },
-          { sourceId: dto.targetId, targetId: ticketId },
-        ],
-      },
-    });
-    if (existing) throw new BadRequestException('These tickets are already linked');
-
-    const link = await this.prisma.ticketLink.create({
-      data: { sourceId: ticketId, targetId: dto.targetId, linkType: dto.linkType },
-    });
+    const create = async (db: PrismaService | Prisma.TransactionClient) => {
+      // Reject a duplicate in either direction (the @@unique only covers one).
+      const existing = await db.ticketLink.findFirst({
+        where: {
+          OR: [
+            { sourceId: ticketId, targetId: dto.targetId },
+            { sourceId: dto.targetId, targetId: ticketId },
+          ],
+        },
+      });
+      if (existing) throw new BadRequestException('These tickets are already linked');
+      return db.ticketLink.create({
+        data: { sourceId: ticketId, targetId: dto.targetId, linkType: dto.linkType },
+      });
+    };
+    const link = actor
+      ? await this.prisma.$transaction(async (tx) => {
+          // Take both fences in a stable order, so a department move cannot race
+          // the relationship insert and A↔B concurrent requests do not deadlock.
+          for (const id of [ticketId, dto.targetId].sort((a, b) => a - b)) {
+            await this.fenceTicketMutation(tx, id, actor, new Date());
+          }
+          return create(tx);
+        })
+      : await create(this.prisma);
     return { linkId: link.id, linkType: link.linkType, targetId: link.targetId };
   }
 
   async removeLink(ticketId: number, linkId: number, actor?: TicketAccessActor): Promise<void> {
-    // Scope the delete to links that actually involve this ticket (either end).
-    const link = await this.prisma.ticketLink.findUnique({ where: { id: linkId } });
-    if (!link || (link.sourceId !== ticketId && link.targetId !== ticketId)) {
-      throw new NotFoundException(`Link ${linkId} not found on ticket ${ticketId}`);
-    }
-    // A link exposes and changes both sides.  Checking just the route ticket
-    // would let Department A delete an A↔B relationship without B access.
+    const remove = async (db: PrismaService | Prisma.TransactionClient) => {
+      // Scope the delete to links that actually involve this ticket (either end).
+      const link = await db.ticketLink.findUnique({ where: { id: linkId } });
+      if (!link || (link.sourceId !== ticketId && link.targetId !== ticketId)) {
+        throw new NotFoundException(`Link ${linkId} not found on ticket ${ticketId}`);
+      }
+      if (actor) {
+        // A link changes both sides. Fence both rows inside the same transaction
+        // so a concurrent department move cannot turn it into an A↔B mutation.
+        for (const id of [link.sourceId, link.targetId].sort((a, b) => a - b)) {
+          await this.fenceTicketMutation(db as Prisma.TransactionClient, id, actor, new Date());
+        }
+      }
+      await db.ticketLink.delete({ where: { id: linkId } });
+    };
     if (actor) {
-      await this.findAccessibleOrThrow(link.sourceId, actor);
-      await this.findAccessibleOrThrow(link.targetId, actor);
+      await this.prisma.$transaction(remove);
+    } else {
+      await remove(this.prisma);
     }
-    await this.prisma.ticketLink.delete({ where: { id: linkId } });
   }
 
   /**
@@ -1775,27 +1857,45 @@ export class TicketsService {
 
   async addTag(ticketId: number, dto: TagDto, actor?: TicketAccessActor): Promise<void> {
     await this.findAccessibleOrThrow(ticketId, actor);
-    await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: {
-        tags: {
-          connectOrCreate: {
-            where: { name: dto.name },
-            create: { name: dto.name },
+    const add = (db: PrismaService | Prisma.TransactionClient) =>
+      db.ticket.update({
+        where: { id: ticketId },
+        data: {
+          tags: {
+            connectOrCreate: {
+              where: { name: dto.name },
+              create: { name: dto.name },
+            },
           },
         },
-      },
-    });
+      });
+    if (actor) {
+      await this.prisma.$transaction(async (tx) => {
+        await this.fenceTicketMutation(tx, ticketId, actor, new Date());
+        await add(tx);
+      });
+    } else {
+      await add(this.prisma);
+    }
   }
 
   async removeTag(ticketId: number, tagName: string, actor?: TicketAccessActor): Promise<void> {
     await this.findAccessibleOrThrow(ticketId, actor);
     const tag = await this.prisma.ticketTag.findUnique({ where: { name: tagName } });
     if (!tag) return; // idempotent
-    await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { tags: { disconnect: { name: tagName } } },
-    });
+    const remove = (db: PrismaService | Prisma.TransactionClient) =>
+      db.ticket.update({
+        where: { id: ticketId },
+        data: { tags: { disconnect: { name: tagName } } },
+      });
+    if (actor) {
+      await this.prisma.$transaction(async (tx) => {
+        await this.fenceTicketMutation(tx, ticketId, actor, new Date());
+        await remove(tx);
+      });
+    } else {
+      await remove(this.prisma);
+    }
   }
 
   // ─────────────────────────── Apply Macro ───────────────────────────
@@ -1821,31 +1921,40 @@ export class TicketsService {
     if (macro.replyText && macro.replyText.trim()) {
       const staff = await this.prisma.staff.findUnique({ where: { id: staffId } });
       const now = new Date();
+      const createMacroReply = async (db: PrismaService | Prisma.TransactionClient): Promise<void> => {
+        await db.ticketPost.create({
+          data: {
+            ticketId,
+            authorType: 'STAFF',
+            staffId,
+            fullName: staff ? `${staff.firstName} ${staff.lastName}`.trim() || staff.email : undefined,
+            email: staff?.email,
+            subject: ticket.subject,
+            contents: macro.replyText,
+            isHtml: false,
+            creationMode: 'STAFF',
+            ipAddress: '0.0.0.0',
+          },
+        });
 
-      await this.prisma.ticketPost.create({
-        data: {
-          ticketId,
-          authorType: 'STAFF',
-          staffId,
-          fullName: staff ? `${staff.firstName} ${staff.lastName}`.trim() || staff.email : undefined,
-          email: staff?.email,
-          subject: ticket.subject,
-          contents: macro.replyText,
-          isHtml: false,
-          creationMode: 'STAFF',
-          ipAddress: '0.0.0.0',
-        },
-      });
-
-      await this.prisma.ticket.update({
-        where: { id: ticketId },
-        data: {
-          totalReplies: { increment: 1 },
-          lastReplyAt: now,
-          lastActivityAt: now,
-          ...(ticket.firstResponseAt === null ? { firstResponseAt: now } : {}),
-        },
-      });
+        await db.ticket.update({
+          where: { id: ticketId },
+          data: {
+            totalReplies: { increment: 1 },
+            lastReplyAt: now,
+            lastActivityAt: now,
+            ...(ticket.firstResponseAt === null ? { firstResponseAt: now } : {}),
+          },
+        });
+      };
+      if (actor) {
+        await this.prisma.$transaction(async (tx) => {
+          await this.fenceTicketMutation(tx, ticketId, actor, now);
+          await createMacroReply(tx);
+        });
+      } else {
+        await createMacroReply(this.prisma);
+      }
     }
 
     // 2. Execute actions[]
@@ -1891,17 +2000,8 @@ export class TicketsService {
               // H8-8: cap the length so a macro can't create an absurd tag.
               const tag = ((action['tag'] ?? action['value']) as string | undefined)?.slice(0, 100);
               if (typeof tag === 'string' && tag) {
-                await this.prisma.ticket.update({
-                  where: { id: ticketId },
-                  data: {
-                    tags: {
-                      connectOrCreate: {
-                        where: { name: tag },
-                        create: { name: tag },
-                      },
-                    },
-                  },
-                });
+                if (actor) await this.addTag(ticketId, { name: tag }, actor);
+                else await this.addTag(ticketId, { name: tag });
               }
               break;
             }
@@ -1910,13 +2010,11 @@ export class TicketsService {
               // H8-8: cap the note length (defensive against an oversized macro).
               const note = ((action['note'] ?? action['value']) as string | undefined)?.slice(0, 5000);
               if (typeof note === 'string' && note) {
-                await this.prisma.ticketNote.create({
-                  data: {
-                    ticketId,
-                    staffId,
-                    contents: `[Macro: ${macro.title}] ${note}`,
-                  },
-                });
+                if (actor) {
+                  await this.addNote(ticketId, `[Macro: ${macro.title}] ${note}`, staffId, undefined, actor);
+                } else {
+                  await this.addNote(ticketId, `[Macro: ${macro.title}] ${note}`, staffId);
+                }
               }
               break;
             }
@@ -2005,16 +2103,27 @@ export class TicketsService {
     const dept = await this.prisma.department.findUnique({ where: { id: dto.departmentId } });
     if (!dept) throw new NotFoundException(`Department ${dto.departmentId} not found`);
 
-    const updated = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { departmentId: dto.departmentId, lastActivityAt: new Date() },
-    });
-
-    await this.writeAudit(ticketId, 'DEPARTMENT_CHANGE', staffId, 'STAFF', {
+    const now = new Date();
+    const data = { departmentId: dto.departmentId, lastActivityAt: now };
+    const audit = {
       field: 'departmentId',
       oldValue: ticket.departmentId.toString(),
       newValue: dto.departmentId.toString(),
-    });
+    };
+    const updated = actor
+      ? await this.prisma.$transaction(async (tx) => {
+          await this.requireTicketAccess(actor).assertCanAccessDepartmentInTransaction(
+            actor,
+            dto.departmentId,
+            tx,
+          );
+          await this.fenceTicketMutation(tx, ticketId, actor, now);
+          const result = await tx.ticket.update({ where: { id: ticketId }, data });
+          await this.writeAudit(ticketId, 'DEPARTMENT_CHANGE', staffId, 'STAFF', audit, tx);
+          return result;
+        })
+      : await this.prisma.ticket.update({ where: { id: ticketId }, data });
+    if (!actor) await this.writeAudit(ticketId, 'DEPARTMENT_CHANGE', staffId, 'STAFF', audit);
 
     return updated;
   }
@@ -2227,6 +2336,24 @@ export class TicketsService {
     });
     if (!ticket) throw new NotFoundException(`Ticket ${id} not found`);
     return ticket;
+  }
+
+  /**
+   * Fence a staff mutation with the same SQL department predicate used for the
+   * initial read.  The conditional update takes a row lock for the rest of an
+   * interactive transaction, so a concurrent department move cannot turn a
+   * correctly-authorized read into a cross-department post/note/relationship
+   * write. Trusted system paths intentionally pass no actor and remain explicit
+   * about being unscoped.
+   */
+  private async fenceTicketMutation(
+    transaction: Prisma.TransactionClient,
+    ticketId: number,
+    actor: TicketAccessActor | undefined,
+    now: Date,
+  ): Promise<void> {
+    if (!actor) return;
+    await this.requireTicketAccess(actor).fenceTicketMutation(transaction, actor, ticketId, now);
   }
 
   /** E3: a ticket can only be assigned to an existing, enabled staff member. */

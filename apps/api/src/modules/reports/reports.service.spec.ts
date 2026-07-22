@@ -254,6 +254,28 @@ describe('ReportsService', () => {
       expect(ticketAccess.resolveScope).toHaveBeenCalledWith(REPORT_RUNNER);
     });
 
+    it('fails closed for an unassigned non-admin instead of emitting invalid or unscoped raw SQL', async () => {
+      (ticketAccess.resolveScope as ReturnType<typeof vi.fn>).mockResolvedValue({
+        unrestricted: false,
+        departmentIds: [],
+      });
+      (ticketAccess.ticketWhereForScope as ReturnType<typeof vi.fn>).mockReturnValue({
+        departmentId: { in: [] },
+      });
+
+      await service.dashboard(REPORT_RUNNER);
+
+      for (const call of (prisma.ticket.groupBy as ReturnType<typeof vi.fn>).mock.calls) {
+        expect(call[0].where).toEqual({
+          AND: [{ mergedIntoId: null }, { departmentId: { in: [] } }],
+        });
+      }
+      const rawAverageCall = (prisma.$queryRaw as ReturnType<typeof vi.fn>).mock.calls[0]!;
+      const rawDepartmentClause = rawAverageCall[1] as { strings: string[]; values: unknown[] };
+      expect(rawDepartmentClause.strings.join('')).toContain('AND FALSE');
+      expect(rawDepartmentClause.values).toEqual([]);
+    });
+
     it('returns 0 avgFirstResponseMinutes when no responded tickets', async () => {
       (prisma.ticket.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (prisma.ticket.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);

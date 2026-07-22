@@ -49,11 +49,13 @@ export class RecipientsController {
     @Body(new ZodValidationPipe(AddRecipientSchema)) dto: AddRecipientDto,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    await this.ticketAccess.assertCanAccessTicket(staff, ticketId);
-    return this.prisma.ticketRecipient.upsert({
-      where: { ticketId_email: { ticketId, email: dto.email } },
-      create: { ticketId, email: dto.email, role: dto.role },
-      update: { role: dto.role },
+    return this.prisma.$transaction(async (tx) => {
+      await this.ticketAccess.fenceTicketMutation(tx, staff, ticketId, new Date());
+      return tx.ticketRecipient.upsert({
+        where: { ticketId_email: { ticketId, email: dto.email } },
+        create: { ticketId, email: dto.email, role: dto.role },
+        update: { role: dto.role },
+      });
     });
   }
 
@@ -65,7 +67,9 @@ export class RecipientsController {
     @Param('email') email: string,
     @CurrentStaff() staff: AuthStaff,
   ) {
-    await this.ticketAccess.assertCanAccessTicket(staff, ticketId);
-    await this.prisma.ticketRecipient.deleteMany({ where: { ticketId, email } });
+    await this.prisma.$transaction(async (tx) => {
+      await this.ticketAccess.fenceTicketMutation(tx, staff, ticketId, new Date());
+      await tx.ticketRecipient.deleteMany({ where: { ticketId, email } });
+    });
   }
 }

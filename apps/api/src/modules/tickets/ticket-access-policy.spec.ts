@@ -36,19 +36,24 @@ describe('TicketAccessPolicy — ACL-01 department isolation', () => {
     expect(prisma.departmentStaff.findMany).not.toHaveBeenCalled();
   });
 
-  it('keeps staff with no DepartmentStaff rows unrestricted (legacy all-department rule)', async () => {
+  it('fails closed for a non-admin with no DepartmentStaff rows', async () => {
     const prisma = makePrisma();
     prisma.departmentStaff.findMany.mockResolvedValue([]);
     const policy = new TicketAccessPolicy(prisma as unknown as PrismaService);
 
-    await expect(policy.ticketWhere(DEPT_A_AGENT)).resolves.toEqual({});
+    await expect(policy.ticketWhere(DEPT_A_AGENT)).resolves.toEqual({
+      department: { is: { staff: { some: { staffId: DEPT_A_AGENT.staffId } } } },
+    });
+    await expect(policy.assertCanAccessDepartment(DEPT_A_AGENT, 1)).rejects.toBeInstanceOf(NotFoundException);
   });
 
   it('builds a SQL department predicate for a restricted staff member', async () => {
     const prisma = makePrisma();
     const policy = new TicketAccessPolicy(prisma as unknown as PrismaService);
 
-    await expect(policy.ticketWhere(DEPT_A_AGENT)).resolves.toEqual({ departmentId: { in: [1] } });
+    await expect(policy.ticketWhere(DEPT_A_AGENT)).resolves.toEqual({
+      department: { is: { staff: { some: { staffId: DEPT_A_AGENT.staffId } } } },
+    });
   });
 
   it('does not disclose a Department B ticket to a Department A agent', async () => {
@@ -58,7 +63,9 @@ describe('TicketAccessPolicy — ACL-01 department isolation', () => {
 
     await expect(policy.assertCanAccessTicket(DEPT_A_AGENT, 202)).rejects.toBeInstanceOf(NotFoundException);
     expect(prisma.ticket.findFirst).toHaveBeenCalledWith({
-      where: { AND: [{ id: 202 }, { departmentId: { in: [1] } }] },
+      where: {
+        AND: [{ id: 202 }, { department: { is: { staff: { some: { staffId: DEPT_A_AGENT.staffId } } } } }],
+      },
       select: { id: true },
     });
   });
@@ -92,7 +99,40 @@ describe('TicketAccessPolicy — ACL-01 department isolation', () => {
     );
   });
 
-  it('permits an unscoped assignee for every department', async () => {
+  it('re-checks target membership inside a write transaction', async () => {
+    const prisma = makePrisma();
+    const policy = new TicketAccessPolicy(prisma as unknown as PrismaService);
+    const transaction = {
+      departmentStaff: { findUnique: vi.fn().mockResolvedValue(null) },
+    };
+
+    await expect(
+      policy.assertCanAccessDepartmentInTransaction(DEPT_A_AGENT, 1, transaction as never),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(transaction.departmentStaff.findUnique).toHaveBeenCalledWith({
+      where: { departmentId_staffId: { departmentId: 1, staffId: DEPT_A_AGENT.staffId } },
+      select: { departmentId: true },
+    });
+  });
+
+  it('fences a child-row mutation with an atomic SQL-scoped ticket update', async () => {
+    const prisma = makePrisma();
+    const policy = new TicketAccessPolicy(prisma as unknown as PrismaService);
+    const transaction = { ticket: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) } };
+
+    await expect(
+      policy.fenceTicketMutation(transaction as never, DEPT_A_AGENT, 202, new Date('2026-07-22T00:00:00Z')),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(transaction.ticket.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          AND: [{ id: 202 }, { department: { is: { staff: { some: { staffId: DEPT_A_AGENT.staffId } } } } }],
+        },
+      }),
+    );
+  });
+
+  it('rejects an unassigned non-admin assignee for every department', async () => {
     const prisma = makePrisma();
     prisma.staff.findUnique.mockResolvedValue({
       id: 20,
@@ -102,6 +142,8 @@ describe('TicketAccessPolicy — ACL-01 department isolation', () => {
     });
     const policy = new TicketAccessPolicy(prisma as unknown as PrismaService);
 
-    await expect(policy.assertAssigneeCanHandleDepartments(20, [1, 2])).resolves.toBeUndefined();
+    await expect(policy.assertAssigneeCanHandleDepartments(20, [1, 2])).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
   });
 });

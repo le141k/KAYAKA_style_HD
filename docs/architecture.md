@@ -63,9 +63,9 @@ HTTP Request
      group changes and logout-all revoke access immediately; fails closed 503 if DB is down.
      Derives fresh permissions from the DB group and attaches AuthStaff to req.user — S3-1)
   → PermissionsGuard  (checks @RequirePermissions(...); admins bypass all checks)
-  → TicketAccessPolicy (staff ticket boundaries only: an administrator or a staff member with no
-     DepartmentStaff rows is unrestricted; otherwise every ticket predicate is constrained in SQL
-     to the staff member's assigned departments. Cross-department detail/mutation/download returns
+  → TicketAccessPolicy (staff ticket boundaries only: only a global administrator is unrestricted;
+     every non-admin needs explicit DepartmentStaff rows and every ticket predicate is constrained
+     in SQL to those assigned departments. Cross-department detail/mutation/download returns
      the same 404 as a missing resource. Bulk validates the complete set before writing; links and
      merges require access to both tickets; a department move and assignment validate the target
      department. Trusted inbound/client/system flows do not impersonate a staff actor.)

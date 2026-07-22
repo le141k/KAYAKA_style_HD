@@ -148,9 +148,14 @@ export class ReportsService {
     const scopedSlaBreached: Prisma.TicketWhereInput = {
       AND: [notMerged, ticketScope, { isResolved: false, dueAt: { lt: now } }],
     };
+    // Prisma's structured predicates treat `in: []` as no rows. The raw AVG
+    // query needs the same fail-closed semantics explicitly: `IN ()` is invalid
+    // PostgreSQL, and dropping the clause would leak every department.
     const rawDepartmentClause = departmentScope.unrestricted
       ? Prisma.empty
-      : Prisma.sql` AND "departmentId" IN (${Prisma.join(departmentScope.departmentIds)})`;
+      : departmentScope.departmentIds.length === 0
+        ? Prisma.sql` AND FALSE`
+        : Prisma.sql` AND "departmentId" IN (${Prisma.join(departmentScope.departmentIds)})`;
     const [byStatus, byPriority, total, resolved, slaBreached, avgRows] = await Promise.all([
       this.prisma.ticket.groupBy({
         by: ['statusId'],
