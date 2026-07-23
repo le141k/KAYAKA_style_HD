@@ -33,6 +33,17 @@ services:
       - "1025:1025"   # SMTP
       - "8025:8025"   # web UI
 
+  # A named volume can predate the current non-root API image. Initialise its
+  # ownership before the API starts, while keeping the long-running API process
+  # unprivileged. -h/-R avoids following a symlink outside this volume.
+  uploads-init:
+    image: node:22.23.1-alpine3.23
+    user: "0:0"
+    restart: "no"
+    volumes:
+      - uploads:/app/uploads
+    command: ["sh", "-ec", "mkdir -p /app/uploads && chown -Rh 1000:1000 /app/uploads"]
+
   api:
     build:
       context: .
@@ -57,6 +68,8 @@ services:
         condition: service_healthy
       mailhog:
         condition: service_started
+      uploads-init:
+        condition: service_completed_successfully
     # On first boot: apply migrations + seed, then start.
     command: ["sh", "-c", "npx prisma migrate deploy && node dist/seed/seed.js && node dist/main.js"]
 

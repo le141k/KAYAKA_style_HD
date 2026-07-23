@@ -98,6 +98,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
   const { t } = useI18n();
   const ta = t.ticketActions;
   const { can } = useAuth();
+  const canRetryOutbound = can(PERMISSIONS.MAIL_VIEW) && can(PERMISSIONS.MAIL_CONFIGURE);
 
   const { data: ticket, isLoading: ticketLoading, isError: ticketError, refetch } = useTicket(ticketId);
   const replyMutation = useReply(ticketId);
@@ -441,26 +442,25 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                       {email.attempts > 0 && (
                         <span className="text-xs text-muted-foreground">попыток: {email.attempts}</span>
                       )}
-                      {can(PERMISSIONS.MAIL_CONFIGURE) &&
-                        (email.state === 'FAILED' || email.state === 'AMBIGUOUS') && (
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="outline"
-                            className="ml-auto"
-                            disabled={retryOutbound.isPending}
-                            onClick={() => {
-                              if (email.state === 'AMBIGUOUS') {
-                                setAmbiguousRetryId(email.id);
-                              } else {
-                                void submitOutboundRetry(email.id);
-                              }
-                            }}
-                          >
-                            <RotateCcw className="h-3.5 w-3.5" />
-                            Повторить
-                          </Button>
-                        )}
+                      {canRetryOutbound && (email.state === 'FAILED' || email.state === 'AMBIGUOUS') && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="ml-auto"
+                          disabled={retryOutbound.isPending}
+                          onClick={() => {
+                            if (email.state === 'AMBIGUOUS') {
+                              setAmbiguousRetryId(email.id);
+                            } else {
+                              void submitOutboundRetry(email.id);
+                            }
+                          }}
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                          Повторить
+                        </Button>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -506,7 +506,7 @@ export function TicketDetailContent({ ticketId }: { ticketId: number }) {
                           >
                             {DELIVERY_LABELS[reply.delivery.state]}
                           </span>
-                          {can(PERMISSIONS.MAIL_CONFIGURE) &&
+                          {canRetryOutbound &&
                             (reply.delivery.state === 'FAILED' || reply.delivery.state === 'AMBIGUOUS') && (
                               <Button
                                 type="button"

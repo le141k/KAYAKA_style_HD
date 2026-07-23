@@ -10,9 +10,10 @@ export class OutboundEmailController {
   constructor(private readonly mailService: MailService) {}
 
   @Post(':id/retry')
-  // A manual retry can resend customer-facing mail, so it is intentionally part of the
-  // configuration/operator capability rather than the read-only mail.view grant.
-  @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
+  // A manual retry can resend customer-facing mail. Require both the mail-console
+  // visibility boundary and the separate configuration/operator capability so a
+  // direct API caller cannot retry an opaque guessed command id.
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW, PERMISSIONS.MAIL_CONFIGURE)
   @ApiOperation({
     summary:
       'Retry a FAILED/AMBIGUOUS outbound email with its original SMTP Message-ID and immutable snapshot',

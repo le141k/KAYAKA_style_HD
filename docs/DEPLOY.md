@@ -14,7 +14,7 @@ Never combine these gates during an incident or a first deployment.
 | Component | Pin |
 | --- | --- |
 | Node.js | `22.23.1-alpine3.23` |
-| Next.js | `15.5.20` |
+| Next.js | `15.5.21` |
 | NestJS | `11.1.28` |
 | PostgreSQL | `16.14-alpine3.23` |
 | Redis | `7.4.8-alpine` |
@@ -76,14 +76,22 @@ Required invariants:
   the verified forward-only migration boundary, with compare-and-swap updates and aggregate-only logs.
 - `TELECOM_HD_UPLOAD_DIR` is exactly `/app/uploads`. This is the sole durable Compose volume mount for
   attachments and inbound raw MIME; another path is rejected by preflight and API production startup.
-- Keep the shared delivery gate explicitly safe until the inbound canary gate:
-  `TELECOM_HD_INBOUND_DELIVERY_ENABLED=false` and `TELECOM_HD_IMAP_ENABLED=false`.
-  `scripts/deploy-prod.sh` rejects a release env with either enabled, so a stale production
-  file cannot consume an IMAP mailbox, accept PIPE mail, or drain an existing ledger before
-  the live canary proof. Every code or migration deployment must therefore start with both
-  false. After the live canary is green, use the separate configuration-only API restart in
-  [the inbound cutover runbook](INBOUND_PRODUCTION_CUTOVER.md) to enable the shared gate and,
-  only for an IMAP canary, polling; turn both false again before the next normal deployment.
+  Before each API start, the one-shot `uploads-init` service repairs ownership of this volume for the
+  unprivileged `node` API user. It has no network ports and exits before the API starts; do not replace
+  it by running the API as root.
+- Keep all mail effects explicitly closed for every normal code or migration deployment:
+  `TELECOM_HD_OUTBOUND_DELIVERY_ENABLED=false`,
+  `TELECOM_HD_INBOUND_DELIVERY_ENABLED=false`,
+  `TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED=false`, and
+  `TELECOM_HD_IMAP_ENABLED=false`.
+  `scripts/deploy-prod.sh` rejects a release environment that opens its normal inbound/IMAP
+  gates. Together, these values ensure a stale production file cannot send SMTP mail, consume
+  an IMAP mailbox, accept PIPE mail, capture raw mail, or drain an existing ledger before the
+  attended live proof. The first mailbox proof is a separate, configuration-only
+  **capture-only** canary in [the inbound cutover runbook](INBOUND_PRODUCTION_CUTOVER.md): it
+  uses one selected queue and one dedicated folder, keeps normal inbound and outbound delivery
+  false, and returns every gate to false afterwards. Do not enable normal delivery or SMTP merely
+  because capture succeeds.
   `TELECOM_HD_IMAP_BOOTSTRAP_POLICY=FROM_NOW`, `TELECOM_HD_IMAP_BACKFILL_LIMIT=0`,
   `TELECOM_HD_INBOUND_MAX_ATTEMPTS=5`, and `TELECOM_HD_INBOUND_RAW_RETENTION_DAYS=30`. Queue connection
   settings are stored in the database; `BACKFILL` requires a deliberate non-zero bounded limit.
@@ -198,11 +206,20 @@ Before enabling production queues after an inbound-ledger migration:
    schema, and do not invent a down migration.
 3. Run the real PostgreSQL migration/upgrade rehearsal and the GreenMail/Dovecot/PIPE matrix from
    [INBOUND_PRODUCTION_CUTOVER.md](INBOUND_PRODUCTION_CUTOVER.md). A missing/red gate blocks
-   queue enablement and production cutover.
-4. Configure exactly one non-customer-impacting canary mailbox/PIPE queue. Verify `/admin/mail`
-   health: connection/poll/accepted stamps, epoch/generation, no unexplained alert, and raw-storage
-   reserve. Deliver a controlled message, retry it, and inspect its ledger/audit outcome.
-5. Only then enable the remaining queues one at a time. Stop immediately on a halted queue,
+   queue enablement and production cutover. This includes the `20260723063000 →
+   20260723065000` capture-retirement/raw-MIME-stage rehearsal, its historical
+   truncated-quarantine inventory, a real-PostgreSQL proof that a queue-bound raw-MIME stage blocks
+   capture arming until normal cleanup completes, and the writer-vs-reaper `ACTIVE` publish-fence
+   race (no final rename after `REAPING`).
+4. First configure exactly one dedicated, non-customer-impacting IMAP folder as the selected
+   capture-only queue. Never use a shared Inbox. Run the attended capture-only procedure with
+   exactly one controlled message; confirm `CAPTURED=1`, no ticket/post/outbox/attachment change,
+   and inspect only safe metadata/audit in `/admin/mail`. Before this restart, stop all old
+   API/inbound workers: the capture-retirement fence is enforced only by the current release.
+   Arming the queue permanently latches it before IMAP authentication, so a later capture uses a
+   new queue and a new empty mailbox/folder even when the first attempt did not capture a message.
+5. Only after that evidence is accepted, run the separately approved normal inbound and outbound
+   canaries, then enable remaining queues one at a time. Stop immediately on a halted queue,
    transport/semantic collision, stale poll, quarantine growth, storage-reserve alert or unexpected
    ticket/post count. Preserve ledger/raw evidence; do not delete rows as a recovery shortcut.
 

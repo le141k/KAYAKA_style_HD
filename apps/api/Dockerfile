@@ -33,6 +33,10 @@ RUN npm ci --omit=dev --omit=optional
 
 FROM node:22.23.1-alpine3.23 AS runner
 ENV NODE_ENV=production
+# `@nestjs/core` loads the HTTP adapter dynamically from the root package. npm
+# keeps this API workspace dependency nested, so expose both production module
+# roots to Node's resolver in the runtime image.
+ENV NODE_PATH=/app/apps/api/node_modules:/app/node_modules
 WORKDIR /app
 # Keep only the workspace manifests in the runtime image. The deploy helper runs
 # `npm audit --package-lock-only` in this exact pinned image, avoiding a host-NPM

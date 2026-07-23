@@ -23,6 +23,7 @@ const CONFIG: AppConfig = {
   TELECOM_HD_SMTP_HOST: 'localhost',
   TELECOM_HD_SMTP_PORT: 1025,
   TELECOM_HD_SMTP_SECURE: false,
+  TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: true,
   TELECOM_HD_MAIL_FROM: '23 Telecom <support@test.example>',
   TELECOM_HD_LOG_LEVEL: 'silent',
   TELECOM_HD_ALARIS_WEBHOOK_SECRET: 'test-inbound-secret-32chars-minimum',
@@ -47,6 +48,9 @@ const CONFIG: AppConfig = {
   TELECOM_HD_CLAMAV_TIMEOUT_MS: 15_000,
   TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
   TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+  TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: false,
+  TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: undefined,
+  TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
   TELECOM_HD_IMAP_ENABLED: false,
   TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'FROM_NOW',
   TELECOM_HD_IMAP_BACKFILL_LIMIT: 0,
@@ -194,6 +198,217 @@ function sendMail(service: MailService): ReturnType<typeof vi.fn> {
 
 describe('MailService durable outbound outbox', () => {
   beforeEach(() => vi.clearAllMocks());
+
+  describe('delivery-disabled safety gate', () => {
+    it('leaves pre-existing queued/retry work untouched and never wakes a worker or SMTP', async () => {
+      const prisma = makePrisma(
+        row({ state: 'RETRY', nextAttemptAt: new Date(Date.now() - 1), attempts: 2 }),
+      );
+      const queue = { add: vi.fn().mockResolvedValue(undefined) };
+      const service = new MailService(
+        { ...CONFIG, TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: false },
+        prisma,
+        queue as never,
+      );
+
+      await service.recoverDurableOutbox();
+      await service.enqueueOutbound(prisma.__outbound.id);
+      await service.processOutboundEmail(prisma.__outbound.id);
+
+      expect(prisma.outboundEmail.findMany).not.toHaveBeenCalled();
+      expect(prisma.outboundEmail.updateMany).not.toHaveBeenCalled();
+      expect(queue.add).not.toHaveBeenCalled();
+      expect(sendMail(service)).not.toHaveBeenCalled();
+      expect(prisma.__outbound).toMatchObject({
+        state: 'RETRY',
+        attempts: 2,
+        nextAttemptAt: expect.any(Date),
+      });
+    });
+
+    it('does not start the durable-outbox recovery scan or timer at application startup', async () => {
+      vi.useFakeTimers();
+      try {
+        const prisma = makePrisma();
+        const service = new MailService({ ...CONFIG, TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: false }, prisma);
+        const recover = vi.spyOn(service, 'recoverDurableOutbox');
+
+        service.onModuleInit();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(recover).not.toHaveBeenCalled();
+        expect(prisma.outboundEmail.findMany).not.toHaveBeenCalled();
+        expect(prisma.outboundEmail.updateMany).not.toHaveBeenCalled();
+        service.onModuleDestroy();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('rejects an operator retry without changing the durable row', async () => {
+      const prisma = makePrisma(row({ state: 'FAILED', attempts: 3 }));
+      const mailAccess = { resolveScope: vi.fn() } as unknown as MailAccessPolicy;
+      const service = new MailService(
+        { ...CONFIG, TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: false },
+        prisma,
+        undefined,
+        undefined,
+        mailAccess,
+      );
+
+      await expect(
+        service.retryOutboundEmail(prisma.__outbound.id, {
+          staffId: 1,
+          isAdmin: true,
+        }),
+      ).rejects.toThrow('Outbound email delivery is disabled');
+
+      expect(mailAccess.resolveScope).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.outboundEmail.updateMany).not.toHaveBeenCalled();
+      expect(prisma.__outbound).toMatchObject({ state: 'FAILED', attempts: 3 });
+    });
+
+    it('rejects volatile send/deliver paths before any SMTP transport call', async () => {
+      const prisma = makePrisma();
+      prisma.emailTemplate.findUnique.mockResolvedValue({
+        subject: 'Security message',
+        htmlBody: '<p>Security message</p>',
+        textBody: 'Security message',
+      });
+      const service = new MailService({ ...CONFIG, TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: false }, prisma);
+
+      await expect(
+        service.send({ to: 'customer@example.test', subject: 'Test', text: 'Body' }),
+      ).rejects.toThrow('Outbound email delivery is disabled');
+      await expect(
+        service.deliver({ to: 'customer@example.test', subject: 'Test', text: 'Body' }, true),
+      ).rejects.toThrow('Outbound email delivery is disabled');
+      await expect(
+        service.sendTemplateStrict('customer@example.test', 'password_reset', 'en', {}),
+      ).rejects.toThrow('Outbound email delivery is disabled');
+
+      expect(sendMail(service)).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('one-row SMTP canary fence', () => {
+    const CANARY_ID = 'cmoutbox00000000000000001';
+    const CANARY_RECIPIENT = 'approved@example.test';
+    const OTHER_ID = 'c000000000000000000000000';
+
+    function canaryConfig() {
+      return {
+        ...CONFIG,
+        TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: CANARY_ID,
+        TELECOM_HD_OUTBOUND_CANARY_RECIPIENT: CANARY_RECIPIENT,
+      };
+    }
+
+    it('scopes startup recovery and Redis enqueue to the selected durable id only', async () => {
+      const prisma = makePrisma(
+        row({
+          id: CANARY_ID,
+          recipients: [{ email: CANARY_RECIPIENT, role: 'TO' }],
+        }),
+      );
+      // The mock intentionally ignores Prisma's where filter. The second runtime
+      // fence must still prevent a bad/stale result from becoming a BullMQ job.
+      prisma.outboundEmail.findMany.mockResolvedValue([{ id: OTHER_ID }]);
+      const queue = { add: vi.fn().mockResolvedValue(undefined) };
+      const service = new MailService(canaryConfig(), prisma, queue as never);
+
+      await service.recoverDurableOutbox();
+      await service.enqueueOutbound(OTHER_ID);
+
+      expect(prisma.outboundEmail.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ id: CANARY_ID }) }),
+      );
+      expect(queue.add).not.toHaveBeenCalled();
+      expect(sendMail(service)).not.toHaveBeenCalled();
+    });
+
+    it('does not inspect, claim, mutate, or send a non-canary stale BullMQ job', async () => {
+      const prisma = makePrisma(row({ id: OTHER_ID }));
+      const service = new MailService(canaryConfig(), prisma);
+
+      await service.processOutboundEmail(OTHER_ID);
+
+      expect(prisma.outboundEmail.findUnique).not.toHaveBeenCalled();
+      expect(prisma.outboundEmail.updateMany).not.toHaveBeenCalled();
+      expect(sendMail(service)).not.toHaveBeenCalled();
+    });
+
+    it('requires exactly the configured sole TO recipient before it claims or sends the selected id', async () => {
+      const prisma = makePrisma(row({ id: CANARY_ID }));
+      const service = new MailService(canaryConfig(), prisma);
+
+      await service.processOutboundEmail(CANARY_ID);
+
+      // Default fixture has TO + CC + BCC; it is deliberately invalid for an
+      // attended canary. A recipient-fence mutation must turn this test red.
+      expect(prisma.outboundEmail.updateMany).not.toHaveBeenCalled();
+      expect(sendMail(service)).not.toHaveBeenCalled();
+    });
+
+    it('does not even mutate an expired selected lease before the recipient canary fence is proven', async () => {
+      const prisma = makePrisma(
+        row({
+          id: CANARY_ID,
+          state: 'PROCESSING',
+          leaseOwner: 'dead-worker',
+          leaseVersion: 1,
+          leaseExpiresAt: new Date(Date.now() - 1_000),
+        }),
+      );
+      const service = new MailService(canaryConfig(), prisma);
+
+      await service.recoverDurableOutbox();
+
+      expect(prisma.outboundEmail.updateMany).not.toHaveBeenCalled();
+      expect(prisma.outboundEmail.findMany).not.toHaveBeenCalled();
+      expect(sendMail(service)).not.toHaveBeenCalled();
+    });
+
+    it('allows only the selected durable id with exactly its approved recipient', async () => {
+      const prisma = makePrisma(
+        row({
+          id: CANARY_ID,
+          recipients: [{ email: CANARY_RECIPIENT.toUpperCase(), role: 'TO' }],
+        }),
+      );
+      const service = new MailService(canaryConfig(), prisma);
+
+      await service.processOutboundEmail(CANARY_ID);
+
+      expect(sendMail(service)).toHaveBeenCalledTimes(1);
+      expect(sendMail(service)).toHaveBeenCalledWith(
+        expect.objectContaining({ to: CANARY_RECIPIENT.toUpperCase() }),
+      );
+    });
+
+    it('blocks all volatile/direct email paths while the durable SMTP canary is active', async () => {
+      const prisma = makePrisma(row({ id: CANARY_ID }));
+      prisma.emailTemplate.findUnique.mockResolvedValue({
+        subject: 'Security message',
+        htmlBody: '<p>Security message</p>',
+        textBody: 'Security message',
+      });
+      const service = new MailService(canaryConfig(), prisma);
+
+      await expect(service.send({ to: CANARY_RECIPIENT, subject: 'test', text: 'body' })).rejects.toThrow(
+        'only permits its selected durable outbox row',
+      );
+      await expect(
+        service.deliver({ to: CANARY_RECIPIENT, subject: 'test', text: 'body' }, true),
+      ).rejects.toThrow('only permits its selected durable outbox row');
+      await expect(service.sendTemplateStrict(CANARY_RECIPIENT, 'password_reset', 'en', {})).rejects.toThrow(
+        'only permits its selected durable outbox row',
+      );
+
+      expect(sendMail(service)).not.toHaveBeenCalled();
+    });
+  });
 
   it('claims with a DB lease and marks SENT + TicketPost.isEmailed only after SMTP acceptance', async () => {
     const prisma = makePrisma();

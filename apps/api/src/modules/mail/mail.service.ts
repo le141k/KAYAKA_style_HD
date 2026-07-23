@@ -184,26 +184,38 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
     // unavailable there and must fail closed if it is ever called.
     @Optional() private readonly mailAccess?: MailAccessPolicy,
   ) {
+    const authenticatedSubmission = Boolean(config.TELECOM_HD_SMTP_USER && config.TELECOM_HD_SMTP_PASSWORD);
+    // Production must never silently fall back to plaintext SMTP when a relay
+    // omits STARTTLS.  The local Gmail test has the same requirement once it
+    // supplies credentials, while unauthenticated development MailHog remains
+    // usable without TLS.
+    const requireStartTls =
+      !config.TELECOM_HD_SMTP_SECURE && (config.NODE_ENV === 'production' || authenticatedSubmission);
     this.transporter = nodemailer.createTransport({
       host: config.TELECOM_HD_SMTP_HOST,
       port: config.TELECOM_HD_SMTP_PORT,
       secure: config.TELECOM_HD_SMTP_SECURE,
-      // Production port 587/25 must upgrade with STARTTLS; do not silently
-      // deliver credentials or reset links after a downgrade/strip attack.
-      requireTLS: config.NODE_ENV === 'production' && !config.TELECOM_HD_SMTP_SECURE,
+      // An authenticated submission port (including the local Gmail canary on
+      // 587) must upgrade with STARTTLS. MailHog/dev without AUTH stays usable,
+      // but credentials must never travel after a TLS downgrade/strip attack.
+      requireTLS: requireStartTls,
       tls: { minVersion: 'TLSv1.2', servername: config.TELECOM_HD_SMTP_HOST },
       connectionTimeout: 10_000,
       greetingTimeout: 10_000,
       socketTimeout: 15_000,
       // Authenticated relay in prod; MailHog/dev needs none. Only set auth when
       // both credentials are provided (otherwise nodemailer would force AUTH).
-      ...(config.TELECOM_HD_SMTP_USER && config.TELECOM_HD_SMTP_PASSWORD
+      ...(authenticatedSubmission
         ? { auth: { user: config.TELECOM_HD_SMTP_USER, pass: config.TELECOM_HD_SMTP_PASSWORD } }
         : {}),
     });
   }
 
   onModuleInit(): void {
+    if (!this.isOutboundDeliveryEnabled()) {
+      this.logger.warn('Outbound email delivery is disabled; durable outbox recovery is not running');
+      return;
+    }
     // PostgreSQL is authoritative. Redis is merely a low-latency wakeup path, so
     // every API/worker process scans eligible rows on startup and periodically.
     void this.recoverDurableOutbox();
@@ -218,6 +230,82 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
   /** Exact configured sender snapshot used by transactional ticket replies. */
   getDefaultFromAddress(): string {
     return this.config.TELECOM_HD_MAIL_FROM;
+  }
+
+  /**
+   * A deployment-time safety switch.  Treat an absent value as closed so an
+   * older/partial environment can never start transmitting queued mail merely
+   * because a new binary was deployed.
+   */
+  private isOutboundDeliveryEnabled(): boolean {
+    return this.config.TELECOM_HD_OUTBOUND_DELIVERY_ENABLED === true;
+  }
+
+  /**
+   * An attended SMTP canary is restricted to one already-audited durable command
+   * and one exact recipient.  The config schema requires the two values to be
+   * supplied together; treat a partial hand-built config as closed nevertheless.
+   */
+  private get outboundCanary(): { emailId: string; recipient: string } | null {
+    const emailId = this.config.TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID;
+    const recipient = normalizeEmail(this.config.TELECOM_HD_OUTBOUND_CANARY_RECIPIENT ?? '');
+    return typeof emailId === 'string' && emailId.length > 0 && recipient.length > 0
+      ? { emailId, recipient }
+      : null;
+  }
+
+  private isAllowedOutboundCanaryId(outboundEmailId: string): boolean {
+    const canary = this.outboundCanary;
+    return canary === null || canary.emailId === outboundEmailId;
+  }
+
+  /** Generic/direct sends are never part of the durable one-row SMTP canary. */
+  private assertDirectOutboundAllowed(): void {
+    this.assertOutboundDeliveryEnabled();
+    if (this.outboundCanary !== null) {
+      throw new ServiceUnavailableException(
+        'Outbound canary only permits its selected durable outbox row; direct email is disabled',
+      );
+    }
+  }
+
+  private matchesOutboundCanaryRecipient(outbound: {
+    recipients: Array<{ email: string; role: string }>;
+  }): boolean {
+    const canary = this.outboundCanary;
+    if (canary === null) return true;
+    return (
+      outbound.recipients.length === 1 &&
+      outbound.recipients[0]?.role === 'TO' &&
+      normalizeEmail(outbound.recipients[0].email) === canary.recipient
+    );
+  }
+
+  /**
+   * Verify recipient shape before any stale-lease or claim mutation. A typo in
+   * the selected id/recipient must not turn an unrelated durable command into
+   * PROCESSING, AMBIGUOUS, or an SMTP attempt.
+   */
+  private async isApprovedOutboundCanaryCommand(outboundEmailId: string): Promise<boolean> {
+    if (!this.isAllowedOutboundCanaryId(outboundEmailId)) return false;
+    if (this.outboundCanary === null) return true;
+    const candidate = await this.prisma.outboundEmail.findUnique({
+      where: { id: outboundEmailId },
+      select: { id: true, recipients: { select: { email: true, role: true } } },
+    });
+    if (!candidate || !this.matchesOutboundCanaryRecipient(candidate)) {
+      this.logger.error(
+        `Outbound canary refused durable row ${outboundEmailId}: it is missing or does not have exactly the approved TO recipient`,
+      );
+      return false;
+    }
+    return true;
+  }
+
+  private assertOutboundDeliveryEnabled(): void {
+    if (!this.isOutboundDeliveryEnabled()) {
+      throw new ServiceUnavailableException('Outbound email delivery is disabled');
+    }
   }
 
   /** Stable identity generated before the durable command is committed. */
@@ -454,6 +542,14 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
    * can never claim delivery just because an inline fallback happened to run.
    */
   async enqueueOutbound(outboundEmailId: string): Promise<void> {
+    if (!this.isOutboundDeliveryEnabled()) {
+      this.logger.warn(`Outbound email ${outboundEmailId} remains queued because delivery is disabled`);
+      return;
+    }
+    if (!this.isAllowedOutboundCanaryId(outboundEmailId)) {
+      this.logger.warn(`Outbound email ${outboundEmailId} remains queued outside the active SMTP canary`);
+      return;
+    }
     if (!this.mailQueue) {
       this.logger.warn(`Outbound email ${outboundEmailId} is durable but no mail worker queue is configured`);
       return;
@@ -479,17 +575,24 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
 
   /** Scan durable mail rows after startup, Redis recovery and worker restarts. */
   async recoverDurableOutbox(): Promise<void> {
+    if (!this.isOutboundDeliveryEnabled()) return;
     if (this.recoveryRunning) return;
     this.recoveryRunning = true;
     try {
       const now = new Date();
+      const canary = this.outboundCanary;
+      // A typo or multi-recipient selected row is not an approved canary. Do
+      // not even convert its stale lease to AMBIGUOUS: the canary contract is
+      // no durable mutation before the exact recipient snapshot is proven.
+      if (canary && !(await this.isApprovedOutboundCanaryCommand(canary.emailId))) return;
       // A worker can die (or lose DB connectivity) after handing bytes to SMTP.
       // Its expired PROCESSING lease is therefore *not* evidence that a retry is
       // safe. Stop automatic delivery and make that uncertainty visible; an
       // operator may retry explicitly with the same Message-ID.
-      await this.markStaleProcessingAmbiguous(now);
+      await this.markStaleProcessingAmbiguous(now, canary?.emailId);
       const due = await this.prisma.outboundEmail.findMany({
         where: {
+          ...(canary ? { id: canary.emailId } : {}),
           OR: [{ state: 'QUEUED' }, { state: 'RETRY', nextAttemptAt: { lte: now } }],
         },
         select: { id: true },
@@ -511,6 +614,10 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
    * the state after SMTP returns.
    */
   async processOutboundEmail(outboundEmailId: string): Promise<void> {
+    // Stale BullMQ jobs may survive a configuration-only safety restart.  Do not
+    // claim or mutate their durable rows while delivery is intentionally closed.
+    if (!this.isOutboundDeliveryEnabled()) return;
+    if (!(await this.isApprovedOutboundCanaryCommand(outboundEmailId))) return;
     const now = new Date();
     // A stale BullMQ job can arrive after the previous worker's lease expired.
     // Do not reclaim and transmit automatically: the prior SMTP attempt may have
@@ -549,6 +656,31 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    // Recipients are immutable in normal operation, but re-check immediately
+    // after the claim so even an unexpected concurrent DB edit cannot turn a
+    // selected id into a multi-recipient SMTP send.
+    if (!this.matchesOutboundCanaryRecipient(outbound)) {
+      await this.prisma.outboundEmail.updateMany({
+        where: {
+          id: outbound.id,
+          state: 'PROCESSING',
+          leaseOwner,
+          leaseVersion: outbound.leaseVersion,
+        },
+        data: {
+          state: 'FAILED',
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          nextAttemptAt: null,
+          lastError: 'Outbound canary recipient guard rejected this row; no SMTP attempt was made',
+        },
+      });
+      this.logger.error(
+        `Outbound canary refused claimed durable row ${outbound.id}; no SMTP attempt was made`,
+      );
+      return;
+    }
+
     const heartbeat = setInterval(
       () => void this.extendLease(outbound.id, leaseOwner, outbound.leaseVersion),
       OUTBOX_HEARTBEAT_MS,
@@ -557,7 +689,7 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
     let smtpAccepted = false;
     try {
       const options = this.toSendMailOptions(outbound);
-      const response = await this.deliverOrThrow(options);
+      const response = await this.deliverOrThrow(options, true);
       smtpAccepted = true;
       await this.markSent(outbound, leaseOwner, response);
     } catch (err) {
@@ -577,6 +709,12 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
     outboundEmailId: string,
     actor: MailAccessActor,
   ): Promise<OutboundDeliveryStatus | null> {
+    if (!this.isOutboundDeliveryEnabled()) {
+      throw new ServiceUnavailableException('Outbound email delivery is disabled');
+    }
+    if (!(await this.isApprovedOutboundCanaryCommand(outboundEmailId))) {
+      throw new ServiceUnavailableException('Outbound email is outside the active SMTP canary');
+    }
     if (!this.mailAccess) throw new ServiceUnavailableException('Mail operator authorization unavailable');
     const scope = await this.mailAccess.resolveScope(actor);
     const scopedWhere: Prisma.OutboundEmailWhereInput = scope.unrestricted
@@ -587,9 +725,15 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
     const result = await this.prisma.$transaction(async (tx) => {
       const row = await tx.outboundEmail.findFirst({
         where: scopedWhere,
-        select: { id: true, ticketId: true, postId: true, state: true },
+        select: {
+          id: true,
+          ticketId: true,
+          postId: true,
+          state: true,
+          recipients: { select: { email: true, role: true } },
+        },
       });
-      if (!row || row.state === 'SENT') return null;
+      if (!row || row.state === 'SENT' || !this.matchesOutboundCanaryRecipient(row)) return null;
       const changed = await tx.outboundEmail.updateMany({
         where: {
           AND: [scopedWhere, { state: { in: ['FAILED', 'AMBIGUOUS', 'RETRY'] } }],
@@ -632,6 +776,7 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
    * no queue is wired (unit tests). Retries with backoff are configured on the job.
    */
   async send(opts: SendMailOptions): Promise<void> {
+    this.assertDirectOutboundAllowed();
     if (!this.mailQueue) {
       await this.deliver(opts);
       return;
@@ -656,6 +801,7 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
    * failure never crashes the ticket flow.
    */
   async deliver(opts: SendMailOptions, throwOnError = false): Promise<void> {
+    this.assertDirectOutboundAllowed();
     try {
       await this.deliverOrThrow(opts);
       this.logger.debug('Mail delivered');
@@ -669,7 +815,12 @@ export class MailService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** SMTP delivery that PROPAGATES failures (used by the strict security path). */
-  private async deliverOrThrow(opts: SendMailOptions): Promise<{ messageId?: string; response?: string }> {
+  private async deliverOrThrow(
+    opts: SendMailOptions,
+    approvedDurableCanaryCommand = false,
+  ): Promise<{ messageId?: string; response?: string }> {
+    this.assertOutboundDeliveryEnabled();
+    if (!approvedDurableCanaryCommand) this.assertDirectOutboundAllowed();
     const toStr = Array.isArray(opts.to) ? opts.to.join(', ') : opts.to;
     const ccStr = opts.cc ? (Array.isArray(opts.cc) ? opts.cc.join(', ') : opts.cc) : undefined;
     const bccStr = opts.bcc ? (Array.isArray(opts.bcc) ? opts.bcc.join(', ') : opts.bcc) : undefined;

@@ -21,15 +21,24 @@ import { Test, type TestingModule } from '@nestjs/testing';
 import type { INestApplication } from '@nestjs/common';
 import supertest from 'supertest';
 import type { PostgreSqlContainer, StartedPostgreSqlContainer } from '@testcontainers/postgresql';
+import type { StartedTestContainer } from 'testcontainers';
+import {
+  prepareIsolatedIntegrationEnvironment,
+  redisConnectionUri,
+  startDisposableRedis,
+  type IsolatedIntegrationEnvironment,
+} from '../../test/integration-runtime';
 
 // Lazy import to avoid crashing when testcontainers is not installed
 let PostgreSqlContainerCtor: typeof PostgreSqlContainer;
 
 let container: StartedPostgreSqlContainer;
+let redis: StartedTestContainer;
 let app: INestApplication;
 let staffRequest: ReturnType<typeof supertest.agent>;
 let publicRequest: ReturnType<typeof supertest>;
 let csrfToken: string;
+let integrationEnvironment: IsolatedIntegrationEnvironment;
 
 function csrfCookieFrom(response: supertest.Response): string {
   const raw = response.headers['set-cookie'];
@@ -52,9 +61,11 @@ beforeAll(async () => {
     .start();
 
   const databaseUrl = container.getConnectionUri();
-  process.env['DATABASE_URL'] = databaseUrl;
-  process.env['TELECOM_HD_JWT_ACCESS_SECRET'] = 'int-test-access-secret-32chars!!';
-  process.env['TELECOM_HD_JWT_REFRESH_SECRET'] = 'int-test-refresh-secret-32chars!!';
+  redis = await startDisposableRedis();
+  integrationEnvironment = prepareIsolatedIntegrationEnvironment({
+    databaseUrl,
+    redisUrl: redisConnectionUri(redis),
+  });
 
   // ── 2. Run migrations ───────────────────────────────────────────────────────
   execSync('npx prisma migrate deploy', {
@@ -97,8 +108,12 @@ beforeAll(async () => {
 }, 120_000);
 
 afterAll(async () => {
-  await app?.close();
-  await container?.stop();
+  try {
+    await app?.close();
+  } finally {
+    await Promise.allSettled([redis?.stop(), container?.stop()]);
+    integrationEnvironment?.restore();
+  }
 });
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

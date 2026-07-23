@@ -35,6 +35,9 @@ export const PERMISSIONS = {
   // destructive/configuration actions that can discard history or re-deliver mail.
   MAIL_VIEW: 'mail.view',
   MAIL_REPLAY: 'mail.replay',
+  // Turning an inert capture into ACCEPTED can create/update a ticket and schedule
+  // outbound mail. It is intentionally not bundled with quarantine replay.
+  MAIL_PROMOTE_CAPTURED: 'mail.capture.promote',
   MAIL_RECONCILE: 'mail.reconcile',
   MAIL_CONFIGURE: 'mail.configure',
   ADMIN_DEPARTMENTS: 'admin.departments',
@@ -95,6 +98,11 @@ export const PERMISSION_CATALOG: PermissionMeta[] = [
   { key: PERMISSIONS.ADMIN_WORKFLOW, label: 'Правила и макросы', category: 'admin' },
   { key: PERMISSIONS.MAIL_VIEW, label: 'Почта: просмотр состояния и карантина', category: 'admin' },
   { key: PERMISSIONS.MAIL_REPLAY, label: 'Почта: повтор карантинных писем', category: 'admin' },
+  {
+    key: PERMISSIONS.MAIL_PROMOTE_CAPTURED,
+    label: 'Почта: передать захваченное письмо в обработку',
+    category: 'admin',
+  },
   { key: PERMISSIONS.MAIL_RECONCILE, label: 'Почта: реконсиляция IMAP', category: 'admin' },
   { key: PERMISSIONS.MAIL_CONFIGURE, label: 'Почта: настройка очередей и правил', category: 'admin' },
   { key: PERMISSIONS.ADMIN_DEPARTMENTS, label: 'Отделы', category: 'admin' },

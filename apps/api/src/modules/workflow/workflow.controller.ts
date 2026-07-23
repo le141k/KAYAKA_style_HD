@@ -236,7 +236,7 @@ export class WorkflowEmailEventController {
   }
 
   @Post(':eventId/replay')
-  @RequirePermissions(PERMISSIONS.MAIL_REPLAY)
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW, PERMISSIONS.MAIL_REPLAY)
   @ApiOperation({ summary: 'Replay a quarantined workflow email event with a CAS fence and audit trail' })
   replay(
     @Param('eventId') eventId: string,

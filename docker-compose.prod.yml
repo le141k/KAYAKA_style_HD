@@ -96,6 +96,17 @@ services:
         reservations:
           memory: 3G
 
+  # A named volume can predate the current non-root API image. Initialise its
+  # ownership before the API starts, while keeping the long-running API process
+  # unprivileged. -h/-R avoids following a symlink outside this volume.
+  uploads-init:
+    image: node:22.23.1-alpine3.23
+    user: "0:0"
+    restart: "no"
+    volumes:
+      - uploads:/app/uploads
+    command: ["sh", "-ec", "mkdir -p /app/uploads && chown -Rh 1000:1000 /app/uploads"]
+
   api:
     image: telecom-hd-api:${TELECOM_HD_RELEASE:?set immutable release id in .env.prod}
     build:
@@ -122,6 +133,8 @@ services:
         condition: service_healthy
       clamav:
         condition: service_healthy
+      uploads-init:
+        condition: service_completed_successfully
     # Bootstrap credentials are never part of the long-running container env.
     # First-install admin creation is an explicit one-shot deploy step.
     command: ["sh", "-c", "npx prisma migrate deploy && exec node dist/main.js"]

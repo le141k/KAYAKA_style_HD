@@ -19,9 +19,14 @@ import { MailAccessPolicy } from './mail-access-policy.service';
 // mailbox advertises UIDVALIDITY/UIDNEXT so the connect-time bootstrap barrier runs.
 vi.mock('imapflow', () => ({
   ImapFlow: class {
-    mailbox = { uidValidity: 7n, uidNext: 10, exists: 9 };
+    mailbox = { uidValidity: 7n, uidNext: 10, exists: 0 };
     connect() {
       return Promise.resolve();
+    }
+    list() {
+      return Promise.resolve([
+        { path: 'Helpdesk/Test', pathAsListed: 'Helpdesk/Test', listed: true, flags: new Set() },
+      ]);
     }
     getMailboxLock() {
       return Promise.resolve({ release: () => undefined });
@@ -45,6 +50,7 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_SMTP_HOST: 'localhost',
   TELECOM_HD_SMTP_PORT: 1025,
   TELECOM_HD_SMTP_SECURE: false,
+  TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: false,
   TELECOM_HD_MAIL_FROM: 'support@test.example',
   TELECOM_HD_LOG_LEVEL: 'silent',
   TELECOM_HD_ALARIS_WEBHOOK_SECRET: 'test-secret',
@@ -71,12 +77,15 @@ const TEST_CONFIG: AppConfig = {
   // Most service tests exercise the accepted delivery pipeline. The production default
   // is closed; fixtures opt in explicitly so a missing config field can never hide it.
   TELECOM_HD_INBOUND_DELIVERY_ENABLED: true,
+  TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: false,
+  TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: undefined,
+  TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
   TELECOM_HD_IMAP_ENABLED: false,
   TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'FROM_NOW',
   TELECOM_HD_IMAP_BACKFILL_LIMIT: 0,
   TELECOM_HD_INBOUND_MAX_ATTEMPTS: 5,
   TELECOM_HD_INBOUND_RAW_RETENTION_DAYS: 30,
-  TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined,
+  TELECOM_HD_FIELD_ENCRYPTION_KEY: 'a'.repeat(64),
 };
 
 function makePrismaMock() {
@@ -95,6 +104,7 @@ function makePrismaMock() {
           departmentId: null,
           routingPriority: 100,
           sendAutoresponder: false,
+          captureRetiredAt: null,
         },
       ]),
       findUnique: vi.fn(),
@@ -114,7 +124,9 @@ function makePrismaMock() {
       create: vi.fn().mockResolvedValue({ id: 1 }),
       createMany: vi.fn().mockResolvedValue({ count: 1 }),
       findMany: vi.fn().mockResolvedValue([]),
+      findFirst: vi.fn().mockResolvedValue(null),
       findUnique: vi.fn(),
+      count: vi.fn().mockResolvedValue(0),
       update: vi.fn().mockResolvedValue({}),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
@@ -124,6 +136,9 @@ function makePrismaMock() {
     inboundRawMimeStaging: {
       create: vi.fn().mockResolvedValue({}),
       findMany: vi.fn().mockResolvedValue([]),
+      findUnique: vi.fn().mockResolvedValue(null),
+      count: vi.fn().mockResolvedValue(0),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
     inboundMessageClaim: {
@@ -159,6 +174,7 @@ function makePrismaMock() {
         departmentId: null,
         sendAutoresponder: false,
         configGeneration: 0,
+        captureRetiredAt: null,
       },
     ]),
   };
@@ -971,12 +987,25 @@ describe('InboundMailService — parser rule helpers', () => {
     function makeLedgerClient(
       uids: number[],
       mailbox: { uidValidity: bigint; uidNext?: number; exists?: number },
-      opts: { vanish?: number[]; fetchOneThrowsAt?: number } = {},
+      opts: {
+        vanish?: number[];
+        fetchOneThrowsAt?: number;
+        sourceForUid?: (uid: number) => Buffer;
+        envelopeForUid?: (uid: number) => unknown;
+      } = {},
     ) {
       const src = imapSrc;
       return {
-        mailbox,
+        mailbox: { ...mailbox, exists: mailbox.exists ?? 0 },
         getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        // Capture-only now verifies the provider's live folder mapping before
+        // it reads a body.  Keep this fake a normal selectable test folder;
+        // unsafe/missing LIST mappings have their own explicit regression tests.
+        list: vi
+          .fn()
+          .mockResolvedValue([
+            { path: 'Helpdesk Test', pathAsListed: 'Helpdesk Test', listed: true, flags: new Set() },
+          ]),
         // eslint-disable-next-line @typescript-eslint/require-await
         fetch: vi.fn(function* () {
           for (const uid of uids) yield { uid };
@@ -985,7 +1014,11 @@ describe('InboundMailService — parser rule helpers', () => {
           const uid = Number(uidStr);
           if (opts.fetchOneThrowsAt === uid) return Promise.reject(new Error('fetch reset'));
           if (opts.vanish?.includes(uid)) return Promise.resolve(false);
-          return Promise.resolve({ uid, source: src(uid) });
+          return Promise.resolve({
+            uid,
+            source: opts.sourceForUid?.(uid) ?? src(uid),
+            envelope: opts.envelopeForUid?.(uid),
+          });
         }),
       };
     }
@@ -1001,6 +1034,8 @@ describe('InboundMailService — parser rule helpers', () => {
         emailAddress: 'support@example.com',
         departmentId: null,
         sendAutoresponder: false,
+        mailbox: 'INBOX',
+        useTls: true,
         lastSeenUid: 100n,
         uidValidity: 7n,
         syncState: 'OK',
@@ -1009,7 +1044,24 @@ describe('InboundMailService — parser rule helpers', () => {
         mailboxEpoch: 1,
         configGeneration: 0,
         reconcileCause: null,
+        captureRetiredAt: null,
         ...over,
+      };
+    }
+
+    function dedicatedCaptureQueue(over: Record<string, unknown> = {}) {
+      return queue({ mailbox: 'Helpdesk Test', ...over });
+    }
+
+    function dedicatedCaptureLockRow() {
+      return {
+        id: 1,
+        emailAddress: 'support@example.com',
+        departmentId: null,
+        sendAutoresponder: false,
+        configGeneration: 0,
+        mailbox: 'Helpdesk Test',
+        captureRetiredAt: null,
       };
     }
 
@@ -1019,7 +1071,8 @@ describe('InboundMailService — parser rule helpers', () => {
     });
 
     it('accepts new UIDs into the ledger and advances the cursor via monotonic CAS', async () => {
-      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(queue());
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(dedicatedCaptureQueue());
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([dedicatedCaptureLockRow()]);
       const client = makeLedgerClient([101, 102], { uidValidity: 7n, uidNext: 103 });
       await poll(client);
 
@@ -1056,6 +1109,459 @@ describe('InboundMailService — parser rule helpers', () => {
           data: { lastSeenUid: 102n },
         }),
       );
+    });
+
+    it('selects the queue folder for polling and fences the cursor against that exact folder', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        queue({ mailbox: 'Helpdesk/Test' }),
+      );
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: 1,
+          emailAddress: 'support@example.com',
+          departmentId: null,
+          sendAutoresponder: false,
+          configGeneration: 0,
+          mailbox: 'Helpdesk/Test',
+        },
+      ]);
+      const client = makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 });
+
+      await poll(client);
+
+      expect(client.getMailboxLock).toHaveBeenCalledWith('Helpdesk/Test');
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ mailbox: 'Helpdesk/Test' }) }),
+      );
+    });
+
+    it('normal IMAP refuses a capture-retired queue before it fetches or accepts any message', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        queue({ captureRetiredAt: new Date() }),
+      );
+      const client = makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 });
+
+      await poll(client);
+
+      expect(client.getMailboxLock).not.toHaveBeenCalled();
+      expect(client.fetch).not.toHaveBeenCalled();
+      expect(client.fetchOne).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+      expect(
+        (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([args]) => args?.data?.lastSeenUid === 101n,
+        ),
+      ).toBe(false);
+    });
+
+    it('P0 capture-retirement fence: normal IMAP acceptance SQL requires captureRetiredAt IS NULL', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(dedicatedCaptureQueue());
+      // Make the fake database return the locked receiving queue only when the
+      // production SELECT ... FOR UPDATE includes the normal lifecycle predicate.
+      // Removing that predicate turns this test red at the durable insert, rather
+      // than merely leaving a string assertion green.
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) =>
+        Promise.resolve(query.sql?.includes('"captureRetiredAt" IS NULL') ? [dedicatedCaptureLockRow()] : []),
+      );
+
+      await poll(makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }));
+
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledTimes(1);
+      const [acceptanceQuery] = (prisma.$queryRaw as ReturnType<typeof vi.fn>).mock.calls[0] ?? [];
+      expect((acceptanceQuery as { sql?: string }).sql).toContain('"captureRetiredAt" IS NULL');
+    });
+
+    it('P0 capture-retirement fence: a normal IMAP lock miss never creates an external raw-MIME reservation', async () => {
+      // Model the only race the pre-fetch snapshot cannot exclude: capture retirement
+      // commits after fetchOne() but before the transaction obtains its queue-row lock.
+      // Inline bytes are deliberately prepared before that final lock, but they have no
+      // filesystem side effect. Large bodies take their own queue-bound reservation; that
+      // lifecycle is tested below with a durable staging-row assertion.
+      const svc = makeInboundService(prisma as unknown as PrismaService);
+      const persist = vi.spyOn(
+        svc as unknown as {
+          persistRawMime: (source: Buffer, queueId: number, capture: boolean) => Promise<unknown>;
+        },
+        'persistRawMime',
+      );
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+
+      const accept = (
+        svc as unknown as {
+          acceptImapMessage: (
+            snapshot: Record<string, unknown>,
+            uidValidity: bigint,
+            uid: number,
+            source: Buffer,
+          ) => Promise<'accepted' | 'duplicate'>;
+        }
+      ).acceptImapMessage;
+
+      await expect(accept.call(svc, dedicatedCaptureQueue(), 7n, 101, imapSrc(101))).rejects.toThrow(
+        /changed before delivery acceptance/i,
+      );
+
+      expect(persist).toHaveBeenCalledWith(imapSrc(101), 1, false);
+      expect(prisma.inboundRawMimeStaging.create).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+    });
+
+    it('capture-only durably records the selected IMAP queue as CAPTURED, advances its cursor, and never wakes the drain', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(dedicatedCaptureQueue());
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([dedicatedCaptureLockRow()]);
+      const drain = vi.spyOn(
+        capture as unknown as { drainDeliveries: () => Promise<void> },
+        'drainDeliveries',
+      );
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }),
+      );
+
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ state: 'CAPTURED' }) }),
+      );
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { lastSeenUid: 101n } }),
+      );
+      expect(drain).not.toHaveBeenCalled();
+      expect(prisma.ticketPost.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('capture-only refuses a non-TLS queue before it fetches or stages any message bytes', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        dedicatedCaptureQueue({ useTls: false }),
+      );
+      const client = makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 });
+      const persist = vi.spyOn(
+        capture as unknown as { persistRawMime: (source: Buffer) => Promise<unknown> },
+        'persistRawMime',
+      );
+
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        client,
+      );
+
+      expect(client.fetch).not.toHaveBeenCalled();
+      expect(client.fetchOne).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
+    });
+
+    it('capture-only stores only bounded IMAP envelope metadata for the operator preview', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(dedicatedCaptureQueue());
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([dedicatedCaptureLockRow()]);
+
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        makeLedgerClient(
+          [101],
+          { uidValidity: 7n, uidNext: 102 },
+          {
+            envelopeForUid: () => ({
+              subject: 'One\r\n capture-only\u0000 test',
+              messageId: ' <capture-101@example.test> ',
+              from: [{ address: ' Sender@Example.Test ' }],
+            }),
+          },
+        ),
+      );
+
+      const [createArgs] =
+        (prisma.inboundDelivery.createMany as ReturnType<typeof vi.fn>).mock.calls[0] ?? [];
+      expect(createArgs).toEqual(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            state: 'CAPTURED',
+            subject: 'One capture-only test',
+            observedMessageId: '<capture-101@example.test>',
+            envelopeFrom: 'sender@example.test',
+          }),
+        }),
+      );
+      expect((createArgs as { data: Record<string, unknown> }).data).not.toHaveProperty('messageId');
+      expect(prisma.inboundMessageClaim.createMany).not.toHaveBeenCalled();
+      expect(prisma.ticketPost.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('capture-only omits invalid IMAP envelope identifiers instead of treating them as mail claims', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(dedicatedCaptureQueue());
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([dedicatedCaptureLockRow()]);
+
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        makeLedgerClient(
+          [101],
+          { uidValidity: 7n, uidNext: 102 },
+          {
+            envelopeForUid: () => ({
+              messageId: '<bad id@example.test>',
+              from: [{ address: 'not-an-address' }],
+            }),
+          },
+        ),
+      );
+
+      const [createArgs] =
+        (prisma.inboundDelivery.createMany as ReturnType<typeof vi.fn>).mock.calls[0] ?? [];
+      const data = (createArgs as { data: Record<string, unknown> }).data;
+      expect(data).toEqual(expect.objectContaining({ state: 'CAPTURED' }));
+      expect(data).not.toHaveProperty('observedMessageId');
+      expect(data).not.toHaveProperty('envelopeFrom');
+      expect(data).not.toHaveProperty('messageId');
+      expect(prisma.inboundMessageClaim.createMany).not.toHaveBeenCalled();
+    });
+
+    it('capture-only stops before a second new IMAP message when its durable one-message limit is full', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+        TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+      });
+      // A full queue can only be a reconnect to an already armed capture
+      // queue. New capture targets must be completely fresh and are rejected
+      // by armCaptureQueue before this advisory capacity read.
+      const retiredAt = new Date();
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        dedicatedCaptureQueue({ captureRetiredAt: retiredAt }),
+      );
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { ...dedicatedCaptureLockRow(), captureRetiredAt: retiredAt },
+      ]);
+      (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+      const client = makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 });
+      const persist = vi.spyOn(
+        capture as unknown as { persistRawMime: (source: Buffer) => Promise<unknown> },
+        'persistRawMime',
+      );
+
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        client,
+      );
+
+      expect(prisma.inboundDelivery.count).toHaveBeenCalledWith({
+        where: { queueId: 1, state: { in: ['CAPTURED', 'QUARANTINED'] } },
+      });
+      // The advisory outer fence is intentionally before fetchOne/persistRawMime:
+      // a full one-message test must not keep reading later raw mail into memory.
+      expect(client.fetchOne).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+      // The capacity error is fail-closed: the cursor stays before the unaccepted UID,
+      // so no later message can be silently skipped behind it.
+      expect(
+        (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([args]) => args?.data?.lastSeenUid === 101n,
+        ),
+      ).toBe(false);
+    });
+
+    it('capture-only permits an exact IMAP retry at capacity without retaining a second copy', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+        TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+      });
+      const source = imapSrc(101);
+      const retiredAt = new Date();
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        dedicatedCaptureQueue({ captureRetiredAt: retiredAt }),
+      );
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { ...dedicatedCaptureLockRow(), captureRetiredAt: retiredAt },
+      ]);
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        queueId: 1,
+        mailboxEpoch: 1,
+        uidValidity: 7n,
+        uid: 101n,
+        contentHash: createHash('sha256').update(source).digest('hex'),
+      });
+      (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }),
+      );
+
+      // At capacity we first make the cheap count/read check, then allow only the
+      // known transport retry through to its content-hash verification.
+      // The only count is the capacity check; an already-retired queue is not
+      // armed a second time. The exact transport retry bypasses this limit in
+      // the transactional accept path after its content hash is verified.
+      expect(prisma.inboundDelivery.count).toHaveBeenCalledTimes(1);
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { lastSeenUid: 101n } }),
+      );
+    });
+
+    it('capture-only refuses to arm a queue with any prior delivery history, including terminal rows', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(dedicatedCaptureQueue());
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([dedicatedCaptureLockRow()]);
+      // A terminal QUARANTINED/PROCESSED row is still delivery history. The
+      // mock returns one only for the fresh-queue count; reverting the query to
+      // the old live-work state filter would instead let the poll fetch a body.
+      (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ where }: { where: { state?: unknown } }) => Promise.resolve(where.state === undefined ? 1 : 0),
+      );
+      const client = makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 });
+
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        client,
+      );
+
+      expect(prisma.inboundDelivery.count).toHaveBeenCalledWith({ where: { queueId: 1 } });
+      expect(client.getMailboxLock).not.toHaveBeenCalled();
+      expect(client.fetch).not.toHaveBeenCalled();
+      expect(client.fetchOne).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ captureRetiredAt: expect.any(Date) }) }),
+      );
+    });
+
+    it('capture-only refuses the shared INBOX before an IMAP lock, fetch, ledger row, or cursor write', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        queue({ mailbox: '  inbox  ' }),
+      );
+      const client = makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 });
+
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        client,
+      );
+
+      expect(client.getMailboxLock).not.toHaveBeenCalled();
+      expect(client.fetch).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+      expect(
+        (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([args]) => args?.data?.lastSeenUid !== undefined,
+        ),
+      ).toBe(false);
+    });
+
+    it('capture-only refuses Gmail All Mail before an IMAP lock, fetch, ledger row, or cursor write', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        queue({ mailbox: '[Gmail]/All Mail' }),
+      );
+      const client = makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 });
+
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        client,
+      );
+
+      expect(client.getMailboxLock).not.toHaveBeenCalled();
+      expect(client.fetch).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+      expect(
+        (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([args]) => args?.data?.lastSeenUid !== undefined,
+        ),
+      ).toBe(false);
+    });
+
+    it('counts a truncated capture quarantine against the one-message limit, so a second UID cannot advance', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        // A deliberately tiny private-test threshold drives the bounded IMAP fetch
+        // through its truncated/QUARANTINED branch without allocating a huge buffer.
+        TELECOM_HD_INBOUND_MAX_SIZE_MB: 0,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+        TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+      });
+      const dedicatedQueue = queue({ mailbox: 'Helpdesk Test' });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(dedicatedQueue)
+        .mockResolvedValueOnce({ ...dedicatedQueue, lastSeenUid: 101n });
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: 1,
+          emailAddress: 'support@example.com',
+          departmentId: null,
+          sendAutoresponder: false,
+          configGeneration: 0,
+          mailbox: 'Helpdesk Test',
+        },
+      ]);
+      (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(0)
+        .mockResolvedValueOnce(0)
+        .mockResolvedValueOnce(1);
+      const source = Buffer.from(
+        'From: sender@example.test\r\n\r\nshort but deliberately over tiny test cap',
+      );
+
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        makeLedgerClient([101], { uidValidity: 7n, uidNext: 102 }, { sourceForUid: () => source }),
+      );
+      await (capture as unknown as { pollQueue: (q: number, c: unknown) => Promise<void> }).pollQueue(
+        1,
+        makeLedgerClient([102], { uidValidity: 7n, uidNext: 103 }, { sourceForUid: () => source }),
+      );
+
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledTimes(1);
+      expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ state: 'QUARANTINED', truncated: true }) }),
+      );
+      expect(
+        (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([args]) => args?.data?.lastSeenUid === 102n,
+        ),
+      ).toBe(false);
     });
 
     it('#10: snapshots the queue department and trusted receiving mailbox onto the delivery at acceptance', async () => {
@@ -1127,15 +1633,27 @@ describe('InboundMailService — parser rule helpers', () => {
       );
     });
 
-    it('P1-H: stores large raw MIME outside PostgreSQL before durable acceptance', async () => {
+    it('P1-H: reserves large raw MIME against the normal queue fence before writing it', async () => {
       const storageKey = 'inbound-raw/00000000-0000-4000-8000-000000000001.eml';
       const storage = {
         allocateKey: vi.fn().mockReturnValue(storageKey),
-        write: vi.fn().mockResolvedValue(storageKey),
+        writeFenced: vi
+          .fn()
+          .mockImplementation(
+            async (_source: Buffer, key: string, fence: (publish: () => Promise<void>) => Promise<void>) => {
+              await fence(async () => undefined);
+              return key;
+            },
+          ),
         commit: vi.fn().mockResolvedValue(undefined),
+        removeFile: vi.fn().mockResolvedValue(undefined),
         remove: vi.fn().mockResolvedValue(undefined),
-      } as unknown as InboundRawStorageService;
-      const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
+      };
+      const svc = makeInboundService(
+        prisma as unknown as PrismaService,
+        TEST_CONFIG,
+        storage as unknown as InboundRawStorageService,
+      );
       const accept = (
         svc as unknown as {
           acceptImapMessage: (
@@ -1159,15 +1677,31 @@ describe('InboundMailService — parser rule helpers', () => {
         }
       ).acceptImapMessage;
       const large = Buffer.alloc(1024 * 1024 + 1, 0x61);
-      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
-        {
-          id: 1,
-          emailAddress: 'support@example.test',
-          departmentId: 4,
-          sendAutoresponder: false,
-          configGeneration: 0,
-        },
-      ]);
+      // Both the short reservation transaction and the final acceptance transaction
+      // must prove the normal (not capture-retired) lifecycle predicate. Returning a
+      // row only when that exact predicate is present makes this a mutation-resistant
+      // fence test rather than a string-only assertion.
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) => {
+        if (query.sql?.includes('FROM "InboundRawMimeStaging"')) {
+          return Promise.resolve(
+            query.sql.includes('SELECT "state"') ? [{ state: 'COMMITTED' }] : [{ storageKey }],
+          );
+        }
+        if (!query.sql?.includes('"captureRetiredAt" IS NULL')) return Promise.resolve([]);
+        if (query.sql.includes('SELECT "id", "emailAddress"')) {
+          return Promise.resolve([
+            {
+              id: 1,
+              emailAddress: 'support@example.test',
+              departmentId: 4,
+              sendAutoresponder: false,
+              configGeneration: 0,
+              mailbox: 'INBOX',
+            },
+          ]);
+        }
+        return Promise.resolve([{ id: 1 }]);
+      });
       (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
         {
           id: 1,
@@ -1177,6 +1711,7 @@ describe('InboundMailService — parser rule helpers', () => {
           sendAutoresponder: false,
         },
       ]);
+      (prisma.inboundDelivery.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
       await accept.call(
         svc,
         {
@@ -1197,11 +1732,27 @@ describe('InboundMailService — parser rule helpers', () => {
         large,
       );
       expect(prisma.inboundRawMimeStaging.create).toHaveBeenCalledWith(
-        expect.objectContaining({ data: expect.objectContaining({ storageKey }) }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            storageKey,
+            queueId: 1,
+            state: 'ACTIVE',
+            leaseExpiresAt: expect.any(Date),
+          }),
+        }),
       );
-      expect(storage.write).toHaveBeenCalledWith(large, storageKey);
-      expect(prisma.inboundRawMimeStaging.deleteMany).toHaveBeenCalledWith({ where: { storageKey } });
+      expect(storage.writeFenced).toHaveBeenCalledWith(large, storageKey, expect.any(Function));
+      expect(
+        (prisma.inboundRawMimeStaging.create as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0],
+      ).toBeLessThan(storage.writeFenced.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY);
+      expect(prisma.inboundRawMimeStaging.deleteMany).toHaveBeenCalledWith({
+        where: { storageKey, state: 'COMMITTED' },
+      });
       expect(storage.commit).toHaveBeenCalledWith(storageKey);
+      const reservationQuery = (prisma.$queryRaw as ReturnType<typeof vi.fn>).mock.calls
+        .map(([query]) => query as { sql?: string })
+        .find((query) => query.sql?.includes('SELECT "id"\n        FROM "EmailQueue"'));
+      expect(reservationQuery?.sql).toContain('"captureRetiredAt" IS NULL');
       expect(prisma.inboundDelivery.createMany).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
@@ -1212,19 +1763,429 @@ describe('InboundMailService — parser rule helpers', () => {
       );
     });
 
-    it('P1-H: bounded marker cleanup removes only stale unreferenced raw MIME files', async () => {
+    it('P0 raw-stage fence: acceptance retains the stage through ledger commit, then commits marker before finalization', async () => {
+      // This is the torn-snapshot regression barrier. If acceptance deletes the durable
+      // stage inside the same transaction as InboundDelivery, a reaper using separate
+      // READ COMMITTED statements can observe neither row and delete the raw file just
+      // before the delivery becomes visible. The stage must instead remain/lock through
+      // the ledger commit, then be finalized only after the pending marker is committed.
+      const storageKey = 'inbound-raw/00000000-0000-4000-8000-000000000012.eml';
+      const events: string[] = [];
+      const storage = {
+        allocateKey: vi.fn().mockReturnValue(storageKey),
+        writeFenced: vi
+          .fn()
+          .mockImplementation(
+            async (_source: Buffer, key: string, fence: (publish: () => Promise<void>) => Promise<void>) => {
+              events.push('write');
+              await fence(async () => {
+                events.push('publish');
+              });
+              return key;
+            },
+          ),
+        commit: vi.fn().mockImplementation(async () => {
+          events.push('marker');
+        }),
+        removeFile: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
+      };
+      const svc = makeInboundService(
+        prisma as unknown as PrismaService,
+        TEST_CONFIG,
+        storage as unknown as InboundRawStorageService,
+      );
+      let transactionNumber = 0;
+      let activeTransaction = 0;
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation(async (input: unknown) => {
+        if (typeof input !== 'function') return Promise.all(input as Promise<unknown>[]);
+        const transaction = ++transactionNumber;
+        activeTransaction = transaction;
+        try {
+          const result = await (input as (tx: typeof prisma) => Promise<unknown>)(prisma);
+          events.push(`commit:${transaction}`);
+          return result;
+        } finally {
+          activeTransaction = 0;
+        }
+      });
+      (prisma.inboundRawMimeStaging.create as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        events.push('stage-create');
+        return {};
+      });
+      (prisma.inboundRawMimeStaging.deleteMany as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        events.push('stage-delete');
+        return { count: 1 };
+      });
+      (prisma.inboundRawMimeStaging.updateMany as ReturnType<typeof vi.fn>).mockImplementation(
+        async ({ data }: { data: { state?: string } }) => {
+          if (data.state === 'COMMITTED') {
+            events.push(`stage-committed:tx${activeTransaction}`);
+          }
+          return { count: 1 };
+        },
+      );
+      Object.assign(prisma.inboundRawMimeStaging as object, {
+        findUnique: vi.fn().mockResolvedValue({ storageKey }),
+        findFirst: vi.fn().mockResolvedValue({ storageKey }),
+      });
+      (prisma.inboundDelivery.createMany as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        events.push('ledger');
+        return { count: 1 };
+      });
+      (prisma.inboundDelivery.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 1 });
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) => {
+        if (query.sql?.includes('FROM "InboundRawMimeStaging"')) {
+          return Promise.resolve(
+            query.sql.includes('SELECT "state"') ? [{ state: 'COMMITTED' }] : [{ storageKey }],
+          );
+        }
+        if (query.sql?.includes('SELECT "id", "emailAddress"')) {
+          return Promise.resolve([
+            {
+              id: 1,
+              emailAddress: 'support@example.test',
+              departmentId: 4,
+              sendAutoresponder: false,
+              configGeneration: 0,
+              mailbox: 'INBOX',
+            },
+          ]);
+        }
+        return Promise.resolve([{ id: 1 }]);
+      });
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: 1,
+          emailAddress: 'support@example.test',
+          departmentId: 4,
+          routingPriority: 100,
+          sendAutoresponder: false,
+        },
+      ]);
+      const accept = (
+        svc as unknown as {
+          acceptImapMessage: (
+            q: Record<string, unknown>,
+            uidValidity: bigint,
+            uid: number,
+            source: Buffer,
+          ) => Promise<'accepted' | 'duplicate'>;
+        }
+      ).acceptImapMessage;
+
+      await expect(
+        accept.call(
+          svc,
+          {
+            id: 1,
+            type: 'IMAP',
+            isEnabled: true,
+            emailAddress: 'support@example.test',
+            departmentId: 4,
+            sendAutoresponder: false,
+            syncState: 'OK',
+            mailbox: 'INBOX',
+            mailboxEpoch: 1,
+            cursorGeneration: 0,
+            configGeneration: 0,
+            uidValidity: 7n,
+            captureRetiredAt: null,
+          },
+          7n,
+          101,
+          Buffer.alloc(1024 * 1024 + 1, 0x61),
+        ),
+      ).resolves.toBe('accepted');
+
+      const ledger = events.indexOf('ledger');
+      const stageCommitted = events.indexOf('stage-committed:tx3');
+      const acceptedCommit = events.indexOf('commit:3');
+      const marker = events.indexOf('marker');
+      const stageDelete = events.indexOf('stage-delete');
+      expect(ledger).toBeGreaterThan(-1);
+      expect(stageCommitted).toBeGreaterThan(ledger);
+      expect(stageCommitted).toBeLessThan(acceptedCommit);
+      expect(acceptedCommit).toBeGreaterThan(ledger);
+      expect(marker).toBeGreaterThan(acceptedCommit);
+      expect(stageDelete).toBeGreaterThan(marker);
+      expect(prisma.inboundRawMimeStaging.updateMany).toHaveBeenCalledWith({
+        where: { storageKey, state: 'ACTIVE' },
+        data: { state: 'COMMITTED' },
+      });
+    });
+
+    it('P0 capture-retirement fence: a capture reservation requires the retired queue marker', async () => {
+      const storageKey = 'inbound-raw/00000000-0000-4000-8000-000000000006.eml';
+      const storage = {
+        allocateKey: vi.fn().mockReturnValue(storageKey),
+        writeFenced: vi
+          .fn()
+          .mockImplementation(
+            async (_source: Buffer, key: string, fence: (publish: () => Promise<void>) => Promise<void>) => {
+              await fence(async () => undefined);
+              return key;
+            },
+          ),
+        removeFile: vi.fn().mockResolvedValue(undefined),
+        commit: vi.fn().mockResolvedValue(undefined),
+      };
+      const capture = makeInboundService(
+        prisma as unknown as PrismaService,
+        {
+          ...TEST_CONFIG,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+        },
+        storage as unknown as InboundRawStorageService,
+      );
+      // The simulated database grants the reservation only to the exact capture
+      // lifecycle predicate. Changing it to IS NULL (or removing it) makes the
+      // write fail before any bytes are staged.
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) => {
+        if (query.sql?.includes('FROM "InboundRawMimeStaging"')) {
+          return Promise.resolve([{ storageKey }]);
+        }
+        return Promise.resolve(query.sql?.includes('"captureRetiredAt" IS NOT NULL') ? [{ id: 1 }] : []);
+      });
+      const persist = (
+        capture as unknown as {
+          persistRawMime: (
+            source: Buffer,
+            queueId: number,
+            capture: boolean,
+          ) => Promise<{
+            rawStorageKey: string | null;
+          }>;
+        }
+      ).persistRawMime;
+      const discard = (capture as unknown as { discardRawStage: (key: string | null) => Promise<void> })
+        .discardRawStage;
+
+      const raw = await persist.call(capture, Buffer.alloc(1024 * 1024 + 1, 0x61), 1, true);
+
+      expect(prisma.inboundRawMimeStaging.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ storageKey, queueId: 1, leaseExpiresAt: expect.any(Date) }),
+        }),
+      );
+      expect(storage.writeFenced).toHaveBeenCalledWith(expect.any(Buffer), storageKey, expect.any(Function));
+      const [reservationQuery] = (prisma.$queryRaw as ReturnType<typeof vi.fn>).mock.calls;
+      expect((reservationQuery?.[0] as { sql?: string } | undefined)?.sql).toContain(
+        '"captureRetiredAt" IS NOT NULL',
+      );
+
+      await discard.call(capture, raw.rawStorageKey);
+    });
+
+    it('P0 raw-stage fence: a stale writer cannot publish after a reaper has taken the stage', async () => {
+      const storageKey = 'inbound-raw/00000000-0000-4000-8000-000000000014.eml';
+      let state: 'ACTIVE' | 'REAPING' = 'ACTIVE';
+      const publish = vi.fn().mockResolvedValue(undefined);
+      const storage = {
+        allocateKey: vi.fn().mockReturnValue(storageKey),
+        writeFenced: vi
+          .fn()
+          .mockImplementation(
+            async (_source: Buffer, key: string, fence: (publish: () => Promise<void>) => Promise<void>) => {
+              // The private temporary write completed, then the reaper atomically claimed the
+              // durable stage. The writer must never receive a usable rename capability after it.
+              state = 'REAPING';
+              await fence(publish);
+              return key;
+            },
+          ),
+        removeFile: vi.fn().mockResolvedValue(undefined),
+        commit: vi.fn().mockResolvedValue(undefined),
+      };
+      const svc = makeInboundService(
+        prisma as unknown as PrismaService,
+        TEST_CONFIG,
+        storage as unknown as InboundRawStorageService,
+      );
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) => {
+        if (query.sql?.includes('FROM "InboundRawMimeStaging"')) {
+          return Promise.resolve(state === 'ACTIVE' ? [{ storageKey }] : []);
+        }
+        return Promise.resolve(query.sql?.includes('"captureRetiredAt" IS NULL') ? [{ id: 1 }] : []);
+      });
+      const persist = (
+        svc as unknown as {
+          persistRawMime: (source: Buffer, queueId: number, capture: boolean) => Promise<unknown>;
+        }
+      ).persistRawMime;
+
+      await expect(persist.call(svc, Buffer.alloc(1024 * 1024 + 1, 0x61), 1, false)).rejects.toThrow(
+        /writer lost its staging fence before publish/i,
+      );
+
+      expect(storage.writeFenced).toHaveBeenCalledWith(expect.any(Buffer), storageKey, expect.any(Function));
+      expect(publish).not.toHaveBeenCalled();
+      expect(storage.removeFile).not.toHaveBeenCalled();
+      expect(storage.commit).not.toHaveBeenCalled();
+    });
+
+    it('P0 capture-retirement fence: failed raw-file cleanup retains the reservation and blocks capture arming', async () => {
+      const storageKey = 'inbound-raw/00000000-0000-4000-8000-000000000007.eml';
+      let stagePresent = false;
+      const storage = {
+        allocateKey: vi.fn().mockReturnValue(storageKey),
+        writeFenced: vi
+          .fn()
+          .mockImplementation(
+            async (_source: Buffer, key: string, fence: (publish: () => Promise<void>) => Promise<void>) => {
+              await fence(async () => undefined);
+              return key;
+            },
+          ),
+        removeFile: vi.fn().mockRejectedValue(new Error('filesystem still has raw bytes')),
+        commit: vi.fn().mockResolvedValue(undefined),
+      };
+      (prisma.inboundRawMimeStaging.create as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        stagePresent = true;
+        return Promise.resolve({});
+      });
+      (prisma.inboundRawMimeStaging.deleteMany as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        stagePresent = false;
+        return Promise.resolve({ count: 1 });
+      });
+      (prisma.inboundRawMimeStaging.count as ReturnType<typeof vi.fn>).mockImplementation(() =>
+        Promise.resolve(stagePresent ? 1 : 0),
+      );
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) => {
+        if (query.sql?.includes('SELECT "id", "captureRetiredAt"')) {
+          return Promise.resolve([{ id: 1, captureRetiredAt: null }]);
+        }
+        return Promise.resolve([{ id: 1 }]);
+      });
+      const capture = makeInboundService(
+        prisma as unknown as PrismaService,
+        {
+          ...TEST_CONFIG,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+        },
+        storage as unknown as InboundRawStorageService,
+      );
+      const persist = (
+        capture as unknown as {
+          persistRawMime: (
+            source: Buffer,
+            queueId: number,
+            capture: boolean,
+          ) => Promise<{
+            rawStorageKey: string | null;
+          }>;
+        }
+      ).persistRawMime;
+      const discard = (capture as unknown as { discardRawStage: (key: string | null) => Promise<void> })
+        .discardRawStage;
+      const arm = (
+        capture as unknown as {
+          armCaptureQueue: (snapshot: Record<string, unknown>, mailbox: string) => Promise<boolean>;
+        }
+      ).armCaptureQueue;
+
+      const raw = await persist.call(capture, Buffer.alloc(1024 * 1024 + 1, 0x61), 1, false);
+      await discard.call(capture, raw.rawStorageKey);
+
+      expect(storage.removeFile).toHaveBeenCalledWith(storageKey);
+      expect(prisma.inboundRawMimeStaging.deleteMany).not.toHaveBeenCalled();
+      expect(storage.commit).not.toHaveBeenCalled();
+      expect(stagePresent).toBe(true);
+      await expect(arm.call(capture, dedicatedCaptureQueue(), 'Helpdesk Test')).rejects.toThrow(
+        /pending raw MIME staging/i,
+      );
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('P1-H: an expired DB-only reservation is reaped even without a pending marker and unblocks capture arming', async () => {
+      // Crash point: the short reservation transaction committed, then the process died
+      // before rawStorage.writeFenced() could create its on-disk pending marker. A marker-only
+      // sweep would never discover this row, permanently preventing a fresh capture arm.
+      const storageKey = 'inbound-raw/00000000-0000-4000-8000-000000000011.eml';
+      let stagePresent = true;
+      let expired = false;
+      const storage = {
+        listPending: vi.fn().mockResolvedValue([]),
+        removeFile: vi.fn().mockResolvedValue(undefined),
+        commit: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
+      } as unknown as InboundRawStorageService;
+      (prisma.inboundRawMimeStaging.findMany as ReturnType<typeof vi.fn>).mockImplementation(() =>
+        Promise.resolve(
+          stagePresent && expired
+            ? [{ storageKey, state: 'ACTIVE', leaseExpiresAt: new Date(Date.now() - 60_000) }]
+            : [],
+        ),
+      );
+      (prisma.inboundRawMimeStaging.count as ReturnType<typeof vi.fn>).mockImplementation(() =>
+        Promise.resolve(stagePresent ? 1 : 0),
+      );
+      (prisma.inboundRawMimeStaging.deleteMany as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        stagePresent = false;
+        return Promise.resolve({ count: 1 });
+      });
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) => {
+        if (query.sql?.includes('SELECT "id", "captureRetiredAt"')) {
+          return Promise.resolve([{ id: 1, captureRetiredAt: null }]);
+        }
+        if (query.sql?.includes('FROM "InboundRawMimeStaging"')) {
+          return Promise.resolve(
+            query.sql.includes('SELECT "state"') ? [{ state: 'REAPING' }] : [{ storageKey }],
+          );
+        }
+        return Promise.resolve([{ id: 1 }]);
+      });
+      const capture = makeInboundService(
+        prisma as unknown as PrismaService,
+        {
+          ...TEST_CONFIG,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+        },
+        storage,
+      );
+      const arm = (
+        capture as unknown as {
+          armCaptureQueue: (snapshot: Record<string, unknown>, mailbox: string) => Promise<boolean>;
+        }
+      ).armCaptureQueue;
+      const cleanup = (capture as unknown as { cleanupUncommittedRawStorage: () => Promise<void> })
+        .cleanupUncommittedRawStorage;
+
+      await expect(arm.call(capture, dedicatedCaptureQueue(), 'Helpdesk Test')).rejects.toThrow(
+        /pending raw MIME staging/i,
+      );
+      expired = true;
+      await cleanup.call(capture);
+
+      expect(prisma.inboundRawMimeStaging.deleteMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ storageKey }) }),
+      );
+      expect(stagePresent).toBe(false);
+      await expect(arm.call(capture, dedicatedCaptureQueue(), 'Helpdesk Test')).resolves.toBe(true);
+    });
+
+    it('P1-H: bounded marker cleanup retains referenced bytes and reaps only an unreferenced legacy orphan', async () => {
       const referenced = 'inbound-raw/00000000-0000-4000-8000-000000000001.eml';
       const orphan = 'inbound-raw/00000000-0000-4000-8000-000000000002.eml';
       const storage = {
         listPending: vi.fn().mockResolvedValue([referenced, orphan]),
         commit: vi.fn().mockResolvedValue(undefined),
+        removeFile: vi.fn().mockResolvedValue(undefined),
         remove: vi.fn().mockResolvedValue(undefined),
       } as unknown as InboundRawStorageService;
       const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
-      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { rawStorageKey: referenced },
-      ]);
       (prisma.inboundRawMimeStaging.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.inboundDelivery.findFirst as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ where }: { where: { rawStorageKey: string } }) =>
+          Promise.resolve(where.rawStorageKey === referenced ? { id: 1 } : null),
+      );
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 
       await (
         svc as unknown as { cleanupUncommittedRawStorage: () => Promise<void> }
@@ -1232,8 +2193,10 @@ describe('InboundMailService — parser rule helpers', () => {
 
       expect(storage.listPending).toHaveBeenCalledWith(100, expect.any(Date));
       expect(storage.commit).toHaveBeenCalledWith(referenced);
-      expect(storage.remove).toHaveBeenCalledWith(orphan);
-      expect(storage.remove).not.toHaveBeenCalledWith(referenced);
+      expect(storage.removeFile).toHaveBeenCalledWith(orphan);
+      expect(storage.removeFile).not.toHaveBeenCalledWith(referenced);
+      expect(storage.commit).toHaveBeenCalledWith(orphan);
+      expect(storage.remove).not.toHaveBeenCalled();
     });
 
     it('P1-H: staged raw MIME is never reaped while its acceptance lease is still live', async () => {
@@ -1241,19 +2204,24 @@ describe('InboundMailService — parser rule helpers', () => {
       const storage = {
         listPending: vi.fn().mockResolvedValue([staged]),
         commit: vi.fn().mockResolvedValue(undefined),
+        removeFile: vi.fn().mockResolvedValue(undefined),
         remove: vi.fn().mockResolvedValue(undefined),
       } as unknown as InboundRawStorageService;
       const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
       (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (prisma.inboundRawMimeStaging.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { storageKey: staged, leaseExpiresAt: new Date(Date.now() + 60_000) },
+        { storageKey: staged, state: 'ACTIVE', leaseExpiresAt: new Date(Date.now() + 60_000) },
       ]);
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) =>
+        Promise.resolve(query.sql?.includes('SELECT "state"') ? [{ state: 'ACTIVE' }] : []),
+      );
 
       await (
         svc as unknown as { cleanupUncommittedRawStorage: () => Promise<void> }
       ).cleanupUncommittedRawStorage();
 
       expect(prisma.inboundRawMimeStaging.deleteMany).not.toHaveBeenCalled();
+      expect(storage.removeFile).not.toHaveBeenCalled();
       expect(storage.remove).not.toHaveBeenCalled();
       expect(storage.commit).not.toHaveBeenCalled();
     });
@@ -1263,21 +2231,190 @@ describe('InboundMailService — parser rule helpers', () => {
       const storage = {
         listPending: vi.fn().mockResolvedValue([staged]),
         commit: vi.fn().mockResolvedValue(undefined),
+        removeFile: vi.fn().mockResolvedValue(undefined),
         remove: vi.fn().mockResolvedValue(undefined),
       } as unknown as InboundRawStorageService;
       const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
       (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (prisma.inboundRawMimeStaging.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { storageKey: staged, leaseExpiresAt: new Date(Date.now() - 60_000) },
+        { storageKey: staged, state: 'ACTIVE', leaseExpiresAt: new Date(Date.now() - 60_000) },
       ]);
       // SELECT … FOR UPDATE SKIP LOCKED returns no row while acceptance owns the stage.
       (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.inboundRawMimeStaging.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        storageKey: staged,
+      });
 
       await (
         svc as unknown as { cleanupUncommittedRawStorage: () => Promise<void> }
       ).cleanupUncommittedRawStorage();
 
       expect(prisma.inboundRawMimeStaging.deleteMany).not.toHaveBeenCalled();
+      expect(storage.removeFile).not.toHaveBeenCalled();
+      expect(storage.remove).not.toHaveBeenCalled();
+      expect(storage.commit).not.toHaveBeenCalled();
+    });
+
+    it('P0 raw-stage fence: reaper rechecks the ledger pointer under the stage lock, never a torn precheck', async () => {
+      const staged = 'inbound-raw/00000000-0000-4000-8000-000000000013.eml';
+      const storage = {
+        listPending: vi.fn().mockResolvedValue([staged]),
+        removeFile: vi.fn().mockResolvedValue(undefined),
+        commit: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
+      } as unknown as InboundRawStorageService;
+      const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
+      // A separate delivery precheck is exactly the torn READ COMMITTED window that used
+      // to make deletion unsafe. The durable stage remains visible/locked while acceptance
+      // commits, so the reaper must inspect the pointer only after obtaining that lock.
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error('must not use a separate stale delivery precheck'),
+      );
+      (prisma.inboundDelivery.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 55 });
+      (prisma.inboundRawMimeStaging.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { storageKey: staged, state: 'COMMITTED', leaseExpiresAt: new Date(Date.now() - 60_000) },
+      ]);
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) =>
+        Promise.resolve(query.sql?.includes('SELECT "state"') ? [{ state: 'COMMITTED' }] : []),
+      );
+
+      await (
+        svc as unknown as { cleanupUncommittedRawStorage: () => Promise<void> }
+      ).cleanupUncommittedRawStorage();
+
+      expect(prisma.inboundDelivery.findFirst).toHaveBeenCalledWith({
+        where: { rawStorageKey: staged },
+        select: { id: true },
+      });
+      expect(storage.removeFile).not.toHaveBeenCalled();
+      expect(storage.remove).not.toHaveBeenCalled();
+      expect(prisma.inboundRawMimeStaging.deleteMany).toHaveBeenCalledWith({
+        where: { storageKey: staged, state: 'COMMITTED' },
+      });
+      expect(storage.commit).toHaveBeenCalledWith(staged);
+    });
+
+    it('P1-H: an expired-stage file-removal failure retains both reservation and pending marker', async () => {
+      const staged = 'inbound-raw/00000000-0000-4000-8000-000000000008.eml';
+      const storage = {
+        listPending: vi.fn().mockResolvedValue([staged]),
+        removeFile: vi.fn().mockRejectedValue(new Error('filesystem unavailable')),
+        commit: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
+      } as unknown as InboundRawStorageService;
+      const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.inboundRawMimeStaging.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { storageKey: staged, state: 'ACTIVE', leaseExpiresAt: new Date(Date.now() - 60_000) },
+      ]);
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) =>
+        Promise.resolve(
+          query.sql?.includes('SELECT "state"') ? [{ state: 'REAPING' }] : [{ storageKey: staged }],
+        ),
+      );
+
+      await (
+        svc as unknown as { cleanupUncommittedRawStorage: () => Promise<void> }
+      ).cleanupUncommittedRawStorage();
+
+      expect(storage.removeFile).toHaveBeenCalledWith(staged);
+      expect(prisma.inboundRawMimeStaging.deleteMany).not.toHaveBeenCalled();
+      expect(prisma.inboundRawMimeStaging.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { state: 'REAPING' } }),
+      );
+      // `commit` deletes the pending marker and `remove` deletes both marker/file. Neither
+      // is safe after file removal failed, so the next bounded reaper pass retains evidence.
+      expect(storage.commit).not.toHaveBeenCalled();
+      expect(storage.remove).not.toHaveBeenCalled();
+    });
+
+    it('P0 raw-stage fence: unlink success plus DB-finalization failure leaves REAPING and blocks acceptance', async () => {
+      const storageKey = 'inbound-raw/00000000-0000-4000-8000-000000000015.eml';
+      let state: 'ACTIVE' | 'REAPING' = 'ACTIVE';
+      const storage = {
+        removeFile: vi.fn().mockResolvedValue(undefined),
+        commit: vi.fn().mockResolvedValue(undefined),
+      } as unknown as InboundRawStorageService;
+      const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) => {
+        if (!query.sql?.includes('FROM "InboundRawMimeStaging"')) return Promise.resolve([]);
+        return Promise.resolve(state === 'ACTIVE' ? [{ storageKey }] : []);
+      });
+      (prisma.inboundRawMimeStaging.updateMany as ReturnType<typeof vi.fn>).mockImplementation(
+        ({
+          where,
+          data,
+        }: {
+          where: { storageKey: string; state: 'ACTIVE' | 'REAPING' };
+          data: { state: 'ACTIVE' | 'REAPING' };
+        }) => {
+          if (where.storageKey !== storageKey || where.state !== state) {
+            return Promise.resolve({ count: 0 });
+          }
+          state = data.state;
+          return Promise.resolve({ count: 1 });
+        },
+      );
+      // Simulate a database failure after bytes were removed: the state row must remain
+      // REAPING, so a later acceptance cannot manufacture a ledger pointer to missing bytes.
+      (prisma.inboundRawMimeStaging.deleteMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+      const discard = (svc as unknown as { discardRawStage: (key: string | null) => Promise<void> })
+        .discardRawStage;
+      const lock = (
+        svc as unknown as {
+          lockRawStageForAcceptance: (tx: unknown, key: string | null) => Promise<void>;
+        }
+      ).lockRawStageForAcceptance;
+
+      await discard.call(svc, storageKey);
+
+      expect(storage.removeFile).toHaveBeenCalledWith(storageKey);
+      expect(prisma.inboundRawMimeStaging.deleteMany).toHaveBeenCalledWith({
+        where: { storageKey, state: 'REAPING' },
+      });
+      expect(state).toBe('REAPING');
+      expect(storage.commit).not.toHaveBeenCalled();
+      await expect(lock.call(svc, prisma, storageKey)).rejects.toThrow(
+        /staging fence is unavailable before acceptance/i,
+      );
+      expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
+    });
+
+    it('P1-H: expired-stage cleanup is file -> durable stage delete -> pending-marker commit', async () => {
+      const staged = 'inbound-raw/00000000-0000-4000-8000-000000000009.eml';
+      const operations: string[] = [];
+      const storage = {
+        listPending: vi.fn().mockResolvedValue([staged]),
+        removeFile: vi.fn().mockImplementation(async () => {
+          operations.push('file');
+        }),
+        commit: vi.fn().mockImplementation(async () => {
+          operations.push('marker');
+        }),
+        remove: vi.fn().mockImplementation(async () => {
+          operations.push('remove');
+        }),
+      } as unknown as InboundRawStorageService;
+      const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.inboundRawMimeStaging.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { storageKey: staged, state: 'ACTIVE', leaseExpiresAt: new Date(Date.now() - 60_000) },
+      ]);
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) =>
+        Promise.resolve(
+          query.sql?.includes('SELECT "state"') ? [{ state: 'REAPING' }] : [{ storageKey: staged }],
+        ),
+      );
+      (prisma.inboundRawMimeStaging.deleteMany as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        operations.push('stage');
+        return { count: 1 };
+      });
+
+      await (
+        svc as unknown as { cleanupUncommittedRawStorage: () => Promise<void> }
+      ).cleanupUncommittedRawStorage();
+
+      expect(operations).toEqual(['file', 'stage', 'marker']);
       expect(storage.remove).not.toHaveBeenCalled();
     });
 
@@ -1285,12 +2422,22 @@ describe('InboundMailService — parser rule helpers', () => {
       const storageKey = 'inbound-raw/00000000-0000-4000-8000-000000000005.eml';
       const storage = {
         allocateKey: vi.fn().mockReturnValue(storageKey),
-        write: vi.fn().mockResolvedValue(storageKey),
+        writeFenced: vi
+          .fn()
+          .mockImplementation(
+            async (_source: Buffer, key: string, fence: (publish: () => Promise<void>) => Promise<void>) => {
+              await fence(async () => undefined);
+              return key;
+            },
+          ),
         commit: vi.fn().mockResolvedValue(undefined),
+        removeFile: vi.fn().mockResolvedValue(undefined),
         remove: vi.fn().mockResolvedValue(undefined),
       } as unknown as InboundRawStorageService;
       const svc = makeInboundService(prisma as unknown as PrismaService, TEST_CONFIG, storage);
-      (prisma.inboundRawMimeStaging.deleteMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+      (prisma.inboundRawMimeStaging.deleteMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ count: 0 })
+        .mockResolvedValueOnce({ count: 1 });
       const accept = (
         svc as unknown as {
           acceptImapMessage: (
@@ -1313,15 +2460,27 @@ describe('InboundMailService — parser rule helpers', () => {
           ) => Promise<'accepted' | 'duplicate'>;
         }
       ).acceptImapMessage;
-      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
-        {
-          id: 1,
-          emailAddress: 'support@example.test',
-          departmentId: null,
-          sendAutoresponder: false,
-          configGeneration: 0,
-        },
-      ]);
+      let activeStageLocks = 0;
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) => {
+        if (query.sql?.includes('FROM "InboundRawMimeStaging"')) {
+          activeStageLocks += 1;
+          return Promise.resolve(activeStageLocks === 1 ? [{ storageKey }] : []);
+        }
+        if (!query.sql?.includes('"captureRetiredAt" IS NULL')) return Promise.resolve([]);
+        if (query.sql.includes('SELECT "id", "emailAddress"')) {
+          return Promise.resolve([
+            {
+              id: 1,
+              emailAddress: 'support@example.test',
+              departmentId: null,
+              sendAutoresponder: false,
+              configGeneration: 0,
+              mailbox: 'INBOX',
+            },
+          ]);
+        }
+        return Promise.resolve([{ id: 1 }]);
+      });
       (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
         {
           id: 1,
@@ -1352,9 +2511,11 @@ describe('InboundMailService — parser rule helpers', () => {
           101,
           Buffer.alloc(1024 * 1024 + 1, 0x61),
         ),
-      ).rejects.toThrow(/staging lease expired/i);
+      ).rejects.toThrow(/staging fence is unavailable/i);
       expect(prisma.inboundDelivery.createMany).not.toHaveBeenCalled();
-      expect(storage.remove).toHaveBeenCalledWith(storageKey);
+      // The reservation cannot be locked as ACTIVE, so cleanup must retain it rather than
+      // unlinking bytes that another transaction may still own.
+      expect(storage.removeFile).not.toHaveBeenCalled();
     });
 
     it('processes out-of-order UIDs and advances the cursor to the max (no loss)', async () => {
@@ -1601,19 +2762,28 @@ describe('InboundMailService — parser rule helpers', () => {
       username: 'support',
       passwordEnc: '',
       useTls: true,
+      mailbox: 'Helpdesk/Test',
       mailboxEpoch: 2,
       cursorGeneration: 5,
       configGeneration: 0,
     };
 
-    function attachLiveClient(client: unknown) {
-      const internals = service as unknown as {
+    function attachLiveClientTo(
+      target: InboundMailService,
+      client: unknown,
+      targetSnapshot: typeof snapshot = snapshot,
+    ) {
+      const internals = target as unknown as {
         connections: Map<number, unknown>;
         connectionFingerprints: Map<number, string>;
         connectionFingerprint: (queue: typeof snapshot) => string;
       };
       internals.connections.set(1, client);
-      internals.connectionFingerprints.set(1, internals.connectionFingerprint(snapshot));
+      internals.connectionFingerprints.set(1, internals.connectionFingerprint(targetSnapshot));
+    }
+
+    function attachLiveClient(client: unknown) {
+      attachLiveClientTo(service, client);
     }
 
     it('FROM_NOW persists UIDNEXT-1 exactly; it never substitutes EXISTS or a wildcard fallback', async () => {
@@ -1629,6 +2799,7 @@ describe('InboundMailService — parser rule helpers', () => {
         cursor: 100,
         selectedUids: [],
       });
+      expect(client.getMailboxLock).toHaveBeenCalledWith('Helpdesk/Test');
       expect(client.search).not.toHaveBeenCalled();
     });
 
@@ -1712,6 +2883,84 @@ describe('InboundMailService — parser rule helpers', () => {
         /UIDVALIDITY\/UIDNEXT/i,
       );
       expect(client.search).not.toHaveBeenCalled();
+    });
+
+    it('capture-only rejects a direct reconcile probe for any nonselected queue before IMAP access', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      const otherQueue = { ...snapshot, id: 2, mailbox: 'Operations' };
+
+      await expect(capture.captureReconcileBaseline(otherQueue, 'FROM_NOW', 0)).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      expect((capture as unknown as { connections: Map<number, unknown> }).connections.size).toBe(0);
+    });
+
+    it('capture-only refuses a provider special-use folder after LIST and drops the reused authenticated socket', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      const client = {
+        mailbox: { uidValidity: 7n, uidNext: 1, exists: 0 },
+        list: vi.fn().mockResolvedValue([
+          {
+            path: 'Helpdesk/Test',
+            pathAsListed: 'Helpdesk/Test',
+            listed: true,
+            flags: new Set(),
+            specialUse: '\\Archive',
+          },
+        ]),
+        getMailboxLock: vi.fn(),
+        logout: vi.fn().mockResolvedValue(undefined),
+      };
+      attachLiveClientTo(capture, client);
+
+      await expect(capture.captureReconcileBaseline(snapshot, 'FROM_NOW', 0)).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+
+      expect(client.getMailboxLock).not.toHaveBeenCalled();
+      expect(client.logout).toHaveBeenCalledTimes(1);
+      expect((capture as unknown as { connections: Map<number, unknown> }).connections.has(1)).toBe(false);
+    });
+
+    it('capture-only refuses a nonempty dedicated folder before it chooses a FROM_NOW baseline', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      const release = vi.fn();
+      const client = {
+        mailbox: { uidValidity: 7n, uidNext: 2, exists: 1 },
+        list: vi.fn().mockResolvedValue([
+          {
+            path: 'Helpdesk/Test',
+            pathAsListed: 'Helpdesk/Test',
+            listed: true,
+            flags: new Set(),
+          },
+        ]),
+        getMailboxLock: vi.fn().mockResolvedValue({ release }),
+        logout: vi.fn().mockResolvedValue(undefined),
+      };
+      attachLiveClientTo(capture, client);
+
+      await expect(capture.captureReconcileBaseline(snapshot, 'FROM_NOW', 0)).rejects.toThrow(/not empty/i);
+
+      expect(client.getMailboxLock).toHaveBeenCalledWith('Helpdesk/Test');
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(client.logout).toHaveBeenCalledTimes(1);
+      expect((capture as unknown as { connections: Map<number, unknown> }).connections.has(1)).toBe(false);
     });
   });
 
@@ -1807,6 +3056,103 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
     });
 
+    it('capture-only re-proves a pre-bootstrapped queue before it can be considered a test target', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        type: 'IMAP',
+        isEnabled: true,
+        useTls: true,
+        mailbox: 'Helpdesk/Test',
+        uidValidity: 7n,
+        syncState: 'OK',
+        reconcileCause: null,
+      });
+      const client = {
+        mailbox: { uidValidity: 7n, uidNext: 10, exists: 0 },
+        list: vi.fn().mockResolvedValue([
+          {
+            path: 'Helpdesk/Test',
+            pathAsListed: 'Helpdesk/Test',
+            listed: true,
+            flags: new Set(),
+            specialUse: '\\Archive',
+          },
+        ]),
+        getMailboxLock: vi.fn(),
+      };
+
+      // The old `uidValidity !== null` early-return must not bypass this LIST check.
+      await expect(
+        (capture as unknown as { bootstrapQueue: (q: number, c: unknown) => Promise<void> }).bootstrapQueue(
+          1,
+          client,
+        ),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(client.list).toHaveBeenCalledTimes(1);
+      expect(client.getMailboxLock).not.toHaveBeenCalled();
+      // Capture-only marks the queue *before* testing the live mailbox. A
+      // provider-side special-use change must therefore fail closed on an
+      // irreversibly retired queue rather than leave a reusable normal queue.
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 1, captureRetiredAt: null }),
+          data: expect.objectContaining({ captureRetiredAt: expect.any(Date) }),
+        }),
+      );
+    });
+
+    it('capture-only refuses a pre-bootstrapped queue whose selected folder is no longer empty', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        type: 'IMAP',
+        isEnabled: true,
+        useTls: true,
+        mailbox: 'Helpdesk/Test',
+        uidValidity: 7n,
+        syncState: 'OK',
+        reconcileCause: null,
+      });
+      const release = vi.fn();
+      const client = {
+        mailbox: { uidValidity: 7n, uidNext: 11, exists: 1 },
+        list: vi
+          .fn()
+          .mockResolvedValue([
+            { path: 'Helpdesk/Test', pathAsListed: 'Helpdesk/Test', listed: true, flags: new Set() },
+          ]),
+        getMailboxLock: vi.fn().mockResolvedValue({ release }),
+      };
+
+      await expect(
+        (capture as unknown as { bootstrapQueue: (q: number, c: unknown) => Promise<void> }).bootstrapQueue(
+          1,
+          client,
+        ),
+      ).rejects.toThrow(/not empty/i);
+      expect(release).toHaveBeenCalledTimes(1);
+      // The first arm is permanent even when the empty-folder proof fails;
+      // operators must use a new queue/folder instead of turning this one back
+      // into normal ticket ingress.
+      expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 1, captureRetiredAt: null }),
+          data: expect.objectContaining({ captureRetiredAt: expect.any(Date) }),
+        }),
+      );
+    });
+
     it('P0-2: connectQueue captures the baseline DURING connect (not the first poll)', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 1,
@@ -1837,6 +3183,63 @@ describe('InboundMailService — parser rule helpers', () => {
         }),
       );
     });
+
+    it('marks capture target ready only after connect completes its live empty-folder proof', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 1,
+        type: 'IMAP',
+        isEnabled: true,
+        useTls: true,
+        mailbox: 'Helpdesk/Test',
+        uidValidity: 7n,
+        syncState: 'OK',
+        reconcileCause: null,
+      });
+
+      expect(capture.isCaptureQueueReady(1)).toBe(false);
+      await (capture as unknown as { connectQueue: (q: number, o: unknown) => Promise<void> }).connectQueue(
+        1,
+        {
+          host: 'h',
+          port: 993,
+          secure: true,
+          auth: { user: 'u', pass: 'p' },
+        },
+      );
+
+      expect(capture.isCaptureQueueReady(1)).toBe(true);
+      await capture.onModuleDestroy();
+    });
+
+    it('drops a socket when synchronous bootstrap fails, then permits a fresh reconnect', async () => {
+      const svc = makeInboundService(prisma as unknown as PrismaService);
+      const bootstrap = vi
+        .spyOn(
+          svc as unknown as { bootstrapQueue: (q: number, c: unknown) => Promise<void> },
+          'bootstrapQueue',
+        )
+        .mockRejectedValueOnce(new Error('baseline failure'))
+        .mockResolvedValueOnce(undefined);
+      const connect = (
+        svc as unknown as {
+          connectQueue: (q: number, o: unknown) => Promise<void>;
+        }
+      ).connectQueue.bind(svc);
+
+      await connect(1, { host: 'h', port: 993, secure: true, auth: { user: 'u', pass: 'p' } });
+      expect((svc as unknown as { connections: Map<number, unknown> }).connections.has(1)).toBe(false);
+
+      await connect(1, { host: 'h', port: 993, secure: true, auth: { user: 'u', pass: 'p' } });
+      expect(bootstrap).toHaveBeenCalledTimes(2);
+      expect((svc as unknown as { connections: Map<number, unknown> }).connections.has(1)).toBe(true);
+      await svc.onModuleDestroy();
+    });
   });
 
   describe('supervisor — reconnect on config change / zero-queue fleet', () => {
@@ -1853,6 +3256,7 @@ describe('InboundMailService — parser rule helpers', () => {
       useTls: true,
       username: 'u',
       passwordEnc: 'secret',
+      mailbox: 'INBOX',
       ...over,
     });
 
@@ -1877,6 +3281,47 @@ describe('InboundMailService — parser rule helpers', () => {
       const second = conns(svc).get(1);
       expect(second).toBeDefined();
       expect(second).not.toBe(first); // dropped + reconnected with new settings
+    });
+
+    it('reconnects when only the selected IMAP folder changes', async () => {
+      const findMany = prisma.emailQueue.findMany as ReturnType<typeof vi.fn>;
+      findMany.mockResolvedValue([row({ mailbox: 'INBOX' })]);
+      const svc = makeInboundService(prisma as unknown as PrismaService, imapOn);
+      await reconcile(svc);
+      const first = conns(svc).get(1);
+
+      findMany.mockResolvedValue([row({ mailbox: 'Helpdesk/Test' })]);
+      await reconcile(svc);
+
+      expect(conns(svc).get(1)).toBeDefined();
+      expect(conns(svc).get(1)).not.toBe(first);
+    });
+
+    it('capture-only logs out and drops an already-open socket when the selected folder becomes unsafe', async () => {
+      const captureConfig = {
+        ...imapOn,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+      };
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        row({ mailbox: '[Gmail]/All Mail' }),
+      ]);
+      const svc = makeInboundService(prisma as unknown as PrismaService, captureConfig);
+      const live = { logout: vi.fn().mockResolvedValue(undefined) };
+      conns(svc).set(1, live);
+      (svc as unknown as { connectionFingerprints: Map<number, string> }).connectionFingerprints.set(
+        1,
+        'old',
+      );
+
+      await reconcile(svc);
+
+      expect(live.logout).toHaveBeenCalledTimes(1);
+      expect(conns(svc).has(1)).toBe(false);
+      expect(
+        (svc as unknown as { connectionFingerprints: Map<number, string> }).connectionFingerprints.has(1),
+      ).toBe(false);
     });
 
     it('no-ops with an empty fleet (supervisor tolerates zero queues)', async () => {
@@ -2055,6 +3500,111 @@ describe('InboundMailService — parser rule helpers', () => {
       expect(prisma.ticketPost.findFirst).not.toHaveBeenCalled();
     });
 
+    it('normal-delivery canary scopes the due scan to its one selected queue', async () => {
+      const canary = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 77,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 55,
+      });
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      await (canary as unknown as { drainDeliveries: () => Promise<void> }).drainDeliveries();
+
+      expect(prisma.inboundDelivery.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, queueId: 77, capturePromotedAt: { not: null } }),
+        }),
+      );
+    });
+
+    it('normal-delivery canary ignores a direct/stale call for a different delivery id', async () => {
+      const canary = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 77,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 99,
+      });
+
+      await (
+        canary as unknown as {
+          processDelivery: (deliveryId: number, departmentId: number | undefined) => Promise<void>;
+        }
+      ).processDelivery(55, undefined);
+
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('normal-delivery canary claim fences the selected immutable delivery by queue id too', async () => {
+      const canary = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 77,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 55,
+      });
+      // The claim takes the queue row lock before it updates the delivery. A
+      // reviewed canary is the only normal path allowed to lock a retired queue.
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ queueId: 77 });
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 77, captureRetiredAt: new Date() },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+
+      await (
+        canary as unknown as {
+          processDelivery: (deliveryId: number, departmentId: number | undefined) => Promise<void>;
+        }
+      ).processDelivery(55, undefined);
+
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, queueId: 77, capturePromotedAt: { not: null } }),
+        }),
+      );
+      expect(prisma.inboundDelivery.findUnique).toHaveBeenCalledWith({
+        where: { id: 55 },
+        select: { queueId: true },
+      });
+    });
+
+    it('normal-delivery canary leaves an old selected ACCEPTED row without promotion provenance unclaimed', async () => {
+      const canary = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 77,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 55,
+      });
+      // Real PostgreSQL rejects the claim because capturePromotedAt IS NULL. The
+      // mock models that DB result; the assertions below make removing the
+      // durable marker predicate turn this test red instead of false-green.
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, departmentId: 1 },
+      ]);
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ queueId: 77 });
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 77, captureRetiredAt: new Date() },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+
+      await (canary as unknown as { drainDeliveries: () => Promise<void> }).drainDeliveries();
+
+      expect(prisma.inboundDelivery.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ capturePromotedAt: { not: null } }),
+        }),
+      );
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ capturePromotedAt: { not: null } }),
+        }),
+      );
+      expect(prisma.inboundDelivery.findUnique).toHaveBeenCalledWith({
+        where: { id: 55 },
+        select: { queueId: true },
+      });
+      expect(
+        (canary as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }).ticketsService
+          .createTicket,
+      ).not.toHaveBeenCalled();
+    });
+
     it('marks a delivery PROCESSED after successful routing (lease-gated settle)', async () => {
       stageDelivery();
       (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
@@ -2111,9 +3661,9 @@ describe('InboundMailService — parser rule helpers', () => {
           data: expect.objectContaining({ state: 'QUARANTINED' }),
         }),
       );
-      expect(prisma.inboundDelivery.update).toHaveBeenCalledWith(
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 55 },
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING', leaseOwner: expect.any(String) }),
           data: expect.objectContaining({ observedMessageId: '<semantic-conflict@x>' }),
         }),
       );
@@ -2169,7 +3719,15 @@ describe('InboundMailService — parser rule helpers', () => {
       stageDelivery();
       (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
       await drain();
-      expect(prisma.inboundDelivery.findUnique).not.toHaveBeenCalled();
+      // Claiming now locks the queue lifecycle first. The single lookup is
+      // that lock precondition; a losing claim must not issue the later full
+      // delivery read or route a ticket.
+      expect(prisma.inboundDelivery.findUnique).toHaveBeenCalledTimes(1);
+      expect(prisma.inboundDelivery.findUnique).toHaveBeenCalledWith({
+        where: { id: 55 },
+        select: { queueId: true },
+      });
+      expect(prisma.ticketPost.findFirst).not.toHaveBeenCalled();
     });
 
     it('reclaims a stale PROCESSING delivery whose lease has expired', async () => {
@@ -2317,7 +3875,7 @@ describe('InboundMailService — parser rule helpers', () => {
       // dedup must ALSO match the legacy transport form — else it creates a duplicate ticket.
       const headerless = Buffer.from('From: a@b.example\r\nSubject: hi\r\n\r\nbody'); // no Message-ID
       (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { id: 55, departmentId: null },
+        { id: 55, departmentId: 1 },
       ]);
       (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
       (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -2326,6 +3884,8 @@ describe('InboundMailService — parser rule helpers', () => {
         attempts: 1,
         transport: 'IMAP',
         queueId: 5,
+        departmentId: 1,
+        mailboxEpoch: 1,
         uidValidity: 42n,
         uid: 75n,
       });
@@ -2349,6 +3909,260 @@ describe('InboundMailService — parser rule helpers', () => {
         }),
       );
     });
+
+    it('P0-A: never applies the legacy headerless bridge after a mailbox epoch changes', async () => {
+      const headerless = Buffer.from('From: a@b.example\r\nSubject: new mailbox mail\r\n\r\nbody');
+      const legacyId = '<imap-5-42-75@helpdesk.invalid>';
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, departmentId: 1 },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 55,
+        rawMime: headerless,
+        attempts: 1,
+        transport: 'IMAP',
+        queueId: 5,
+        departmentId: 1,
+        mailboxEpoch: 2,
+        uidValidity: 42n,
+        uid: 75n,
+        transportKey: 'imap:5:2:42:75',
+      });
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ where }: { where: { inboundMessageId?: { in?: string[] } } }) => {
+          const ids = where?.inboundMessageId?.in ?? [];
+          // This simulates the old ticket post. A correct epoch-2 delivery must never query it.
+          if (ids.includes(legacyId)) return Promise.resolve({ id: 900, ticketId: 90 });
+          return Promise.resolve(null);
+        },
+      );
+      const createTicket = vi
+        .fn()
+        .mockResolvedValue({ id: 101, mask: 'TT-000101', subject: 'new mailbox mail' });
+      (
+        service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }
+      ).ticketsService.createTicket = createTicket;
+
+      await drain();
+
+      expect(createTicket).toHaveBeenCalledTimes(1);
+      const dedupCall = (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        where: { inboundMessageId: { in: string[] } };
+      };
+      expect(dedupCall.where.inboundMessageId.in).not.toContain(legacyId);
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ state: 'PROCESSED', ticketId: 101 }),
+        }),
+      );
+    });
+
+    it('P1 ACL: writes the new ticket owner before a post lookup can fail after ticket creation', async () => {
+      const routedRaw = Buffer.from('From: a@b.example\r\nSubject: route to C\r\n\r\nbody');
+      stageDelivery({
+        rawMime: routedRaw,
+        attempts: 1,
+        queueId: 7,
+        departmentId: 33,
+        transportKey: 'imap:7:1:9:55',
+        routingSnapshot: [],
+      });
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, departmentId: 33 },
+      ]);
+      const createTicket = vi.fn().mockResolvedValue({ id: 42, mask: 'TT-000042', subject: 'route to C' });
+      (
+        service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }
+      ).ticketsService.createTicket = createTicket;
+      let postLookup = 0;
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        postLookup += 1;
+        if (postLookup === 1) return Promise.resolve(null); // inbound idempotency lookup
+        const ticketOwnerWasFenced = (
+          prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>
+        ).mock.calls.some((call) => {
+          const args = call[0] as { data?: Record<string, unknown> } | undefined;
+          return args?.data?.effectiveOwnerKind === 'TICKET' && args.data?.effectiveOwnerTicketId === 42;
+        });
+        // This assertion is deliberately inside the next operation: removing or moving the
+        // fence after the post lookup makes this test red rather than merely checking a final
+        // call list that could be satisfied too late.
+        expect(ticketOwnerWasFenced).toBe(true);
+        return Promise.reject(new Error('post lookup failed after ticket creation'));
+      });
+
+      await drain();
+
+      expect(createTicket).toHaveBeenCalledTimes(1);
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ state: 'RETRY' }),
+        }),
+      );
+    });
+
+    it('P1 ACL: resets to UNRESOLVED when the post-create ticket-owner fence cannot be written', async () => {
+      const routedRaw = Buffer.from('From: a@b.example\r\nSubject: owner fence failure\r\n\r\nbody');
+      stageDelivery({
+        rawMime: routedRaw,
+        attempts: 1,
+        queueId: 7,
+        departmentId: 33,
+        transportKey: 'imap:7:1:9:55',
+        routingSnapshot: [],
+      });
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, departmentId: 33 },
+      ]);
+      (
+        service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }
+      ).ticketsService.createTicket = vi
+        .fn()
+        .mockResolvedValue({ id: 42, mask: 'TT-000042', subject: 'owner fence failure' });
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ data }: { data: Record<string, unknown> }) =>
+          Promise.resolve(
+            data.effectiveOwnerKind === 'TICKET' && data.effectiveOwnerTicketId === 42
+              ? { count: 0 }
+              : { count: 1 },
+          ),
+      );
+
+      await drain();
+
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({
+            state: 'RETRY',
+            effectiveOwnerKind: 'UNRESOLVED',
+            effectiveOwnerDepartmentId: null,
+            effectiveOwnerTicketId: null,
+          }),
+        }),
+      );
+    });
+
+    it('P1 ACL: known inbound-post dedup is fenced to its ticket before the delivery is skipped', async () => {
+      stageDelivery({ attempts: 1, departmentId: 11, transportKey: 'imap:7:1:9:55', routingSnapshot: [] });
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, departmentId: 11 },
+      ]);
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 97, ticketId: 42 });
+
+      await drain();
+
+      expect(
+        (service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }).ticketsService
+          .createTicket,
+      ).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ effectiveOwnerKind: 'TICKET', effectiveOwnerTicketId: 42 }),
+        }),
+      );
+    });
+
+    it('P1 ACL: a finalized logical-duplicate copy inherits the winner ticket, never its route', async () => {
+      stageDelivery({ attempts: 1, departmentId: 11, transportKey: 'imap:7:1:9:55', routingSnapshot: [] });
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, departmentId: 11 },
+      ]);
+      let duplicateClaim: Record<string, unknown> | null = null;
+      (prisma.inboundMessageClaim.createMany as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ data }: { data: Record<string, unknown> }) => {
+          duplicateClaim = { ...data, winnerDeliveryId: 88, ticketId: 42 };
+          return Promise.resolve({ count: 0 });
+        },
+      );
+      (prisma.inboundMessageClaim.findUnique as ReturnType<typeof vi.fn>).mockImplementation(() =>
+        Promise.resolve(duplicateClaim),
+      );
+
+      await drain();
+
+      expect(
+        (service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }).ticketsService
+          .createTicket,
+      ).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 55, state: 'PROCESSING' }),
+          data: expect.objectContaining({ effectiveOwnerKind: 'TICKET', effectiveOwnerTicketId: 42 }),
+        }),
+      );
+    });
+
+    it('P1 ACL: an unfinished logical duplicate stays UNRESOLVED until its winner finalizes', async () => {
+      stageDelivery({ attempts: 1, departmentId: 11, transportKey: 'imap:7:1:9:55', routingSnapshot: [] });
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 55, departmentId: 11 },
+      ]);
+      let duplicateClaim: Record<string, unknown> | null = null;
+      (prisma.inboundMessageClaim.createMany as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ data }: { data: Record<string, unknown> }) => {
+          duplicateClaim = { ...data, winnerDeliveryId: 88, ticketId: null };
+          return Promise.resolve({ count: 0 });
+        },
+      );
+      (prisma.inboundMessageClaim.findUnique as ReturnType<typeof vi.fn>).mockImplementation(() =>
+        Promise.resolve(duplicateClaim),
+      );
+
+      await drain();
+
+      expect(
+        (service as unknown as { ticketsService: { createTicket: ReturnType<typeof vi.fn> } }).ticketsService
+          .createTicket,
+      ).not.toHaveBeenCalled();
+      const ownerWrites = (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (call) => {
+          const args = call[0] as { data?: Record<string, unknown> } | undefined;
+          return args?.data?.effectiveOwnerKind !== undefined;
+        },
+      );
+      expect(ownerWrites).toEqual([]);
+    });
+
+    it('P1 ACL: winner propagation includes semanticHash so a conflicting Message-ID copy is never relabelled', async () => {
+      const svc = service as unknown as {
+        processRawMessage: (
+          source: Buffer,
+          departmentId: number | undefined,
+          opts: { deliveryId: number; leaseToken: string },
+        ) => Promise<unknown>;
+        ticketsService: { createTicket: ReturnType<typeof vi.fn> };
+      };
+      svc.ticketsService.createTicket = vi
+        .fn()
+        .mockResolvedValue({ id: 42, mask: 'TT-000042', subject: 'winner' });
+      (prisma.ticketPost.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+      await svc.processRawMessage(raw, 11, { deliveryId: 77, leaseToken: 'lease-77' });
+
+      const propagation = (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mock.calls.find(
+        (call) => {
+          const args = call[0] as
+            | { where?: Record<string, unknown>; data?: Record<string, unknown> }
+            | undefined;
+          return (
+            args?.data?.effectiveOwnerKind === 'TICKET' &&
+            args.data?.effectiveOwnerTicketId === 42 &&
+            args.where?.messageIdHash !== undefined
+          );
+        },
+      )?.[0] as { where: Record<string, unknown> } | undefined;
+      expect(propagation?.where).toEqual({
+        messageIdHash: expect.any(String),
+        semanticHash: expect.any(String),
+      });
+    });
   });
 
   // ─── PIPE ingress: idempotency-key collision ─────────────────────────────────
@@ -2367,9 +4181,16 @@ describe('InboundMailService — parser rule helpers', () => {
         departmentId: 3,
         type: 'PIPE',
         isEnabled: true,
+        captureRetiredAt: null,
       });
       (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { id: 7, emailAddress: 'pipe-support@example.test', departmentId: 3, sendAutoresponder: false },
+        {
+          id: 7,
+          emailAddress: 'pipe-support@example.test',
+          departmentId: 3,
+          sendAutoresponder: false,
+          captureRetiredAt: null,
+        },
       ]);
       (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
         {
@@ -2378,6 +4199,7 @@ describe('InboundMailService — parser rule helpers', () => {
           departmentId: 3,
           routingPriority: 100,
           sendAutoresponder: false,
+          captureRetiredAt: null,
         },
       ]);
     });
@@ -2395,6 +4217,181 @@ describe('InboundMailService — parser rule helpers', () => {
         ).ingestRawMessage('message', undefined, 'mta-77', 7),
       ).rejects.toBeInstanceOf(ServiceUnavailableException);
       expect(prisma.emailQueue.findUnique).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+    });
+
+    it('capture-only rejects PIPE before raw staging, queue lookup, or ledger acceptance', async () => {
+      const capture = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+        TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 7,
+      });
+      const persist = vi.spyOn(
+        capture as unknown as { persistRawMime: (source: Buffer) => Promise<unknown> },
+        'persistRawMime',
+      );
+      await expect(
+        (
+          capture as unknown as {
+            ingestRawMessage: (s: string, d: number | undefined, e: string, q: number) => Promise<void>;
+          }
+        ).ingestRawMessage('message', undefined, 'capture-other', 7),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(persist).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.findUnique).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+    });
+
+    it('normal-delivery canary rejects a different PIPE queue before raw staging or ledger acceptance', async () => {
+      const canary = makeInboundService(prisma as unknown as PrismaService, {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 8,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 99,
+      });
+      const persist = vi.spyOn(
+        canary as unknown as { persistRawMime: (source: Buffer) => Promise<unknown> },
+        'persistRawMime',
+      );
+
+      await expect(
+        (
+          canary as unknown as {
+            ingestRawMessage: (s: string, d: number | undefined, e: string, q: number) => Promise<void>;
+          }
+        ).ingestRawMessage('message', undefined, 'canary-other-queue', 7),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+
+      expect(persist).not.toHaveBeenCalled();
+      expect(prisma.emailQueue.findUnique).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+    });
+
+    it('normal PIPE refuses a capture-retired queue before it stages raw MIME', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 7,
+        emailAddress: 'pipe-support@example.test',
+        departmentId: 3,
+        type: 'PIPE',
+        isEnabled: true,
+        captureRetiredAt: new Date(),
+      });
+      const persist = vi.spyOn(
+        service as unknown as { persistRawMime: (source: Buffer) => Promise<unknown> },
+        'persistRawMime',
+      );
+
+      await expect(ingest('message', 'retired-pipe')).rejects.toBeInstanceOf(ConflictException);
+
+      expect(persist).not.toHaveBeenCalled();
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
+    });
+
+    it('P0 capture-retirement fence: PIPE acceptance SQL requires captureRetiredAt IS NULL', async () => {
+      // Keep this focused on the durable acceptance transaction; inline ticket
+      // processing is covered by drain tests and is irrelevant to the queue-row
+      // lock predicate.
+      const processDelivery = vi.spyOn(
+        service as unknown as {
+          processDelivery: (deliveryId: number, departmentId: number | undefined) => Promise<void>;
+        },
+        'processDelivery',
+      );
+      processDelivery.mockResolvedValue(undefined);
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) =>
+        Promise.resolve(
+          query.sql?.includes('"captureRetiredAt" IS NULL')
+            ? [
+                {
+                  id: 7,
+                  emailAddress: 'pipe-support@example.test',
+                  departmentId: 3,
+                  sendAutoresponder: false,
+                },
+              ]
+            : [],
+        ),
+      );
+
+      await ingest('message', 'pipe-marker-sql');
+
+      expect(prisma.inboundDelivery.create).toHaveBeenCalledTimes(1);
+      const [acceptanceQuery] = (prisma.$queryRaw as ReturnType<typeof vi.fn>).mock.calls[0] ?? [];
+      expect((acceptanceQuery as { sql?: string }).sql).toContain('"captureRetiredAt" IS NULL');
+      expect(processDelivery).toHaveBeenCalledWith(1, 3);
+    });
+
+    it('P0 capture-retirement fence: a normal PIPE final-lock miss removes its queue-bound raw reservation', async () => {
+      // A capture transition can win after the webhook's initial findUnique() but
+      // after the short pre-write reservation commits but before the final acceptance
+      // transaction locks the receiving queue. The raw file may have been written in
+      // that interval, so failure must clean it in file -> stage -> marker order and
+      // never create a ledger row.
+      const storageKey = 'inbound-raw/00000000-0000-4000-8000-000000000010.eml';
+      const storage = {
+        allocateKey: vi.fn().mockReturnValue(storageKey),
+        writeFenced: vi
+          .fn()
+          .mockImplementation(
+            async (_source: Buffer, key: string, fence: (publish: () => Promise<void>) => Promise<void>) => {
+              await fence(async () => undefined);
+              return key;
+            },
+          ),
+        removeFile: vi.fn().mockResolvedValue(undefined),
+        commit: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
+      };
+      const svc = makeInboundService(
+        prisma as unknown as PrismaService,
+        TEST_CONFIG,
+        storage as unknown as InboundRawStorageService,
+      );
+      const persist = vi.spyOn(
+        svc as unknown as {
+          persistRawMime: (source: Buffer, queueId: number, capture: boolean) => Promise<unknown>;
+        },
+        'persistRawMime',
+      );
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockImplementation((query: { sql?: string }) => {
+        if (query.sql?.includes('FROM "InboundRawMimeStaging"')) {
+          return Promise.resolve([{ storageKey }]);
+        }
+        if (!query.sql?.includes('"captureRetiredAt" IS NULL')) return Promise.resolve([]);
+        // Reservation succeeds, but the final SELECT ... FOR UPDATE sees the queue
+        // after capture retirement and rejects the incoming PIPE delivery.
+        return Promise.resolve(
+          query.sql.includes('SELECT "id"\n        FROM "EmailQueue"') ? [{ id: 7 }] : [],
+        );
+      });
+      const large = Buffer.alloc(1024 * 1024 + 1, 0x61);
+
+      await expect(
+        (
+          svc as unknown as {
+            ingestRawMessage: (
+              source: Buffer,
+              departmentId: number | undefined,
+              externalId: string,
+              queueId: number,
+            ) => Promise<void>;
+          }
+        ).ingestRawMessage(large, undefined, 'pipe-fenced-large', 7),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(persist).toHaveBeenCalledWith(large, 7, false);
+      expect(storage.allocateKey).toHaveBeenCalledTimes(1);
+      expect(storage.writeFenced).toHaveBeenCalledWith(large, storageKey, expect.any(Function));
+      expect(prisma.inboundRawMimeStaging.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ storageKey, queueId: 7 }) }),
+      );
+      expect(storage.removeFile).toHaveBeenCalledWith(storageKey);
+      expect(prisma.inboundRawMimeStaging.deleteMany).toHaveBeenCalledWith({
+        where: { storageKey, state: 'REAPING' },
+      });
+      expect(storage.commit).toHaveBeenCalledWith(storageKey);
+      expect(storage.remove).not.toHaveBeenCalled();
       expect(prisma.inboundDelivery.create).not.toHaveBeenCalled();
     });
 
@@ -2607,6 +4604,79 @@ describe('InboundMailService — parser rule helpers', () => {
       await svc.onModuleInit();
       expect((svc as unknown as { pollHandle: unknown }).pollHandle).not.toBeNull();
       await svc.onModuleDestroy();
+    });
+
+    it('normal-delivery canary skips global raw-retention work outside its queue', async () => {
+      const cfg = {
+        ...TEST_CONFIG,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 77,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 55,
+        TELECOM_HD_IMAP_ENABLED: false,
+      };
+      const svc = makeInboundService(prisma as unknown as PrismaService, cfg);
+      const prune = vi.spyOn(svc as unknown as { pruneRawMime: () => Promise<void> }, 'pruneRawMime');
+
+      await svc.onModuleInit();
+
+      expect(prune).not.toHaveBeenCalled();
+      expect((svc as unknown as { pruneHandle: unknown }).pruneHandle).toBeNull();
+      await svc.onModuleDestroy();
+    });
+
+    it('capture-only skips global raw retention and refuses shared INBOX before a connection', async () => {
+      vi.useFakeTimers();
+      try {
+        const cfg = {
+          ...TEST_CONFIG,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_IMAP_ENABLED: true,
+        };
+        (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>)
+          .mockResolvedValueOnce([]) // loop-suppression addresses
+          .mockResolvedValueOnce([
+            {
+              id: 1,
+              type: 'IMAP',
+              isEnabled: true,
+              mailbox: 'INBOX',
+              host: 'imap.example.test',
+              port: 993,
+              useTls: true,
+              username: 'test',
+              passwordEnc: 'ignored-before-connect',
+            },
+          ]);
+        const svc = makeInboundService(prisma as unknown as PrismaService, cfg);
+        const prune = vi.spyOn(svc as unknown as { pruneRawMime: () => Promise<void> }, 'pruneRawMime');
+        const connect = vi.spyOn(
+          svc as unknown as { connectQueue: (q: number, o: unknown) => Promise<void> },
+          'connectQueue',
+        );
+
+        await svc.onModuleInit();
+
+        expect(prune).not.toHaveBeenCalled();
+        expect((svc as unknown as { pruneHandle: unknown }).pruneHandle).toBeNull();
+        expect(connect).not.toHaveBeenCalled();
+        expect((svc as unknown as { connections: Map<number, unknown> }).connections.size).toBe(0);
+        expect(prisma.emailQueue.findMany).toHaveBeenNthCalledWith(
+          2,
+          expect.objectContaining({ where: { isEnabled: true, type: 'IMAP', id: 1 } }),
+        );
+        expect(prisma.emailQueue.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: 1 },
+            data: expect.objectContaining({
+              lastError: 'Capture-only requires a TLS-enabled, canonical dedicated IMAP test folder',
+            }),
+          }),
+        );
+        await svc.onModuleDestroy();
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

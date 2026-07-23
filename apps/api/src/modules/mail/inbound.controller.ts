@@ -64,6 +64,20 @@ export class InboundController {
     // The Express middleware normally rejects this before parsing the body. Keep the
     // controller guard too: unit/direct Nest invocation and any future transport adapter
     // must not bypass the same cutover fence.
+    // Capture-only is intentionally an IMAP-folder canary. Keep this controller
+    // guard even though the Express pre-parser rejects first: direct invocation or a
+    // future transport adapter must never turn that mode into a PIPE raw-MIME sink.
+    if (this.config.TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED === true) {
+      throw new ServiceUnavailableException('PIPE ingress is disabled during IMAP capture-only mode');
+    }
+    if (
+      this.config.TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID !== undefined ||
+      this.config.TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID !== undefined
+    ) {
+      throw new ServiceUnavailableException(
+        'PIPE ingress is disabled during the promotion-only inbound canary',
+      );
+    }
     if (!this.config.TELECOM_HD_INBOUND_DELIVERY_ENABLED) {
       throw new ServiceUnavailableException('Inbound delivery is temporarily disabled');
     }

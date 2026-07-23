@@ -18,13 +18,17 @@ import { ZodValidationPipe } from '../../common/zod-validation.pipe';
 import {
   CreateEmailQueueSchema,
   DeleteEmailQueueSchema,
+  ListCapturedInboundSchema,
   ListQuarantinedInboundSchema,
+  PromoteCapturedInboundSchema,
   ReconcileEmailQueueSchema,
   ReplayQuarantinedInboundSchema,
   UpdateEmailQueueSchema,
   type CreateEmailQueueDto,
   type DeleteEmailQueueDto,
+  type ListCapturedInboundDto,
   type ListQuarantinedInboundDto,
+  type PromoteCapturedInboundDto,
   type ReconcileEmailQueueDto,
   type ReplayQuarantinedInboundDto,
   type UpdateEmailQueueDto,
@@ -72,7 +76,9 @@ export class EmailQueueController {
   }
 
   @Post('inbound/quarantine/:deliveryId/replay')
-  @RequirePermissions(PERMISSIONS.MAIL_REPLAY)
+  // A replay can create ticket/outbox work. The operator must first have the
+  // metadata-view capability; an action-only role cannot replay a guessed id.
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW, PERMISSIONS.MAIL_REPLAY)
   @ApiOperation({ summary: 'Replay a quarantined inbound delivery (reset to ACCEPTED)' })
   replayQuarantined(
     @Param('deliveryId', ParseIntPipe) deliveryId: number,
@@ -80,6 +86,37 @@ export class EmailQueueController {
     @CurrentStaff() staff: AuthStaff,
   ) {
     return this.emailQueueService.replayQuarantined(deliveryId, dto, staff);
+  }
+
+  @Get('inbound/captured')
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
+  @ApiOperation({ summary: 'Paginated captured inbound metadata, filters and totals (never raw MIME)' })
+  listCaptured(
+    @Query(new ZodValidationPipe(ListCapturedInboundSchema)) query: ListCapturedInboundDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.emailQueueService.listCaptured(query, staff);
+  }
+
+  @Get('inbound/captured/:deliveryId')
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW)
+  @ApiOperation({ summary: 'Captured inbound metadata and audit history (never raw MIME)' })
+  getCaptured(@Param('deliveryId', ParseIntPipe) deliveryId: number, @CurrentStaff() staff: AuthStaff) {
+    return this.emailQueueService.getCaptured(deliveryId, staff);
+  }
+
+  @Post('inbound/captured/:deliveryId/promote')
+  // Promotion can create ticket/outbox work. Require both the review surface and
+  // the deliberately separate destructive capability: an action-only role must not
+  // promote a guessed delivery id it could not inspect first.
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW, PERMISSIONS.MAIL_PROMOTE_CAPTURED)
+  @ApiOperation({ summary: 'Promote a captured inbound delivery to normal processing' })
+  promoteCaptured(
+    @Param('deliveryId', ParseIntPipe) deliveryId: number,
+    @Body(new ZodValidationPipe(PromoteCapturedInboundSchema)) dto: PromoteCapturedInboundDto,
+    @CurrentStaff() staff: AuthStaff,
+  ) {
+    return this.emailQueueService.promoteCaptured(deliveryId, dto, staff);
   }
 
   @Get(':id')
@@ -90,7 +127,7 @@ export class EmailQueueController {
   }
 
   @Post()
-  @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW, PERMISSIONS.MAIL_CONFIGURE)
   @ApiOperation({ summary: 'Create an email queue' })
   create(
     @Body(new ZodValidationPipe(CreateEmailQueueSchema)) dto: CreateEmailQueueDto,
@@ -100,7 +137,7 @@ export class EmailQueueController {
   }
 
   @Put(':id')
-  @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW, PERMISSIONS.MAIL_CONFIGURE)
   @ApiOperation({ summary: 'Update an email queue (partial)' })
   update(
     @Param('id', ParseIntPipe) id: number,
@@ -111,7 +148,7 @@ export class EmailQueueController {
   }
 
   @Delete(':id')
-  @RequirePermissions(PERMISSIONS.MAIL_CONFIGURE)
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW, PERMISSIONS.MAIL_CONFIGURE)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Delete an email queue' })
   delete(
@@ -123,7 +160,7 @@ export class EmailQueueController {
   }
 
   @Post(':id/reconcile')
-  @RequirePermissions(PERMISSIONS.MAIL_RECONCILE)
+  @RequirePermissions(PERMISSIONS.MAIL_VIEW, PERMISSIONS.MAIL_RECONCILE)
   @ApiOperation({
     summary: 'Cutover / reconcile a halted IMAP queue (RESUME_MIGRATED / FROM_NOW / BACKFILL)',
   })

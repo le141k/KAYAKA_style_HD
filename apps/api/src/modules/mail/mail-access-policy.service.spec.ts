@@ -30,14 +30,20 @@ describe('MailAccessPolicy', () => {
     expect(policy.queueWhereForScope(scope)).toEqual({ departmentId: { in: [] } });
     expect(policy.ticketWhereForScope(scope)).toEqual({ departmentId: { in: [] } });
     expect(policy.deliveryWhereForScope(scope)).toEqual({
-      AND: [
-        { departmentId: { in: [] } },
-        { OR: [{ queueId: null }, { queue: { is: { departmentId: { in: [] } } } }] },
+      OR: [
+        {
+          effectiveOwnerKind: { in: ['RECEIVING', 'ROUTED'] },
+          effectiveOwnerDepartmentId: { in: [] },
+        },
+        {
+          effectiveOwnerKind: 'TICKET',
+          effectiveOwnerTicket: { is: { departmentId: { in: [] } } },
+        },
       ],
     });
   });
 
-  it('uses both the immutable delivery snapshot and source queue for department access', async () => {
+  it('uses only the effective owner and follows the ticket relation for department access', async () => {
     const { policy } = makePolicy([3, 3, 8]);
     const scope = await policy.resolveScope({ staffId: 13, isAdmin: false });
 
@@ -46,9 +52,15 @@ describe('MailAccessPolicy', () => {
       AND: [
         { id: 91 },
         {
-          AND: [
-            { departmentId: { in: [3, 8] } },
-            { OR: [{ queueId: null }, { queue: { is: { departmentId: { in: [3, 8] } } } }] },
+          OR: [
+            {
+              effectiveOwnerKind: { in: ['RECEIVING', 'ROUTED'] },
+              effectiveOwnerDepartmentId: { in: [3, 8] },
+            },
+            {
+              effectiveOwnerKind: 'TICKET',
+              effectiveOwnerTicket: { is: { departmentId: { in: [3, 8] } } },
+            },
           ],
         },
       ],

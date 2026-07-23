@@ -7,6 +7,7 @@ import { Logger } from 'nestjs-pino';
 import type { AppConfig } from './config/configuration';
 import { BigIntSerializerInterceptor } from './common/bigint-serializer.interceptor';
 import { inboundSecretMatches } from './common/inbound-secret.util';
+import { tryNormalizePipeDeliveryId, tryParsePipeQueueId } from './modules/mail/pipe-input.util';
 
 /**
  * Register the PIPE ingress guard and parsers in the only safe order:
@@ -21,6 +22,10 @@ export function configureInboundPipeMiddleware(
     | 'TELECOM_HD_INBOUND_WEBHOOK_SECRET'
     | 'TELECOM_HD_INBOUND_MAX_SIZE_MB'
     | 'TELECOM_HD_INBOUND_DELIVERY_ENABLED'
+    | 'TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED'
+    | 'TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID'
+    | 'TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID'
+    | 'TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID'
   >,
 ): void {
   const inboundLimit = `${config.TELECOM_HD_INBOUND_MAX_SIZE_MB}mb`;
@@ -34,8 +39,47 @@ export function configureInboundPipeMiddleware(
     // This is deliberately before the route-specific raw/JSON body parsers. During a
     // code/migration cutover an authenticated MTA must receive a retryable failure,
     // while the API must neither allocate/parse the MIME nor create an InboundDelivery.
+    // Capture-only is deliberately IMAP-only. Reject all PIPE requests here (before
+    // either body parser) even if a stale environment points the capture id at a PIPE
+    // queue: the Gmail canary must never retain MTA traffic as a side effect.
+    if (config.TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED === true) {
+      res
+        .status(503)
+        .json({ statusCode: 503, message: 'PIPE ingress is disabled during IMAP capture-only mode' });
+      return;
+    }
+    // The normal canary is promotion-only. Reject at the header boundary (not
+    // merely in InboundMailService) so authenticated MTA traffic cannot force
+    // MIME buffering or retry churn while the one captured row is processed.
+    if (
+      config.TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID !== undefined ||
+      config.TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID !== undefined
+    ) {
+      res
+        .status(503)
+        .json({
+          statusCode: 503,
+          message: 'PIPE ingress is disabled during the promotion-only inbound canary',
+        });
+      return;
+    }
     if (!config.TELECOM_HD_INBOUND_DELIVERY_ENABLED) {
       res.status(503).json({ statusCode: 503, message: 'Inbound delivery is temporarily disabled' });
+      return;
+    }
+    // Validate every required, bounded transport identity while the request is still
+    // header-only. A valid shared secret must not let malformed PIPE traffic allocate
+    // up to TELECOM_HD_INBOUND_MAX_SIZE_MB merely to receive a deterministic 400.
+    const rawDeliveryId = req.headers['x-inbound-delivery-id'];
+    const rawQueueId = req.headers['x-inbound-queue-id'];
+    const deliveryId = tryNormalizePipeDeliveryId(
+      Array.isArray(rawDeliveryId) ? rawDeliveryId[0] : rawDeliveryId,
+    );
+    const queueId = tryParsePipeQueueId(Array.isArray(rawQueueId) ? rawQueueId[0] : rawQueueId);
+    if (deliveryId === null || queueId === null) {
+      res
+        .status(400)
+        .json({ statusCode: 400, message: 'Valid PIPE delivery and queue headers are required' });
       return;
     }
     next();
