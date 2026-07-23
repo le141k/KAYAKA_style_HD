@@ -38,6 +38,9 @@ describe('mail console HTTP route registration', () => {
         .fn()
         .mockImplementation((id: number) => Promise.resolve({ route: 'quarantine', id })),
       replayQuarantined: vi.fn(),
+      listCaptured: vi.fn().mockResolvedValue({ route: 'inbound-captured' }),
+      getCaptured: vi.fn().mockImplementation((id: number) => Promise.resolve({ route: 'captured', id })),
+      promoteCaptured: vi.fn().mockResolvedValue({ promoted: true }),
     };
     const workflowEvents = {
       operatorHealth: vi.fn().mockResolvedValue({ route: 'workflow-health' }),
@@ -85,6 +88,22 @@ describe('mail console HTTP route registration', () => {
       .get('/admin/email-queues/inbound/quarantine/123')
       .expect(200)
       .expect({ route: 'quarantine', id: 123 });
+    await supertest(server)
+      .get('/admin/email-queues/inbound/captured')
+      .expect(200)
+      .expect({ route: 'inbound-captured' });
+    await supertest(server)
+      .get('/admin/email-queues/inbound/captured/124')
+      .expect(200)
+      .expect({ route: 'captured', id: 124 });
+    await supertest(server)
+      .post('/admin/email-queues/inbound/captured/124/promote')
+      .send({
+        reason: 'Capture-only verification passed',
+        expectedUpdatedAt: '2026-07-23T12:00:00.000Z',
+      })
+      .expect(201)
+      .expect({ promoted: true });
     await supertest(server)
       .get('/admin/workflow-email-events/health')
       .expect(200)

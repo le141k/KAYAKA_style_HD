@@ -14,8 +14,11 @@ import { QueryError } from '@/components/QueryError';
 import {
   useEmailQueues,
   useCreateEmailQueue,
+  useCaptured,
+  useCapturedDetail,
   useDeleteEmailQueue,
   useInboundHealth,
+  usePromoteCaptured,
   useWorkflowEmailEventDetail,
   useWorkflowEmailEvents,
   useWorkflowEmailHealth,
@@ -26,6 +29,7 @@ import {
   useReplayQuarantined,
   useUpdateEmailQueue,
   type AdminEmailQueue,
+  type CapturedDelivery,
   type EmailQueueConfigInput,
   type EmailQueueSyncState,
   type QuarantinedDelivery,
@@ -75,6 +79,8 @@ type QueueForm = {
   host: string;
   port: string;
   username: string;
+  /** IMAP folder only; it is a queue identity and never contains credentials or message content. */
+  mailbox: string;
   /** Write-only: it is intentionally always blank when opening an existing queue. */
   password: string;
   useTls: boolean;
@@ -90,6 +96,9 @@ const EMPTY_QUEUE_FORM: QueueForm = {
   host: '',
   port: '993',
   username: '',
+  // A new IMAP queue must make its folder choice explicit.  `INBOX` is valid for a
+  // normal production queue, but is never a safe default for an attended capture test.
+  mailbox: '',
   password: '',
   useTls: true,
   departmentId: '',
@@ -105,6 +114,7 @@ function queueFormFromQueue(queue: AdminEmailQueue): QueueForm {
     host: queue.host,
     port: String(queue.port),
     username: queue.username,
+    mailbox: queue.mailbox?.trim() || 'INBOX',
     password: '',
     useTls: queue.useTls,
     departmentId: queue.departmentId === null ? '' : String(queue.departmentId),
@@ -140,6 +150,14 @@ export function MailContent() {
     reason: quarantineReason || undefined,
     messageId: quarantineMessageId || undefined,
   });
+  const [capturedPage, setCapturedPage] = useState(1);
+  const [capturedQueueId, setCapturedQueueId] = useState('');
+  const [capturedMessageId, setCapturedMessageId] = useState('');
+  const captured = useCaptured({
+    page: capturedPage,
+    queueId: /^\d+$/.test(capturedQueueId) ? Number(capturedQueueId) : undefined,
+    messageId: capturedMessageId || undefined,
+  });
   const [workflowEventPage, setWorkflowEventPage] = useState(1);
   const [workflowEventState, setWorkflowEventState] = useState<WorkflowEmailEventState | ''>('');
   const workflowEvents = useWorkflowEmailEvents({
@@ -148,6 +166,7 @@ export function MailContent() {
   });
   const reconcile = useReconcileQueue();
   const replay = useReplayQuarantined();
+  const promoteCaptured = usePromoteCaptured();
   const replayWorkflowEmail = useReplayWorkflowEmailEvent();
   const { data: me } = useMe();
   const createQueue = useCreateEmailQueue();
@@ -159,6 +178,12 @@ export function MailContent() {
   const detail = useQuarantineDetail(detailFor?.id ?? null);
   const [replayFor, setReplayFor] = useState<QuarantinedDelivery | null>(null);
   const [replayReason, setReplayReason] = useState('');
+  const [capturedDetailFor, setCapturedDetailFor] = useState<CapturedDelivery | null>(null);
+  const capturedDetail = useCapturedDetail(capturedDetailFor?.id ?? null);
+  const [capturedPromoteFor, setCapturedPromoteFor] = useState<CapturedDelivery | null>(null);
+  const [capturedPromoteReason, setCapturedPromoteReason] = useState('');
+  const [capturedPromoteConfirmation, setCapturedPromoteConfirmation] = useState('');
+  const [capturedPromoteAcknowledged, setCapturedPromoteAcknowledged] = useState(false);
   const [workflowDetailFor, setWorkflowDetailFor] = useState<WorkflowEmailEventListItem | null>(null);
   const workflowDetail = useWorkflowEmailEventDetail(workflowDetailFor?.id ?? null);
   const [workflowReplayFor, setWorkflowReplayFor] = useState<WorkflowEmailEventListItem | null>(null);
@@ -173,12 +198,36 @@ export function MailContent() {
   const [queueForm, setQueueForm] = useState<QueueForm>(EMPTY_QUEUE_FORM);
   const canReconcile = hasPermission(me, PERMISSIONS.MAIL_RECONCILE);
   const canReplay = hasPermission(me, PERMISSIONS.MAIL_REPLAY);
+  const canPromoteCaptured = hasPermission(me, PERMISSIONS.MAIL_PROMOTE_CAPTURED);
   const canConfigure = hasPermission(me, PERMISSIONS.MAIL_CONFIGURE);
   const configMutationPending = createQueue.isPending || updateQueue.isPending || deleteQueue.isPending;
+  const h = health.data;
+  // Keep the browser fail-closed even though the API repeats this check transactionally.
+  // A stale/rolling health response must not turn a saved test capture into ticket work.
+  const capturePromotionBlockReason =
+    h?.captureOnly !== false
+      ? 'Сначала выключите capture-only режим и дождитесь свежего состояния здоровья очереди.'
+      : h?.normalInboundDeliveryEnabled !== true
+        ? 'Сначала включите обычную inbound-обработку и дождитесь свежего состояния здоровья очереди.'
+        : null;
+  const capturePromotionReady = capturePromotionBlockReason === null;
+  const captureQueueId = h?.captureQueueId;
+  const captureMaxMessages = h?.captureMaxMessages;
+  const captureTarget = h?.captureTarget;
+  const captureScopeSummary =
+    h?.captureOnly === true &&
+    captureTarget?.ready === true &&
+    Number.isInteger(captureQueueId) &&
+    captureQueueId! > 0 &&
+    Number.isInteger(captureMaxMessages) &&
+    captureMaxMessages! > 0
+      ? `Готова очередь #${captureQueueId} · лимит ${captureMaxMessages} письмо(а).`
+      : null;
 
   function reloadQueueData() {
     void queues.refetch();
     void health.refetch();
+    void captured.refetch();
     void workflowEmailHealth.refetch();
     void workflowEvents.refetch();
   }
@@ -233,6 +282,7 @@ export function MailContent() {
     const emailAddress = queueForm.emailAddress.trim();
     const host = queueForm.host.trim();
     const username = queueForm.username.trim();
+    const mailbox = queueForm.mailbox.trim();
     const port = Number(queueForm.port);
     const routingPriority = Number(queueForm.routingPriority);
     const departmentId = queueForm.departmentId.trim() === '' ? null : Number(queueForm.departmentId);
@@ -257,6 +307,29 @@ export function MailContent() {
       toast({ title: 'Для IMAP/POP3 укажите хост и имя пользователя', variant: 'destructive' });
       return;
     }
+    if (queueForm.type === 'IMAP') {
+      if (!mailbox || mailbox.length > 255 || /[\r\n]/.test(mailbox) || mailbox.includes('\0')) {
+        toast({
+          title: 'Укажите корректную IMAP-папку',
+          description: 'Папка не может быть пустой, длиннее 255 символов или содержать перенос строки.',
+          variant: 'destructive',
+        });
+        return;
+      }
+      if (
+        h?.captureOnly === true &&
+        editingQueue?.id === h.captureQueueId &&
+        mailbox.toLowerCase() === 'inbox'
+      ) {
+        toast({
+          title: 'INBOX запрещён в активном capture-only режиме',
+          description:
+            'Выберите отдельную тестовую IMAP-папку. Общий Inbox нельзя использовать для захвата raw MIME.',
+          variant: 'destructive',
+        });
+        return;
+      }
+    }
 
     const payload: EmailQueueConfigInput = {
       type: queueForm.type,
@@ -265,6 +338,9 @@ export function MailContent() {
       port,
       username,
       useTls: queueForm.useTls,
+      // The API keeps a mailbox field for every legacy queue type. Only IMAP uses it;
+      // preserve the server default for PIPE/POP3 instead of forcing their hidden form field.
+      mailbox: queueForm.type === 'IMAP' ? mailbox : 'INBOX',
       departmentId,
       routingPriority,
       sendAutoresponder: queueForm.sendAutoresponder,
@@ -410,6 +486,90 @@ export function MailContent() {
     );
   }
 
+  function openCapturedPromotion(delivery: CapturedDelivery) {
+    // Fail closed in the browser too. The server repeats this check because health can go stale.
+    if (!canPromoteCaptured) {
+      toast({
+        title: 'Недостаточно прав',
+        description: 'Для передачи захваченного письма в обработку требуется отдельное право.',
+        variant: 'destructive',
+      });
+      return false;
+    }
+    if (capturePromotionBlockReason) {
+      toast({
+        title: 'Продвижение недоступно',
+        description: capturePromotionBlockReason,
+        variant: 'destructive',
+      });
+      return false;
+    }
+    if (!delivery.promoteAllowed) {
+      toast({
+        title: 'Продвижение заблокировано',
+        description:
+          delivery.promoteBlockReason ?? 'Сервер не разрешил передавать это сохранённое письмо в обработку.',
+        variant: 'destructive',
+      });
+      return false;
+    }
+    setCapturedPromoteFor(delivery);
+    setCapturedPromoteReason('');
+    setCapturedPromoteConfirmation('');
+    setCapturedPromoteAcknowledged(false);
+    return true;
+  }
+
+  function closeCapturedPromotion(force = false) {
+    if (promoteCaptured.isPending && !force) return;
+    setCapturedPromoteFor(null);
+    setCapturedPromoteReason('');
+    setCapturedPromoteConfirmation('');
+    setCapturedPromoteAcknowledged(false);
+  }
+
+  function submitCapturedPromotion() {
+    if (!capturedPromoteFor) return;
+    if (!canPromoteCaptured) return;
+    if (capturePromotionBlockReason) {
+      toast({
+        title: 'Продвижение остановлено',
+        description: capturePromotionBlockReason,
+        variant: 'destructive',
+      });
+      return;
+    }
+    promoteCaptured.mutate(
+      {
+        deliveryId: capturedPromoteFor.id,
+        reason: capturedPromoteReason.trim(),
+        expectedUpdatedAt: capturedPromoteFor.updatedAt,
+      },
+      {
+        onSuccess: () => {
+          toast({
+            title: 'Письмо передано в обычную обработку',
+            description: `Captured delivery #${capturedPromoteFor.id}`,
+          });
+          closeCapturedPromotion(true);
+          setCapturedDetailFor(null);
+        },
+        onError: (error: unknown) => {
+          void captured.refetch();
+          void health.refetch();
+          toast({
+            title: 'Не удалось передать письмо в обработку',
+            description: errorMessage(
+              error,
+              'Обновите запись: она могла измениться или тестовый режим ещё включён.',
+            ),
+            variant: 'destructive',
+          });
+        },
+      },
+    );
+  }
+
   function submitWorkflowEmailReplay() {
     if (!workflowReplayFor) return;
     replayWorkflowEmail.mutate(
@@ -440,7 +600,6 @@ export function MailContent() {
     );
   }
 
-  const h = health.data;
   const workflowH = workflowEmailHealth.data;
 
   return (
@@ -463,6 +622,7 @@ export function MailContent() {
               void queues.refetch();
               void health.refetch();
               void quarantine.refetch();
+              void captured.refetch();
               void workflowEmailHealth.refetch();
               void workflowEvents.refetch();
             }}
@@ -486,13 +646,40 @@ export function MailContent() {
           <QueryError onRetry={() => void health.refetch()} />
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-7">
+            {h?.captureOnly && (
+              <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm text-amber-700 dark:text-amber-400">
+                <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+                <div>
+                  <p className="font-medium">Включён тестовый режим capture-only</p>
+                  <p className="mt-1">
+                    Новые письма сохраняются для проверки, но не создают заявки, ответы или исходящую почту.
+                    Захваченные письма показаны отдельно и не входят в бэклог.
+                  </p>
+                  <p className="mt-1 font-medium">
+                    {captureScopeSummary ??
+                      captureTarget?.reason ??
+                      'Сервер не подтвердил выбранную очередь: не отправляйте тестовое письмо.'}
+                  </p>
+                </div>
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
               {[
                 { label: 'Бэклог', value: h ? h.ledger.backlog : '—' },
                 { label: 'В обработке', value: h ? h.ledger.byState.processing : '—' },
                 { label: 'Повтор', value: h ? h.ledger.byState.retry : '—' },
                 { label: 'Карантин', value: h ? h.ledger.byState.quarantined : '—' },
                 { label: 'Карантин, объём', value: h ? formatBytes(h.ledger.quarantineBytes) : '—' },
+                { label: 'Захвачено (тест)', value: h ? (h.ledger.byState.captured ?? '—') : '—' },
+                {
+                  label: 'Захвачено, объём',
+                  value:
+                    h && h.ledger.capturedBytes !== undefined ? formatBytes(h.ledger.capturedBytes) : '—',
+                },
+                {
+                  label: 'Самое раннее захваченное',
+                  value: h?.ledger.oldestCapturedAt ? <RelativeTime date={h.ledger.oldestCapturedAt} /> : '—',
+                },
                 { label: 'Обработано', value: h ? h.ledger.byState.processed : '—' },
                 { label: 'Пропущено', value: h ? h.ledger.byState.skipped : '—' },
               ].map((s) => (
@@ -612,6 +799,24 @@ export function MailContent() {
                       <div className="mt-1 text-xs text-muted-foreground">
                         отдел: {q.departmentId ?? '—'} · автоответ: {q.sendAutoresponder ? 'вкл' : 'выкл'}
                       </div>
+                      {q.type === 'IMAP' && (
+                        <div
+                          className="mt-1 max-w-xs truncate text-xs text-muted-foreground"
+                          title={q.mailbox ?? 'INBOX'}
+                        >
+                          IMAP-папка: {q.mailbox?.trim() || 'INBOX'}
+                        </div>
+                      )}
+                      {h?.captureOnly === true && h.captureQueueId === q.id && (
+                        <Badge variant="outline" className="mt-1">
+                          capture-only · лимит {h.captureMaxMessages ?? '—'}
+                        </Badge>
+                      )}
+                      {q.captureRetiredAt && (
+                        <Badge variant="outline" className="mt-1 ml-1">
+                          capture-retired · normal inbound заблокирован
+                        </Badge>
+                      )}
                     </TableCell>
                     <TableCell className="text-muted-foreground">{q.type}</TableCell>
                     <TableCell>{syncStateBadge(q.syncState)}</TableCell>
@@ -655,58 +860,71 @@ export function MailContent() {
                           <Button
                             variant="outline"
                             size="sm"
-                            disabled={!q.allowedModes?.length || reconcile.isPending}
+                            disabled={
+                              Boolean(q.captureRetiredAt) || !q.allowedModes?.length || reconcile.isPending
+                            }
+                            title={
+                              q.captureRetiredAt
+                                ? 'Capture-очередь нельзя реконсилировать или использовать повторно'
+                                : undefined
+                            }
                             onClick={() => openReconcile(q)}
                           >
                             Реконсиляция
                           </Button>
                         )}
-                        {canConfigure && (
-                          <>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={configMutationPending || q.syncState === 'BOOTSTRAPPING'}
-                              title={
-                                q.syncState === 'BOOTSTRAPPING'
-                                  ? 'Настройки нельзя менять во время IMAP-baseline'
-                                  : undefined
-                              }
-                              onClick={() => openEditQueue(q)}
-                            >
-                              <Pencil className="mr-1 h-3.5 w-3.5" />
-                              Изменить
-                            </Button>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={configMutationPending || q.syncState === 'BOOTSTRAPPING'}
-                              title={
-                                q.syncState === 'BOOTSTRAPPING'
-                                  ? 'Настройки нельзя менять во время IMAP-baseline'
-                                  : undefined
-                              }
-                              onClick={() => void toggleQueue(q)}
-                            >
-                              {q.isEnabled ? 'Выключить' : 'Включить'}
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="text-destructive hover:text-destructive"
-                              disabled={configMutationPending || q.syncState === 'BOOTSTRAPPING'}
-                              title={
-                                q.syncState === 'BOOTSTRAPPING'
-                                  ? 'Очередь нельзя удалять во время IMAP-baseline'
-                                  : undefined
-                              }
-                              onClick={() => void deleteQueueById(q)}
-                            >
-                              <Trash2 className="mr-1 h-3.5 w-3.5" />
-                              Удалить
-                            </Button>
-                          </>
-                        )}
+                        {canConfigure &&
+                          (q.captureRetiredAt ? (
+                            <span className="text-xs text-muted-foreground">
+                              Очередь навсегда закрыта после capture; для нового теста создайте новую папку и
+                              очередь.
+                            </span>
+                          ) : (
+                            <>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={configMutationPending || q.syncState === 'BOOTSTRAPPING'}
+                                title={
+                                  q.syncState === 'BOOTSTRAPPING'
+                                    ? 'Настройки нельзя менять во время IMAP-baseline'
+                                    : undefined
+                                }
+                                onClick={() => openEditQueue(q)}
+                              >
+                                <Pencil className="mr-1 h-3.5 w-3.5" />
+                                Изменить
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={configMutationPending || q.syncState === 'BOOTSTRAPPING'}
+                                title={
+                                  q.syncState === 'BOOTSTRAPPING'
+                                    ? 'Настройки нельзя менять во время IMAP-baseline'
+                                    : undefined
+                                }
+                                onClick={() => void toggleQueue(q)}
+                              >
+                                {q.isEnabled ? 'Выключить' : 'Включить'}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="text-destructive hover:text-destructive"
+                                disabled={configMutationPending || q.syncState === 'BOOTSTRAPPING'}
+                                title={
+                                  q.syncState === 'BOOTSTRAPPING'
+                                    ? 'Очередь нельзя удалять во время IMAP-baseline'
+                                    : undefined
+                                }
+                                onClick={() => void deleteQueueById(q)}
+                              >
+                                <Trash2 className="mr-1 h-3.5 w-3.5" />
+                                Удалить
+                              </Button>
+                            </>
+                          ))}
                       </div>
                     </TableCell>
                   </TableRow>
@@ -720,6 +938,156 @@ export function MailContent() {
                 )}
               </TableBody>
             </Table>
+          </div>
+        )}
+      </section>
+
+      {/* ── Capture-only inbox: metadata, never raw MIME ───────────────────── */}
+      <section className="space-y-3">
+        <div>
+          <h2 className="text-sm font-semibold text-muted-foreground">
+            Захваченные тестовые письма {captured.data ? `(${captured.data.total})` : ''}
+          </h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Здесь видны только метаданные и журнал действий. Тело письма и raw MIME в интерфейс не передаются.
+          </p>
+        </div>
+        {captured.isError ? (
+          <QueryError onRetry={() => void captured.refetch()} />
+        ) : (
+          <div className="space-y-3">
+            {!capturePromotionReady && (
+              <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm text-amber-700 dark:text-amber-400">
+                <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+                <div>
+                  <p className="font-medium">
+                    {h?.captureOnly
+                      ? 'Capture-only включён: продвижение в обработку заблокировано.'
+                      : h?.captureOnly !== false
+                        ? 'Состояние capture-only ещё не подтверждено: продвижение заблокировано.'
+                        : 'Обычная inbound-обработка выключена: продвижение заблокировано.'}
+                  </p>
+                  <p className="mt-1">{capturePromotionBlockReason}</p>
+                </div>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-2">
+              <Input
+                aria-label="Фильтр захваченных писем по очереди"
+                className="max-w-44"
+                inputMode="numeric"
+                placeholder="Queue ID"
+                value={capturedQueueId}
+                onChange={(e) => {
+                  setCapturedQueueId(e.target.value);
+                  setCapturedPage(1);
+                }}
+              />
+              <Input
+                aria-label="Фильтр захваченных писем по Message-ID"
+                className="max-w-64"
+                placeholder="Message-ID"
+                value={capturedMessageId}
+                onChange={(e) => {
+                  setCapturedMessageId(e.target.value);
+                  setCapturedPage(1);
+                }}
+              />
+            </div>
+            <div className="overflow-x-auto rounded-xl border border-border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>#</TableHead>
+                    <TableHead>Очередь</TableHead>
+                    <TableHead>От</TableHead>
+                    <TableHead>Тема</TableHead>
+                    <TableHead>Размер</TableHead>
+                    <TableHead>Когда</TableHead>
+                    <TableHead className="text-right">Действия</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {(captured.data?.items ?? []).map((delivery) => (
+                    <TableRow key={delivery.id}>
+                      <TableCell className="tabular-nums">
+                        <div className="flex items-center gap-2">
+                          {delivery.id}
+                          <Badge variant="outline">CAPTURED</Badge>
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">{delivery.queueId ?? 'PIPE'}</TableCell>
+                      <TableCell className="max-w-[12rem] truncate">{delivery.envelopeFrom ?? '—'}</TableCell>
+                      <TableCell className="max-w-[16rem] truncate">
+                        {delivery.subject || '(без темы)'}
+                      </TableCell>
+                      <TableCell className="tabular-nums">{formatBytes(delivery.sizeBytes)}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">
+                        <RelativeTime date={delivery.createdAt} />
+                      </TableCell>
+                      <TableCell className="space-x-2 text-right">
+                        <Button variant="ghost" size="sm" onClick={() => setCapturedDetailFor(delivery)}>
+                          Детали
+                        </Button>
+                        {canPromoteCaptured && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={
+                              promoteCaptured.isPending || !capturePromotionReady || !delivery.promoteAllowed
+                            }
+                            title={
+                              !capturePromotionReady
+                                ? (capturePromotionBlockReason ??
+                                  'Продвижение пока не подтверждено сервером.')
+                                : !delivery.promoteAllowed
+                                  ? (delivery.promoteBlockReason ?? 'Сервер заблокировал продвижение.')
+                                  : undefined
+                            }
+                            onClick={() => openCapturedPromotion(delivery)}
+                          >
+                            В обработку
+                          </Button>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {(captured.data?.items ?? []).length === 0 && !captured.isLoading && (
+                    <TableRow>
+                      <TableCell colSpan={7} className="py-6 text-center text-sm text-muted-foreground">
+                        Захваченных писем пока нет.
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+            {captured.data && (
+              <div className="flex items-center justify-between text-sm text-muted-foreground">
+                <span>
+                  Страница {captured.data.page} из{' '}
+                  {Math.max(1, Math.ceil(captured.data.total / captured.data.limit))}
+                </span>
+                <div className="space-x-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={captured.data.page <= 1}
+                    onClick={() => setCapturedPage((page) => Math.max(1, page - 1))}
+                  >
+                    Назад
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={captured.data.page * captured.data.limit >= captured.data.total}
+                    onClick={() => setCapturedPage((page) => page + 1)}
+                  >
+                    Дальше
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -1094,6 +1462,177 @@ export function MailContent() {
         </DialogContent>
       </Dialog>
 
+      {/* ── Capture-only metadata / audit dialog (raw MIME is never requested) ─ */}
+      <Dialog open={capturedDetailFor !== null} onOpenChange={(open) => !open && setCapturedDetailFor(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Захваченное письмо #{capturedDetailFor?.id}</DialogTitle>
+          </DialogHeader>
+          {capturedDetail.isError ? (
+            <QueryError onRetry={() => void capturedDetail.refetch()} />
+          ) : capturedDetail.data ? (
+            <div className="space-y-3 text-sm">
+              <p className="rounded-md border border-border bg-muted/30 p-2 text-xs text-muted-foreground">
+                В этом окне доступны только метаданные. Raw MIME, тело и ключ внешнего хранилища не
+                запрашиваются и не отображаются.
+              </p>
+              <dl className="space-y-2">
+                {[
+                  ['Транспорт', capturedDetail.data.delivery.transport],
+                  ['Очередь', capturedDetail.data.delivery.queueId ?? 'PIPE'],
+                  [
+                    'Message-ID',
+                    capturedDetail.data.delivery.observedMessageId ??
+                      capturedDetail.data.delivery.messageId ??
+                      '—',
+                  ],
+                  ['От', capturedDetail.data.delivery.envelopeFrom ?? '—'],
+                  ['Кому', capturedDetail.data.delivery.envelopeTo ?? '—'],
+                  ['Тема', capturedDetail.data.delivery.subject || '(без темы)'],
+                  ['Размер', formatBytes(capturedDetail.data.delivery.sizeBytes)],
+                  ['Попыток', capturedDetail.data.delivery.attempts],
+                  [
+                    'Захвачено',
+                    <RelativeTime key="captured-at" date={capturedDetail.data.delivery.createdAt} />,
+                  ],
+                ].map(([label, value]) => (
+                  <div key={String(label)} className="grid grid-cols-3 gap-2">
+                    <dt className="text-muted-foreground">{label}</dt>
+                    <dd className="col-span-2 break-words">{value}</dd>
+                  </div>
+                ))}
+                <div className="grid grid-cols-3 gap-2">
+                  <dt className="text-muted-foreground">Ошибка</dt>
+                  <dd className="col-span-2 break-words text-destructive">
+                    {capturedDetail.data.delivery.lastError ?? '—'}
+                  </dd>
+                </div>
+              </dl>
+              {!capturedDetail.data.delivery.promoteAllowed && (
+                <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-amber-700 dark:text-amber-300">
+                  {capturedDetail.data.delivery.promoteBlockReason ??
+                    'Сервер не разрешает передавать это захваченное письмо в обычную обработку.'}
+                </div>
+              )}
+              <div className="space-y-1 border-t pt-3">
+                <p className="font-medium">История действий</p>
+                {capturedDetail.data.audit.length === 0 ? (
+                  <p className="text-muted-foreground">Нет действий оператора.</p>
+                ) : (
+                  capturedDetail.data.audit.map((entry) => (
+                    <p key={entry.id} className="text-xs text-muted-foreground">
+                      <RelativeTime date={entry.createdAt} /> · {entry.action} ·{' '}
+                      {entry.actorEmail || 'system'}
+                      {entry.reason ? ` · ${entry.reason}` : ''}
+                    </p>
+                  ))
+                )}
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">Загрузка метаданных…</p>
+          )}
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setCapturedDetailFor(null)}>
+              Закрыть
+            </Button>
+            {capturedDetail.data && canPromoteCaptured && (
+              <Button
+                variant="outline"
+                disabled={
+                  promoteCaptured.isPending ||
+                  !capturePromotionReady ||
+                  !capturedDetail.data.delivery.promoteAllowed
+                }
+                title={
+                  !capturePromotionReady
+                    ? (capturePromotionBlockReason ?? 'Продвижение пока не подтверждено сервером.')
+                    : !capturedDetail.data.delivery.promoteAllowed
+                      ? (capturedDetail.data.delivery.promoteBlockReason ??
+                        'Сервер заблокировал продвижение.')
+                      : undefined
+                }
+                onClick={() => {
+                  if (openCapturedPromotion(capturedDetail.data.delivery)) setCapturedDetailFor(null);
+                }}
+              >
+                В обработку
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── Capture promotion is intentionally versioned and double-confirmed ─ */}
+      <Dialog open={capturedPromoteFor !== null} onOpenChange={(open) => !open && closeCapturedPromotion()}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Передать письмо #{capturedPromoteFor?.id} в обработку</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 text-sm">
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-amber-700 dark:text-amber-300">
+              Это необратимо для тестового режима: письмо станет обычной delivery-записью и может создать или
+              обновить тикет. Продолжайте только после выключения capture-only и включения обычной
+              inbound-обработки.
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium" htmlFor="captured-promote-reason">
+                Причина <span className="text-destructive">*</span>
+              </label>
+              <Textarea
+                id="captured-promote-reason"
+                aria-label="Причина передачи захваченного письма в обработку"
+                value={capturedPromoteReason}
+                onChange={(event) => setCapturedPromoteReason(event.target.value)}
+                placeholder="Почему это письмо можно безопасно передать в обычную обработку"
+                rows={3}
+              />
+            </div>
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={capturedPromoteAcknowledged}
+                onChange={(event) => setCapturedPromoteAcknowledged(event.target.checked)}
+              />
+              <span>
+                Подтверждаю, что capture-only выключен, обычная inbound-обработка включена, и понимаю, что
+                обычная обработка может создать тикет.
+              </span>
+            </label>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium" htmlFor="captured-promote-confirmation">
+                Введите <span className="font-mono">PROMOTE</span> для подтверждения
+              </label>
+              <Input
+                id="captured-promote-confirmation"
+                aria-label="Подтверждение передачи захваченного письма в обработку"
+                value={capturedPromoteConfirmation}
+                onChange={(event) => setCapturedPromoteConfirmation(event.target.value)}
+                autoComplete="off"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => closeCapturedPromotion()}>
+              Отмена
+            </Button>
+            <Button
+              disabled={
+                promoteCaptured.isPending ||
+                !capturePromotionReady ||
+                capturedPromoteReason.trim().length === 0 ||
+                !capturedPromoteAcknowledged ||
+                capturedPromoteConfirmation !== 'PROMOTE'
+              }
+              onClick={submitCapturedPromotion}
+            >
+              Передать в обработку
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* ── Quarantine detail dialog ────────────────────────────────────────── */}
       <Dialog open={detailFor !== null} onOpenChange={(o) => !o && setDetailFor(null)}>
         <DialogContent>
@@ -1372,6 +1911,37 @@ export function MailContent() {
               </div>
             </div>
 
+            {queueForm.type === 'IMAP' && (
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium" htmlFor="mail-queue-mailbox">
+                  IMAP-папка
+                </label>
+                <Input
+                  id="mail-queue-mailbox"
+                  value={queueForm.mailbox}
+                  onChange={(event) =>
+                    setQueueForm((current) => ({ ...current, mailbox: event.target.value }))
+                  }
+                  placeholder="Например, Helpdesk Test"
+                  autoComplete="off"
+                  maxLength={255}
+                  required
+                  disabled={configMutationPending}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Выберите явную папку. Для capture-only используйте отдельную тестовую IMAP-папку, никогда не
+                  общий INBOX. Смена папки сбрасывает IMAP-курсор и требует реконсиляции; письма и учётные
+                  данные в интерфейс не загружаются.
+                </p>
+                {h?.captureOnly === true && editingQueue?.id === h.captureQueueId && (
+                  <p className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-300">
+                    Эта очередь выбрана для capture-only. INBOX и системные папки нельзя сохранить как
+                    тестовую папку; укажите новую пустую выделенную папку/ярлык.
+                  </p>
+                )}
+              </div>
+            )}
+
             <div className="grid gap-4 sm:grid-cols-[1fr_8rem]">
               <div className="space-y-1.5">
                 <label className="text-sm font-medium" htmlFor="mail-queue-host">
@@ -1524,6 +2094,14 @@ export function MailContent() {
                 оператор не выполнит реконсиляцию.
               </p>
             )}
+            {editingQueue?.type === 'IMAP' &&
+              queueForm.type === 'IMAP' &&
+              queueForm.mailbox.trim() !== (editingQueue.mailbox?.trim() || 'INBOX') && (
+                <p className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-300">
+                  Вы меняете IMAP-папку. После сохранения очередь будет остановлена до явной реконсиляции;
+                  сначала убедитесь, что это выделенная тестовая папка.
+                </p>
+              )}
 
             <DialogFooter>
               <Button

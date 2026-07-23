@@ -50,13 +50,38 @@ hash и storage key являются snapshot. `AttachmentsService` отказы
 
 - В staff ticket timeline видно `QUEUED`, `PROCESSING`, `SENT`, `RETRY`,
   `FAILED` или `AMBIGUOUS` возле public staff post.
-- `POST /api/admin/outbound-emails/:id/retry` требует `admin.mail`. Допустимы
+- `POST /api/admin/outbound-emails/:id/retry` требует оба права: `mail.view` и
+  `mail.configure`. Допустимы
   только `FAILED`, `AMBIGUOUS`, `RETRY`; original `Message-ID`, content and
   recipients сохраняются. Попытка записывается как `OUTBOUND_RETRY` в ticket
   audit log.
 - Для `AMBIGUOUS` сначала проверить SMTP relay по сохранённому Message-ID.
   Не объявлять письмо доставленным только по тому, что job завершился/Redis
   принял задачу.
+
+## Единственный SMTP canary перед включением доставки
+
+Реальные SMTP-параметры можно сохранить заранее, но до отдельного canary
+`TELECOM_HD_OUTBOUND_DELIVERY_ENABLED` остаётся `false`: наличие логина и
+пароля само по себе не даёт приложению права отправлять почту.
+
+Для attended-проверки разрешается только одна уже просмотренная строка
+`OutboundEmail` и один согласованный адрес получателя. В owner-only окружении
+задаются одновременно:
+
+```dotenv
+TELECOM_HD_OUTBOUND_DELIVERY_ENABLED=true
+TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID=<CUID одной OutboundEmail>
+TELECOM_HD_OUTBOUND_CANARY_RECIPIENT=<один согласованный адрес>
+```
+
+При этих двух селекторах runtime блокирует direct/template-почту, recovery
+других строк, повторную отправку другой строки, CC/BCC и получателя, который
+не совпадает с сохранённым единственным `TO`. Перед включением inbound должен
+быть закрыт; после ровно одного SMTP accept сразу снова поставить
+`TELECOM_HD_OUTBOUND_DELIVERY_ENABLED=false`, очистить **оба** селектора и
+перезапустить API. Полная последовательность и production preflight описаны
+в [INBOUND_PRODUCTION_CUTOVER.md](INBOUND_PRODUCTION_CUTOVER.md#5-promotion-only-normal-inbound-and-one-recipient-outbound-canaries).
 
 ## Ограничение этого среза
 

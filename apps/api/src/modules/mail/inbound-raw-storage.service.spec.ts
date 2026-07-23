@@ -58,6 +58,83 @@ describe('InboundRawStorageService', () => {
     await expect(service.listPending(10, new Date(Date.now() + 1_000))).resolves.toEqual([]);
   });
 
+  it('publishes a fenced write only when its caller grants the atomic rename capability', async () => {
+    const service = await makeService();
+    const key = service.allocateKey();
+    const source = Buffer.from('fenced raw MIME');
+    let callbackRan = false;
+
+    await service.writeFenced(source, key, async (publish) => {
+      // The temporary file is private: a reaper/reader cannot observe a partially written
+      // destination before the caller has obtained its durable DB staging lock.
+      await expect(service.read(key)).rejects.toThrow(/unavailable/i);
+      await publish();
+      callbackRan = true;
+    });
+
+    expect(callbackRan).toBe(true);
+    await expect(service.read(key)).resolves.toEqual(source);
+  });
+
+  it('retains the marker and published bytes when the caller rolls back after publish', async () => {
+    const service = await makeService();
+    const key = service.allocateKey();
+    const source = Buffer.from('rollback-recovery raw MIME');
+
+    await expect(
+      service.writeFenced(source, key, async (publish) => {
+        await publish();
+        throw new Error('simulated transaction rollback');
+      }),
+    ).rejects.toThrow(/storage write failed/i);
+
+    // The staging state/reaper, not this storage helper, owns recovery after publication. If we
+    // hid the marker here, a durable ACTIVE/REAPING reservation could no longer prove cleanup.
+    await expect(service.read(key)).resolves.toEqual(source);
+    await expect(service.listPending(10, new Date(Date.now() + 1_000))).resolves.toEqual([key]);
+  });
+
+  it('does not publish bytes when a stale writer loses its fence before rename', async () => {
+    const service = await makeService();
+    const key = service.allocateKey();
+
+    await expect(
+      service.writeFenced(Buffer.from('must remain private'), key, async () => {
+        throw new Error('stage is already REAPING');
+      }),
+    ).rejects.toThrow(/storage write failed/i);
+
+    await expect(service.read(key)).rejects.toThrow(/unavailable/i);
+    await expect(service.listPending(10, new Date(Date.now() + 1_000))).resolves.toEqual([]);
+  });
+
+  it('removes the deterministic pre-publish temp file during staged cleanup', async () => {
+    const service = await makeService();
+    const key = service.allocateKey();
+    const id = key.slice('inbound-raw/'.length, -'.eml'.length);
+    let entered!: () => void;
+    const enteredFence = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let abortFence!: (reason: Error) => void;
+    const holdFence = new Promise<void>((_resolve, reject) => {
+      abortFence = reject;
+    });
+    const writer = service.writeFenced(Buffer.from('private pre-publish bytes'), key, async () => {
+      entered();
+      await holdFence;
+    });
+
+    await enteredFence;
+    const stagingTemp = join(roots[0]!, 'inbound-raw', '.staging', `${id}.tmp`);
+    await expect(readFile(stagingTemp)).resolves.toEqual(Buffer.from('private pre-publish bytes'));
+
+    await service.removeFile(key);
+    await expect(readFile(stagingTemp)).rejects.toMatchObject({ code: 'ENOENT' });
+    abortFence(new Error('simulated stale writer abort'));
+    await expect(writer).rejects.toThrow(/storage write failed/i);
+  });
+
   it('does not leak a filesystem path through a storage-read failure', async () => {
     const service = await makeService();
     const missing = 'inbound-raw/00000000-0000-4000-8000-000000000099.eml';

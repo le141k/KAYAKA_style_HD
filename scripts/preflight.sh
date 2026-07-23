@@ -74,6 +74,15 @@ check_int() {
   fi
 }
 
+require_blank() {
+  local key="$1"
+  if [[ -z "$(get_val "$key")" ]]; then
+    ok "$key — blank (no attended canary scope remains)"
+  else
+    fail "$key — must be blank during normal deploy; use only the attended canary procedure"
+  fi
+}
+
 PLACEHOLDER_RE='(change[-_]?me|dev[-_]?secret|placeholder|example|changeme|0{4,}|demo1234)'
 
 check_not_placeholder() {
@@ -141,7 +150,7 @@ REQUIRED_KEYS=(
   TELECOM_HD_ALARIS_WEBHOOK_SECRET TELECOM_HD_INBOUND_WEBHOOK_SECRET
   TELECOM_HD_FIELD_ENCRYPTION_KEY
   TELECOM_HD_SMTP_HOST TELECOM_HD_SMTP_PORT TELECOM_HD_SMTP_SECURE
-  TELECOM_HD_SMTP_USER TELECOM_HD_SMTP_PASSWORD TELECOM_HD_MAIL_FROM
+  TELECOM_HD_SMTP_USER TELECOM_HD_SMTP_PASSWORD TELECOM_HD_MAIL_FROM TELECOM_HD_OUTBOUND_DELIVERY_ENABLED
   TELECOM_HD_UPLOAD_DIR
   TELECOM_HD_CLIENT_PORTAL_ENABLED TELECOM_HD_CLIENT_UPLOAD_ENABLED
   TELECOM_HD_PUBLIC_TICKET_CREATE_ENABLED TELECOM_HD_PUBLIC_UPLOAD_ENABLED
@@ -150,7 +159,7 @@ REQUIRED_KEYS=(
   TELECOM_HD_ORPHAN_ATTACHMENT_TTL_HOURS TELECOM_HD_ORPHAN_ATTACHMENT_MAX_COUNT
   TELECOM_HD_ORPHAN_ATTACHMENT_MAX_SIZE_MB TELECOM_HD_UPLOAD_MIN_FREE_DISK_MB
   TELECOM_HD_ATTACHMENT_CLEANUP_MAX_ITEMS TELECOM_HD_ATTACHMENT_CLEANUP_MAX_RUN_SECONDS
-  TELECOM_HD_INBOUND_DELIVERY_ENABLED TELECOM_HD_IMAP_ENABLED TELECOM_HD_IMAP_BOOTSTRAP_POLICY TELECOM_HD_IMAP_BACKFILL_LIMIT
+  TELECOM_HD_INBOUND_DELIVERY_ENABLED TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES TELECOM_HD_IMAP_ENABLED TELECOM_HD_IMAP_BOOTSTRAP_POLICY TELECOM_HD_IMAP_BACKFILL_LIMIT
   TELECOM_HD_INBOUND_MAX_ATTEMPTS TELECOM_HD_INBOUND_RAW_RETENTION_DAYS
   TELECOM_HD_CLAMAV_ENABLED TELECOM_HD_CLAMAV_HOST
   TELECOM_HD_CLAMAV_PORT TELECOM_HD_CLAMAV_TIMEOUT_MS COMPOSE_PROFILES
@@ -377,7 +386,23 @@ fi
 
 printf '\n%s\n' '--- 5. Inbound-mail global safety gates ---'
 check_bool TELECOM_HD_INBOUND_DELIVERY_ENABLED
+check_bool TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED
 check_bool TELECOM_HD_IMAP_ENABLED
+check_bool TELECOM_HD_OUTBOUND_DELIVERY_ENABLED
+check_int TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES 1 100
+require_blank TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID
+require_blank TELECOM_HD_OUTBOUND_CANARY_RECIPIENT
+require_blank TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID
+require_blank TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID
+
+# A real SMTP relay can be configured before it is approved to transmit. Do not
+# let a normal code/migration deploy recover existing durable outbox rows.
+OUTBOUND_DELIVERY_ENABLED="$(get_val TELECOM_HD_OUTBOUND_DELIVERY_ENABLED)"
+if is_true "$OUTBOUND_DELIVERY_ENABLED"; then
+  fail 'TELECOM_HD_OUTBOUND_DELIVERY_ENABLED — must be false during deploy; enable only for an attended outbound canary'
+else
+  ok 'TELECOM_HD_OUTBOUND_DELIVERY_ENABLED — fail-closed for deployment; SMTP is configured but no mail is sent'
+fi
 
 # A release starts API workers immediately after the forward-only migration boundary.
 # The shared gate closes BOTH IMAP and PIPE before their body/ledger work, so a stale
@@ -387,6 +412,13 @@ if is_true "$INBOUND_DELIVERY_ENABLED"; then
   fail 'TELECOM_HD_INBOUND_DELIVERY_ENABLED — must be false during deploy; enable only for the documented attended inbound canary'
 else
   ok 'TELECOM_HD_INBOUND_DELIVERY_ENABLED — fail-closed for deployment; IMAP + PIPE remain operator-gated'
+fi
+
+CAPTURE_ONLY_ENABLED="$(get_val TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED)"
+if is_true "$CAPTURE_ONLY_ENABLED"; then
+  fail 'TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED — must be false during normal deploy; enable only through the documented attended capture-only restart'
+else
+  ok 'TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED — fail-closed for deployment; no mailbox is captured'
 fi
 
 # IMAP remains independently closed for PIPE-only canaries. The reviewed post-deploy

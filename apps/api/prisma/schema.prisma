@@ -92,11 +92,25 @@ enum InboundTransport {
 
 enum InboundDeliveryState {
   ACCEPTED // durably recorded (raw MIME stored); not yet processed
+  // Capture-only acceptance. Raw RFC822 bytes are durable, but this state is never
+  // selected by the drain and cannot become processable merely by a later config flip.
+  // An operator must explicitly promote one row through the audited capture API.
+  CAPTURED
   PROCESSING // claimed by a drain worker
   PROCESSED // business op committed (ticket/post created or threaded)
   RETRY // transient failure; retried with backoff, never discarded
   QUARANTINED // permanent failure / attempts exhausted; needs operator, raw MIME retained
   SKIPPED // intentionally not ticketed (loop/bounce/parser-ignore/duplicate)
+}
+
+// Durable state machine for a large raw-MIME staging reservation. Acceptance may only
+// consume ACTIVE; it writes COMMITTED in the same transaction as InboundDelivery. A reaper
+// commits REAPING before any filesystem delete, so a database rollback cannot revive a stage
+// whose bytes have already been removed.
+enum InboundRawMimeStagingState {
+  ACTIVE
+  COMMITTED
+  REAPING
 }
 
 // Per-queue IMAP sync health. NEEDS_RECONCILIATION halts polling (fail-closed) after a
@@ -546,6 +560,7 @@ model Ticket {
   customFields    Json           @default("{}")
 
   posts           TicketPost[]
+  effectiveOwnerInboundDeliveries InboundDelivery[] @relation("InboundDeliveryEffectiveOwnerTicket")
   notes           TicketNote[]
   attachments     Attachment[]
   watchers        TicketWatcher[]
@@ -850,6 +865,10 @@ model EmailQueue {
   username       String         @default("")
   passwordEnc    String         @default("")   // encrypted at rest
   useTls         Boolean        @default(true)
+  // IMAP folder selected for this queue. Keeping it on the queue (rather than assuming
+  // INBOX) lets a test/capture queue read a dedicated folder without touching a shared
+  // mailbox. A change is treated as a mailbox identity change by the service.
+  mailbox        String         @default("INBOX")
   department     Department?    @relation(fields: [departmentId], references: [id])
   departmentId   Int?
   signature      String         @default("")
@@ -890,6 +909,11 @@ model EmailQueue {
   bootstrapPolicy       EmailQueueBootstrapPolicy?
   bootstrapBackfillLimit Int?
 
+  // An immutable lifetime fence for an attended capture-only mailbox. It latches before
+  // MIME is fetched, so a test folder can never later be reused as normal inbound ingress.
+  // There is intentionally no DTO/API field that can clear it: create a fresh queue/folder.
+  captureRetiredAt       DateTime?
+
   // Operator liveness signal (advisory; not part of any cursor/acceptance CAS). These
   // values make a disconnected/stuck poller visible without exposing credentials or raw
   // driver errors. `lastPollAt` is retained for API compatibility; start/completed give
@@ -904,9 +928,15 @@ model EmailQueue {
   lastAcceptedAt          DateTime?
 
   inboundDeliveries InboundDelivery[]
+  inboundRawMimeStages InboundRawMimeStaging[]
   routedInboundDeliveries InboundDelivery[] @relation("InboundDeliveryRoutedQueue")
   routedInboundMessageClaims InboundMessageClaim[] @relation("InboundMessageClaimRoutedQueue")
   outboundEmails OutboundEmail[]
+
+  // Kept in sync with the explicit production migration.  This index serves the
+  // supervisor's normal-mode query, which must exclude permanently retired
+  // capture queues without scanning every enabled IMAP queue.
+  @@index([isEnabled, type, captureRetiredAt], map: "EmailQueue_isEnabled_type_captureRetiredAt_idx")
 }
 
 /**
@@ -1012,6 +1042,18 @@ enum EmailQueueBootstrapPolicy {
   BACKFILL
 }
 
+/** Authoritative lifecycle of a delivery's non-admin mail-operator owner. */
+enum InboundDeliveryEffectiveOwnerKind {
+  // A captured/truncated delivery whose MIME is never entering normal ticket routing.
+  RECEIVING
+  // A deterministic queue route or parser-rule target before a ticket exists.
+  ROUTED
+  // A known ticket; access follows that ticket's current department through the relation.
+  TICKET
+  // Ownership was not safely resolved. Non-admin mail operators must not see or act on it.
+  UNRESOLVED
+}
+
 model InboundDelivery {
   id            Int              @id @default(autoincrement())
   transport     InboundTransport
@@ -1065,13 +1107,22 @@ model InboundDelivery {
   routedQueueId Int?
   routedDepartment Department?   @relation("InboundDeliveryRoutedDepartment", fields: [routedDepartmentId], references: [id], onDelete: SetNull)
   routedDepartmentId Int?
+  // Authoritative non-admin operator ACL owner. This is intentionally distinct from
+  // the receiving queue snapshot and deterministic recipient route: a parser rule or
+  // a threaded reply can ultimately create/update a ticket in another department.
+  // TICKET follows the linked ticket's current department; if the relation is deleted,
+  // its kind stays TICKET and access fails closed rather than falling back to this scalar.
+  effectiveOwnerKind InboundDeliveryEffectiveOwnerKind @default(UNRESOLVED)
+  effectiveOwnerDepartmentId Int?
+  effectiveOwnerTicket Ticket? @relation("InboundDeliveryEffectiveOwnerTicket", fields: [effectiveOwnerTicketId], references: [id], onDelete: SetNull)
+  effectiveOwnerTicketId Int?
   messageClaim InboundMessageClaim? @relation("InboundDeliveryMessageClaim", fields: [messageIdHash], references: [messageIdHash], onDelete: SetNull)
   winningMessageClaim InboundMessageClaim? @relation("InboundMessageClaimWinner")
 
   // Durable raw MIME so a failed/quarantined delivery can be replayed. Inline for
   // bounded messages; `rawStorageKey` is used when externalised to object storage.
   // `rawMime` is pruned (set NULL) for terminal PROCESSED/SKIPPED deliveries older than
-  // the retention window; QUARANTINED rows keep it (needed for replay). `truncated` marks
+  // the retention window; QUARANTINED and CAPTURED rows keep it (needed for replay/review). `truncated` marks
   // an IMAP fetch that hit the size ceiling — its raw bytes are incomplete (replay must
   // re-fetch the original), so it is quarantined rather than partially ticketed.
   rawMime       Bytes?
@@ -1082,6 +1133,10 @@ model InboundDelivery {
 
   // Lifecycle
   state         InboundDeliveryState @default(ACCEPTED)
+  // Written only by the audited CAPTURED -> ACCEPTED promotion transaction. A
+  // promotion-only normal canary requires this durable provenance marker so an
+  // arbitrary historical ACCEPTED/RETRY row can never be selected by mistake.
+  capturePromotedAt DateTime?
   attempts      Int              @default(0)
   lastError     String?
   nextAttemptAt DateTime?
@@ -1098,24 +1153,39 @@ model InboundDelivery {
   processedAt   DateTime?
 
   @@index([state, nextAttemptAt])
+  @@index([queueId, capturePromotedAt, state])
   @@index([queueId, mailboxEpoch, uidValidity, uid])
+  // The raw-stage reaper verifies an externalised MIME pointer by this key while
+  // holding the stage-row fence. Keep that lookup bounded so cleanup cannot delay
+  // capture arming on a large terminal-delivery ledger.
+  @@index([rawStorageKey])
   @@index([messageIdHash])
   @@index([observedMessageId])
   @@index([routedQueueId])
+  @@index([effectiveOwnerKind, effectiveOwnerDepartmentId, state])
+  @@index([effectiveOwnerTicketId])
 }
 
 /**
  * Durable fence for a large raw-MIME file between filesystem staging and its ledger row.
- * A reaper may delete an expired stage only after locking this row; acceptance deletes the
- * same row in the transaction that creates InboundDelivery, so a slow transaction can never
- * have its file removed underneath it.
+ * Acceptance writes COMMITTED in the same transaction as the ledger pointer. A reaper commits
+ * REAPING before it touches the filesystem, so a rollback after unlink can never let a later
+ * acceptance create a pointer to missing bytes.
  */
 model InboundRawMimeStaging {
   storageKey     String   @id
+  // The queue that still owns this uncommitted raw-MIME write. Capture arming
+  // checks this durable reservation under the queue lock, so a failed cleanup
+  // cannot leave bytes from a normal worker behind a newly retired queue.
+  queue          EmailQueue? @relation(fields: [queueId], references: [id], onDelete: SetNull)
+  queueId        Int?
+  state          InboundRawMimeStagingState @default(ACTIVE)
   leaseExpiresAt DateTime
   createdAt      DateTime @default(now())
 
   @@index([leaseExpiresAt])
+  @@index([queueId, leaseExpiresAt])
+  @@index([state, leaseExpiresAt])
 }
 
 /**

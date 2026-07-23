@@ -14,13 +14,16 @@ import { APP_CONFIG, type AppConfig } from '../../config/configuration';
 export class InboundRawStorageService {
   private static readonly PREFIX = 'inbound-raw';
   private static readonly PENDING_DIR = '.pending';
+  private static readonly STAGING_DIR = '.staging';
   private readonly root: string;
   private readonly pendingRoot: string;
+  private readonly stagingRoot: string;
   private readonly logger = new Logger(InboundRawStorageService.name);
 
   constructor(@Inject(APP_CONFIG) private readonly config: AppConfig) {
     this.root = resolve(config.TELECOM_HD_UPLOAD_DIR, InboundRawStorageService.PREFIX);
     this.pendingRoot = join(this.root, InboundRawStorageService.PENDING_DIR);
+    this.stagingRoot = join(this.root, InboundRawStorageService.STAGING_DIR);
   }
 
   /** Allocate an opaque key before writing so the database can fence the staging lifecycle. */
@@ -28,16 +31,44 @@ export class InboundRawStorageService {
     return `${InboundRawStorageService.PREFIX}/${randomUUID()}.eml`;
   }
 
+  /** Write and publish immediately; retained for callers that do not need a DB staging fence. */
   async write(bytes: Buffer, storageKey = this.allocateKey()): Promise<string> {
+    return this.writeWithPublishFence(bytes, storageKey, async (publish) => publish());
+  }
+
+  /**
+   * Write raw bytes to a private temporary file, then let the caller run the short durable
+   * database fence around the final atomic rename. A stale writer cannot publish after a reaper
+   * has committed its stage as REAPING: the callback observes that state before it receives the
+   * `publish()` capability. If a DB transaction rolls back after publish, leave the marker and
+   * destination intact so the durable stage/reaper can clean them safely.
+   */
+  async writeFenced(
+    bytes: Buffer,
+    storageKey: string,
+    fence: (publish: () => Promise<void>) => Promise<void>,
+  ): Promise<string> {
+    return this.writeWithPublishFence(bytes, storageKey, fence);
+  }
+
+  private async writeWithPublishFence(
+    bytes: Buffer,
+    storageKey: string,
+    fence: (publish: () => Promise<void>) => Promise<void>,
+  ): Promise<string> {
     await this.assertCapacity(bytes.length);
     await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
     await fs.mkdir(this.pendingRoot, { recursive: true, mode: 0o700 });
-    const id = this.idFromStorageKey(storageKey);
+    await fs.mkdir(this.stagingRoot, { recursive: true, mode: 0o700 });
     const destination = this.pathFor(storageKey);
     const pending = this.pendingPathFor(storageKey);
-    const temporary = join(this.root, `.${id}.${randomUUID()}.tmp`);
+    // The staging path is deterministic from the durable storage key. A process may die after
+    // writing this private temp file but before it acquires the publish fence; the DB reaper can
+    // then remove both this file and the destination without needing an untracked random name.
+    const temporary = this.temporaryPathFor(storageKey);
     let handle: FileHandle | undefined;
     let pendingHandle: FileHandle | undefined;
+    let published = false;
     try {
       // The durable pending marker is written BEFORE the raw file. If this process crashes
       // between the atomic rename and ledger INSERT, the bounded reaper can prove whether the
@@ -53,15 +84,29 @@ export class InboundRawStorageService {
       await handle.sync();
       await handle.close();
       handle = undefined;
-      // Atomic on the same filesystem: readers see either the complete message or no key.
-      await fs.rename(temporary, destination);
-      await this.syncDirectory(dirname(destination));
+      await fence(async () => {
+        if (published) {
+          throw new ServiceUnavailableException('Inbound raw MIME publish was attempted more than once');
+        }
+        // Atomic on the same filesystem: readers see either the complete message or no key.
+        await fs.rename(temporary, destination);
+        published = true;
+        await this.syncDirectory(dirname(destination));
+      });
+      if (!published) {
+        throw new ServiceUnavailableException(
+          'Inbound raw MIME staging fence returned without publishing bytes',
+        );
+      }
       return storageKey;
     } catch (err) {
       await handle?.close().catch(() => undefined);
       await pendingHandle?.close().catch(() => undefined);
       await fs.unlink(temporary).catch(() => undefined);
-      await this.unlinkIfPresent(pending).catch(() => undefined);
+      // If publish succeeded but the fence transaction later failed, the database still has a
+      // durable ACTIVE/REAPING reservation. Do not hide its pending marker or delete the file:
+      // persistRawMime()/the reaper owns that recovery path and must remain able to prove it.
+      if (!published) await this.unlinkIfPresent(pending).catch(() => undefined);
       if (err instanceof ServiceUnavailableException) throw err;
       this.logger.error(`Inbound raw MIME write failed (${this.errorKind(err)})`);
       throw new ServiceUnavailableException('Inbound raw MIME storage write failed');
@@ -91,9 +136,26 @@ export class InboundRawStorageService {
 
   /** Idempotent cleanup; a missing file is already a completed cleanup. */
   async remove(storageKey: string): Promise<void> {
+    await this.removeFile(storageKey);
+    try {
+      await this.unlinkIfPresent(this.pendingPathFor(storageKey));
+    } catch (err) {
+      if (err instanceof ServiceUnavailableException) throw err;
+      this.logger.error(`Inbound raw MIME cleanup failed (${this.errorKind(err)})`);
+      throw new ServiceUnavailableException('Inbound raw MIME storage cleanup failed');
+    }
+  }
+
+  /**
+   * Remove only raw bytes, retaining the pending marker until the caller has durably released
+   * its staging reservation. This removes both the published destination and the deterministic
+   * pre-publish temp file so a crashed writer cannot leave private MIME bytes behind an armable
+   * capture queue.
+   */
+  async removeFile(storageKey: string): Promise<void> {
     try {
       await this.unlinkIfPresent(this.pathFor(storageKey));
-      await this.unlinkIfPresent(this.pendingPathFor(storageKey));
+      await this.unlinkIfPresent(this.temporaryPathFor(storageKey));
     } catch (err) {
       if (err instanceof ServiceUnavailableException) throw err;
       this.logger.error(`Inbound raw MIME cleanup failed (${this.errorKind(err)})`);
@@ -176,13 +238,13 @@ export class InboundRawStorageService {
     return join(this.pendingRoot, id);
   }
 
-  private idFromStorageKey(storageKey: string): string {
+  private temporaryPathFor(storageKey: string): string {
     const path = this.pathFor(storageKey);
     const id = path.slice(this.root.length + 1, -'.eml'.length);
     if (!/^[0-9a-f-]{36}$/i.test(id)) {
       throw new ServiceUnavailableException('Invalid inbound raw storage key');
     }
-    return id;
+    return join(this.stagingRoot, `${id}.tmp`);
   }
 
   private async unlinkIfPresent(path: string): Promise<void> {

@@ -13,15 +13,29 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execSync } from 'child_process';
 import { Test, type TestingModule } from '@nestjs/testing';
 import type { INestApplication } from '@nestjs/common';
+import express from 'express';
 import supertest from 'supertest';
 import type { PostgreSqlContainer, StartedPostgreSqlContainer } from '@testcontainers/postgresql';
+import { configureInboundPipeMiddleware } from '../../app.factory';
+import { APP_CONFIG, type AppConfig } from '../../config/configuration';
+import { PrismaService } from '../../prisma/prisma.service';
+import {
+  prepareIsolatedIntegrationEnvironment,
+  redisConnectionUri,
+  startDisposableRedis,
+  type IsolatedIntegrationEnvironment,
+} from '../../test/integration-runtime';
+import type { StartedTestContainer } from 'testcontainers';
 
 let PostgreSqlContainerCtor: typeof PostgreSqlContainer;
 let container: StartedPostgreSqlContainer;
+let redis: StartedTestContainer;
 let app: INestApplication;
 let staffRequest: ReturnType<typeof supertest.agent>;
 let webhookRequest: ReturnType<typeof supertest>;
 let csrfToken: string;
+let pipeQueueId: number;
+let integrationEnvironment: IsolatedIntegrationEnvironment;
 
 const INBOUND_SECRET = 'inbound-dev-secret-change-me-0000';
 const CLIENT_EMAIL = 'carrier-noc@acme-telecom.example';
@@ -78,11 +92,13 @@ beforeAll(async () => {
     .start();
 
   const databaseUrl = container.getConnectionUri();
-  process.env['DATABASE_URL'] = databaseUrl;
-  process.env['TELECOM_HD_JWT_ACCESS_SECRET'] = 'int-test-access-secret-32chars!!';
-  process.env['TELECOM_HD_JWT_REFRESH_SECRET'] = 'int-test-refresh-secret-32chars!!';
-  process.env['TELECOM_HD_INBOUND_WEBHOOK_SECRET'] = INBOUND_SECRET;
-  process.env['TELECOM_HD_INBOUND_DELIVERY_ENABLED'] = 'true';
+  redis = await startDisposableRedis();
+  integrationEnvironment = prepareIsolatedIntegrationEnvironment({
+    databaseUrl,
+    redisUrl: redisConnectionUri(redis),
+    inboundDeliveryEnabled: true,
+    inboundWebhookSecret: INBOUND_SECRET,
+  });
 
   execSync('npx prisma migrate deploy', {
     env: { ...process.env, DATABASE_URL: databaseUrl },
@@ -97,9 +113,29 @@ beforeAll(async () => {
 
   const { AppModule } = await import('../../app.module');
   const moduleRef: TestingModule = await Test.createTestingModule({ imports: [AppModule] }).compile();
-  app = moduleRef.createNestApplication();
+  app = moduleRef.createNestApplication({ bodyParser: false });
+  // Exercise the actual production PIPE middleware order: secret/header gate before
+  // raw RFC822 parsing. A bare Nest test app otherwise uses its default JSON parser
+  // and would turn this MIME fixture into an unrelated 400 response.
+  const expressInstance = app.getHttpAdapter().getInstance() as express.Application;
+  configureInboundPipeMiddleware(expressInstance, moduleRef.get<AppConfig>(APP_CONFIG));
+  expressInstance.use(express.json({ limit: '1mb' }));
+  expressInstance.use(express.urlencoded({ extended: true, limit: '1mb' }));
   app.setGlobalPrefix('api');
   await app.init();
+  const prisma = moduleRef.get(PrismaService);
+  const support = await prisma.department.findFirst({ where: { title: 'Support' }, select: { id: true } });
+  if (!support) throw new Error('Integration seed did not create the Support department');
+  const pipeQueue = await prisma.emailQueue.create({
+    data: {
+      type: 'PIPE',
+      emailAddress: 'pipe-integration@23telecom.example',
+      departmentId: support.id,
+      isEnabled: true,
+    },
+    select: { id: true },
+  });
+  pipeQueueId = pipeQueue.id;
   staffRequest = supertest.agent(app.getHttpServer());
   webhookRequest = supertest(app.getHttpServer());
 
@@ -115,8 +151,12 @@ beforeAll(async () => {
 }, 120_000);
 
 afterAll(async () => {
-  await app?.close();
-  await container?.stop();
+  try {
+    await app?.close();
+  } finally {
+    await Promise.allSettled([redis?.stop(), container?.stop()]);
+    integrationEnvironment?.restore();
+  }
 });
 
 describe('Inbound mail integration (A2 + A4)', () => {
@@ -134,6 +174,8 @@ describe('Inbound mail integration (A2 + A4)', () => {
     await webhookRequest
       .post('/api/inbound/pipe')
       .set('x-inbound-secret', INBOUND_SECRET)
+      .set('x-inbound-delivery-id', 'inbound-int-delivery-1')
+      .set('x-inbound-queue-id', String(pipeQueueId))
       .set('Content-Type', 'message/rfc822')
       .send(buildMime(FIRST_MESSAGE_ID))
       .expect(202);
@@ -157,6 +199,8 @@ describe('Inbound mail integration (A2 + A4)', () => {
     await webhookRequest
       .post('/api/inbound/pipe')
       .set('x-inbound-secret', INBOUND_SECRET)
+      .set('x-inbound-delivery-id', 'inbound-int-delivery-1')
+      .set('x-inbound-queue-id', String(pipeQueueId))
       .set('Content-Type', 'message/rfc822')
       .send(buildMime(FIRST_MESSAGE_ID))
       .expect(202);
@@ -168,6 +212,8 @@ describe('Inbound mail integration (A2 + A4)', () => {
     await webhookRequest
       .post('/api/inbound/pipe')
       .set('x-inbound-secret', INBOUND_SECRET)
+      .set('x-inbound-delivery-id', 'inbound-int-delivery-2')
+      .set('x-inbound-queue-id', String(pipeQueueId))
       .set('Content-Type', 'message/rfc822')
       .send(buildMime('<inbound-int-2@acme-telecom.example>', FIRST_MESSAGE_ID))
       .expect(202);

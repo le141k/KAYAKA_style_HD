@@ -2,6 +2,89 @@ import { z } from 'zod';
 
 // ─────────────────── EmailQueue ───────────────────
 
+/**
+ * The one canonical IMAP folder representation used at every boundary.  Keep this
+ * deliberately ASCII-only: JavaScript String.trim() and PostgreSQL btrim() disagree
+ * on Unicode whitespace, which can otherwise make the poller select a different
+ * folder from the one the database accepted.  Non-ASCII whitespace is a literal
+ * folder-name character; only the explicit six ASCII edge characters are removed.
+ */
+export const IMAP_MAILBOX_ASCII_EDGE_WHITESPACE = /^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g;
+export const MAX_IMAP_MAILBOX_CODE_POINTS = 255;
+export const DEFAULT_IMAP_MAILBOX = 'INBOX';
+
+/** Normalize an operator-supplied IMAP folder name into its durable canonical form. */
+export function normalizeImapMailbox(value: string): string {
+  const mailbox = value.replace(IMAP_MAILBOX_ASCII_EDGE_WHITESPACE, '');
+  if (
+    mailbox.length === 0 ||
+    Array.from(mailbox).length > MAX_IMAP_MAILBOX_CODE_POINTS ||
+    /[\r\n]/.test(mailbox) ||
+    mailbox.includes('\0')
+  ) {
+    throw new Error('mailbox must be a non-empty IMAP folder name up to 255 characters');
+  }
+  return mailbox;
+}
+
+/**
+ * Validate a mailbox read from durable storage without silently rewriting it. A
+ * malformed direct SQL write must halt the queue instead of selecting a subtly
+ * different IMAP folder at runtime.
+ */
+export function readCanonicalImapMailbox(value: unknown): string {
+  if (value === undefined || value === null) return DEFAULT_IMAP_MAILBOX;
+  if (typeof value !== 'string') throw new Error('Configured IMAP mailbox is invalid');
+  const canonical = normalizeImapMailbox(value);
+  if (canonical !== value) throw new Error('Configured IMAP mailbox is not canonical');
+  return canonical;
+}
+
+/**
+ * A queue must name its IMAP folder explicitly.  We default legacy/new queues to INBOX,
+ * but reject control characters and unbounded values before they can reach an IMAP command.
+ */
+export const ImapMailboxSchema = z.string().transform((value, ctx) => {
+  try {
+    return normalizeImapMailbox(value);
+  } catch {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'mailbox must be a non-empty IMAP folder name up to 255 characters without controls',
+    });
+    return z.NEVER;
+  }
+});
+
+/**
+ * Capture-only is for an empty, operator-created test folder — never a provider's
+ * primary or special-use mailbox. IMAP special-use flags are checked again live at
+ * connection time; these common names stop the most dangerous mistakes before any
+ * authenticated IMAP session is opened (including Gmail's English system folders).
+ */
+const KNOWN_UNSAFE_CAPTURE_MAILBOXES = new Set([
+  'INBOX',
+  'ALL MAIL',
+  'ARCHIVE',
+  'SENT',
+  'SENT MAIL',
+  'DRAFTS',
+  'TRASH',
+  'JUNK',
+  'SPAM',
+  'IMPORTANT',
+  '[GMAIL]/ALL MAIL',
+  '[GMAIL]/SENT MAIL',
+  '[GMAIL]/DRAFTS',
+  '[GMAIL]/TRASH',
+  '[GMAIL]/SPAM',
+  '[GMAIL]/IMPORTANT',
+]);
+
+export function isKnownUnsafeCaptureMailbox(mailbox: string): boolean {
+  return KNOWN_UNSAFE_CAPTURE_MAILBOXES.has(mailbox.trim().replace(/\s+/g, ' ').toUpperCase());
+}
+
 export const CreateEmailQueueSchema = z.object({
   type: z.enum(['IMAP', 'POP3', 'PIPE']).default('IMAP'),
   emailAddress: z.string().email(),
@@ -10,6 +93,9 @@ export const CreateEmailQueueSchema = z.object({
   username: z.string().default(''),
   password: z.string().default(''), // plain-text; stored as passwordEnc (encrypt at-rest TODO)
   useTls: z.boolean().default(true),
+  // IMAP uses this exact folder for bootstrap/reconcile/poll locks. It is intentionally
+  // independent of the receiving email address, which is still used for routing.
+  mailbox: ImapMailboxSchema.default('INBOX'),
   departmentId: z.number().int().positive().nullable().optional(),
   signature: z.string().default(''),
   // Lower values win deterministic routing when one logical message is delivered to
@@ -22,13 +108,19 @@ export const CreateEmailQueueSchema = z.object({
 // input too, so internal callers/older seeds remain backward-compatible during rollout.
 export type CreateEmailQueueDto = Omit<
   z.infer<typeof CreateEmailQueueSchema>,
-  'routingPriority' | 'sendAutoresponder'
+  'routingPriority' | 'sendAutoresponder' | 'mailbox'
 > & {
   routingPriority?: number;
   sendAutoresponder?: boolean;
+  // Optional only for trusted legacy/internal callers. HTTP validation always materialises
+  // INBOX; the service defensively normalises this to keep old seeds compatible.
+  mailbox?: string;
 };
 
 export const UpdateEmailQueueSchema = CreateEmailQueueSchema.partial().extend({
+  // Do not let the create-time default silently turn a partial update into an INBOX
+  // identity change. Omitted means "leave the selected folder unchanged".
+  mailbox: ImapMailboxSchema.optional(),
   // Reject stale queue forms rather than letting a last write silently restore
   // an old address, department or autoresponder policy.
   expectedConfigGeneration: z.number().int().nonnegative(),
@@ -119,3 +211,31 @@ export const ReplayQuarantinedInboundSchema = z.object({
   expectedUpdatedAt: z.coerce.date(),
 });
 export type ReplayQuarantinedInboundDto = z.infer<typeof ReplayQuarantinedInboundSchema>;
+
+// ─────────────────── Captured inbound operator actions ───────────────────
+
+/**
+ * Capture-only mode durably stores inbound mail without allowing the drain to create or
+ * update tickets. These filters intentionally mirror quarantine observability and only
+ * address persisted metadata; neither raw MIME nor an opaque storage key is an API field.
+ */
+export const ListCapturedInboundSchema = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().positive().max(100).default(25),
+  queueId: z.coerce.number().int().positive().optional(),
+  reason: z.string().trim().min(1).max(300).optional(),
+  messageId: z.string().trim().min(1).max(512).optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+});
+export type ListCapturedInboundDto = z.infer<typeof ListCapturedInboundSchema>;
+
+/**
+ * Promotion is deliberately versioned and requires an auditable operator reason. A stale
+ * capture view must not promote a delivery that has since been changed by another operator.
+ */
+export const PromoteCapturedInboundSchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+  expectedUpdatedAt: z.coerce.date(),
+});
+export type PromoteCapturedInboundDto = z.infer<typeof PromoteCapturedInboundSchema>;

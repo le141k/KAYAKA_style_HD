@@ -24,15 +24,37 @@ export function normalizePipeDeliveryId(value: string | undefined): string {
   return normalized;
 }
 
-/** Header must be a positive, canonical integer id (never a float / exponent). */
-export function parsePipeQueueId(value: string | undefined): number {
+/**
+ * Non-throwing counterpart for the Express pre-parser guard. It lets the HTTP layer
+ * reject malformed authenticated headers before allocating a potentially large raw
+ * RFC822 body; the controller still calls the throwing form as defence in depth.
+ */
+export function tryNormalizePipeDeliveryId(value: string | undefined): string | null {
+  try {
+    return normalizePipeDeliveryId(value);
+  } catch {
+    return null;
+  }
+}
+
+/** Parse exactly the canonical positive-decimal header syntax used by PIPE. */
+export function tryParsePipeQueueId(value: string | undefined): number | null {
   const normalized = value?.trim() ?? '';
   if (!/^[1-9]\d*$/.test(normalized)) {
-    throw new BadRequestException('x-inbound-queue-id is required and must be a positive integer');
+    return null;
   }
   const parsed = Number(normalized);
   if (!Number.isSafeInteger(parsed)) {
-    throw new BadRequestException('x-inbound-queue-id is outside the supported range');
+    return null;
+  }
+  return parsed;
+}
+
+/** Header must be a positive, canonical integer id (never a float / exponent). */
+export function parsePipeQueueId(value: string | undefined): number {
+  const parsed = tryParsePipeQueueId(value);
+  if (parsed === null) {
+    throw new BadRequestException('x-inbound-queue-id is required and must be a positive integer');
   }
   return parsed;
 }

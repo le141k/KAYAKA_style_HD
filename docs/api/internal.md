@@ -350,19 +350,25 @@ Durable, idempotent, fail-closed inbound pipeline backed by the **`InboundDelive
 Both transports (IMAP poll, `POST /api/inbound/pipe`) record every message in the ledger under a
 UNIQUE `transportKey` before it is processed.
 
-- **Cutover master gate:** `TELECOM_HD_INBOUND_DELIVERY_ENABLED` defaults to `false`. While it is
-  false, the API does not start the IMAP supervisor or ledger drain, `pollNow()` is a no-op, and
-  PIPE returns retryable 503 before its body parser. Existing `ACCEPTED`/`RETRY` ledger rows and
-  all operator health/reconcile/quarantine/replay endpoints remain available; an attended
-  configuration-only restart with the gate true is required before any ticket can be created.
+- **Normal-delivery gate and capture-only exception:** `TELECOM_HD_INBOUND_DELIVERY_ENABLED`
+  defaults to `false`. When it and capture-only are both false, the API does not start the IMAP
+  supervisor or ledger drain, `pollNow()` is a no-op, and PIPE returns retryable 503 before its
+  body parser. Existing `ACCEPTED`/`RETRY` ledger rows and all operator
+  health/reconcile/quarantine/replay endpoints remain available. An attended, explicitly scoped
+  capture-only restart is the narrow exception: only the configured **TLS-enabled IMAP** queue may
+  accept mail, it writes one terminal `CAPTURED` record, **every PIPE request remains 503 before
+  parsing**, and neither the drain nor ticket/post/attachment,
+  auto-responder, or outbox work runs. It is not a normal-delivery shortcut.
 
-- **Public:** `ingestRawMessage(source, departmentId?, externalId?, queueId?)` — PIPE ingress:
-  records a ledger delivery (idempotent by `externalId` or content hash) and processes it inline.
+- **Public:** `ingestRawMessage(source, departmentId?, externalId?, queueId?)` — normal-mode PIPE ingress:
+  records a ledger delivery idempotently by the trusted, required `externalId` (never by content
+  hash alone) and normally processes it
+  inline. It is rejected during capture-only mode; capture is IMAP-folder-only.
   An optional `queueId` (from the `x-inbound-queue-id` header) binds the delivery to an
   `EmailQueue` — the queue's department routes the message and the delivery records the queue
   (unknown id → 400); the `transportKey` is scoped by the bound queue (`pipe:<queueId|->:…`).
   `pollNow()` — run one accept+drain cycle now (ops / live-IMAP verification).
-- **Accept phase (IMAP, per queue):** discovers new UIDs uid-only, then `fetchOne`s each
+- **Accept phase (IMAP, per queue and explicit selected mailbox/folder):** discovers new UIDs uid-only, then `fetchOne`s each
   (source capped at `TELECOM_HD_INBOUND_MAX_SIZE_MB`) and accepts it in a short DB transaction
   whose row lock rechecks `isEnabled`, type, `syncState`, `mailboxEpoch`, `cursorGeneration`, and
   UIDVALIDITY. The transport key is `imap:<queueId>:<mailboxEpoch>:<uidValidity>:<uid>`; a stale
@@ -384,7 +390,7 @@ UNIQUE `transportKey` before it is processed.
   queue to `BOOTSTRAPPING`, captures UIDVALIDITY plus exact `UIDNEXT - 1` under the mailbox lock,
   and writes the baseline in a second epoch/generation CAS before returning success. BACKFILL
   enumerates actual existing UIDs under that same lock; it never uses `boundary - N`.
-- **Drain phase (only while the master gate is enabled):** a `setInterval` (30 s, plus one
+- **Drain phase (only while normal inbound delivery is enabled):** a `setInterval` (30 s, plus one
   **startup drain** for crash recovery) processes
   `ACCEPTED`/`RETRY` deliveries in id order; claims each with a **lease** (CAS: `ACCEPTED`, a
   `RETRY` whose `nextAttemptAt` is due, or a `PROCESSING` whose `leaseExpiresAt` passed →
@@ -443,7 +449,8 @@ state = PROCESSING`): a **0-row settle** means the lease was lost mid-processing
   retention prune** (`pruneRawMime`, `setInterval` hourly + once at startup, unref'd) nulls the
   inline `rawMime` (setting `rawPrunedAt`) of terminal `PROCESSED`/`SKIPPED` deliveries older than
   `TELECOM_HD_INBOUND_RAW_RETENTION_DAYS` (default 30; 0 disables), keeping metadata + `contentHash`;
-  `QUARANTINED` rows are never pruned (raw MIME is needed to replay).
+  `QUARANTINED` and `CAPTURED` rows are never pruned (raw MIME is needed to replay/review). During
+  capture-only mode the global raw-MIME retention/reaper timers do not start at all.
 - TODO: IMAP IDLE push.
 
 ### Current inbound contract
@@ -451,18 +458,49 @@ state = PROCESSING`): a **0-row settle** means the lease was lost mid-processing
 - IMAP acceptance is a transaction fenced by enabled IMAP queue, `mailboxEpoch`,
   `cursorGeneration`, `syncState=OK` and `uidValidity`. Transport key is
   `imap:<queue>:<epoch>:<uidValidity>:<uid>`; stale pollers cannot insert after an identity or
-  reconcile boundary. Cursor safe frontier uses the same fixed snapshot.
+  reconcile boundary. The queue's explicit `mailbox` folder is part of the IMAP connection/lock
+  identity; do not use a shared Inbox for a test queue. Cursor safe frontier uses the same fixed
+  snapshot.
 - Reconcile is server-side cause/mode gated and returns `allowedModes`. `FROM_NOW` and BACKFILL
   obtain UIDNEXT/UIDVALIDITY under mailbox lock and persist their baseline before HTTP success.
 - PIPE requires secret, enabled PIPE queue id and normalized delivery id. The factory middleware
-  validates secret before a bounded raw parser; transport key stores SHA-256(delivery id), and the
-  trusted queue address is snapshotted as `envelopeTo`.
+  validates the secret **and required canonical headers** before a bounded raw parser; transport key
+  stores SHA-256(delivery id), and the trusted queue address is snapshotted as `envelopeTo`. In
+  capture-only mode it rejects **all** PIPE requests before MIME bytes are buffered.
+- Capture-only is an attended, selected-**IMAP**-queue hold: acceptance writes one terminal `CAPTURED` with
+  private raw MIME, no drain is scheduled, and no ticket/post/attachment/autoresponder/outbox
+  action is allowed. Its IMAP target requires implicit TLS, is live-checked via `LIST` (not
+  special-use/non-select), and must be empty under a mailbox lock after each capture-only
+  connection; health stays not-ready
+  until that proof succeeds. Captured list/detail are `mail.view` metadata/audit views; promotion
+  requires both `mail.view` and the separate `mail.capture.promote`, a reason and a row-version CAS, and is refused
+  until capture-only is inactive. Before the IMAP client authenticates, the selected queue is
+  durably latched with `captureRetiredAt`; the accept/cursor/PIPE/drain/replay/reconcile fences all
+  distinguish that marker from normal ingress. After its first terminal capture evidence the queue
+  is disabled, and PostgreSQL prevents marker clearing, re-enabling a disabled marked queue, or
+  deleting it. The queue stays only as evidence for the one reviewed captured-delivery promotion;
+  every later capture attempt needs a new queue and new dedicated folder. Old workers must be
+  quiesced before this mode is armed because they do not understand the marker.
 - `InboundDelivery` records each transport copy. Real Message-ID logical identity is an atomic
   `InboundMessageClaim`; `observedMessageId`/semantic hash stay on every copy. Headerless IMAP
   messages use transport identity, never content hash alone.
 - Poll and drain are single-flight. Liveness distinguishes connection attempt/connect/disconnect,
   poll started/completed and accepted. Large raw MIME is stored privately under uploads using a
-  pending marker + fsync/rename + bounded DB-proven orphan reaper; user-visible storage errors are
+  queue-bound durable stage with `ACTIVE`/`COMMITTED`/`REAPING` state. The raw writer first fsyncs
+  deterministic private temp `inbound-raw/.staging/<UUID>.tmp` from the opaque storage key;
+  immediately before final atomic rename it locks `ACTIVE` in a short publish-fence transaction. If cleanup already committed `REAPING`, the writer aborts before
+  publish; if it wins, it renames and refreshes the `ACTIVE` lease while that row lock is held.
+  A rollback after publish retains its marker and destination file for durable stage/reaper recovery.
+  Acceptance then locks only `ACTIVE`, writes its ledger pointer and marks it `COMMITTED` in one DB
+  transaction; its post-commit finalizer commits the raw-storage marker and then deletes only a
+  `COMMITTED` stage. Failed/orphan cleanup first commits `ACTIVE → REAPING`, performs destructive
+  filesystem unlink outside the DB transaction, deleting both destination and deterministic temp,
+  then deletes the stage and marker. The DB-first
+  bounded reaper scans expired `ACTIVE` plus all `COMMITTED`/`REAPING` stages even without a marker;
+  referenced `COMMITTED` files are retained and `REAPING` can never be accepted. Capture arming
+  invokes that sweep, locks the same queue and refuses while a reservation remains, so a rollback
+  cannot strand normal raw bytes behind a capture-retired queue. Historical unowned stage rows remain
+  under normal cleanup; the migration never invents queue ownership. User-visible storage errors are
   sanitized.
 
 ---
@@ -515,17 +553,24 @@ polling the endpoint. Cleared in `onModuleDestroy`.
 
 ### Current queue/operator contract
 
-- Queue update atomically advances mailbox epoch for IMAP identity/transport transitions; it does
-  not rely on an in-memory epoch. Password-only changes do not invalidate the mailbox snapshot.
+- Queue update atomically advances mailbox epoch for IMAP identity/transport/folder transitions;
+  it does not rely on an in-memory epoch. Each IMAP queue has an explicit `mailbox` folder
+  selection, so a dedicated test folder is configured on the queue rather than through a global
+  environment variable. Password-only changes do not invalidate the mailbox snapshot.
 - Reconcile requires expected generation and a server-allowed mode. Request, terminal completion or
   failure audit entries are written with their conditional state transitions; a CAS loser is 409 and
   produces no false audit.
 - `listQuarantined(query)` returns server pagination/filter metadata only. Detail returns audit and
   `replayAllowed`/block reason, never raw bytes or `rawStorageKey`. Replay requires reason + row
   version and writes state/audit in one transaction.
+- `listCaptured(query)` / `getCaptured(id)` have the same metadata-only, department-scoped
+  `mail.view` boundary. `promoteCaptured(id, dto)` requires `mail.view` + `mail.capture.promote`; it writes the
+  `CAPTURED → ACCEPTED` transition and audit in one transaction, and refuses while capture-only is
+  active so an operator cannot accidentally turn a test hold into ticket processing.
 - `health()` includes quarantine bytes, raw-storage reserve and collision alerts as well as queue
-  liveness. All mail operator routes use `mail.view`, `mail.replay`, `mail.reconcile` or
-  `mail.configure`; backend guard is authoritative.
+  liveness. Every mutating mail operator route requires `mail.view` **plus** its specific
+  `mail.replay`, `mail.capture.promote`, `mail.reconcile` or `mail.configure` capability; backend
+  guard is authoritative.
 
 ## InboundAuditService (`apps/api/src/modules/mail/inbound-audit.service.ts`)
 
@@ -698,9 +743,11 @@ Each feature module that needs a queue calls `BullModule.registerQueue({ name })
 | `mail`     | per-message send job      | `MailService`            | `MailProcessor`      | Durable outbox wake-up; PostgreSQL scan/recovery remains authoritative for SMTP delivery                                        |
 
 Inbound mail is NOT on a BullMQ queue — it runs on in-process `setInterval` timers:
-`InboundMailService` polls IMAP (60 s) and drains the ledger (30 s, + a startup drain for crash
-recovery) and prunes raw MIME (hourly, + at startup); `EmailQueueService` emits inbound health
-alerts (5 min). IMAP IDLE push is a future TODO.
+With normal inbound delivery enabled, `InboundMailService` polls IMAP (60 s) and drains the ledger
+(30 s, + a startup drain for crash recovery). In the attended capture-only mode, only the selected
+TLS-enabled IMAP queue may poll/accept one `CAPTURED` delivery; the drain and global raw-MIME
+retention/reaper timers remain off. `EmailQueueService` emits inbound health alerts (5 min). IMAP IDLE push is
+a future TODO.
 
 ---
 

@@ -6,11 +6,19 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { EmailQueueService } from './email-queue.service';
-import { ReconcileEmailQueueSchema, ReplayQuarantinedInboundSchema, UpdateEmailQueueSchema } from './dto';
+import {
+  CreateEmailQueueSchema,
+  PromoteCapturedInboundSchema,
+  ReconcileEmailQueueSchema,
+  ReplayQuarantinedInboundSchema,
+  UpdateEmailQueueSchema,
+} from './dto';
 import type { PrismaService } from '../../prisma/prisma.service';
 import { MailAccessPolicy } from './mail-access-policy.service';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+const TEST_FIELD_ENCRYPTION_KEY = 'a'.repeat(64);
 
 /** Build the Prisma-shaped record that the service would return (no passwordEnc). */
 function makeSafeQueue(overrides: Partial<SafeQueue> = {}): SafeQueue {
@@ -22,6 +30,7 @@ function makeSafeQueue(overrides: Partial<SafeQueue> = {}): SafeQueue {
     port: 993,
     username: 'support',
     useTls: true,
+    mailbox: 'INBOX',
     departmentId: null,
     signature: '',
     routingPriority: 100,
@@ -39,6 +48,7 @@ function makeSafeQueue(overrides: Partial<SafeQueue> = {}): SafeQueue {
     reconcileRequestedAt: null,
     bootstrapPolicy: null,
     bootstrapBackfillLimit: null,
+    captureRetiredAt: null,
     lastConnectedAt: null,
     lastConnectionAttemptAt: null,
     lastDisconnectedAt: null,
@@ -59,6 +69,7 @@ type SafeQueue = {
   port: number;
   username: string;
   useTls: boolean;
+  mailbox: string;
   departmentId: number | null;
   signature: string;
   routingPriority: number;
@@ -83,6 +94,7 @@ type SafeQueue = {
   reconcileRequestedAt: Date | null;
   bootstrapPolicy: 'FROM_NOW' | 'BACKFILL' | null;
   bootstrapBackfillLimit: number | null;
+  captureRetiredAt: Date | null;
   lastConnectedAt: Date | null;
   lastConnectionAttemptAt: Date | null;
   lastDisconnectedAt: Date | null;
@@ -135,6 +147,7 @@ function makePrismaMock() {
       findMany: vi.fn().mockResolvedValue([]),
       count: vi.fn().mockResolvedValue(0),
     },
+    $queryRaw: vi.fn().mockResolvedValue([{ id: 1, captureRetiredAt: null }]),
   } as unknown as Record<string, unknown>;
   const inboundDelivery = prisma.inboundDelivery as {
     findUnique: ReturnType<typeof vi.fn>;
@@ -161,6 +174,10 @@ function makeCursorBefore(overrides: Record<string, unknown> = {}) {
     reconcileCause: 'LEGACY_MIGRATION',
     cursorGeneration: 0,
     mailboxEpoch: 1,
+    configGeneration: 0,
+    mailbox: 'INBOX',
+    useTls: true,
+    captureRetiredAt: null,
     ...overrides,
   };
 }
@@ -170,7 +187,10 @@ function makeCursorBefore(overrides: Record<string, unknown> = {}) {
 describe('EmailQueueService', () => {
   let service: EmailQueueService;
   let prisma: ReturnType<typeof makePrismaMock>;
-  let baselineProbe: { captureReconcileBaseline: ReturnType<typeof vi.fn> };
+  let baselineProbe: {
+    captureReconcileBaseline: ReturnType<typeof vi.fn>;
+    isCaptureQueueReady: ReturnType<typeof vi.fn>;
+  };
 
   beforeEach(() => {
     prisma = makePrismaMock();
@@ -181,12 +201,13 @@ describe('EmailQueueService', () => {
         cursor: 100,
         selectedUids: [],
       }),
+      isCaptureQueueReady: vi.fn().mockReturnValue(true),
     };
     service = new EmailQueueService(
       prisma as unknown as PrismaService,
       undefined,
       baselineProbe as unknown as import('./inbound.service').InboundMailService,
-      undefined,
+      { TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY } as never,
       undefined,
       new MailAccessPolicy(prisma as unknown as PrismaService),
     );
@@ -272,15 +293,42 @@ describe('EmailQueueService', () => {
       expect(result).not.toHaveProperty('passwordEnc');
       expect(result).not.toHaveProperty('password');
 
-      // Prisma was called with passwordEnc (may be encrypted or plain depending on env), not password
+      // A non-empty credential must be encrypted at rest; the service must never use
+      // the legacy development plaintext fallback for an operator-entered password.
       const createCall = (prisma.emailQueue.create as ReturnType<typeof vi.fn>).mock.calls[0] as [
         { data: Record<string, unknown>; select: Record<string, boolean> },
       ];
-      // passwordEnc must be set (either plain or encrypted)
       expect(createCall[0].data).toHaveProperty('passwordEnc');
-      expect(typeof createCall[0].data['passwordEnc']).toBe('string');
+      expect(createCall[0].data['passwordEnc']).toMatch(/^v1:/);
       expect(createCall[0].data).not.toHaveProperty('password');
       expect(createCall[0].select).not.toHaveProperty('passwordEnc');
+      expect(createCall[0].data.mailbox).toBe('INBOX');
+    });
+
+    it('refuses a non-empty queue password when field encryption is unavailable before Prisma writes', async () => {
+      const unsafe = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        undefined,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+
+      await expect(
+        unsafe.create({
+          type: 'IMAP',
+          emailAddress: 'secret@example.com',
+          host: 'imap.example.com',
+          port: 993,
+          username: 'user',
+          password: 'fresh-app-password',
+          useTls: true,
+          signature: '',
+          isEnabled: false,
+        }),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(prisma.emailQueue.create).not.toHaveBeenCalled();
     });
 
     it('stores empty passwordEnc when no password supplied', async () => {
@@ -324,6 +372,31 @@ describe('EmailQueueService', () => {
       ];
       expect(createCall[0].data.routingPriority).toBe(100);
     });
+
+    it('validates and normalizes an IMAP folder while defaulting legacy callers to INBOX', () => {
+      expect(CreateEmailQueueSchema.parse({ emailAddress: 'folder@example.com' }).mailbox).toBe('INBOX');
+      expect(
+        CreateEmailQueueSchema.parse({ emailAddress: 'folder@example.com', mailbox: '  Helpdesk/Test  ' })
+          .mailbox,
+      ).toBe('Helpdesk/Test');
+      expect(
+        CreateEmailQueueSchema.safeParse({ emailAddress: 'folder@example.com', mailbox: '   ' }).success,
+      ).toBe(false);
+      expect(
+        CreateEmailQueueSchema.safeParse({
+          emailAddress: 'folder@example.com',
+          mailbox: `A${'x'.repeat(255)}`,
+        }).success,
+      ).toBe(false);
+      expect(
+        CreateEmailQueueSchema.safeParse({ emailAddress: 'folder@example.com', mailbox: 'INBOX\nother' })
+          .success,
+      ).toBe(false);
+      expect(UpdateEmailQueueSchema.parse({ expectedConfigGeneration: 0 }).mailbox).toBeUndefined();
+      expect(UpdateEmailQueueSchema.safeParse({ expectedConfigGeneration: 0, mailbox: '   ' }).success).toBe(
+        false,
+      );
+    });
   });
 
   // ── update ────────────────────────────────────────────────────────────────
@@ -345,9 +418,8 @@ describe('EmailQueueService', () => {
       const updateCall = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls[0] as [
         { where: Record<string, unknown>; data: Record<string, unknown> },
       ];
-      // passwordEnc must be set (either plain or encrypted)
       expect(updateCall[0].data).toHaveProperty('passwordEnc');
-      expect(typeof updateCall[0].data['passwordEnc']).toBe('string');
+      expect(updateCall[0].data['passwordEnc']).toMatch(/^v1:/);
       expect(updateCall[0].data).not.toHaveProperty('password');
       expect(updateCall[0].where).toMatchObject({
         AND: expect.arrayContaining([expect.objectContaining({ configGeneration: 0 })]),
@@ -366,6 +438,23 @@ describe('EmailQueueService', () => {
       ];
       expect(updateCall[0].data).not.toHaveProperty('passwordEnc');
       expect(updateCall[0].data).not.toHaveProperty('password');
+    });
+
+    it('refuses a password update when field encryption is unavailable before the CAS write', async () => {
+      const unsafe = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        undefined,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeSafeQueue({ id: 3 }));
+
+      await expect(
+        unsafe.update(3, { password: 'fresh-app-password', expectedConfigGeneration: 0 }),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
     });
 
     it('refuses an edit while the queue owns a synchronous IMAP reconcile baseline', async () => {
@@ -406,6 +495,66 @@ describe('EmailQueueService', () => {
         mailboxEpoch: { increment: 1 },
         reconcileCause: 'MAILBOX_IDENTITY_CHANGED',
       });
+    });
+
+    it('identity guard: changing the IMAP folder bumps epoch/generation and requires reconcile', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSafeQueue({ id: 3, mailbox: 'INBOX', uidValidity: 42n }),
+      );
+
+      await service.update(3, { mailbox: 'Helpdesk/Test', expectedConfigGeneration: 0 });
+
+      const call = (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mock.calls[0] as [
+        { data: Record<string, unknown> },
+      ];
+      expect(call[0].data).toMatchObject({
+        mailbox: 'Helpdesk/Test',
+        uidValidity: null,
+        lastSeenUid: 0n,
+        syncState: 'NEEDS_RECONCILIATION',
+        reconcileCause: 'MAILBOX_IDENTITY_CHANGED',
+        cursorGeneration: { increment: 1 },
+        mailboxEpoch: { increment: 1 },
+      });
+    });
+
+    it('refuses changing the active capture queue back to shared INBOX', async () => {
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 3,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSafeQueue({ id: 3, mailbox: 'Helpdesk/Test' }),
+      );
+
+      await expect(
+        capture.update(3, { mailbox: 'INBOX', expectedConfigGeneration: 0 }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('permanently refuses normal-ingress reconfiguration of a capture-retired queue before any write', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSafeQueue({
+          id: 3,
+          mailbox: 'Helpdesk/Capture-2026-07-23',
+          captureRetiredAt: new Date('2026-07-23T11:00:00.000Z'),
+        }),
+      );
+
+      await expect(
+        service.update(3, { signature: 'normal ingress must use a new queue', expectedConfigGeneration: 0 }),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
     });
 
     it('identity guard: a password-only change never resets the cursor', async () => {
@@ -454,6 +603,39 @@ describe('EmailQueueService', () => {
       expect(calls[0]?.[0]).toMatchObject({
         where: { AND: expect.arrayContaining([expect.objectContaining({ configGeneration: 0 })]) },
       });
+    });
+
+    it('P1: refuses an update that was read before reconcile entered BOOTSTRAPPING', async () => {
+      const beforeReconcile = makeSafeQueue({
+        id: 3,
+        syncState: 'NEEDS_RECONCILIATION',
+        configGeneration: 7,
+        cursorGeneration: 4,
+        mailboxEpoch: 2,
+      });
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(beforeReconcile);
+      (prisma.emailQueue.updateMany as ReturnType<typeof vi.fn>).mockImplementation(
+        ({ where }: { where: { AND?: Array<Record<string, unknown>> } }) => {
+          const fence = where.AND ?? [];
+          const hasEveryPreReconcileSnapshotField = [
+            { configGeneration: 7 },
+            { syncState: 'NEEDS_RECONCILIATION' },
+            { cursorGeneration: 4 },
+            { mailboxEpoch: 2 },
+          ].every((expected) =>
+            fence.some((candidate) =>
+              Object.entries(expected).every(([key, value]) => candidate[key] === value),
+            ),
+          );
+          // Simulate beginMailboxReconcile() winning after the form read. If any fence is
+          // removed, this mock returns a false success and the expectation below turns red.
+          return Promise.resolve({ count: hasEveryPreReconcileSnapshotField ? 0 : 1 });
+        },
+      );
+
+      await expect(
+        service.update(3, { signature: 'stale form', expectedConfigGeneration: 7 }),
+      ).rejects.toBeInstanceOf(ConflictException);
     });
 
     it('IMAP → PIPE → IMAP transitions consume epochs and never resurrect the old cursor', async () => {
@@ -539,6 +721,21 @@ describe('EmailQueueService', () => {
       );
       expect(prisma.emailQueue.deleteMany).not.toHaveBeenCalled();
     });
+
+    it('permanently refuses deleting a capture-retired queue before the delete CAS', async () => {
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSafeQueue({
+          captureRetiredAt: new Date('2026-07-23T11:00:00.000Z'),
+          mailbox: 'Helpdesk/Capture-2026-07-23',
+        }),
+      );
+
+      await expect(service.delete(1, { expectedConfigGeneration: 0 })).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+
+      expect(prisma.emailQueue.deleteMany).not.toHaveBeenCalled();
+    });
   });
 
   // ── #7 reconcile / quarantine ─────────────────────────────────────────────
@@ -576,7 +773,7 @@ describe('EmailQueueService', () => {
       const result = await service.reconcile(1, fromNow, { staffId: 42, email: 'ops@example.com' });
 
       expect(baselineProbe.captureReconcileBaseline).toHaveBeenCalledWith(
-        expect.objectContaining({ id: 1, mailboxEpoch: 1, cursorGeneration: 1 }),
+        expect.objectContaining({ id: 1, mailbox: 'INBOX', mailboxEpoch: 1, cursorGeneration: 1 }),
         'FROM_NOW',
         0,
       );
@@ -585,6 +782,7 @@ describe('EmailQueueService', () => {
         where: expect.objectContaining({
           cursorGeneration: 0,
           mailboxEpoch: 1,
+          mailbox: 'INBOX',
           syncState: 'NEEDS_RECONCILIATION',
         }),
         data: expect.objectContaining({ syncState: 'BOOTSTRAPPING', cursorGeneration: { increment: 1 } }),
@@ -711,6 +909,79 @@ describe('EmailQueueService', () => {
       await expect(service.reconcile(404, fromNow)).rejects.toBeInstanceOf(NotFoundException);
     });
 
+    it('capture-only cannot reconcile a different queue or open its mailbox boundary', async () => {
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeCursorBefore({ id: 2, mailbox: 'Shared/Operations' }),
+      );
+
+      await expect(capture.reconcile(2, fromNow, { staffId: 42 })).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+      expect(baselineProbe.captureReconcileBaseline).not.toHaveBeenCalled();
+    });
+
+    it('capture-only rejects a selected shared INBOX before BOOTSTRAPPING or IMAP access', async () => {
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeCursorBefore({ id: 1, mailbox: 'INBOX' }),
+      );
+
+      await expect(capture.reconcile(1, fromNow, { staffId: 42 })).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+      expect(baselineProbe.captureReconcileBaseline).not.toHaveBeenCalled();
+    });
+
+    it('capture-only rejects Gmail All Mail and any historical BACKFILL before BOOTSTRAPPING or IMAP access', async () => {
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(makeCursorBefore({ id: 1, mailbox: '[Gmail]/All Mail' }))
+        .mockResolvedValueOnce(makeCursorBefore({ id: 1, mailbox: 'Helpdesk/Test' }));
+
+      await expect(capture.reconcile(1, fromNow, { staffId: 42 })).rejects.toBeInstanceOf(ConflictException);
+      await expect(
+        capture.reconcile(
+          1,
+          { mode: 'BACKFILL', expectedCursorGeneration: 0, backfillLimit: 1 },
+          { staffId: 42 },
+        ),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.emailQueue.updateMany).not.toHaveBeenCalled();
+      expect(baselineProbe.captureReconcileBaseline).not.toHaveBeenCalled();
+    });
+
     it('returns allowed modes from server state rather than asking the UI to infer cause', async () => {
       (prisma.emailQueue.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSafeQueue({ syncState: 'NEEDS_RECONCILIATION', reconcileCause: 'MAILBOX_IDENTITY_CHANGED' }),
@@ -766,7 +1037,7 @@ describe('EmailQueueService', () => {
       ]);
     });
 
-    it('returns detail/audit metadata but never a raw storage key', async () => {
+    it('returns a safe audit timeline without opaque audit JSON or a raw storage key', async () => {
       (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 92,
         state: 'QUARANTINED',
@@ -784,16 +1055,31 @@ describe('EmailQueueService', () => {
         createdAt: new Date(),
         updatedAt: new Date(),
       });
-      (prisma.inboundAuditLog.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.inboundAuditLog.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: 1,
+          actorStaffId: null,
+          actorEmail: 'system',
+          action: 'mail.quarantined',
+          reason: 'bad MIME',
+          metadata: { rawStorageKey: 'inbound-raw/secret.eml' },
+          createdAt: new Date(),
+        },
+      ]);
 
       const out = await service.getQuarantined(92);
 
       expect(out.delivery).toMatchObject({ id: 92, replayAllowed: true, replayBlockReason: null });
       expect(out.delivery).not.toHaveProperty('rawStorageKey');
+      expect(out.audit[0]).not.toHaveProperty('metadata');
       const args = (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
         select: Record<string, boolean>;
       };
       expect(args.select).not.toHaveProperty('rawStorageKey');
+      const auditArgs = (prisma.inboundAuditLog.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        select: Record<string, boolean>;
+      };
+      expect(auditArgs.select).not.toHaveProperty('metadata');
     });
   });
 
@@ -814,7 +1100,12 @@ describe('EmailQueueService', () => {
       await expect(service.replayQuarantined(9, replayDto, actor)).resolves.toEqual({ replayed: true });
       expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 9, state: 'QUARANTINED', updatedAt: replayDto.expectedUpdatedAt },
+          where: {
+            AND: expect.arrayContaining([
+              { id: 9, state: 'QUARANTINED', updatedAt: replayDto.expectedUpdatedAt },
+              { NOT: { queue: { is: { captureRetiredAt: { not: null } } } } },
+            ]),
+          },
           data: expect.objectContaining({ state: 'ACCEPTED', attempts: 0 }),
         }),
       );
@@ -828,6 +1119,50 @@ describe('EmailQueueService', () => {
           }),
         }),
       );
+    });
+
+    it('capture-only refuses quarantine replay before it reads, requeues, or audits any legacy delivery', async () => {
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+
+      await expect(capture.replayQuarantined(9, replayDto, actor)).rejects.toBeInstanceOf(ConflictException);
+
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.inboundAuditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('refuses replay from a capture-retired queue even when an in-memory caller would otherwise accept the CAS', async () => {
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        state: 'QUARANTINED',
+        queueId: 3,
+        truncated: false,
+        updatedAt: replayDto.expectedUpdatedAt,
+      });
+      // The queue-row lock is the authoritative lifecycle fence. This deliberately makes the
+      // mocked transition look successful: removing the lock would turn this test false-green.
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 3, captureRetiredAt: new Date('2026-07-23T11:00:00.000Z') },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+      await expect(service.replayQuarantined(9, replayDto, actor)).rejects.toBeInstanceOf(ConflictException);
+
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.inboundAuditLog.create).not.toHaveBeenCalled();
     });
 
     it('throws NotFoundException when the delivery is not quarantined', async () => {
@@ -860,7 +1195,567 @@ describe('EmailQueueService', () => {
     });
   });
 
+  describe('captured inbound operator API', () => {
+    const expectedUpdatedAt = new Date('2026-07-23T12:00:00.000Z');
+    const promoteDto = {
+      reason: 'Capture-only verification passed; release to the normal inbound drain',
+      expectedUpdatedAt,
+    };
+    const actor = { staffId: 7, email: 'ops@example.test', isAdmin: true };
+
+    const captureReadyService = () =>
+      new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_IMAP_ENABLED: false,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: false,
+          TELECOM_HD_INBOUND_MAX_SIZE_MB: 35,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 3,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 95,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+
+    it('lists captured metadata without raw MIME or opaque storage keys', async () => {
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: 93,
+          transport: 'IMAP',
+          queueId: 2,
+          messageId: '<capture@example.test>',
+          observedMessageId: '<capture@example.test>',
+          envelopeFrom: 'sender@example.test',
+          envelopeTo: 'noc@example.test',
+          subject: 'Captured test',
+          sizeBytes: 2048,
+          attempts: 0,
+          lastError: null,
+          truncated: false,
+          rawMime: Buffer.from('secret mime'),
+          rawStorageKey: 'inbound-raw/secret.eml',
+          createdAt: expectedUpdatedAt,
+          updatedAt: expectedUpdatedAt,
+        },
+      ]);
+      (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+
+      const out = await service.listCaptured({ page: 1, limit: 25 });
+
+      expect(out.items[0]).toMatchObject({ id: 93, promoteAllowed: true, promoteBlockReason: null });
+      expect(out.items[0]).not.toHaveProperty('rawMime');
+      expect(out.items[0]).not.toHaveProperty('rawStorageKey');
+      const args = (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        where: { state: string };
+        select: Record<string, boolean>;
+      };
+      expect(args.where.state).toBe('CAPTURED');
+      expect(args.select).not.toHaveProperty('rawMime');
+      expect(args.select).not.toHaveProperty('rawStorageKey');
+    });
+
+    it('scopes captured listings to the operator department exactly like quarantine', async () => {
+      (prisma.departmentStaff.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ departmentId: 41 }]);
+      (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.inboundDelivery.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+
+      await service.listCaptured({ page: 1, limit: 25 }, { staffId: 8, isAdmin: false });
+
+      const args = (prisma.inboundDelivery.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        where: { AND: Array<{ state?: string } | { OR?: unknown[] }> };
+      };
+      expect(args.where.AND).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ state: 'CAPTURED' }),
+          expect.objectContaining({
+            OR: expect.arrayContaining([
+              expect.objectContaining({
+                effectiveOwnerKind: { in: ['RECEIVING', 'ROUTED'] },
+                effectiveOwnerDepartmentId: { in: [41] },
+              }),
+              expect.objectContaining({
+                effectiveOwnerKind: 'TICKET',
+                effectiveOwnerTicket: { is: { departmentId: { in: [41] } } },
+              }),
+            ]),
+          }),
+        ]),
+      );
+    });
+
+    it('returns captured detail/audit metadata without raw MIME, storage keys, or audit JSON', async () => {
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 94,
+        state: 'CAPTURED',
+        transport: 'PIPE',
+        queueId: 3,
+        messageId: null,
+        observedMessageId: null,
+        envelopeFrom: null,
+        envelopeTo: 'noc@example.test',
+        subject: 'Capture',
+        sizeBytes: 1024,
+        attempts: 0,
+        lastError: null,
+        truncated: false,
+        rawMime: Buffer.from('secret mime'),
+        rawStorageKey: 'inbound-raw/secret.eml',
+        createdAt: expectedUpdatedAt,
+        updatedAt: expectedUpdatedAt,
+      });
+      (prisma.inboundAuditLog.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: 12,
+          action: 'mail.captured',
+          reason: 'Capture-only enabled',
+          metadata: { rawStorageKey: 'inbound-raw/secret.eml' },
+          createdAt: expectedUpdatedAt,
+        },
+      ]);
+
+      const out = await service.getCaptured(94);
+
+      expect(out.delivery).toMatchObject({ id: 94, promoteAllowed: true, promoteBlockReason: null });
+      expect(out.delivery).not.toHaveProperty('rawMime');
+      expect(out.delivery).not.toHaveProperty('rawStorageKey');
+      expect(out.audit[0]).not.toHaveProperty('metadata');
+      const args = (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        select: Record<string, boolean>;
+      };
+      expect(args.select).not.toHaveProperty('rawMime');
+      expect(args.select).not.toHaveProperty('rawStorageKey');
+    });
+
+    it('atomically promotes CAPTURED -> ACCEPTED with a durable reason audit', async () => {
+      const ops = captureReadyService();
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        state: 'CAPTURED',
+        queueId: 3,
+        truncated: false,
+        updatedAt: expectedUpdatedAt,
+      });
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 3, captureRetiredAt: new Date('2026-07-23T11:00:00.000Z') },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+      await expect(ops.promoteCaptured(95, promoteDto, actor)).resolves.toEqual({ promoted: true });
+
+      expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function));
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            AND: expect.arrayContaining([
+              {
+                id: 95,
+                queueId: 3,
+                state: 'CAPTURED',
+                updatedAt: expectedUpdatedAt,
+              },
+              { queue: { is: { captureRetiredAt: { not: null } } } },
+            ]),
+          },
+          data: expect.objectContaining({
+            state: 'ACCEPTED',
+            capturePromotedAt: expect.any(Date),
+            attempts: 0,
+            lastError: null,
+            nextAttemptAt: null,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+          }),
+        }),
+      );
+      expect(prisma.inboundAuditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: 'mail.capture_promoted',
+            deliveryId: 95,
+            reason: promoteDto.reason,
+            actorStaffId: 7,
+            metadata: { expectedUpdatedAt: expectedUpdatedAt.toISOString() },
+          }),
+        }),
+      );
+    });
+
+    it('normal inbound canary refuses a different captured delivery before any state or audit write', async () => {
+      const scoped = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: false,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 3,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 96,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+
+      await expect(scoped.promoteCaptured(95, promoteDto, actor)).rejects.toBeInstanceOf(ConflictException);
+
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.inboundAuditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('normal inbound canary accepts only its selected delivery in its selected queue', async () => {
+      const scoped = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: false,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 3,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 95,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        state: 'CAPTURED',
+        queueId: 3,
+        truncated: false,
+        updatedAt: expectedUpdatedAt,
+      });
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 3, captureRetiredAt: new Date('2026-07-23T11:00:00.000Z') },
+      ]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+      await expect(scoped.promoteCaptured(95, promoteDto, actor)).resolves.toEqual({ promoted: true });
+
+      expect(prisma.inboundDelivery.updateMany).toHaveBeenCalledTimes(1);
+      expect(prisma.inboundAuditLog.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses promotion unless the selected delivery is locked to a capture-retired queue', async () => {
+      const ops = captureReadyService();
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        state: 'CAPTURED',
+        queueId: 3,
+        truncated: false,
+        updatedAt: expectedUpdatedAt,
+      });
+      // Do not make updateMany enforce the predicate itself: the queue-row lock must reject
+      // this stale/non-capture queue before any durable state transition can happen.
+      (prisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: 3, captureRetiredAt: null }]);
+      (prisma.inboundDelivery.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+      await expect(ops.promoteCaptured(95, promoteDto, actor)).rejects.toBeInstanceOf(ConflictException);
+
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.inboundAuditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('normal inbound canary rejects its selected delivery if it belongs to another queue', async () => {
+      const scoped = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: false,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 3,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 95,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        state: 'CAPTURED',
+        queueId: 4,
+        truncated: false,
+        updatedAt: expectedUpdatedAt,
+      });
+
+      await expect(scoped.promoteCaptured(95, promoteDto, actor)).rejects.toBeInstanceOf(ConflictException);
+
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.inboundAuditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('requires normal delivery enabled and capture-only disabled before any promotion write', async () => {
+      for (const config of [
+        {
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: false,
+        },
+        {
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+        },
+      ]) {
+        const blocked = new EmailQueueService(
+          prisma as unknown as PrismaService,
+          undefined,
+          undefined,
+          config as never,
+          undefined,
+          new MailAccessPolicy(prisma as unknown as PrismaService),
+        );
+        await expect(blocked.promoteCaptured(95, promoteDto, actor)).rejects.toBeInstanceOf(
+          ConflictException,
+        );
+      }
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.inboundAuditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a stale capture version with no false audit row', async () => {
+      const ops = captureReadyService();
+      (prisma.inboundDelivery.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        state: 'CAPTURED',
+        truncated: false,
+        updatedAt: new Date('2026-07-23T12:00:01.000Z'),
+      });
+
+      await expect(ops.promoteCaptured(95, promoteDto, actor)).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.inboundDelivery.updateMany).not.toHaveBeenCalled();
+      expect(prisma.inboundAuditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects invalid promotion DTOs without an operator reason or row version', () => {
+      expect(PromoteCapturedInboundSchema.safeParse({ expectedUpdatedAt }).success).toBe(false);
+      expect(PromoteCapturedInboundSchema.safeParse({ reason: promoteDto.reason }).success).toBe(false);
+    });
+  });
+
   describe('health', () => {
+    it('reports the selected capture scope/cap and warns if an IMAP capture queue still points at shared INBOX', async () => {
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_IMAP_ENABLED: true,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+          TELECOM_HD_INBOUND_MAX_SIZE_MB: 35,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeSafeQueue({ id: 1, mailbox: 'INBOX', isEnabled: false }),
+      ]);
+
+      const out = await capture.health(new Date('2026-07-23T12:00:00.000Z'));
+
+      expect(out).toMatchObject({
+        captureOnly: true,
+        normalInboundDeliveryEnabled: false,
+        captureQueueId: 1,
+        captureMaxMessages: 1,
+        captureTarget: { queueId: 1, ready: false },
+      });
+      expect(out.alerts).toEqual(
+        expect.arrayContaining([expect.objectContaining({ kind: 'capture_mailbox_unsafe' })]),
+      );
+    });
+
+    it('marks capture as not ready when its configured target is missing, disabled, or not a healthy baseline', async () => {
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_IMAP_ENABLED: true,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+          TELECOM_HD_INBOUND_MAX_SIZE_MB: 35,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      const findMany = prisma.emailQueue.findMany as ReturnType<typeof vi.fn>;
+
+      findMany.mockResolvedValueOnce([]);
+      const missing = await capture.health(new Date('2026-07-23T12:00:00.000Z'));
+      expect(missing.captureTarget).toMatchObject({ queueId: null, ready: false });
+      expect(missing.alerts).toEqual(
+        expect.arrayContaining([expect.objectContaining({ kind: 'capture_target_not_ready' })]),
+      );
+
+      findMany.mockResolvedValueOnce([makeSafeQueue({ id: 1, mailbox: 'Helpdesk/Test', isEnabled: false })]);
+      const disabled = await capture.health(new Date('2026-07-23T12:00:00.000Z'));
+      expect(disabled.captureTarget).toMatchObject({
+        queueId: 1,
+        ready: false,
+        reason: expect.stringMatching(/disabled/i),
+      });
+
+      findMany.mockResolvedValueOnce([
+        makeSafeQueue({
+          id: 1,
+          mailbox: 'Helpdesk/Test',
+          isEnabled: true,
+          syncState: 'BOOTSTRAPPING',
+          uidValidity: null,
+        }),
+      ]);
+      const baselinePending = await capture.health(new Date('2026-07-23T12:00:00.000Z'));
+      expect(baselinePending.captureTarget).toMatchObject({
+        queueId: 1,
+        ready: false,
+        reason: expect.stringMatching(/baseline/i),
+      });
+    });
+
+    it('marks capture not-ready when the selected credential-bearing IMAP queue is not TLS enabled', async () => {
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_IMAP_ENABLED: true,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+          TELECOM_HD_INBOUND_MAX_SIZE_MB: 35,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeSafeQueue({ id: 1, mailbox: 'Helpdesk/Test', isEnabled: true, uidValidity: 77n, useTls: false }),
+      ]);
+
+      const out = await capture.health(new Date('2026-07-23T12:00:00.000Z'));
+
+      expect(out.captureTarget).toMatchObject({
+        queueId: 1,
+        ready: false,
+        reason: expect.stringMatching(/TLS/i),
+      });
+      expect(out.alerts).toEqual(
+        expect.arrayContaining([expect.objectContaining({ kind: 'capture_target_not_ready' })]),
+      );
+    });
+
+    it('marks capture ready only after the enabled dedicated IMAP queue has a healthy UIDVALIDITY baseline and live runtime proof', async () => {
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_IMAP_ENABLED: true,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+          TELECOM_HD_INBOUND_MAX_SIZE_MB: 35,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeSafeQueue({
+          id: 1,
+          mailbox: 'Helpdesk/Test',
+          isEnabled: true,
+          uidValidity: 77n,
+          captureRetiredAt: new Date('2026-07-23T11:00:00.000Z'),
+        }),
+      ]);
+
+      const out = await capture.health(new Date('2026-07-23T12:00:00.000Z'));
+
+      expect(out.captureTarget).toEqual({ queueId: 1, ready: true, reason: null });
+      expect(out.alerts.some((alert) => alert.kind === 'capture_target_not_ready')).toBe(false);
+      expect(prisma.emailQueue.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ select: expect.objectContaining({ useTls: true }) }),
+      );
+    });
+
+    it('keeps a healthy-looking capture target not-ready until its durable retirement marker exists', async () => {
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_IMAP_ENABLED: true,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+          TELECOM_HD_INBOUND_MAX_SIZE_MB: 35,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeSafeQueue({ id: 1, mailbox: 'Helpdesk/Test', isEnabled: true, uidValidity: 77n }),
+      ]);
+
+      const out = await capture.health(new Date('2026-07-23T12:00:00.000Z'));
+
+      expect(out.captureTarget).toMatchObject({
+        queueId: 1,
+        ready: false,
+        reason: expect.stringMatching(/durably armed/i),
+      });
+      expect(out.alerts).toEqual(
+        expect.arrayContaining([expect.objectContaining({ kind: 'capture_target_not_ready' })]),
+      );
+    });
+
+    it('keeps capture not-ready until this process has verified the live dedicated folder', async () => {
+      (baselineProbe.isCaptureQueueReady as ReturnType<typeof vi.fn>).mockReturnValue(false);
+      const capture = new EmailQueueService(
+        prisma as unknown as PrismaService,
+        undefined,
+        baselineProbe as unknown as import('./inbound.service').InboundMailService,
+        {
+          TELECOM_HD_IMAP_ENABLED: true,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 1,
+          TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+          TELECOM_HD_INBOUND_MAX_SIZE_MB: 35,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: TEST_FIELD_ENCRYPTION_KEY,
+        } as never,
+        undefined,
+        new MailAccessPolicy(prisma as unknown as PrismaService),
+      );
+      (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeSafeQueue({
+          id: 1,
+          mailbox: 'Helpdesk/Test',
+          isEnabled: true,
+          uidValidity: 77n,
+          captureRetiredAt: new Date('2026-07-23T11:00:00.000Z'),
+        }),
+      ]);
+
+      const out = await capture.health(new Date('2026-07-23T12:00:00.000Z'));
+
+      expect(out.captureTarget).toMatchObject({
+        queueId: 1,
+        ready: false,
+        reason: expect.stringMatching(/not yet verified/i),
+      });
+      expect(out.alerts).toEqual(
+        expect.arrayContaining([expect.objectContaining({ kind: 'capture_target_not_ready' })]),
+      );
+    });
+
     it('reports backlog + byState and raises halt / quarantine / stalled alerts', async () => {
       (prisma.emailQueue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
         makeSafeQueue({ id: 1, isEnabled: true, syncState: 'NEEDS_RECONCILIATION' }),

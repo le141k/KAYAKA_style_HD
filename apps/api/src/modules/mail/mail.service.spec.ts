@@ -37,6 +37,7 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_SMTP_HOST: 'localhost',
   TELECOM_HD_SMTP_PORT: 1025,
   TELECOM_HD_SMTP_SECURE: false,
+  TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: true,
   TELECOM_HD_MAIL_FROM: 'support@test.example',
   TELECOM_HD_LOG_LEVEL: 'silent',
   TELECOM_HD_ALARIS_WEBHOOK_SECRET: 'test-secret',
@@ -61,6 +62,9 @@ const TEST_CONFIG: AppConfig = {
   TELECOM_HD_CLAMAV_TIMEOUT_MS: 15000,
   TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
   TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+  TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: false,
+  TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: undefined,
+  TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
   TELECOM_HD_IMAP_ENABLED: false,
   TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'FROM_NOW',
   TELECOM_HD_IMAP_BACKFILL_LIMIT: 0,
@@ -227,6 +231,49 @@ describe('MailService', () => {
           tls: expect.objectContaining({ minVersion: 'TLSv1.2', servername: 'smtp.acme.test' }),
         }),
       );
+    });
+
+    it('requires STARTTLS for an authenticated local submission relay too', () => {
+      new MailService(
+        {
+          ...TEST_CONFIG,
+          TELECOM_HD_SMTP_HOST: 'smtp.gmail.com',
+          TELECOM_HD_SMTP_PORT: 587,
+          TELECOM_HD_SMTP_SECURE: false,
+          TELECOM_HD_SMTP_USER: 'test@example.test',
+          TELECOM_HD_SMTP_PASSWORD: 'test-app-password',
+          // Delivery remains separately kill-switched; this asserts transport
+          // configuration only and never makes a network request.
+          TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: false,
+        },
+        prisma as unknown as PrismaService,
+      );
+
+      const createTransport = nodemailer.createTransport as unknown as ReturnType<typeof vi.fn>;
+      expect(createTransport).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          requireTLS: true,
+          auth: { user: 'test@example.test', pass: 'test-app-password' },
+        }),
+      );
+    });
+
+    it('keeps unauthenticated local MailHog usable without requiring STARTTLS', () => {
+      new MailService(
+        {
+          ...TEST_CONFIG,
+          NODE_ENV: 'test',
+          TELECOM_HD_SMTP_HOST: 'mailhog',
+          TELECOM_HD_SMTP_PORT: 1025,
+          TELECOM_HD_SMTP_SECURE: false,
+          TELECOM_HD_SMTP_USER: undefined,
+          TELECOM_HD_SMTP_PASSWORD: undefined,
+        },
+        prisma as unknown as PrismaService,
+      );
+
+      const createTransport = nodemailer.createTransport as unknown as ReturnType<typeof vi.fn>;
+      expect(createTransport).toHaveBeenLastCalledWith(expect.objectContaining({ requireTLS: false }));
     });
 
     it('sends an email without throwing', async () => {

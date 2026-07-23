@@ -651,9 +651,10 @@ Implementation is complete; production scanner/load/storage evidence remains in 
 - [~] **S6-3 Apply migrations to a fresh database.** Prove every migration applies from zero and
   upgrades a restored production-shaped copy. Prefer expand/contract migrations compatible with
   the previous image; document the forward-fix boundary and never test destructive rollback live.
-  _(From-zero proof done locally on disposable PostgreSQL 15: all 31 migrations applied, seed
-  succeeded and the ownership audit reported CLEAN. **Still open (VM):** upgrade and audit a restored
-  production-shaped copy behind the allowlist.)_
+  _(Historical evidence only: an earlier 31-migration chain applied locally on disposable PostgreSQL 15,
+  seed succeeded and the ownership audit reported CLEAN. It is superseded by the current 51-migration
+  release. **Still open and mandatory before deploy:** current-image from-zero proof plus upgrade and
+  audit of a restored production-shaped copy behind the allowlist.)_
 - [ ] **S6-4 Run the security repro matrix behind the allowlist.** At minimum, prove anonymous/email-only
       client list/detail/reply/download fail; Client A cannot access/mutate Client B; secrets never
       appear in JSON/logs; old sessions fail after password/role/disable/logout; wrong-origin or

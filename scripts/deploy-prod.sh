@@ -262,7 +262,7 @@ PROJECT_SERVICES="$(
 while IFS= read -r service; do
   [[ -z "$service" ]] && continue
   case "$service" in
-    postgres|redis|clamav|api|web|caddy|proxy) ;;
+    postgres|redis|clamav|api|web|caddy|proxy|uploads-init) ;;
     *) echo "[deploy-prod] ERROR: unknown project sidecar '${service}'; inspect it manually" >&2; exit 1 ;;
   esac
 done <<< "$PROJECT_SERVICES"
@@ -742,6 +742,10 @@ else
   wait_healthy "$POSTGRES_ID" postgres 120
   wait_healthy "$REDIS_ID" redis 120
   wait_healthy "$CLAMAV_ID" clamav 180
+  # The first install reaches its very first Prisma migration only after private
+  # PostgreSQL exists. Prove CREATE EXTENSION pgcrypto capability *before* that
+  # irreversible schema boundary, just as the existing-release path does above.
+  assert_pgcrypto_migration_capability
   echo '[deploy-prod] Applying Prisma migrations before starting the first API worker.'
   "${COMPOSE[@]}" run --rm --no-deps -T api npx prisma migrate deploy
   assert_required_automated_email_templates

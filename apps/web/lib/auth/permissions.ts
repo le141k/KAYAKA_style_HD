@@ -28,6 +28,7 @@ export const PERMISSIONS = {
   ADMIN_WORKFLOW: 'admin.workflow',
   MAIL_VIEW: 'mail.view',
   MAIL_REPLAY: 'mail.replay',
+  MAIL_PROMOTE_CAPTURED: 'mail.capture.promote',
   MAIL_RECONCILE: 'mail.reconcile',
   MAIL_CONFIGURE: 'mail.configure',
   ADMIN_DEPARTMENTS: 'admin.departments',

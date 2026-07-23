@@ -5,6 +5,11 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['src/**/*.int-spec.ts'],
+    // Fixtures intentionally pin and then restore process.env before dynamically
+    // importing AppModule. Run files serially so a future fixture cannot race that
+    // isolation boundary or share an external dependency by accident.
+    isolate: true,
+    fileParallelism: false,
     // Integration tests can be slow (Testcontainers + migrations)
     testTimeout: 120_000,
     hookTimeout: 120_000,

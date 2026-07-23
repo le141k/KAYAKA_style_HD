@@ -55,6 +55,7 @@ const FALLBACK_PERMISSIONS: RbacPermissionMeta[] = [
   { key: 'admin.workflow', label: 'Правила и макросы', category: 'admin' },
   { key: 'mail.view', label: 'Почта: просмотр состояния и карантина', category: 'admin' },
   { key: 'mail.replay', label: 'Почта: повтор карантинных писем', category: 'admin' },
+  { key: 'mail.capture.promote', label: 'Почта: передать захваченное письмо в обработку', category: 'admin' },
   { key: 'mail.reconcile', label: 'Почта: реконсиляция IMAP', category: 'admin' },
   { key: 'mail.configure', label: 'Почта: настройка очередей и правил', category: 'admin' },
   { key: 'admin.departments', label: 'Отделы', category: 'admin' },

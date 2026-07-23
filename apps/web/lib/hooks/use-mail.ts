@@ -15,6 +15,8 @@ export interface AdminEmailQueue {
   port: number;
   username: string;
   useTls: boolean;
+  /** Exact IMAP folder selected for this queue. Older API responses are treated as INBOX by the UI. */
+  mailbox?: string;
   departmentId: number | null;
   /** Queue policy is versioned so an old browser tab cannot restore stale settings. */
   configGeneration: number;
@@ -28,6 +30,8 @@ export interface AdminEmailQueue {
   cursorGeneration: number;
   bootstrapPolicy: 'FROM_NOW' | 'BACKFILL' | null;
   bootstrapBackfillLimit: number | null;
+  /** Set once a queue has been used for an attended capture; never normal ingress again. */
+  captureRetiredAt?: string | null;
   mailboxEpoch?: number;
   reconcileCause?: string | null;
   reconcileRequestedAt?: string | null;
@@ -54,6 +58,8 @@ export interface EmailQueueConfigInput {
   username: string;
   password?: string;
   useTls: boolean;
+  /** Explicit on create; omitted only by partial update callers that preserve the existing folder. */
+  mailbox: string;
   departmentId: number | null;
   routingPriority: number;
   sendAutoresponder: boolean;
@@ -90,6 +96,7 @@ export interface InboundHealth {
       | 'uidValidity'
       | 'cursorGeneration'
       | 'bootstrapPolicy'
+      | 'captureRetiredAt'
       | 'mailboxEpoch'
       | 'reconcileCause'
       | 'reconcileRequestedAt'
@@ -112,12 +119,35 @@ export interface InboundHealth {
       quarantined: number;
       processed: number;
       skipped: number;
+      /**
+       * Capture-only deliveries are intentionally terminal and are never part of
+       * the actionable backlog. Optional while an older API is rolling out.
+       */
+      captured?: number;
     };
     quarantineBytes: number;
+    /** Byte total for capture-only deliveries, deliberately separate from quarantine. */
+    capturedBytes?: number;
     stalledProcessing: number;
     oldestPendingAt: string | null;
+    /** Oldest capture-only delivery; never used for the normal backlog age alert. */
+    oldestCapturedAt?: string | null;
     lastProcessedAt: string | null;
   };
+  /** True only while the server accepts mail without creating tickets or replies. */
+  captureOnly?: boolean;
+  /** Numeric queue selected by the active capture-only fence; safe to show to operators. */
+  captureQueueId?: number | null;
+  /** Durable maximum number of rows the active capture-only fence may retain. */
+  captureMaxMessages?: number | null;
+  /** Server-confirmed readiness of the selected capture test folder; never infer this from only an env id. */
+  captureTarget?: {
+    queueId: number | null;
+    ready: boolean;
+    reason: string | null;
+  } | null;
+  /** True only when the normal inbound drain may process an explicitly promoted capture. */
+  normalInboundDeliveryEnabled?: boolean;
   rawStorage: {
     availableBytes: string;
     reserveBytes: string;
@@ -231,18 +261,72 @@ export interface QuarantinePage {
 
 export interface QuarantineDetail {
   delivery: QuarantinedDelivery & { state: 'QUARANTINED'; replayBlockReason?: string | null };
+  /** The API intentionally omits opaque audit metadata from this view. */
   audit: Array<{
     id: number;
     actorStaffId: number | null;
     actorEmail: string;
     action: string;
     reason: string | null;
-    metadata: Record<string, unknown>;
     createdAt: string;
   }>;
 }
 
 export interface QuarantineFilters {
+  page?: number;
+  limit?: number;
+  queueId?: number;
+  reason?: string;
+  messageId?: string;
+}
+
+/**
+ * A capture-only row contains delivery metadata only. Raw MIME and raw-storage
+ * references are deliberately absent from this browser-facing contract.
+ */
+export interface CapturedDelivery {
+  id: number;
+  transport: 'IMAP' | 'PIPE';
+  queueId: number | null;
+  /** Legacy API name during the delivery-claim expand phase. */
+  messageId?: string | null;
+  /** Non-unique observed RFC Message-ID after the claim cutover. */
+  observedMessageId?: string | null;
+  envelopeFrom: string | null;
+  envelopeTo: string | null;
+  subject: string;
+  sizeBytes: number;
+  attempts: number;
+  lastError: string | null;
+  truncated: boolean;
+  /** Server capability: truncated MIME must never be promoted. */
+  promoteAllowed: boolean;
+  promoteBlockReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CapturedPage {
+  items: CapturedDelivery[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface CapturedDetail {
+  delivery: CapturedDelivery & { state: 'CAPTURED' };
+  /** The API intentionally omits opaque audit metadata from this view. */
+  audit: Array<{
+    id: number;
+    actorStaffId: number | null;
+    actorEmail: string;
+    action: string;
+    reason: string | null;
+    createdAt: string;
+  }>;
+}
+
+export interface CapturedFilters {
   page?: number;
   limit?: number;
   queueId?: number;
@@ -266,6 +350,8 @@ const mailKeys = {
   health: ['admin', 'inbound-health'] as const,
   quarantine: (filters: QuarantineFilters) => ['admin', 'inbound-quarantine', filters] as const,
   quarantineDetail: (id: number) => ['admin', 'inbound-quarantine', id] as const,
+  captured: (filters: CapturedFilters) => ['admin', 'inbound-captured', filters] as const,
+  capturedDetail: (id: number) => ['admin', 'inbound-captured', id] as const,
   workflowEmailHealth: ['admin', 'workflow-email-health'] as const,
   workflowEmailEvents: (filters: WorkflowEmailEventFilters) =>
     ['admin', 'workflow-email-events', filters] as const,
@@ -394,6 +480,26 @@ export function useQuarantineDetail(deliveryId: number | null) {
   });
 }
 
+export function useCaptured(filters: CapturedFilters = {}) {
+  const normalized = { page: 1, limit: 25, ...filters };
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(normalized)) {
+    if (value !== undefined && value !== '') params.set(key, String(value));
+  }
+  return useQuery({
+    queryKey: mailKeys.captured(normalized),
+    queryFn: () => api.get<CapturedPage>(`/admin/email-queues/inbound/captured?${params.toString()}`),
+  });
+}
+
+export function useCapturedDetail(deliveryId: number | null) {
+  return useQuery({
+    queryKey: mailKeys.capturedDetail(deliveryId ?? 0),
+    queryFn: () => api.get<CapturedDetail>(`/admin/email-queues/inbound/captured/${deliveryId}`),
+    enabled: deliveryId !== null,
+  });
+}
+
 export function useReconcileQueue() {
   const qc = useQueryClient();
   return useMutation({
@@ -424,6 +530,34 @@ export function useReplayQuarantined() {
       }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['admin', 'inbound-quarantine'] });
+      void qc.invalidateQueries({ queryKey: mailKeys.health });
+    },
+  });
+}
+
+/**
+ * Promotion changes a terminal capture-only row into normal delivery. The UI
+ * always supplies the row version it inspected; the API owns the final capture
+ * mode and permission checks and returns a conflict for a stale row.
+ */
+export function usePromoteCaptured() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      deliveryId,
+      reason,
+      expectedUpdatedAt,
+    }: {
+      deliveryId: number;
+      reason: string;
+      expectedUpdatedAt: string;
+    }) =>
+      api.post<{ promoted: boolean }>(`/admin/email-queues/inbound/captured/${deliveryId}/promote`, {
+        reason,
+        expectedUpdatedAt,
+      }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['admin', 'inbound-captured'] });
       void qc.invalidateQueries({ queryKey: mailKeys.health });
     },
   });

@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { assertProductionSecrets, type AppConfig } from './configuration';
+import {
+  assertInboundCaptureMode,
+  assertInboundNormalCanaryMode,
+  assertOutboundCanaryMode,
+  parseConfig,
+  assertProductionSecrets,
+  type AppConfig,
+} from './configuration';
 
 const STRONG_A = 'a'.repeat(16) + 'b'.repeat(16) + '17';
 const STRONG_B = 'c'.repeat(16) + 'd'.repeat(16) + '42';
@@ -19,7 +26,10 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
     TELECOM_HD_SMTP_HOST: 'smtp.example.com',
     TELECOM_HD_SMTP_PORT: 587,
     TELECOM_HD_SMTP_SECURE: true,
-    TELECOM_HD_MAIL_FROM: 'Help <help@example.com>',
+    TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: false,
+    TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: undefined,
+    TELECOM_HD_OUTBOUND_CANARY_RECIPIENT: undefined,
+    TELECOM_HD_MAIL_FROM: 'Help <help@acme.com>',
     TELECOM_HD_LOG_LEVEL: 'info',
     TELECOM_HD_ALARIS_WEBHOOK_SECRET: STRONG_A.replace('17', '99'),
     TELECOM_HD_INBOUND_WEBHOOK_SECRET: STRONG_B.replace('42', '77'),
@@ -42,6 +52,14 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
     TELECOM_HD_CLAMAV_PORT: 3310,
     TELECOM_HD_CLAMAV_TIMEOUT_MS: 15000,
     TELECOM_HD_CLIENT_PORTAL_ENABLED: false,
+    TELECOM_HD_INBOUND_DELIVERY_ENABLED: false,
+    TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: undefined,
+    TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: undefined,
+    TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: false,
+    TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: undefined,
+    TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+    TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'FROM_NOW',
+    TELECOM_HD_IMAP_BACKFILL_LIMIT: 0,
     TELECOM_HD_FIELD_ENCRYPTION_KEY: FIELD_ENCRYPTION_KEY,
     ...over,
   } as AppConfig;
@@ -142,6 +160,64 @@ describe('assertProductionSecrets', () => {
     ).not.toThrow();
   });
 
+  it('requires authenticated SMTP credentials for a production outbound canary', () => {
+    expect(() => assertProductionSecrets(makeConfig({ TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: true }))).toThrow(
+      /SMTP_USER.*required.*outbound delivery/i,
+    );
+    expect(() =>
+      assertProductionSecrets(
+        makeConfig({
+          TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: true,
+          TELECOM_HD_SMTP_USER: 'noc@23telecom.co.uk',
+          TELECOM_HD_SMTP_PASSWORD: 'app-password-value',
+        }),
+      ),
+    ).not.toThrow();
+  });
+
+  it('requires a real, syntactically valid sender when production outbound delivery is enabled', () => {
+    const enabledOutbound = {
+      TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: true,
+      TELECOM_HD_SMTP_USER: 'noc@acme.com',
+      TELECOM_HD_SMTP_PASSWORD: 'app-password-value',
+    } as const;
+
+    expect(() =>
+      assertProductionSecrets(
+        makeConfig({ ...enabledOutbound, TELECOM_HD_MAIL_FROM: 'Help <help@example.com>' }),
+      ),
+    ).toThrow(/MAIL_FROM.*non-placeholder sender/i);
+    expect(() =>
+      assertProductionSecrets(makeConfig({ ...enabledOutbound, TELECOM_HD_MAIL_FROM: 'help@example' })),
+    ).toThrow(/MAIL_FROM.*non-placeholder sender/i);
+    expect(() =>
+      assertProductionSecrets(makeConfig({ ...enabledOutbound, TELECOM_HD_MAIL_FROM: 'help@localhost' })),
+    ).toThrow(/MAIL_FROM.*non-placeholder sender/i);
+    expect(() =>
+      assertProductionSecrets(makeConfig({ ...enabledOutbound, TELECOM_HD_MAIL_FROM: '' })),
+    ).toThrow(/MAIL_FROM.*non-placeholder sender/i);
+    expect(() =>
+      assertProductionSecrets(makeConfig({ ...enabledOutbound, TELECOM_HD_MAIL_FROM: 'not an email' })),
+    ).toThrow(/MAIL_FROM.*non-placeholder sender/i);
+    expect(() =>
+      assertProductionSecrets(
+        makeConfig({ ...enabledOutbound, TELECOM_HD_MAIL_FROM: 'Help Desk <help@acme.com>' }),
+      ),
+    ).not.toThrow();
+  });
+
+  it('rejects placeholder SMTP passwords when production outbound delivery is enabled', () => {
+    expect(() =>
+      assertProductionSecrets(
+        makeConfig({
+          TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: true,
+          TELECOM_HD_SMTP_USER: 'noc@acme.com',
+          TELECOM_HD_SMTP_PASSWORD: 'CHANGE_ME_smtp_password',
+        }),
+      ),
+    ).toThrow(/SMTP_PASSWORD.*strong non-default/i);
+  });
+
   it('rejects verified-client uploads while the client portal is closed', () => {
     expect(() =>
       assertProductionSecrets(
@@ -166,5 +242,274 @@ describe('assertProductionSecrets', () => {
         }),
       ),
     ).not.toThrow();
+  });
+});
+
+describe('assertInboundCaptureMode', () => {
+  it('accepts an explicitly scoped capture-only configuration with physical outbound disabled', () => {
+    expect(() =>
+      assertInboundCaptureMode(
+        makeConfig({
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 42,
+        }),
+      ),
+    ).not.toThrow();
+  });
+
+  it('rejects capture-only combined with normal processing or physical outbound delivery', () => {
+    expect(() =>
+      assertInboundCaptureMode(
+        makeConfig({
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 42,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: true,
+        }),
+      ),
+    ).toThrow(/cannot be true together/i);
+    expect(() =>
+      assertInboundCaptureMode(
+        makeConfig({
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 42,
+          TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: true,
+        }),
+      ),
+    ).toThrow(/OUTBOUND_DELIVERY_ENABLED.*must be false/i);
+  });
+
+  it('rejects every normal-delivery and SMTP canary selector while capture-only is active', () => {
+    const capture = {
+      TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+      TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 42,
+    } as const;
+
+    expect(() =>
+      assertInboundCaptureMode(makeConfig({ ...capture, TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 99 })),
+    ).toThrow(/INBOUND_NORMAL_CANARY_QUEUE_ID.*blank/i);
+    expect(() =>
+      assertInboundCaptureMode(makeConfig({ ...capture, TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 99 })),
+    ).toThrow(/INBOUND_NORMAL_CANARY_DELIVERY_ID.*blank/i);
+    expect(() =>
+      assertInboundCaptureMode(
+        makeConfig({
+          ...capture,
+          TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: 'cmoutbox00000000000000001',
+          TELECOM_HD_OUTBOUND_CANARY_RECIPIENT: 'noc@acme.com',
+        }),
+      ),
+    ).toThrow(/OUTBOUND_CANARY.*blank/i);
+  });
+
+  it('rejects capture-only without an explicit queue id', () => {
+    expect(() =>
+      assertInboundCaptureMode(makeConfig({ TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true })),
+    ).toThrow(/CAPTURE_QUEUE_ID/i);
+  });
+
+  it('rejects an unsafe hand-built capture queue id instead of silently closing the runtime gate', () => {
+    for (const queueId of [-1, 1.5, Number.NaN]) {
+      expect(() =>
+        assertInboundCaptureMode(
+          makeConfig({
+            TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+            TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: queueId,
+          }),
+        ),
+      ).toThrow(/CAPTURE_QUEUE_ID/i);
+    }
+  });
+
+  it('accepts exactly one capture message and rejects every wider or malformed capacity', () => {
+    expect(() =>
+      assertInboundCaptureMode(
+        makeConfig({
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 42,
+          TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 1,
+        }),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertInboundCaptureMode(
+        makeConfig({
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 42,
+          TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 0,
+        }),
+      ),
+    ).toThrow(/CAPTURE_MAX_MESSAGES/i);
+    expect(() =>
+      assertInboundCaptureMode(
+        makeConfig({
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 42,
+          TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES: 2,
+        }),
+      ),
+    ).toThrow(/CAPTURE_MAX_MESSAGES/i);
+  });
+
+  it('requires a valid field-encryption key in capture-only mode outside production too', () => {
+    expect(() =>
+      assertInboundCaptureMode(
+        makeConfig({
+          NODE_ENV: 'development',
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 42,
+          TELECOM_HD_FIELD_ENCRYPTION_KEY: undefined,
+        }),
+      ),
+    ).toThrow(/FIELD_ENCRYPTION_KEY/i);
+  });
+
+  it('refuses a historical IMAP bootstrap policy in capture-only mode', () => {
+    expect(() =>
+      assertInboundCaptureMode(
+        makeConfig({
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 42,
+          TELECOM_HD_IMAP_BOOTSTRAP_POLICY: 'BACKFILL',
+          TELECOM_HD_IMAP_BACKFILL_LIMIT: 1,
+        }),
+      ),
+    ).toThrow(/BOOTSTRAP_POLICY.*FROM_NOW/i);
+    expect(() =>
+      assertInboundCaptureMode(
+        makeConfig({
+          TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: true,
+          TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: 42,
+          TELECOM_HD_IMAP_BACKFILL_LIMIT: 1,
+        }),
+      ),
+    ).toThrow(/BACKFILL_LIMIT.*0/i);
+  });
+});
+
+describe('assertOutboundCanaryMode', () => {
+  it('requires the durable command id and recipient to be configured together', () => {
+    const emailId = 'cmoutbox00000000000000001';
+    const recipient = 'noc@acme.com';
+
+    expect(() =>
+      assertOutboundCanaryMode(makeConfig({ TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: emailId })),
+    ).toThrow(/CANARY_EMAIL_ID.*CANARY_RECIPIENT.*together/i);
+    expect(() =>
+      assertOutboundCanaryMode(makeConfig({ TELECOM_HD_OUTBOUND_CANARY_RECIPIENT: recipient })),
+    ).toThrow(/CANARY_EMAIL_ID.*CANARY_RECIPIENT.*together/i);
+    expect(() =>
+      assertOutboundCanaryMode(
+        makeConfig({
+          TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: emailId,
+          TELECOM_HD_OUTBOUND_CANARY_RECIPIENT: recipient,
+        }),
+      ),
+    ).not.toThrow();
+  });
+
+  it('requires every inbound transport and inbound canary selector to be closed', () => {
+    const canary = {
+      TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: 'cmoutbox00000000000000001',
+      TELECOM_HD_OUTBOUND_CANARY_RECIPIENT: 'noc@acme.com',
+    };
+    expect(() =>
+      assertOutboundCanaryMode(
+        makeConfig({
+          ...canary,
+          TELECOM_HD_INBOUND_DELIVERY_ENABLED: true,
+          TELECOM_HD_IMAP_ENABLED: true,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 42,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 99,
+        }),
+      ),
+    ).toThrow(/INBOUND_DELIVERY_ENABLED.*IMAP_ENABLED.*NORMAL_CANARY_QUEUE_ID/is);
+  });
+});
+
+describe('assertInboundNormalCanaryMode', () => {
+  it('requires the captured queue id and delivery id to be configured together', () => {
+    expect(() =>
+      assertInboundNormalCanaryMode(makeConfig({ TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 42 })),
+    ).toThrow(/NORMAL_CANARY_QUEUE_ID.*NORMAL_CANARY_DELIVERY_ID.*together/i);
+    expect(() =>
+      assertInboundNormalCanaryMode(makeConfig({ TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 99 })),
+    ).toThrow(/NORMAL_CANARY_QUEUE_ID.*NORMAL_CANARY_DELIVERY_ID.*together/i);
+    expect(() =>
+      assertInboundNormalCanaryMode(
+        makeConfig({
+          TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 42,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 99,
+        }),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertInboundNormalCanaryMode(
+        makeConfig({
+          TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 42,
+          TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 99,
+          TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: true,
+        }),
+      ),
+    ).toThrow(/OUTBOUND_DELIVERY_ENABLED.*false/i);
+  });
+});
+
+describe('parseConfig canary fences', () => {
+  const environment: NodeJS.ProcessEnv = {
+    NODE_ENV: 'test',
+    DATABASE_URL: 'postgresql://u:p@db:5432/x',
+    TELECOM_HD_JWT_ACCESS_SECRET: STRONG_A,
+    TELECOM_HD_JWT_REFRESH_SECRET: STRONG_B,
+  };
+
+  it('parses paired positive safe inbound ids and normalizes blank canary fields to undefined', () => {
+    expect(
+      parseConfig({
+        ...environment,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: '42',
+        TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: '99',
+        TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: '',
+        TELECOM_HD_OUTBOUND_CANARY_RECIPIENT: ' ',
+      }),
+    ).toMatchObject({
+      TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: 42,
+      TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: 99,
+      TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: undefined,
+      TELECOM_HD_OUTBOUND_CANARY_RECIPIENT: undefined,
+    });
+  });
+
+  it('rejects unsafe/half-configured inbound ids and malformed or half-configured SMTP canary fences', () => {
+    expect(() =>
+      parseConfig({ ...environment, TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: '9007199254740992' }),
+    ).toThrow(/INBOUND_NORMAL_CANARY_QUEUE_ID/i);
+    expect(() => parseConfig({ ...environment, TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: '42' })).toThrow(
+      /NORMAL_CANARY_QUEUE_ID.*NORMAL_CANARY_DELIVERY_ID.*together/i,
+    );
+    expect(() =>
+      parseConfig({
+        ...environment,
+        TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID: '42',
+        TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID: '99',
+        TELECOM_HD_OUTBOUND_DELIVERY_ENABLED: 'true',
+      }),
+    ).toThrow(/OUTBOUND_DELIVERY_ENABLED.*false/i);
+    expect(() =>
+      parseConfig({
+        ...environment,
+        TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: 'not-a-cuid',
+        TELECOM_HD_OUTBOUND_CANARY_RECIPIENT: 'noc@acme.com',
+      }),
+    ).toThrow(/OUTBOUND_CANARY_EMAIL_ID/i);
+    expect(() =>
+      parseConfig({
+        ...environment,
+        TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: 'cmoutbox00000000000000001',
+        TELECOM_HD_OUTBOUND_CANARY_RECIPIENT: 'not an email',
+      }),
+    ).toThrow(/OUTBOUND_CANARY_RECIPIENT/i);
+    expect(() =>
+      parseConfig({ ...environment, TELECOM_HD_OUTBOUND_CANARY_EMAIL_ID: 'cmoutbox00000000000000001' }),
+    ).toThrow(/CANARY_EMAIL_ID.*CANARY_RECIPIENT.*together/i);
   });
 });

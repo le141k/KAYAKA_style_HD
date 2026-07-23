@@ -6,11 +6,13 @@ import type { AppConfig } from '../../config/configuration';
 
 const SECRET = 'inbound-webhook-secret-32chars-min!!';
 
-function makeController(deliveryEnabled = true) {
+function makeController(deliveryEnabled = true, captureOnlyEnabled = false, captureQueueId?: number) {
   const inbound = { ingestRawMessage: vi.fn().mockResolvedValue(undefined) } as unknown as InboundMailService;
   const config = {
     TELECOM_HD_INBOUND_WEBHOOK_SECRET: SECRET,
     TELECOM_HD_INBOUND_DELIVERY_ENABLED: deliveryEnabled,
+    TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED: captureOnlyEnabled,
+    TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID: captureQueueId,
   } as AppConfig;
   return { controller: new InboundController(inbound, config), inbound };
 }
@@ -40,6 +42,14 @@ describe('InboundController (A1 webhook)', () => {
       ServiceUnavailableException,
     );
     expect(disabled.inbound.ingestRawMessage).not.toHaveBeenCalled();
+  });
+
+  it('capture-only rejects PIPE before it reads a body or reaches the service', async () => {
+    const capture = makeController(false, true, 42);
+    await expect(capture.controller.pipe(SECRET, 'mta-1', { raw: RAW }, '42')).rejects.toThrow(
+      ServiceUnavailableException,
+    );
+    expect(capture.inbound.ingestRawMessage).not.toHaveBeenCalled();
   });
 
   it('requires both a trusted delivery id and a PIPE queue id', async () => {

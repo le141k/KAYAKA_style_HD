@@ -1,7 +1,7 @@
 # ADR 0007 — Durable inbound-delivery ledger (fail-closed IMAP/PIPE ingestion)
 
 - Status: Accepted
-- Date: 2026-07-17; amended 2026-07-22
+- Date: 2026-07-17; amended 2026-07-22 and 2026-07-23
 
 ## Context
 
@@ -55,14 +55,31 @@ Use a durable **`InboundDelivery` ledger** and split inbound work into acceptanc
   reply keep post, recipients, counters and audit in the same transaction (LIFE-03).
 - Failed delivery is retried then quarantined; it is never discarded. Truncated IMAP MIME is
   fast-quarantined and cannot be replayed without safe original refetch.
-- Small raw MIME stays inline. Large MIME uses the existing uploads volume with a pending marker,
-  fsync/atomic rename, ledger pointer and bounded marker reaper. Quarantined evidence is excluded
-  from retention. Capacity is checked against the existing storage reserve and fails closed.
+- Small raw MIME stays inline. Large MIME takes a short, durable queue-bound staging reservation
+  in `ACTIVE` state before filesystem I/O. It is written and fsynced to deterministic private temp
+  `inbound-raw/.staging/<UUID>.tmp` derived from its opaque key;
+  immediately before final atomic rename, a short publish-fence transaction locks `ACTIVE`. A
+  reaper that already committed `REAPING` makes the writer abort before publish; a winning writer
+  renames and refreshes its lease while holding the stage lock. Acceptance then locks `ACTIVE` and
+  atomically writes its `InboundDelivery` pointer plus `COMMITTED`; its post-commit finalizer commits
+  the marker then deletes only the `COMMITTED` stage. A publish-fence rollback retains its marker and
+  destination file for the durable stage/reaper to recover. Failed/orphan cleanup commits `REAPING` before
+  destructive filesystem unlink (both destination and deterministic temp), then removes stage/marker
+  only after unlink succeeds. That unlink is never inside the database transaction; only the brief
+  atomic publish hand-off is. The DB-first
+  reaper scans expired `ACTIVE` and all `COMMITTED`/`REAPING` rows even with no marker. Capture-only
+  arming runs a bounded sweep, locks the same queue and refuses while a reservation remains, so an
+  acceptance rollback cannot strand normal raw bytes behind a capture-retired queue. Quarantined
+  evidence is excluded from retention. Capacity is checked against the existing storage reserve and
+  fails closed.
 - `/api/inbound/pipe` authenticates before its route-specific parser, preserves raw bytes and
   validates queue/type/id before acceptance. JSON and raw MIME use bounded parsers.
 - Poll and drain supervisors are single-flight, expose durable liveness and emit health alerts.
-  `mail.view`, `mail.replay`, `mail.reconcile`, and `mail.configure` are separate permissions;
-  reconcile/replay state transitions and their reason/audit are transactional.
+  `mail.view`, `mail.replay`, `mail.capture.promote`, `mail.reconcile`, and `mail.configure` are
+  separate permissions; every mutating mail operator action requires `mail.view` plus its specific
+  capability. Promotion from inert capture to normal ticket processing requires the view and
+  promotion permissions, not a replay privilege. Reconcile/replay state transitions and their
+  reason/audit are transactional.
 
 ## Consequences
 

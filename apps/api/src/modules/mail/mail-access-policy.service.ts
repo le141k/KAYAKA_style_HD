@@ -50,17 +50,24 @@ export class MailAccessPolicy {
   }
 
   /**
-   * A delivery must have an allowed department snapshot.  When it has a source
-   * queue, that queue must independently remain in the allowed department too;
-   * this protects against a stale/corrupt snapshot becoming an IDOR path.
+   * A delivery is governed only by its durable effective owner: inbound routing may
+   * accept through queue A yet create/update a ticket in B/C. Ticket-owned rows join
+   * the target ticket so a department move is reflected immediately. UNRESOLVED and a
+   * deleted target ticket match no non-admin scope (fail closed).
    */
   deliveryWhereForScope(scope: MailDepartmentScope): Prisma.InboundDeliveryWhereInput {
     if (scope.unrestricted) return {};
     const allowed = { in: scope.departmentIds };
     return {
-      AND: [
-        { departmentId: allowed },
-        { OR: [{ queueId: null }, { queue: { is: { departmentId: allowed } } }] },
+      OR: [
+        {
+          effectiveOwnerKind: { in: ['RECEIVING', 'ROUTED'] },
+          effectiveOwnerDepartmentId: allowed,
+        },
+        {
+          effectiveOwnerKind: 'TICKET',
+          effectiveOwnerTicket: { is: { departmentId: allowed } },
+        },
       ],
     };
   }

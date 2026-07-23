@@ -17,6 +17,7 @@ describe('permissions catalog', () => {
     expect(isKnownPermission('does.not.exist')).toBe(false);
     expect(isKnownPermission('admin.mail')).toBe(false);
     expect(isKnownPermission('mail.reconcile')).toBe(true);
+    expect(isKnownPermission('mail.capture.promote')).toBe(true);
   });
 
   it('unknownPermissions returns only the keys outside the catalog', () => {
@@ -53,6 +54,7 @@ describe('role presets', () => {
     expect(m).not.toContain(PERMISSIONS.ADMIN_SLA);
     expect(m).not.toContain(PERMISSIONS.ADMIN_ALARIS);
     expect(m).not.toContain(PERMISSIONS.MAIL_REPLAY);
+    expect(m).not.toContain(PERMISSIONS.MAIL_PROMOTE_CAPTURED);
     expect(m).not.toContain(PERMISSIONS.MAIL_RECONCILE);
     expect(m).not.toContain(PERMISSIONS.MAIL_CONFIGURE);
     // no admin.* keys at all
@@ -63,6 +65,7 @@ describe('role presets', () => {
     for (const permission of [
       PERMISSIONS.MAIL_VIEW,
       PERMISSIONS.MAIL_REPLAY,
+      PERMISSIONS.MAIL_PROMOTE_CAPTURED,
       PERMISSIONS.MAIL_RECONCILE,
       PERMISSIONS.MAIL_CONFIGURE,
     ]) {

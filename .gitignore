@@ -12,6 +12,7 @@ out/
 
 # env
 .env
+.env.tmp-*
 .env.local
 .env.*.local
 !.env.example

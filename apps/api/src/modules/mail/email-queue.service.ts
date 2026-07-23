@@ -11,14 +11,22 @@ import {
   type OnModuleDestroy,
   type OnModuleInit,
 } from '@nestjs/common';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { encryptField } from '../../common/field-encrypt.util';
 import { APP_CONFIG, type AppConfig } from '../../config/configuration';
+import {
+  DEFAULT_IMAP_MAILBOX,
+  isKnownUnsafeCaptureMailbox,
+  normalizeImapMailbox as normalizeRequestedImapMailbox,
+  readCanonicalImapMailbox,
+} from './dto';
 import type {
   CreateEmailQueueDto,
   DeleteEmailQueueDto,
+  ListCapturedInboundDto,
   ListQuarantinedInboundDto,
+  PromoteCapturedInboundDto,
   ReconcileEmailQueueDto,
   ReplayQuarantinedInboundDto,
   UpdateEmailQueueDto,
@@ -39,6 +47,40 @@ export type InboundActor = Partial<MailAccessActor>;
 /** Scheduled process work is intentionally global; HTTP callers always pass their staff actor. */
 const SYSTEM_MAIL_OPERATOR: MailAccessActor = { staffId: 1, isAdmin: true, email: 'system' };
 
+const CAPTURED_DELIVERY_STATE = 'CAPTURED' as const;
+const FIELD_ENCRYPTION_KEY_PATTERN = /^[0-9a-f]{64}$/i;
+
+/** Defence in depth for internal callers that bypass the HTTP Zod schema. */
+function normalizeImapMailbox(value: string | undefined | null): string {
+  try {
+    return normalizeRequestedImapMailbox(value ?? DEFAULT_IMAP_MAILBOX);
+  } catch {
+    throw new BadRequestException('mailbox must be a non-empty IMAP folder name up to 255 characters');
+  }
+}
+
+/** A non-canonical durable row is not normalized at runtime: halt instead of selecting another folder. */
+function readPersistedImapMailbox(value: unknown): string {
+  try {
+    return readCanonicalImapMailbox(value);
+  } catch {
+    throw new ServiceUnavailableException('Configured IMAP mailbox is invalid or non-canonical');
+  }
+}
+
+type CapturePromotionConfig = Pick<
+  AppConfig,
+  | 'TELECOM_HD_IMAP_ENABLED'
+  | 'TELECOM_HD_INBOUND_DELIVERY_ENABLED'
+  | 'TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED'
+  | 'TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID'
+  | 'TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES'
+  | 'TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID'
+  | 'TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID'
+  | 'TELECOM_HD_INBOUND_MAX_SIZE_MB'
+  | 'TELECOM_HD_FIELD_ENCRYPTION_KEY'
+>;
+
 /** Fields that are always omitted from responses (stored password). */
 const SAFE_SELECT = {
   id: true,
@@ -48,6 +90,7 @@ const SAFE_SELECT = {
   port: true,
   username: true,
   useTls: true,
+  mailbox: true,
   departmentId: true,
   signature: true,
   routingPriority: true,
@@ -66,6 +109,7 @@ const SAFE_SELECT = {
   reconcileRequestedAt: true,
   bootstrapPolicy: true,
   bootstrapBackfillLimit: true,
+  captureRetiredAt: true,
   lastConnectedAt: true,
   lastConnectionAttemptAt: true,
   lastDisconnectedAt: true,
@@ -115,10 +159,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     @Optional() private readonly inboundMail?: InboundMailService,
     @Optional()
     @Inject(APP_CONFIG)
-    private readonly config?: Pick<
-      AppConfig,
-      'TELECOM_HD_IMAP_ENABLED' | 'TELECOM_HD_INBOUND_DELIVERY_ENABLED' | 'TELECOM_HD_INBOUND_MAX_SIZE_MB'
-    >,
+    private readonly config?: CapturePromotionConfig,
     @Optional() private readonly rawStorage?: InboundRawStorageService,
     @Optional() private readonly mailAccess?: MailAccessPolicy,
   ) {}
@@ -155,6 +196,25 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     return this.mailAccess;
   }
 
+  /**
+   * Queue passwords are credentials, not ordinary development fields.  Refuse a
+   * non-empty write unless this process has a valid AES-256 key, rather than relying
+   * on encryptField's legacy plaintext compatibility path.  This is especially
+   * important for the attended Gmail test, where the operator enters a fresh app
+   * password through this API/UI.
+   */
+  private encryptQueuePassword(password: string | undefined): string {
+    const value = password ?? '';
+    if (value === '') return '';
+    const key = this.config?.TELECOM_HD_FIELD_ENCRYPTION_KEY;
+    if (!key || !FIELD_ENCRYPTION_KEY_PATTERN.test(key)) {
+      throw new ServiceUnavailableException(
+        'Email queue credentials cannot be stored until a valid field-encryption key is configured',
+      );
+    }
+    return encryptField(value, key);
+  }
+
   private normalizeMailActor(actor?: InboundActor): MailAccessActor {
     if (
       actor &&
@@ -180,6 +240,50 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
 
   private async resolveMailScope(actor?: InboundActor): Promise<MailDepartmentScope> {
     return this.accessPolicy().resolveScope(this.normalizeMailActor(actor));
+  }
+
+  /**
+   * A captured row must remain inert until the runtime has left capture-only mode AND the normal
+   * delivery/drain gate is explicitly open. This is fail-closed for a missing config field during
+   * a staged rollout: an operator cannot accidentally turn a test capture into a ticket.
+   */
+  private assertCapturePromotionEnabled(): { queueId: number; deliveryId: number } {
+    const config = this.config;
+    if (
+      config?.TELECOM_HD_INBOUND_DELIVERY_ENABLED !== true ||
+      config?.TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED !== false
+    ) {
+      throw new ConflictException(
+        'Captured deliveries can be promoted only when inbound capture-only mode is disabled and normal delivery is enabled',
+      );
+    }
+    const canary = this.normalCanaryPromotionScope();
+    if (!canary) {
+      throw new ConflictException(
+        'Captured delivery promotion requires one exact normal-canary queue and delivery selector',
+      );
+    }
+    return canary;
+  }
+
+  /**
+   * A normal inbound canary may promote exactly the delivery named in its
+   * environment selector. This backend check is authoritative; the UI may hide
+   * other buttons, but it must never be able to manufacture future ACCEPTED
+   * backlog outside the attended one-row experiment.
+   */
+  private normalCanaryPromotionScope(): { queueId: number; deliveryId: number } | null {
+    const queueId = this.config?.TELECOM_HD_INBOUND_NORMAL_CANARY_QUEUE_ID;
+    const deliveryId = this.config?.TELECOM_HD_INBOUND_NORMAL_CANARY_DELIVERY_ID;
+    const validQueueId = Number.isSafeInteger(queueId) && queueId! > 0;
+    const validDeliveryId = Number.isSafeInteger(deliveryId) && deliveryId! > 0;
+    if (!validQueueId && !validDeliveryId) return null;
+    if (!validQueueId || !validDeliveryId) {
+      throw new ConflictException(
+        'Inbound normal canary selector is incomplete; captured promotion is fail-closed',
+      );
+    }
+    return { queueId: queueId!, deliveryId: deliveryId! };
   }
 
   private queueWhereWithScope(
@@ -224,13 +328,13 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     const access = this.accessPolicy();
     const scope = await this.resolveMailScope(actor);
     access.assertCanTargetQueueDepartment(scope, dto.departmentId);
-    const { password, routingPriority = 100, ...rest } = dto;
-    const encKey = process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
+    const { password, routingPriority = 100, mailbox, ...rest } = dto;
     return this.prisma.emailQueue.create({
       data: {
         ...rest,
+        mailbox: normalizeImapMailbox(mailbox),
         routingPriority,
-        passwordEnc: encryptField(password ?? '', encKey),
+        passwordEnc: this.encryptQueuePassword(password),
       },
       select: SAFE_SELECT,
     });
@@ -257,13 +361,24 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         port: true,
         username: true,
         useTls: true,
+        mailbox: true,
         mailboxEpoch: true,
         cursorGeneration: true,
         configGeneration: true,
         syncState: true,
+        captureRetiredAt: true,
       },
     });
     if (!current) throw new NotFoundException(`EmailQueue #${id} not found`);
+    const retiredQueueDisableOnly =
+      current.captureRetiredAt !== null &&
+      dto.isEnabled === false &&
+      Object.keys(dto).every((key) => key === 'expectedConfigGeneration' || key === 'isEnabled');
+    if (current.captureRetiredAt !== null && !retiredQueueDisableOnly) {
+      throw new ConflictException(
+        'This capture-only queue is permanently retired from normal ingress; create a new queue and mailbox instead',
+      );
+    }
     if (current.syncState === 'BOOTSTRAPPING') {
       throw new ConflictException('Queue is reconciling; reload after the IMAP baseline completes');
     }
@@ -276,23 +391,42 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     // A queue form carries every editable field. It must be a single optimistic
     // write: re-reading and retrying after a CAS miss would let a stale form put
     // back a previous mailbox identity/address/department.
-    const { password, expectedConfigGeneration: _expectedConfigGeneration, ...rest } = dto;
+    const {
+      password,
+      expectedConfigGeneration: _expectedConfigGeneration,
+      mailbox: requestedMailbox,
+      ...rest
+    } = dto;
     void _expectedConfigGeneration;
     const data: Record<string, unknown> = { ...rest, configGeneration: { increment: 1 } };
+    if (requestedMailbox !== undefined) data.mailbox = normalizeImapMailbox(requestedMailbox);
     if (password !== undefined) {
-      const encKey = process.env['TELECOM_HD_FIELD_ENCRYPTION_KEY'];
-      data.passwordEnc = encryptField(password, encKey);
+      data.passwordEnc = this.encryptQueuePassword(password);
     }
 
     const nextType = rest.type ?? current.type;
+    const currentMailbox = readPersistedImapMailbox(current.mailbox);
+    const nextMailbox = (data.mailbox as string | undefined) ?? currentMailbox;
     const touchesImap = current.type === 'IMAP' || nextType === 'IMAP';
+    const configuredCaptureQueueId = this.config?.TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID;
+    if (
+      this.config?.TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED === true &&
+      id === configuredCaptureQueueId &&
+      nextType === 'IMAP' &&
+      isKnownUnsafeCaptureMailbox(nextMailbox)
+    ) {
+      throw new BadRequestException(
+        'Capture-only requires an empty dedicated IMAP test folder; Inbox and provider special-use folders are refused',
+      );
+    }
     const identityChanged =
       touchesImap &&
       (nextType !== current.type ||
         (rest.host !== undefined && rest.host !== current.host) ||
         (rest.port !== undefined && rest.port !== current.port) ||
         (rest.username !== undefined && rest.username !== current.username) ||
-        (rest.useTls !== undefined && rest.useTls !== current.useTls));
+        (rest.useTls !== undefined && rest.useTls !== current.useTls) ||
+        nextMailbox !== currentMailbox);
 
     if (identityChanged) {
       data.uidValidity = null;
@@ -301,7 +435,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       data.reconcileCause = 'MAILBOX_IDENTITY_CHANGED';
       data.reconcileRequestedAt = null;
       data.lastError =
-        'Mailbox identity changed (host/username/port/TLS/type) — cursor reset; run FROM_NOW or bounded BACKFILL';
+        'Mailbox identity changed (host/username/port/TLS/folder/type) — cursor reset; run FROM_NOW or bounded BACKFILL';
       data.cursorGeneration = { increment: 1 };
       data.mailboxEpoch = { increment: 1 };
       data.bootstrapPolicy = null;
@@ -309,7 +443,20 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     }
 
     const updated = await this.prisma.emailQueue.updateMany({
-      where: { AND: [scopedWhere, { configGeneration: current.configGeneration }] },
+      // `beginMailboxReconcile()` moves a queue to BOOTSTRAPPING and advances its cursor
+      // generation without changing configGeneration. Fence all reconcile-owned snapshot
+      // fields here so a form read just before that transition cannot invalidate the
+      // completion CAS and strand the queue in BOOTSTRAPPING.
+      where: {
+        AND: [
+          scopedWhere,
+          { configGeneration: current.configGeneration },
+          { syncState: current.syncState },
+          { cursorGeneration: current.cursorGeneration },
+          { mailboxEpoch: current.mailboxEpoch },
+          { captureRetiredAt: current.captureRetiredAt },
+        ],
+      },
       data,
     });
     if (updated.count !== 1) {
@@ -337,9 +484,14 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     const scopedWhere = access.queueByIdWhereForScope(id, scope);
     const current = await this.prisma.emailQueue.findFirst({
       where: scopedWhere,
-      select: { configGeneration: true, syncState: true },
+      select: { configGeneration: true, syncState: true, captureRetiredAt: true },
     });
     if (!current) throw new NotFoundException(`EmailQueue #${id} not found`);
+    if (current.captureRetiredAt !== null) {
+      throw new ConflictException(
+        'This capture-only queue is permanently retired and cannot be deleted; create a new queue and mailbox instead',
+      );
+    }
     if (current.syncState === 'BOOTSTRAPPING') {
       throw new ConflictException(
         'Queue is reconciling; it cannot be deleted until the IMAP baseline completes',
@@ -356,6 +508,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           scopedWhere,
           { configGeneration: current.configGeneration },
           { syncState: { not: 'BOOTSTRAPPING' } },
+          { captureRetiredAt: null },
         ],
       },
     });
@@ -386,9 +539,23 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         cursorGeneration: true,
         mailboxEpoch: true,
         configGeneration: true,
+        mailbox: true,
+        useTls: true,
+        captureRetiredAt: true,
       },
     });
     if (!before) throw new NotFoundException(`EmailQueue #${id} not found`);
+    if (before.captureRetiredAt !== null) {
+      throw new ConflictException(
+        'This capture-only queue is permanently retired and cannot be reconciled; create a new queue and mailbox instead',
+      );
+    }
+    if (this.config?.TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED === true) {
+      throw new ConflictException(
+        'Capture-only queues are armed and baselined only by the capture supervisor; reconcile is disabled for this attended test',
+      );
+    }
+    this.assertCaptureReconcileScope(before, dto);
     this.assertReconcileAllowed(before, dto);
 
     if (dto.mode === 'RESUME_MIGRATED') {
@@ -479,6 +646,44 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * While capture-only is active, reconciliation is not a harmless admin read:
+   * FROM_NOW/BACKFILL opens a mailbox and can commit a cursor boundary. Restrict it
+   * to the one selected test queue before BOOTSTRAPPING or any IMAP connection is
+   * attempted. This closes the otherwise separate reconcile path around the polling
+   * and PIPE capture fences.
+   */
+  private assertCaptureReconcileScope(
+    before: { id: number; type: string; mailbox?: string; useTls?: boolean },
+    dto: Pick<ReconcileEmailQueueDto, 'mode'>,
+  ): void {
+    if (this.config?.TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED !== true) return;
+    const selectedId = this.config.TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID;
+    if (
+      typeof selectedId !== 'number' ||
+      !Number.isSafeInteger(selectedId) ||
+      selectedId < 1 ||
+      before.id !== selectedId
+    ) {
+      throw new ConflictException(
+        'Capture-only mode permits reconcile only for its explicitly selected test queue',
+      );
+    }
+    if (dto.mode !== 'FROM_NOW') {
+      throw new ConflictException(
+        'Capture-only permits only FROM_NOW; historical mailbox import is refused for the attended test',
+      );
+    }
+    if (before.type === 'IMAP' && before.useTls !== true) {
+      throw new ConflictException('Capture-only requires implicit TLS for the selected IMAP test queue');
+    }
+    if (before.type === 'IMAP' && isKnownUnsafeCaptureMailbox(readPersistedImapMailbox(before.mailbox))) {
+      throw new ConflictException(
+        'Capture-only requires an empty dedicated IMAP test folder; Inbox and provider special-use folders are refused',
+      );
+    }
+  }
+
   private async beginMailboxReconcile(
     before: {
       id: number;
@@ -490,6 +695,9 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       cursorGeneration: number;
       mailboxEpoch: number;
       configGeneration: number;
+      mailbox?: string;
+      useTls?: boolean;
+      captureRetiredAt: Date | null;
     },
     dto: ReconcileEmailQueueDto,
     actor: InboundActor,
@@ -506,6 +714,8 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           cursorGeneration: before.cursorGeneration,
           mailboxEpoch: before.mailboxEpoch,
           configGeneration: before.configGeneration,
+          mailbox: readPersistedImapMailbox(before.mailbox),
+          captureRetiredAt: before.captureRetiredAt,
         }),
         data: {
           syncState: 'BOOTSTRAPPING',
@@ -539,13 +749,15 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           username: true,
           passwordEnc: true,
           useTls: true,
+          mailbox: true,
           mailboxEpoch: true,
           cursorGeneration: true,
           configGeneration: true,
+          captureRetiredAt: true,
         },
       });
       if (!started) throw new ConflictException('Queue disappeared while reconcile was requested');
-      return started;
+      return { ...started, mailbox: readPersistedImapMailbox(started.mailbox) };
     });
   }
 
@@ -555,6 +767,8 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       mailboxEpoch: number;
       cursorGeneration: number;
       configGeneration: number;
+      mailbox: string;
+      captureRetiredAt: Date | null;
     },
     cause: ReconcileCause,
     dto: ReconcileEmailQueueDto,
@@ -572,6 +786,8 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           cursorGeneration: started.cursorGeneration,
           mailboxEpoch: started.mailboxEpoch,
           configGeneration: started.configGeneration,
+          mailbox: started.mailbox,
+          captureRetiredAt: started.captureRetiredAt,
         }),
         data: {
           uidValidity: baseline.uidValidity,
@@ -612,7 +828,14 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async failMailboxReconcile(
-    started: { id: number; mailboxEpoch: number; cursorGeneration: number; configGeneration: number },
+    started: {
+      id: number;
+      mailboxEpoch: number;
+      cursorGeneration: number;
+      configGeneration: number;
+      mailbox: string;
+      captureRetiredAt: Date | null;
+    },
     cause: ReconcileCause,
     dto: ReconcileEmailQueueDto,
     actor: InboundActor,
@@ -629,6 +852,8 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           cursorGeneration: started.cursorGeneration,
           mailboxEpoch: started.mailboxEpoch,
           configGeneration: started.configGeneration,
+          mailbox: started.mailbox,
+          captureRetiredAt: started.captureRetiredAt,
         }),
         data: {
           syncState: 'NEEDS_RECONCILIATION',
@@ -668,6 +893,8 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       cursorGeneration: number;
       mailboxEpoch: number;
       configGeneration: number;
+      mailbox?: string;
+      captureRetiredAt: Date | null;
     },
     dto: ReconcileEmailQueueDto,
     actor: InboundActor,
@@ -701,6 +928,8 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           cursorGeneration: before.cursorGeneration,
           mailboxEpoch: before.mailboxEpoch,
           configGeneration: before.configGeneration,
+          mailbox: readPersistedImapMailbox(before.mailbox),
+          captureRetiredAt: before.captureRetiredAt,
         }),
         data: {
           uidValidity: legacyUidValidity,
@@ -780,6 +1009,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       reconcileCause: ReconcileCause;
       cursorGeneration: number;
       mailboxEpoch: number;
+      mailbox?: string;
     },
     dto: ReconcileEmailQueueDto,
     extra: Record<string, unknown>,
@@ -794,15 +1024,21 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         reconcileCause: before.reconcileCause,
         cursorGeneration: before.cursorGeneration,
         mailboxEpoch: before.mailboxEpoch,
+        mailbox: readPersistedImapMailbox(before.mailbox),
       },
       ...extra,
     };
   }
 
-  private withAllowedModes<T extends { reconcileCause: ReconcileCause; syncState: string }>(queue: T) {
+  private withAllowedModes<
+    T extends { reconcileCause: ReconcileCause; syncState: string; captureRetiredAt?: Date | null },
+  >(queue: T) {
     return {
       ...queue,
-      allowedModes: queue.syncState === 'OK' ? [] : allowedReconcileModes(queue.reconcileCause),
+      allowedModes:
+        queue.captureRetiredAt != null || queue.syncState === 'OK'
+          ? []
+          : allowedReconcileModes(queue.reconcileCause),
     };
   }
 
@@ -985,7 +1221,6 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         actorEmail: true,
         action: true,
         reason: true,
-        metadata: true,
         createdAt: true,
       },
     });
@@ -1000,8 +1235,48 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           ? 'The stored MIME is truncated; safely replaying it requires a future original-message re-fetch.'
           : null,
       },
-      audit,
+      // Generic audit JSON is deliberately not an HTTP contract. Transport adapters may
+      // add implementation detail to it later (for example an opaque raw-storage key),
+      // while operators only need this actor/action/reason timeline to decide on replay.
+      audit: audit.map((entry) => {
+        const {
+          metadata: _metadata,
+          rawMime: _rawMime,
+          rawStorageKey: _rawStorageKey,
+          ...safeEntry
+        } = entry as typeof entry & {
+          metadata?: unknown;
+          rawMime?: Buffer | null;
+          rawStorageKey?: string | null;
+        };
+        return safeEntry;
+      }),
     };
+  }
+
+  /**
+   * Serialize delivery transitions with capture arming.  `armCaptureQueue()` takes
+   * this queue row lock before it checks for normal work; every normal transition
+   * must take the same lock before it can make a row processable.
+   */
+  private async lockDeliveryQueueCaptureState(
+    tx: Prisma.TransactionClient,
+    queueId: number | null,
+    expectCaptureRetired: boolean,
+  ): Promise<boolean> {
+    // Old, intentionally orphaned normal ledger rows retain their raw MIME but
+    // cannot originate from a capture-retired queue: deletion of such a queue is
+    // blocked by both this service and the database trigger.
+    if (queueId === null) return !expectCaptureRetired;
+    const queues = await tx.$queryRaw<Array<{ id: number; captureRetiredAt: Date | null }>>(Prisma.sql`
+      SELECT "id", "captureRetiredAt"
+      FROM "EmailQueue"
+      WHERE "id" = ${queueId}
+      FOR UPDATE
+    `);
+    const queue = queues[0];
+    if (!queue) return false;
+    return expectCaptureRetired ? queue.captureRetiredAt !== null : queue.captureRetiredAt === null;
   }
 
   /**
@@ -1009,13 +1284,21 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
    * the drain reprocesses it. The raw MIME was retained, so nothing was lost.
    */
   async replayQuarantined(deliveryId: number, dto: ReplayQuarantinedInboundDto, actor: InboundActor) {
+    // Capture-only is an inert, IMAP-only evidence-gathering window. Replaying any
+    // pre-existing quarantine would leave normal work ACCEPTED for the next restart,
+    // so refuse it before even reading or mutating the ledger.
+    if (this.config?.TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED === true) {
+      throw new ConflictException(
+        'Quarantined deliveries cannot be replayed while inbound capture-only mode is active',
+      );
+    }
     const effectiveActor = this.normalizeMailActor(actor);
     const access = this.accessPolicy();
     const scope = await this.resolveMailScope(effectiveActor);
     await this.prisma.$transaction(async (tx) => {
       const current = await tx.inboundDelivery.findFirst({
         where: access.deliveryByIdWhereForScope(deliveryId, scope),
-        select: { state: true, truncated: true, updatedAt: true },
+        select: { state: true, truncated: true, updatedAt: true, queueId: true },
       });
       if (!current || current.state !== 'QUARANTINED') {
         throw new NotFoundException(`Quarantined delivery #${deliveryId} not found`);
@@ -1030,15 +1313,22 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       if (current.updatedAt.getTime() !== dto.expectedUpdatedAt.getTime()) {
         throw new ConflictException(`Quarantined delivery #${deliveryId} changed; refresh before replaying`);
       }
+      if (!(await this.lockDeliveryQueueCaptureState(tx, current.queueId, false))) {
+        throw new ConflictException(
+          `Quarantined delivery #${deliveryId} belongs to a capture-retired queue and cannot be replayed`,
+        );
+      }
       const reset = await tx.inboundDelivery.updateMany({
-        where: scope.unrestricted
-          ? { id: deliveryId, state: 'QUARANTINED', updatedAt: dto.expectedUpdatedAt }
-          : {
-              AND: [
-                { id: deliveryId, state: 'QUARANTINED', updatedAt: dto.expectedUpdatedAt },
-                access.deliveryWhereForScope(scope),
-              ],
-            },
+        where: {
+          AND: [
+            { id: deliveryId, state: 'QUARANTINED', updatedAt: dto.expectedUpdatedAt },
+            // Keep the marker in the transition CAS as well as under the row lock:
+            // a mocked/future caller cannot accidentally turn this into a read-only
+            // advisory check.
+            { NOT: { queue: { is: { captureRetiredAt: { not: null } } } } },
+            ...(scope.unrestricted ? [] : [access.deliveryWhereForScope(scope)]),
+          ],
+        },
         data: { state: 'ACCEPTED', attempts: 0, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null },
       });
       if (reset.count !== 1) {
@@ -1064,6 +1354,265 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Paginated capture-only index. Capture mode deliberately preserves the message bytes in the
+   * ledger while preventing ticket work; operators may inspect safe delivery metadata before
+   * explicitly promoting an individual row. Raw MIME and object-storage keys never leave this
+   * service through this endpoint.
+   */
+  async listCaptured(query: ListCapturedInboundDto, actor?: InboundActor) {
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(actor);
+    const baseWhere: Prisma.InboundDeliveryWhereInput = {
+      state: CAPTURED_DELIVERY_STATE,
+      ...(query.queueId !== undefined ? { queueId: query.queueId } : {}),
+      ...(query.reason ? { lastError: { contains: query.reason, mode: 'insensitive' } } : {}),
+      ...(query.messageId
+        ? {
+            OR: [
+              { messageId: { contains: query.messageId, mode: 'insensitive' } },
+              { observedMessageId: { contains: query.messageId, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+      ...(query.from || query.to
+        ? {
+            createdAt: {
+              ...(query.from ? { gte: query.from } : {}),
+              ...(query.to ? { lte: query.to } : {}),
+            },
+          }
+        : {}),
+    };
+    const where: Prisma.InboundDeliveryWhereInput = scope.unrestricted
+      ? baseWhere
+      : { AND: [baseWhere, access.deliveryWhereForScope(scope)] };
+    const select = {
+      id: true,
+      transport: true,
+      queueId: true,
+      messageId: true,
+      observedMessageId: true,
+      envelopeFrom: true,
+      envelopeTo: true,
+      subject: true,
+      sizeBytes: true,
+      attempts: true,
+      lastError: true,
+      truncated: true,
+      createdAt: true,
+      updatedAt: true,
+    } as const;
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.inboundDelivery.findMany({
+        where,
+        orderBy: { id: 'desc' },
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
+        select,
+      }),
+      this.prisma.inboundDelivery.count({ where }),
+    ]);
+    return {
+      items: items.map((rawItem) => {
+        // Defence in depth: keep a future mock/projection from reflecting an opaque key even
+        // though the Prisma projection above excludes it.
+        const {
+          rawMime: _rawMime,
+          rawStorageKey: _rawStorageKey,
+          ...item
+        } = rawItem as typeof rawItem & {
+          rawMime?: Buffer | null;
+          rawStorageKey?: string | null;
+        };
+        return {
+          ...item,
+          promoteAllowed: !item.truncated,
+          promoteBlockReason: item.truncated
+            ? 'The stored MIME is truncated; it cannot be promoted to ticket processing safely.'
+            : null,
+        };
+      }),
+      total,
+      page: query.page,
+      limit: query.limit,
+    };
+  }
+
+  /**
+   * Capture-only detail is intentionally limited to delivery and audit metadata. In
+   * particular, this is not a raw-MIME download endpoint and it does not disclose opaque
+   * external storage keys.
+   */
+  async getCaptured(deliveryId: number, actor?: InboundActor) {
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(actor);
+    const delivery = await this.prisma.inboundDelivery.findFirst({
+      where: access.deliveryByIdWhereForScope(deliveryId, scope),
+      select: {
+        id: true,
+        transport: true,
+        queueId: true,
+        messageId: true,
+        observedMessageId: true,
+        envelopeFrom: true,
+        envelopeTo: true,
+        subject: true,
+        sizeBytes: true,
+        attempts: true,
+        lastError: true,
+        truncated: true,
+        createdAt: true,
+        updatedAt: true,
+        state: true,
+      },
+    });
+    if (!delivery || delivery.state !== CAPTURED_DELIVERY_STATE) {
+      throw new NotFoundException(`Captured delivery #${deliveryId} not found`);
+    }
+    // Do not select generic JSON metadata here: audit metadata can contain implementation
+    // details supplied by a transport adapter. The durable actor/action/reason timeline is the
+    // operator information needed for promotion without risking a raw-storage-key disclosure.
+    const audit = await this.prisma.inboundAuditLog.findMany({
+      where: { deliveryId },
+      orderBy: { id: 'desc' },
+      take: 100,
+      select: {
+        id: true,
+        actorStaffId: true,
+        actorEmail: true,
+        action: true,
+        reason: true,
+        createdAt: true,
+      },
+    });
+    const {
+      rawMime: _rawMime,
+      rawStorageKey: _rawStorageKey,
+      ...safeDelivery
+    } = delivery as typeof delivery & {
+      rawMime?: Buffer | null;
+      rawStorageKey?: string | null;
+    };
+    const safeAudit = audit.map((entry) => {
+      // Prisma's select excludes metadata, but strip it again so a mock/future projection cannot
+      // inadvertently expose a transport implementation detail such as rawStorageKey.
+      const {
+        metadata: _metadata,
+        rawMime: _rawMime,
+        rawStorageKey: _rawStorageKey,
+        ...safeEntry
+      } = entry as typeof entry & {
+        metadata?: unknown;
+        rawMime?: Buffer | null;
+        rawStorageKey?: string | null;
+      };
+      return safeEntry;
+    });
+    return {
+      delivery: {
+        ...safeDelivery,
+        promoteAllowed: !safeDelivery.truncated,
+        promoteBlockReason: safeDelivery.truncated
+          ? 'The stored MIME is truncated; it cannot be promoted to ticket processing safely.'
+          : null,
+      },
+      audit: safeAudit,
+    };
+  }
+
+  /**
+   * Promote one deliberately captured delivery into normal durable processing. The compare and
+   * state transition use the inspected row version, and the operator audit is in the same
+   * transaction so CAPTURED -> ACCEPTED never succeeds without a durable reason.
+   */
+  async promoteCaptured(deliveryId: number, dto: PromoteCapturedInboundDto, actor: InboundActor) {
+    const canary = this.assertCapturePromotionEnabled();
+    if (canary.deliveryId !== deliveryId) {
+      throw new ConflictException(
+        'Only the selected captured delivery may be promoted during the inbound normal canary',
+      );
+    }
+    const effectiveActor = this.normalizeMailActor(actor);
+    const access = this.accessPolicy();
+    const scope = await this.resolveMailScope(effectiveActor);
+    await this.prisma.$transaction(async (tx) => {
+      const current = await tx.inboundDelivery.findFirst({
+        where: access.deliveryByIdWhereForScope(deliveryId, scope),
+        select: { state: true, truncated: true, updatedAt: true, queueId: true },
+      });
+      if (!current || current.state !== CAPTURED_DELIVERY_STATE) {
+        throw new NotFoundException(`Captured delivery #${deliveryId} not found`);
+      }
+      if (current.queueId !== canary.queueId) {
+        throw new ConflictException(
+          'Selected captured delivery does not belong to the inbound normal canary queue',
+        );
+      }
+      if (!(await this.lockDeliveryQueueCaptureState(tx, current.queueId, true))) {
+        throw new ConflictException(
+          'Captured delivery does not belong to a capture-retired queue and cannot be promoted',
+        );
+      }
+      // A truncated record is not a faithful original message. Never let a capture-only review
+      // turn incomplete bytes into a customer ticket.
+      if (current.truncated) {
+        throw new BadRequestException(
+          `Captured delivery #${deliveryId} has truncated raw MIME and cannot be promoted safely`,
+        );
+      }
+      if (current.updatedAt.getTime() !== dto.expectedUpdatedAt.getTime()) {
+        throw new ConflictException(`Captured delivery #${deliveryId} changed; refresh before promoting`);
+      }
+      const promoted = await tx.inboundDelivery.updateMany({
+        where: {
+          AND: [
+            {
+              id: deliveryId,
+              queueId: canary.queueId,
+              state: CAPTURED_DELIVERY_STATE,
+              updatedAt: dto.expectedUpdatedAt,
+            },
+            { queue: { is: { captureRetiredAt: { not: null } } } },
+            ...(scope.unrestricted ? [] : [access.deliveryWhereForScope(scope)]),
+          ],
+        },
+        data: {
+          state: 'ACCEPTED',
+          capturePromotedAt: new Date(),
+          // A captured row is visible to its dedicated test queue for review. Once promoted
+          // into normal processing, hide it from non-admin operators until parsing resolves
+          // the real ticket owner (thread target / parser rule / deterministic route).
+          effectiveOwnerKind: 'UNRESOLVED',
+          effectiveOwnerDepartmentId: null,
+          effectiveOwnerTicketId: null,
+          attempts: 0,
+          lastError: null,
+          nextAttemptAt: null,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+        },
+      });
+      if (promoted.count !== 1) {
+        throw new ConflictException(`Captured delivery #${deliveryId} changed; refresh before promoting`);
+      }
+      await tx.inboundAuditLog.create({
+        data: {
+          actorStaffId: effectiveActor.staffId,
+          actorEmail: effectiveActor.email ?? '',
+          action: 'mail.capture_promoted',
+          deliveryId,
+          reason: dto.reason,
+          metadata: { expectedUpdatedAt: dto.expectedUpdatedAt.toISOString() },
+        },
+      });
+    });
+    this.logger.warn(
+      `AUDIT inbound capture promoted delivery=${deliveryId} actorStaffId=${effectiveActor.staffId}`,
+    );
+    return { promoted: true };
+  }
+
+  /**
    * Operator health snapshot: per-queue sync state + the inbound ledger backlog, staleness
    * timestamps, and a computed `alerts` list (halted queue, quarantine, stalled lease,
    * aged backlog). One call an admin dashboard / alerting probe can poll.
@@ -1081,6 +1630,8 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
       select: {
         id: true,
         emailAddress: true,
+        mailbox: true,
+        useTls: true,
         isEnabled: true,
         syncState: true,
         lastError: true,
@@ -1091,6 +1642,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         reconcileCause: true,
         reconcileRequestedAt: true,
         bootstrapPolicy: true,
+        captureRetiredAt: true,
         lastConnectionAttemptAt: true,
         lastConnectedAt: true,
         lastDisconnectedAt: true,
@@ -1110,6 +1662,7 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     const count = (state: string): number => grouped.find((g) => g.state === state)?._count._all ?? 0;
     const byState = {
       accepted: count('ACCEPTED'),
+      captured: count('CAPTURED'),
       processing: count('PROCESSING'),
       retry: count('RETRY'),
       quarantined: count('QUARANTINED'),
@@ -1118,39 +1671,181 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
     };
 
     const collisionSince = new Date(suppliedNow.getTime() - 24 * 60 * 60_000);
-    const [oldestPending, lastProcessed, stalledProcessing, quarantineSize, recentCollisions] =
-      await Promise.all([
-        this.prisma.inboundDelivery.findFirst({
-          where: scopedDeliveries({ state: { in: ['ACCEPTED', 'RETRY'] } }),
-          orderBy: { createdAt: 'asc' },
-          select: { id: true, createdAt: true, nextAttemptAt: true, attempts: true },
-        }),
-        this.prisma.inboundDelivery.findFirst({
-          where: scopedDeliveries({ state: 'PROCESSED' }),
-          orderBy: { processedAt: 'desc' },
-          select: { processedAt: true },
-        }),
-        this.prisma.inboundDelivery.count({
-          where: scopedDeliveries({ state: 'PROCESSING', leaseExpiresAt: { lt: suppliedNow } }),
-        }),
-        this.prisma.inboundDelivery.aggregate({
-          where: scopedDeliveries({ state: 'QUARANTINED' }),
-          _sum: { sizeBytes: true },
-        }),
-        scope.unrestricted
-          ? this.prisma.inboundAuditLog.count({
-              where: {
-                action: { in: ['mail.transport_collision', 'mail.message_id_conflict'] },
-                createdAt: { gte: collisionSince },
-              },
-            })
-          : Promise.resolve(0),
-      ]);
+    const [
+      oldestPending,
+      oldestCaptured,
+      lastProcessed,
+      stalledProcessing,
+      quarantineSize,
+      capturedSize,
+      recentCollisions,
+    ] = await Promise.all([
+      this.prisma.inboundDelivery.findFirst({
+        where: scopedDeliveries({ state: { in: ['ACCEPTED', 'RETRY'] } }),
+        orderBy: { createdAt: 'asc' },
+        select: { id: true, createdAt: true, nextAttemptAt: true, attempts: true },
+      }),
+      this.prisma.inboundDelivery.findFirst({
+        where: scopedDeliveries({ state: CAPTURED_DELIVERY_STATE }),
+        orderBy: { createdAt: 'asc' },
+        select: { createdAt: true },
+      }),
+      this.prisma.inboundDelivery.findFirst({
+        where: scopedDeliveries({ state: 'PROCESSED' }),
+        orderBy: { processedAt: 'desc' },
+        select: { processedAt: true },
+      }),
+      this.prisma.inboundDelivery.count({
+        where: scopedDeliveries({ state: 'PROCESSING', leaseExpiresAt: { lt: suppliedNow } }),
+      }),
+      this.prisma.inboundDelivery.aggregate({
+        where: scopedDeliveries({ state: 'QUARANTINED' }),
+        _sum: { sizeBytes: true },
+      }),
+      this.prisma.inboundDelivery.aggregate({
+        where: scopedDeliveries({ state: CAPTURED_DELIVERY_STATE }),
+        _sum: { sizeBytes: true },
+      }),
+      scope.unrestricted
+        ? this.prisma.inboundAuditLog.count({
+            where: {
+              action: { in: ['mail.transport_collision', 'mail.message_id_conflict'] },
+              createdAt: { gte: collisionSince },
+            },
+          })
+        : Promise.resolve(0),
+    ]);
 
     const enabledQueues = queues.filter((q) => q.isEnabled);
     const halted = enabledQueues.filter((q) => q.syncState === 'NEEDS_RECONCILIATION').map((q) => q.id);
+    const retiredCaptureQueues = queues.filter((q) => q.captureRetiredAt !== null);
     const alerts: Array<{ severity: 'warning' | 'critical'; kind: string; message: string }> = [];
-    if (this.config?.TELECOM_HD_INBOUND_DELIVERY_ENABLED === false) {
+    const captureOnly = this.config?.TELECOM_HD_INBOUND_CAPTURE_ONLY_ENABLED === true;
+    const normalInboundDeliveryEnabled = this.config?.TELECOM_HD_INBOUND_DELIVERY_ENABLED === true;
+    const configuredCaptureQueueId = this.config?.TELECOM_HD_INBOUND_CAPTURE_QUEUE_ID;
+    const captureQueueId =
+      captureOnly &&
+      typeof configuredCaptureQueueId === 'number' &&
+      Number.isSafeInteger(configuredCaptureQueueId) &&
+      configuredCaptureQueueId > 0 &&
+      (scope.unrestricted || queues.some((queue) => queue.id === configuredCaptureQueueId))
+        ? configuredCaptureQueueId
+        : null;
+    const configuredCaptureMax = this.config?.TELECOM_HD_INBOUND_CAPTURE_MAX_MESSAGES;
+    const captureMaxMessages =
+      captureOnly &&
+      typeof configuredCaptureMax === 'number' &&
+      Number.isSafeInteger(configuredCaptureMax) &&
+      configuredCaptureMax >= 1 &&
+      configuredCaptureMax <= 100
+        ? configuredCaptureMax
+        : null;
+    const selectedCaptureQueue =
+      captureQueueId === null ? undefined : queues.find((queue) => queue.id === captureQueueId);
+    const captureEncryptionReady = /^[0-9a-f]{64}$/i.test(this.config?.TELECOM_HD_FIELD_ENCRYPTION_KEY ?? '');
+    const captureRuntimeReady =
+      captureQueueId !== null && this.inboundMail?.isCaptureQueueReady(captureQueueId) === true;
+    // The UI must not infer test readiness from an env id alone. A capture canary is safe
+    // to send only after the server confirms a visible, enabled dedicated IMAP folder has
+    // completed its FROM_NOW baseline under the active capture gates.
+    const captureTarget = !captureOnly
+      ? null
+      : !selectedCaptureQueue
+        ? {
+            queueId: null,
+            ready: false,
+            reason:
+              'The selected capture queue is missing, outside your scope, or is not a visible IMAP queue. Do not send a test message.',
+          }
+        : !selectedCaptureQueue.isEnabled
+          ? {
+              queueId: selectedCaptureQueue.id,
+              ready: false,
+              reason: 'The selected capture queue is disabled.',
+            }
+          : selectedCaptureQueue.useTls !== true
+            ? {
+                queueId: selectedCaptureQueue.id,
+                ready: false,
+                reason:
+                  'The selected capture queue must use implicit TLS before a credential-bearing test can start.',
+              }
+            : isKnownUnsafeCaptureMailbox(selectedCaptureQueue.mailbox)
+              ? {
+                  queueId: selectedCaptureQueue.id,
+                  ready: false,
+                  reason: 'The selected capture queue uses Inbox or a provider special-use folder.',
+                }
+              : this.config?.TELECOM_HD_IMAP_ENABLED !== true
+                ? {
+                    queueId: selectedCaptureQueue.id,
+                    ready: false,
+                    reason: 'IMAP polling is disabled globally.',
+                  }
+                : !captureEncryptionReady
+                  ? {
+                      queueId: selectedCaptureQueue.id,
+                      ready: false,
+                      reason: 'The local field-encryption key is not configured safely.',
+                    }
+                  : captureMaxMessages !== 1
+                    ? {
+                        queueId: selectedCaptureQueue.id,
+                        ready: false,
+                        reason: 'The attended test requires an exactly one-message capture limit.',
+                      }
+                    : selectedCaptureQueue.syncState !== 'OK' || selectedCaptureQueue.uidValidity === null
+                      ? {
+                          queueId: selectedCaptureQueue.id,
+                          ready: false,
+                          reason: 'The selected queue has not completed a healthy IMAP baseline yet.',
+                        }
+                      : selectedCaptureQueue.captureRetiredAt === null
+                        ? {
+                            queueId: selectedCaptureQueue.id,
+                            ready: false,
+                            reason:
+                              'The selected queue has not been durably armed for capture-only; restart the API and wait for the safety fence before sending a test message.',
+                          }
+                        : !captureRuntimeReady
+                          ? {
+                              queueId: selectedCaptureQueue.id,
+                              ready: false,
+                              reason:
+                                'The server has not yet verified the selected folder as a live empty capture target. Do not send a test message.',
+                            }
+                          : { queueId: selectedCaptureQueue.id, ready: true, reason: null };
+    if (captureOnly) {
+      alerts.push({
+        severity: 'warning',
+        kind: 'capture_only_active',
+        message:
+          'Inbound capture-only mode is active: selected test mail is stored without ticket processing or outbound mail.',
+      });
+      if (!captureTarget?.ready) {
+        alerts.push({
+          severity: 'critical',
+          kind: 'capture_target_not_ready',
+          message:
+            captureTarget?.reason ?? 'The selected capture target is not ready. Do not send a test message.',
+        });
+      }
+      if (selectedCaptureQueue && isKnownUnsafeCaptureMailbox(selectedCaptureQueue.mailbox)) {
+        alerts.push({
+          severity: 'critical',
+          kind: 'capture_mailbox_unsafe',
+          message:
+            'Capture-only selected an IMAP queue using an unsafe special-use folder. The runtime refuses it; choose a new empty test folder before retrying.',
+        });
+      }
+      if (captureMaxMessages === null) {
+        alerts.push({
+          severity: 'critical',
+          kind: 'capture_configuration_invalid',
+          message: 'Capture-only message limit is invalid; the runtime remains fail-closed.',
+        });
+      }
+    } else if (this.config?.TELECOM_HD_INBOUND_DELIVERY_ENABLED === false) {
       alerts.push({
         severity: 'critical',
         kind: 'inbound_delivery_disabled',
@@ -1213,6 +1908,17 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
           severity: 'warning',
           kind: 'bootstrap_stalled',
           message: `Queue ${q.id} (${q.emailAddress}) has been bootstrapping for over 10 minutes.`,
+        });
+      }
+    }
+    if (!captureOnly) {
+      for (const queue of retiredCaptureQueues) {
+        alerts.push({
+          severity: 'warning',
+          kind: `capture_queue_retired_${queue.id}`,
+          message:
+            `Queue #${queue.id} is permanently retired after capture-only use and is excluded from normal inbound; ` +
+            'create a new queue and mailbox for future mail tests.',
         });
       }
     }
@@ -1304,12 +2010,19 @@ export class EmailQueueService implements OnModuleInit, OnModuleDestroy {
         backlog: byState.accepted + byState.retry,
         byState,
         quarantineBytes: quarantineSize._sum.sizeBytes ?? 0,
+        capturedBytes: capturedSize._sum.sizeBytes ?? 0,
         stalledProcessing,
         oldestPendingAt: oldestPending?.createdAt ?? null,
+        oldestCapturedAt: oldestCaptured?.createdAt ?? null,
         lastProcessedAt: lastProcessed?.processedAt ?? null,
       },
       rawStorage: storage,
       alerts,
+      captureOnly,
+      normalInboundDeliveryEnabled,
+      captureQueueId,
+      captureMaxMessages,
+      captureTarget,
       checkedAt: suppliedNow,
     };
   }
